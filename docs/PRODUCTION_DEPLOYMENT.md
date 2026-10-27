@@ -581,7 +581,9 @@ git fetch --tags origin
 git checkout vX.Y.Z
 echo 'LAB_PLAYGROUND_VERSION=X.Y.Z' >> .env
 gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:X.Y.Z \
-  -R Ragnar-Security/Ragnar-Lab-Playground
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z
 ```
 
 Then follow steps 1, 3 and 5 of the redeploy above, and replace step 4 with:

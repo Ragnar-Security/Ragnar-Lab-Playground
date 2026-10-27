@@ -17,14 +17,22 @@ Requirements: Docker with the Compose v2 plugin, version 2.24.0 or later
 ## 1. Verify what you downloaded
 
 Download `lab-playground-<version>-deploy.tar.gz` and `SHA256SUMS` from the
-GitHub Release, then:
+GitHub Release, then check that the release workflow built both from the
+release tag. `-R` alone would accept an attestation from any workflow on any
+branch of the repository; `--signer-workflow` and `--source-ref` close that.
+The release notes repeat these commands with the tag's commit filled in as
+`--source-digest`.
 
 ```bash
 sha256sum -c SHA256SUMS
 gh attestation verify lab-playground-<version>-deploy.tar.gz \
-  -R Ragnar-Security/Ragnar-Lab-Playground
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/v<version>
 gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:<version> \
-  -R Ragnar-Security/Ragnar-Lab-Playground
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/v<version>
 ```
 
 ## 2. Unpack and configure
@@ -51,7 +59,9 @@ LAB_PLAYGROUND_VERSION=<version>
 ```
 
 `LAB_PLAYGROUND_VERSION` may also pin the image digest from the release notes,
-for example `1.0.0@sha256:<digest>`. Edit `templates.yaml` for your Proxmox
+for example `1.0.0@sha256:<digest>`. It must name an exact release: the
+preflight below refuses a moving tag such as `latest`, which would let any
+restart change what runs. Edit `templates.yaml` for your Proxmox
 cluster, then check `.env` against the production rules:
 
 ```bash

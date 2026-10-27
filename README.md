@@ -153,8 +153,9 @@ docker compose up -d --build
 ## Install from a release
 
 Each `vX.Y.Z` release publishes a container image,
-`ghcr.io/ragnar-security/lab-playground:X.Y.Z` (also `X.Y` and `latest`), for
-linux/amd64 and linux/arm64, with build provenance and an SBOM. The
+`ghcr.io/ragnar-security/lab-playground:X.Y.Z`, for linux/amd64 and
+linux/arm64, with build provenance and an SBOM. The highest release also
+moves `latest`, and the highest of each `X.Y` line moves `X.Y`. The
 [GitHub Release](https://github.com/Ragnar-Security/Ragnar-Lab-Playground/releases)
 carries the upgrade notes and a deploy bundle: the production Compose stack,
 the `docker-compose.release.yml` override, the Caddy configuration, example
@@ -164,8 +165,14 @@ is needed.
 ```bash
 # Verify the download and the image (GitHub CLI)
 sha256sum -c SHA256SUMS
-gh attestation verify lab-playground-1.0.0-deploy.tar.gz -R Ragnar-Security/Ragnar-Lab-Playground
-gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:1.0.0 -R Ragnar-Security/Ragnar-Lab-Playground
+gh attestation verify lab-playground-1.0.0-deploy.tar.gz \
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/v1.0.0
+gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:1.0.0 \
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/v1.0.0
 
 tar -xzf lab-playground-1.0.0-deploy.tar.gz
 cd lab-playground-1.0.0
@@ -485,7 +492,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 1. **Unit Tests job** -- installs dependencies, runs the pure-Python test subset.
 2. **Integration Tests job** -- builds the Docker test environment, installs Playwright + Chromium, runs browser tests, then tears down.
 3. **Docker Push job** -- (main branch only) builds the production image and pushes to Docker Hub with `latest` and SHA tags. Requires `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets.
-4. **Release** (`.github/workflows/release.yml`) -- on a `vX.Y.Z` tag: checks the tag against the version and the CHANGELOG, reruns this CI on the tag, builds and attests the GHCR image and the deploy bundle, and creates the GitHub Release. See [docs/RELEASING.md](docs/RELEASING.md).
+4. **Release** (`.github/workflows/release.yml`) -- on a pushed `vX.Y.Z` (or `vX.Y.Z-rc.N`) tag: checks the tag against the version and the CHANGELOG, reruns this CI on the tag, and, after a maintainer approves the `release` environment, publishes and attests the GHCR image and the deploy bundle and creates the GitHub Release. A manual run is a dry run that publishes nothing. See [docs/RELEASING.md](docs/RELEASING.md).
 
 ## API Reference
 
