@@ -366,16 +366,54 @@ def test_inventory_is_single_call_and_configs_only_read_for_untracked_app_guests
     assert boundary.guests[704].config.get.call_count == 0
 
 
-def test_only_status_code_404_is_classified_as_not_found(app):
-    class ProxmoxError(Exception):
-        def __init__(self, message, status_code=None):
-            super().__init__(message)
-            self.status_code = status_code
+class _ProxmoxError(Exception):
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        self.status_code = status_code
 
+
+# Real Proxmox answers a request for a missing guest with HTTP 500 and this
+# message, not 404 (verified against a live PVE 9 cluster).
+_MISSING = "500 Internal Server Error: Configuration file 'nodes/pve/qemu-server/700.conf' does not exist"
+
+
+def _vanishes_after_first_inventory(boundary, resources):
+    # The sweep's own inventory still lists the guest; the fresh read used to
+    # confirm absence does not.
+    boundary.api.cluster.resources.get.side_effect = [resources, []]
+
+
+@pytest.mark.parametrize("operation", ["stop", "delete"])
+def test_missing_guest_in_real_proxmox_shape_is_reported_not_found(app, operation):
+    resources = [_resource(status="running" if operation == "stop" else "stopped")]
+    boundary = ProxmoxBoundary(
+        resources,
+        operation_errors={(700, operation): _ProxmoxError(_MISSING, status_code=500)},
+    )
+    _vanishes_after_first_inventory(boundary, resources)
+    with app.app_context():
+        result = _run(boundary)
+    assert result[0]["status"] == "not_found"
+
+
+def test_missing_message_is_not_trusted_while_inventory_still_lists_the_guest(app):
     boundary = ProxmoxBoundary(
         [_resource()],
-        operation_errors={(700, "stop"): ProxmoxError("gone", status_code=404)},
+        operation_errors={(700, "stop"): _ProxmoxError(_MISSING, status_code=500)},
     )
+    with app.app_context():
+        result = _run(boundary)
+    assert result[0]["status"] == "stop_failed"
+    boundary.guests[700].delete.assert_not_called()
+
+
+def test_404_counts_as_gone_only_when_fresh_inventory_agrees(app):
+    resources = [_resource()]
+    boundary = ProxmoxBoundary(
+        resources,
+        operation_errors={(700, "stop"): _ProxmoxError("gone", status_code=404)},
+    )
+    _vanishes_after_first_inventory(boundary, resources)
     with app.app_context():
         result = _run(boundary)
     assert result[0]["status"] == "not_found"
@@ -383,7 +421,7 @@ def test_only_status_code_404_is_classified_as_not_found(app):
 
     transport = ProxmoxBoundary(
         [_resource(701, "student-bob-web")],
-        operation_errors={(701, "stop"): ProxmoxError("request /qemu/404 failed")},
+        operation_errors={(701, "stop"): _ProxmoxError("request /qemu/404 failed")},
     )
     with app.app_context():
         result = _run(transport)
