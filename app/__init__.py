@@ -38,7 +38,7 @@ __version__ = "1.0.0"
 __all__ = ["create_app", "db"]
 
 
-def create_app(testing=False):
+def create_app(testing=False, test_config=None):
     """
     Application factory function
 
@@ -46,10 +46,17 @@ def create_app(testing=False):
 
     Args:
         testing: If True, use SQLite in-memory and skip config validation
+        test_config: Optional mapping applied over the testing defaults
+            before the database is initialized, e.g. a per-test
+            SQLALCHEMY_DATABASE_URI. Flask-SQLAlchemy builds the engine in
+            init_app, so setting the URI afterwards has no effect.
 
     Returns:
         Flask: Configured Flask application
     """
+    if test_config is not None and not testing:
+        raise ValueError('test_config requires testing=True')
+
     app = Flask(__name__, template_folder='../templates', static_folder='../static')
 
     # Load configuration
@@ -62,6 +69,8 @@ def create_app(testing=False):
         # Clear MySQL-only pool options inherited from ProductionConfig.
         # SQLite uses StaticPool which rejects pool_size/max_overflow/etc.
         app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {}
+        if test_config is not None:
+            app.config.update(test_config)
     else:
         # Validate configuration in non-test mode
         if not config.TESTING:
