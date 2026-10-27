@@ -1,8 +1,18 @@
 #!/bin/bash
-# Script to create student accounts on the jumpbox from students.csv
+# Create student accounts on the jumpbox from a Canvas students.csv.
+# Runs ON the jumpbox, as root.
+#
 # Usage: sudo ./create_student_accounts.sh <path-to-students.csv>
+#
+# Environment:
+#   JUMPBOX_CREDENTIALS_FILE  where generated username,password lines are
+#                             written (default: ./jumpbox-credentials.csv, mode 0600)
+#
+# Every new account gets its own random password, forced to change at first
+# login. The password travels only on chpasswd's stdin (never argv) and is
+# written only to the credentials file; it is never printed.
 
-if [ "$EUID" -ne 0 ]; then 
+if [ "$(id -u)" -ne 0 ]; then
     echo "ERROR: This script must be run as root (use sudo)"
     exit 1
 fi
@@ -14,17 +24,18 @@ if [ -z "$1" ]; then
 fi
 
 CSV_FILE="$1"
+JUMPBOX_CREDENTIALS_FILE="${JUMPBOX_CREDENTIALS_FILE:-./jumpbox-credentials.csv}"
 
 if [ ! -f "$CSV_FILE" ]; then
     echo "ERROR: File not found: $CSV_FILE"
     exit 1
 fi
 
-# Default password (students will be forced to change on first login)
-DEFAULT_PASSWORD="ChangeMe2026!"
+# Owner-only: this file holds the one-time initial passwords.
+(umask 077; touch "$JUMPBOX_CREDENTIALS_FILE")
+chmod 600 "$JUMPBOX_CREDENTIALS_FILE"
 
 echo "Creating student accounts from $CSV_FILE"
-echo "Default password: $DEFAULT_PASSWORD"
 echo "Students will be forced to change password on first login"
 echo ""
 
@@ -34,38 +45,42 @@ SKIPPED=0
 while IFS=, read -r sis_id login_id; do
     # Trim whitespace and carriage returns (Windows CRLF issue)
     login_id=$(echo "$login_id" | tr -d '\r' | xargs)
-    
+
     # Skip header row
     if [ "$login_id" = "SIS Login ID" ]; then
         continue
     fi
-    
+
     # Skip empty lines
     if [ -z "$login_id" ]; then
         continue
     fi
-    
+
     # Check if user already exists
     if id "$login_id" &>/dev/null; then
         echo "SKIP: User $login_id already exists"
         SKIPPED=$((SKIPPED + 1))
         continue
     fi
-    
+
     # Create user with home directory
     if useradd -m -s /bin/bash "$login_id"; then
-        # Set default password
-        echo "$login_id:$DEFAULT_PASSWORD" | chpasswd
-        
+        password=$(openssl rand -base64 12)
+        # printf is a builtin, so the password is in no process listing.
+        printf '%s:%s\n' "$login_id" "$password" | chpasswd
+
         # Force password change on first login
         chage -d 0 "$login_id"
-        
+
+        (umask 077; printf '%s,%s\n' "$login_id" "$password" >> "$JUMPBOX_CREDENTIALS_FILE")
+        password=""
+
         echo "CREATED: $login_id"
         CREATED=$((CREATED + 1))
     else
         echo "ERROR: Failed to create user $login_id"
     fi
-    
+
 done < "$CSV_FILE"
 
 echo ""
@@ -75,7 +90,5 @@ echo "Created: $CREATED"
 echo "Skipped: $SKIPPED"
 echo "=========================================="
 echo ""
-echo "Students can log in with:"
-echo "  Username: <their-login-id>"
-echo "  Password: $DEFAULT_PASSWORD"
-echo "  (They will be forced to change on first login)"
+echo "Initial passwords: $JUMPBOX_CREDENTIALS_FILE (mode 0600)"
+echo "Deliver each password privately; it must be changed at first login."

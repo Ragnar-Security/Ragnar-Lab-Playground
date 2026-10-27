@@ -12,6 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent
 TERM_CHANGEOVER = ROOT / "scripts" / "term_changeover.sh"
 HEADSCALE_CHANGEOVER = ROOT / "scripts" / "headscale_term_changeover.sh"
 JUMPBOX = ROOT / "scripts" / "configure_jumpbox.sh"
+STUDENT_ACCOUNTS = ROOT / "scripts" / "create_student_accounts.sh"
+JUMPBOX_LOCAL = ROOT / "scripts" / "create_jumpbox_local.sh"
 
 TERM_REQUIRED = [
     "PORTAL_HOST",
@@ -238,3 +240,75 @@ def test_setup_production_passes_proxmox_credentials_via_environment(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert out.read_text() == repr(("h'ost", evil_user, evil))
     assert not marker.exists()
+
+
+def test_create_student_accounts_uses_unique_random_passwords_via_stdin(tmp_path):
+    csv = tmp_path / "students.csv"
+    csv.write_text("SIS User ID,SIS Login ID\n100000001,alice\n100000002,bob\n")
+    creds = tmp_path / "creds.csv"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "calls.log"
+    stdin_log = tmp_path / "chpasswd.stdin"
+    fakes = {
+        "id": 'if [ "$1" = "-u" ]; then echo 0; exit 0; fi\nexit 1\n',
+        "useradd": 'printf "useradd %s\\n" "$*" >> "$CALL_LOG"\n',
+        "chage": 'printf "chage %s\\n" "$*" >> "$CALL_LOG"\n',
+        "chpasswd": (
+            'printf "chpasswd %s\\n" "$*" >> "$CALL_LOG"\n'
+            'cat >> "$STDIN_LOG"\n'
+        ),
+    }
+    for name, body in fakes.items():
+        tool = bin_dir / name
+        tool.write_text("#!/bin/sh\n" + body)
+        tool.chmod(tool.stat().st_mode | stat.S_IEXEC)
+
+    env = dict(os.environ)
+    env.update(
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        CALL_LOG=str(log),
+        STDIN_LOG=str(stdin_log),
+        JUMPBOX_CREDENTIALS_FILE=str(creds),
+    )
+    result = subprocess.run(
+        ["bash", str(STUDENT_ACCOUNTS), str(csv)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
+    )
+
+    assert result.returncode == 0, result.stderr
+    legacy = "Change" + "Me2026!"  # split so the literal never appears in the repo
+    calls = log.read_text()
+    assert legacy not in calls + result.stdout + result.stderr
+    assert stat.S_IMODE(creds.stat().st_mode) == 0o600
+    rows = [line.split(",") for line in creds.read_text().splitlines()]
+    assert [r[0] for r in rows] == ["alice", "bob"]
+    passwords = [r[1] for r in rows]
+    assert len(set(passwords)) == 2 and all(len(p) >= 12 for p in passwords)
+    sent = stdin_log.read_text().splitlines()
+    assert sent == [f"alice:{passwords[0]}", f"bob:{passwords[1]}"]
+    for password in passwords:
+        assert password not in calls  # never on argv
+        assert password not in result.stdout + result.stderr
+    assert "chage -d 0 alice" in calls and "chage -d 0 bob" in calls
+    assert str(creds) in result.stdout
+
+
+def test_legacy_shared_student_password_is_gone_from_repo():
+    pattern = "Change" + "Me2026"
+    found = subprocess.run(
+        ["git", "grep", "-l", "-i", pattern, "--", ".", ":!tests/test_ops_scripts.py"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert found.stdout == ""
+
+
+def test_jumpbox_local_does_not_advertise_default_ubuntu_login():
+    text = JUMPBOX_LOCAL.read_text()
+    assert "ubuntu/ubuntu" not in text

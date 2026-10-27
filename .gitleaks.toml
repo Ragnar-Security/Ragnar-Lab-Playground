@@ -1,0 +1,16 @@
+# Extend the default gitleaks ruleset; do not replace it.
+[extend]
+useDefault = true
+
+# Synthetic test fixtures: deterministic dummy values used to exercise the
+# production-settings validators. They are not real credentials.
+[[allowlists]]
+description = "Synthetic credential fixtures in tests"
+condition = "AND"
+paths = [
+  '''(^|/)tests/test_preflight_env\.py$''',
+  '''(^|/)tests/test_security_settings\.py$''',
+]
+regexes = [
+  '''(?:Rt|Us|Ad)-[A-Za-z0-9]{3,}-?[A-Za-z0-9]*|s3c[A-Za-z0-9_-]*91x''',
+]
