@@ -13,9 +13,9 @@ from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from .proxmox_service import (
-    confirm_proxmox_absence, get_proxmox_connection, inspect_vm_guest,
-    reset_cluster_vm_index, vm_lifecycle_lock, wait_for_proxmox_task,
-    VM_GUEST_ABSENT, VM_GUEST_MATCH,
+    confirm_proxmox_absence, get_cluster_vm_index, get_proxmox_connection,
+    inspect_vm_guest, reset_cluster_vm_index, vm_lifecycle_lock,
+    wait_for_proxmox_task, VM_GUEST_ABSENT, VM_GUEST_MATCH,
 )
 from .orphan_reaper import maybe_reap_orphaned_vms
 from .models import db, VMRecord, AdminAlert
@@ -69,6 +69,84 @@ def _deletion_retry_due(vm_record, now):
     return now >= (
         vm_record.deletion_last_attempt_at + timedelta(minutes=delay_minutes)
     )
+
+
+def reconcile_missing_vm_records(proxmox):
+    """Retire live records whose guest was deleted outside the portal.
+
+    A guest deleted by hand in Proxmox otherwise keeps its record, and with
+    it the admission commitment, until expiry. A record is retired only when
+    fresh cluster inventory has not listed its VMID on two sightings at
+    least ORPHAN_CONFIRM_SECONDS apart with no sighting of it in between,
+    the last confirmed under the VMID lifecycle lock. A failed inventory
+    read is never evidence: it restarts the count. Returns retired VMIDs.
+    """
+    # Lazy import: app.routes imports this module.
+    from .routes.utils import (
+        note_vm_state, VM_MISSING, VM_PRESENT, VM_UNKNOWN,
+    )
+
+    now = datetime.now()
+    live = [(vm.id, vm.vmid, vm.node) for vm in
+            VMRecord.query.filter(VMRecord.destroyed == False,  # noqa: E712
+                                  VMRecord.expires_at > now).all()]
+    if not live:
+        return []
+    try:
+        index = get_cluster_vm_index(proxmox, max_age=0, allow_stale=False)
+    except Exception as error:
+        logger.warning("Record reconciliation skipped; inventory "
+                       "unavailable: %s", error)
+        return []
+
+    retired = []
+    for record_id, vmid, node in live:
+        if int(vmid) in index:
+            note_vm_state(node, vmid, VM_PRESENT)
+            continue
+        with vm_lifecycle_lock(vmid):
+            # Fresh transaction under the lock: a concurrent destroy or
+            # replacement must be visible before deciding.
+            db.session.rollback()
+            vm_record = db.session.get(VMRecord, record_id)
+            if (vm_record is None or vm_record.destroyed
+                    or vm_record.vmid != vmid):
+                continue
+            absent = confirm_proxmox_absence(proxmox, vmid)
+            if not note_vm_state(node, vmid,
+                                 VM_MISSING if absent else VM_UNKNOWN):
+                if absent:
+                    logger.warning(
+                        "VM %s (%s) is not in the cluster inventory; keeping "
+                        "its record until a later sighting confirms it",
+                        vmid, vm_record.vm_name)
+                continue
+
+            message = (f"VM {vmid} ({vm_record.vm_name}) on node {node} was "
+                       "deleted outside the portal: the Proxmox cluster "
+                       "inventory no longer lists it. Its record has been "
+                       "retired before its expiry.")
+            db.session.add(AdminAlert(
+                alert_type='vm_record_reconciled',
+                severity='warning',
+                message=message,
+                vmid=vmid,
+                vm_name=vm_record.vm_name,
+                details=json.dumps({
+                    'reason': 'absent_from_cluster_inventory',
+                    'vm_type': vm_record.vm_type,
+                    'node': node,
+                    'student_name': vm_record.student_name,
+                    'template_name': vm_record.template_name,
+                    'expires_at': vm_record.expires_at.isoformat(),
+                }),
+            ))
+            _retire_vm_record(vm_record)
+            db.session.commit()
+            _forget_vm_caches(node, vmid)
+            logger.warning("Retired record for VM %s: %s", vmid, message)
+            retired.append(vmid)
+    return retired
 
 # Alert file path
 ALERT_LOG_FILE = "/app/data/failed_vms.log"
@@ -128,7 +206,6 @@ def check_and_destroy_expired_vms(app):
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Worker {worker_id}] Checking for expired VMs...")
                 
                 proxmox = get_proxmox_connection()
-                maybe_reap_orphaned_vms(proxmox)
                 
                 # Check all active VMs in database for expiration
                 current_time = datetime.now()
@@ -163,6 +240,15 @@ def check_and_destroy_expired_vms(app):
                         db.session.rollback()
                         vm_record = db.session.get(VMRecord, record_id)
                         if vm_record is None or vm_record.destroyed:
+                            continue
+                        # The batch was selected before this lock was held,
+                        # so an extension may have committed since. The
+                        # extend route writes expires_at under this same
+                        # lock, so this fresh read is the deciding one.
+                        if vm_record.expires_at > datetime.now():
+                            logger.info(
+                                f"[Worker {worker_id}] VM {vmid} was extended "
+                                f"to {vm_record.expires_at}; not destroying")
                             continue
 
                         identity = inspect_vm_guest(
@@ -204,6 +290,13 @@ def check_and_destroy_expired_vms(app):
                             if should_alert:
                                 _send_deletion_failure_alert(vm_record)
                     time.sleep(1)
+
+                reconcile_missing_vm_records(proxmox)
+
+                # Orphan cleanup runs after expiry and is time-boxed
+                # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
+                # never stand between an expired VM and its destroy.
+                maybe_reap_orphaned_vms(proxmox)
         
         except Exception as e:
             logger.error(f"Error in expiration checker: {str(e)}")

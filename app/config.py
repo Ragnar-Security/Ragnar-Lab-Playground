@@ -105,6 +105,13 @@ MEMORY_THRESHOLD = _env_number('MEMORY_THRESHOLD', '85.0', float)
 ORPHAN_REAPER_ENABLED = (os.environ.get('ORPHAN_REAPER_ENABLED') or 'true').lower() == 'true'
 ORPHAN_REAPER_DRY_RUN = (os.environ.get('ORPHAN_REAPER_DRY_RUN') or 'false').lower() == 'true'
 ORPHAN_REAPER_GRACE_MINUTES = _env_number('ORPHAN_REAPER_GRACE_MINUTES', 60, int)
+# A sweep runs inline in the expiry loop, after that loop's expiry pass. One
+# hung guest can cost 60 s (stop) + 120 s (delete), so a backlog would hold
+# up the next expiry pass. A sweep starts no new guest once it has run
+# MAX_PASS_SECONDS or acted on MAX_PASS_GUESTS; the rest wait for the next
+# sweep. Worst-case sweep length: MAX_PASS_SECONDS + 180 s.
+ORPHAN_REAPER_MAX_PASS_SECONDS = _env_number('ORPHAN_REAPER_MAX_PASS_SECONDS', 120, int)
+ORPHAN_REAPER_MAX_PASS_GUESTS = _env_number('ORPHAN_REAPER_MAX_PASS_GUESTS', 10, int)
 
 # ============ DATABASE CONFIGURATION ============
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///instance/app.db')

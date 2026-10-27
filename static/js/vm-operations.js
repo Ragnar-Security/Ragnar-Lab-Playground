@@ -367,7 +367,7 @@ function loadVMList() {
                                     ? '<span class="badge bg-danger fs-6">EXPIRED</span>'
                                     : `<span class="countdown-timer badge ${timerClass} fs-6" data-remaining="${escapeHtml(group.time_remaining_seconds)}">...</span>`
                                 }
-                                <button class="btn btn-sm btn-warning extend-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}" ${!isLow && !isExpired ? 'disabled' : ''}>
+                                <button class="btn btn-sm btn-warning extend-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}" data-scope="${escapeHtml(group.deployment_scope)}" ${!isLow && !isExpired ? 'disabled' : ''}>
                                     <i class="bi bi-clock"></i> Extend
                                 </button>
                                 <button class="btn btn-sm btn-danger destroy-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}">
@@ -429,6 +429,9 @@ function loadVMList() {
                     const formData = new FormData();
                     formData.append('deployment_group', group);
                     formData.append('student_name', student);
+                    // A student's own lab and their group's lab can share a
+                    // name; the scope tells /extend which one this card is.
+                    formData.append('deployment_scope', this.dataset.scope);
                     this.disabled = true;
                     this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Extending...';
                     fetch('/extend', { method: 'POST', body: formData })

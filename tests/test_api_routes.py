@@ -9,7 +9,7 @@ from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
 from app import create_app
 from app.routes.utils import VM_PRESENT
-from app.models import db, User, VMRecord
+from app.models import db, User, VMRecord, StudentGroup, StudentGroupMember
 
 
 class TestAPIRoutes(unittest.TestCase):
@@ -576,6 +576,117 @@ class TestAPIRoutes(unittest.TestCase):
                          expires_at + timedelta(minutes=60))
         self.assertEqual(db.session.get(VMRecord, other_vm.id).expires_at,
                          expires_at)
+
+    def _same_named_deployments(self, group_slug='team1'):
+        """One individual and one group deployment of homework1 for testuser."""
+        group = StudentGroup(name=group_slug, display_name='Team')
+        db.session.add(group)
+        db.session.flush()
+        db.session.add(StudentGroupMember(group_id=group.id,
+                                          user_id=self.test_user.id))
+        expires_at = datetime.now() + timedelta(minutes=30)
+        individual = VMRecord(
+            vmid=120, vm_name='student-testuser-vm', vm_type='qemu',
+            node='pve1', template_name='homework1/vm', student_name='testuser',
+            expires_at=expires_at, created_by_user_id=self.test_user.id,
+        )
+        group_vm = VMRecord(
+            vmid=121, vm_name=f'group-{group_slug}-vm', vm_type='qemu',
+            node='pve1', template_name='homework1/vm', student_name=group_slug,
+            expires_at=expires_at, created_by_user_id=self.test_user.id,
+            owner_group_id=group.id,
+        )
+        db.session.add_all([individual, group_vm])
+        db.session.commit()
+        return individual.id, group_vm.id, expires_at
+
+    def _extend(self, **form):
+        config = {'deployment_groups': [{
+            'display_name': 'homework1', 'extend_time_minutes': 60}]}
+        with patch('app.template_manager.load_template_config',
+                   return_value=config), \
+             patch('app.proxmox_service.ProxmoxAPI'):
+            return self.client.post(
+                '/extend', data={'deployment_group': 'homework1', **form})
+
+    def test_student_extend_individual_scope_leaves_group_deployment(self):
+        individual_id, group_id, expires_at = self._same_named_deployments()
+
+        response = self._extend(deployment_scope='individual')
+
+        self.assertTrue(response.get_json()['success'])
+        self.assertEqual(db.session.get(VMRecord, individual_id).expires_at,
+                         expires_at + timedelta(minutes=60))
+        self.assertEqual(db.session.get(VMRecord, group_id).expires_at,
+                         expires_at)
+
+    def test_student_extend_group_scope_leaves_individual_deployment(self):
+        individual_id, group_id, expires_at = self._same_named_deployments()
+
+        response = self._extend(deployment_scope='group')
+
+        self.assertTrue(response.get_json()['success'])
+        self.assertEqual(db.session.get(VMRecord, group_id).expires_at,
+                         expires_at + timedelta(minutes=60))
+        self.assertEqual(db.session.get(VMRecord, individual_id).expires_at,
+                         expires_at)
+
+    def test_student_extend_without_scope_refuses_ambiguous_name(self):
+        """A cached pre-fix page must not extend two deployments at once."""
+        individual_id, group_id, expires_at = self._same_named_deployments()
+
+        response = self._extend()
+
+        self.assertFalse(response.get_json()['success'])
+        self.assertIn('reload', response.get_json()['error'].lower())
+        self.assertEqual(db.session.get(VMRecord, individual_id).expires_at,
+                         expires_at)
+        self.assertEqual(db.session.get(VMRecord, group_id).expires_at,
+                         expires_at)
+
+    def test_admin_extend_scope_separates_student_and_same_named_group(self):
+        individual_id, group_id, expires_at = self._same_named_deployments(
+            group_slug='testuser')
+        admin = User(login_id='adminuser', full_name='Admin User', is_admin=True)
+        admin.set_password('adminpass')
+        db.session.add(admin)
+        db.session.commit()
+        self.client.post(
+            '/auth/login',
+            data=json.dumps({'login_id': 'adminuser', 'password': 'adminpass'}),
+            content_type='application/json',
+        )
+
+        response = self._extend(student_name='testuser',
+                                deployment_scope='group')
+
+        self.assertTrue(response.get_json()['success'])
+        self.assertEqual(db.session.get(VMRecord, group_id).expires_at,
+                         expires_at + timedelta(minutes=60))
+        self.assertEqual(db.session.get(VMRecord, individual_id).expires_at,
+                         expires_at)
+
+    def test_list_gives_each_deployment_its_own_scoped_card(self):
+        """The Extend button can only name a deployment the list told it."""
+        self._same_named_deployments(group_slug='testuser')
+
+        with patch('app.routes.vm_listing.get_proxmox_connection'), \
+             patch('app.routes.vm_listing._verify_vm_exists',
+                   return_value=(VM_PRESENT, None)), \
+             patch('app.routes.vm_listing._get_vm_ip_addresses',
+                   return_value=[]):
+            response = self.client.get('/list')
+
+        cards = [
+            (card['group_name'], card['deployment_scope'],
+             [vm['vmid'] for vm in card['vms']])
+            for student in response.get_json()['students']
+            for card in student['deployment_groups']
+        ]
+        self.assertCountEqual(cards, [
+            ('homework1', 'individual', [120]),
+            ('homework1', 'group', [121]),
+        ])
     
     @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})

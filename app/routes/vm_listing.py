@@ -158,11 +158,16 @@ def list_vms():
                     'deployment_groups': {}
                 }
 
-            # Create deployment group entry if doesn't exist
-            if group_name not in students[student_key]['deployment_groups']:
+            # One card per deployment. A student's own lab and their group's
+            # lab can share a name; the card's scope is what its Extend
+            # button sends, so one card must never mix the two.
+            deployment_scope = 'individual' if record.owner_group_id is None else 'group'
+            card_key = (group_name, deployment_scope)
+            if card_key not in students[student_key]['deployment_groups']:
                 remaining_secs = int((record.expires_at - datetime.now()).total_seconds()) if record.expires_at else 0
-                students[student_key]['deployment_groups'][group_name] = {
+                students[student_key]['deployment_groups'][card_key] = {
                     'group_name': group_name,
+                    'deployment_scope': deployment_scope,
                     'vm_count': 0,
                     'created_at': record.created_at.isoformat() if record.created_at else None,
                     'expires_at': record.expires_at.isoformat() if record.expires_at else None,
@@ -206,8 +211,8 @@ def list_vms():
                 if tpl and tpl.get('mask_ip', False):
                     ip_display = mask_ip_address(ip_display)
 
-            students[student_key]['deployment_groups'][group_name]['vm_count'] += 1
-            students[student_key]['deployment_groups'][group_name]['vms'].append({
+            students[student_key]['deployment_groups'][card_key]['vm_count'] += 1
+            students[student_key]['deployment_groups'][card_key]['vms'].append({
                 'type': record.vm_type,
                 'vmid': record.vmid,
                 'name': record.vm_name,

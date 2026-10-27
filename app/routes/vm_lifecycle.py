@@ -40,6 +40,9 @@ def extend_vm():
     Expected form data:
         - deployment_group: str - Deployment group name to extend
         - student_name: str - Student name (required for admins)
+        - deployment_scope: 'individual' | 'group' - which of the same-named
+          deployments to extend. Omitted only by pages loaded before the
+          field existed; such a request is refused when the name is ambiguous.
 
     Returns:
         JSON: { success: bool, new_expiration: str, extended_count: int }
@@ -49,8 +52,14 @@ def extend_vm():
 
     deployment_group_name = request.form.get('deployment_group', '').strip()
     student_name = request.form.get('student_name', '').strip()
+    deployment_scope = request.form.get('deployment_scope', '').strip().lower()
     if not deployment_group_name:
         return jsonify({'success': False, 'error': 'Deployment group name required'})
+    if deployment_scope not in ('', 'individual', 'group'):
+        return jsonify({
+            'success': False,
+            'error': 'deployment_scope must be "individual" or "group"',
+        })
 
     if user.is_admin and not student_name:
         return jsonify({
@@ -62,30 +71,39 @@ def extend_vm():
         # Scope the deployment before checking its extension window. Without
         # the student filter, an admin extending one dashboard row extended
         # every student's copy of the same lab.
+        query = VMRecord.query.filter(
+            VMRecord.template_name.like(f"{deployment_group_name}/%"),
+            VMRecord.destroyed == False,
+        )
         if user.is_admin:
-            vm_records = VMRecord.query.filter(
-                VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                VMRecord.student_name == student_name,
-                VMRecord.destroyed == False,
-            ).all()
+            query = query.filter(VMRecord.student_name == student_name)
         else:
             member_group_ids = [row.group_id for row in
                                 StudentGroupMember.query.filter_by(user_id=user_id).all()]
             if member_group_ids:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                    or_(
-                        VMRecord.created_by_user_id == user_id,
-                        VMRecord.owner_group_id.in_(member_group_ids),
-                    ),
-                    VMRecord.destroyed == False,
-                ).all()
-            else:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
+                query = query.filter(or_(
                     VMRecord.created_by_user_id == user_id,
-                    VMRecord.destroyed == False,
-                ).all()
+                    VMRecord.owner_group_id.in_(member_group_ids),
+                ))
+            else:
+                query = query.filter(VMRecord.created_by_user_id == user_id)
+        # A student's own deployment and their group's deployment may share
+        # a deployment-group name (and, for an admin, a group slug may equal
+        # a student's name). The scope picks exactly one of them.
+        if deployment_scope == 'individual':
+            query = query.filter(VMRecord.owner_group_id.is_(None))
+        elif deployment_scope == 'group':
+            query = query.filter(VMRecord.owner_group_id.isnot(None))
+        vm_records = query.all()
+
+        if (not deployment_scope
+                and len({vm.owner_group_id for vm in vm_records}) > 1):
+            return jsonify({
+                'success': False,
+                'error': (f'"{deployment_group_name}" names more than one of '
+                          'your deployments. Reload the page and use the '
+                          'Extend button on the one you want.'),
+            })
 
         if not vm_records:
             if user.is_admin:
@@ -126,31 +144,50 @@ def extend_vm():
         if deployment_group:
             extend_minutes = deployment_group.get('extend_time_minutes', 1440)
 
-        # Extend all VMs in the deployment group
+        # Extend each VM under its lifecycle lock, re-reading the row first.
+        # The expiry worker decides and destroys under the same lock, so an
+        # extension either commits before its expiry re-check (and the VM
+        # survives) or waits until the destroy finished (and finds no row),
+        # never in between.
         proxmox = get_proxmox_connection()
         extended_count = 0
         new_expiration = None
 
-        for vm_record in vm_records:
-            # Update expiration time
-            new_expiration = vm_record.expires_at + timedelta(minutes=extend_minutes)
-            vm_record.expires_at = new_expiration
+        # Capture identities first: each rollback below expires the loaded
+        # objects, and touching one whose row was retired would raise.
+        targets = [(vm.id, vm.vmid) for vm in vm_records]
+        for record_id, vmid in targets:
+            with vm_lifecycle_lock(vmid):
+                # End MySQL's REPEATABLE READ snapshot under the lock.
+                db.session.rollback()
+                vm_record = db.session.get(VMRecord, record_id)
+                if (vm_record is None or vm_record.destroyed
+                        or vm_record.vmid != vmid):
+                    continue
 
-            # Update VM description in Proxmox
-            try:
-                if vm_record.vm_type == 'lxc':
-                    proxmox.nodes(vm_record.node).lxc(vm_record.vmid).config.put(
-                        description=f"Expires: {new_expiration.isoformat()}"
-                    )
-                else:
-                    proxmox.nodes(vm_record.node).qemu(vm_record.vmid).config.put(
-                        description=f"Expires: {new_expiration.isoformat()}"
-                    )
-                extended_count += 1
-            except Exception as e:
-                logger.warning(f"Warning: Could not update Proxmox description for VM {vm_record.vmid}: {str(e)}")
+                new_expiration = vm_record.expires_at + timedelta(minutes=extend_minutes)
+                vm_record.expires_at = new_expiration
 
-        db.session.commit()
+                # Update VM description in Proxmox
+                try:
+                    if vm_record.vm_type == 'lxc':
+                        proxmox.nodes(vm_record.node).lxc(vm_record.vmid).config.put(
+                            description=f"Expires: {new_expiration.isoformat()}"
+                        )
+                    else:
+                        proxmox.nodes(vm_record.node).qemu(vm_record.vmid).config.put(
+                            description=f"Expires: {new_expiration.isoformat()}"
+                        )
+                    extended_count += 1
+                except Exception as e:
+                    logger.warning(f"Warning: Could not update Proxmox description for VM {vm_record.vmid}: {str(e)}")
+                db.session.commit()
+
+        if new_expiration is None:
+            return jsonify({
+                'success': False,
+                'error': f'No live VMs left to extend in deployment group "{deployment_group_name}"',
+            })
 
         return jsonify({
             'success': True,
