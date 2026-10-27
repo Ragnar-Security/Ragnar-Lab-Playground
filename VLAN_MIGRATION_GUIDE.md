@@ -3,8 +3,8 @@
 ## Overview
 
 Each student is assigned **two unique VLAN tags** during database initialization:
-- **Entry VLAN** (100-200): Used for the entry point VM's second NIC. IP pattern: `10.0.<vlan>.x`
-- **Internal VLAN** (200-300): Used for all VMs' primary NIC. IP pattern: `10.1.<vlan>.x`
+- **Entry VLAN** (100-200): Used for the entry point VM's second NIC. Network: `10.<vlan>.0.0/24`, with the jumpbox as gateway and DHCP server (`docs/JUMPBOX.md`)
+- **Internal VLAN** (200-300): Used for all VMs' primary NIC. The jumpbox does not serve these networks.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ Each student is assigned **two unique VLAN tags** during database initialization
 - The entry point VM is marked with `entry_point: true` in `templates.yaml`
 
 ### IP Display
-- Only the entry point VM's `10.0.x.x` IP is shown to students
+- Only the entry point VM's entry-network (`10.<vlan>.0.x`) IP is shown to students
 - Non-entry-point VMs show `-` for IP in the dashboard
 
 ## Database Schema
@@ -69,10 +69,10 @@ iface vmbr0 inet static
     bridge-stp off
     bridge-fd 0
     bridge-vlan-aware yes
-    bridge-vids 100-300
+    bridge-vids 100-500
 ```
 
-Configure your physical switch trunk port to allow VLANs 100-300.
+Configure your physical switch trunk port to allow VLANs 100-500 (student VLANs 100-300, group VLANs 300-500).
 
 ## Verification
 

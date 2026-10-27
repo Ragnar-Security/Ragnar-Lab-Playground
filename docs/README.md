@@ -82,6 +82,12 @@ Start here to get the application up and running:
   - Scoring algorithm, scheduler lifecycle, security considerations
   - Full HTTP API + file-by-file architecture reference
 
+### Lab Jumpbox
+- **[JUMPBOX.md](JUMPBOX.md)** - The router for every lab VLAN
+  - Provisioning the VM, VLAN gateways and DHCP, Tailscale subnet router
+  - Recommended Headscale ACL and key-only SSH
+  - Optional Zeek/RITA monitoring and student accounts
+
 ## Architecture & Technical Details
 
 ### System Architecture
