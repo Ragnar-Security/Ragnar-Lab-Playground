@@ -36,6 +36,7 @@ services:
       - SITE_ORG=${SITE_ORG:-}
       - VPN_LOGIN_SERVER=${VPN_LOGIN_SERVER:-}
       - SELF_SERVICE_PASSWORD_RESET=${SELF_SERVICE_PASSWORD_RESET:-false}
+      - PASSWORD_RESET_TOKEN_TTL_MINUTES=${PASSWORD_RESET_TOKEN_TTL_MINUTES:-60}
       # Session cookies keep their production defaults (Secure, HttpOnly,
       # SameSite=Lax): this stack is always served over HTTPS through Caddy,
       # so the Secure/HttpOnly switches are deliberately not passed through.

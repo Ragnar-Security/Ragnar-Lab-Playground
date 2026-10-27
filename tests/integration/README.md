@@ -40,3 +40,5 @@ TEST_BASE_URL=http://localhost:5099 uv run --no-sync python -m pytest tests/inte
 - Student management tab
 - All VMs tab with filters
 - Admin assignment API access
+- Admin-issued password reset link: created in the Students tab, used once in
+  a fresh browser, then the student signs in with the new password

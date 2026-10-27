@@ -177,6 +177,18 @@ def get_koth_defaults():
     }
 
 
+def _reset_token_ttl_minutes():
+    """Lifetime of an admin-issued reset link. A zero or negative value would
+    mint links that are dead on arrival, so it falls back to the default."""
+    default = 60
+    minutes = _env_number('PASSWORD_RESET_TOKEN_TTL_MINUTES', default, int)
+    if minutes < 1:
+        logger.warning("PASSWORD_RESET_TOKEN_TTL_MINUTES=%r must be at least 1; using %r",
+                       minutes, default)
+        return default
+    return minutes
+
+
 # ============ FLASK CONFIGURATION ============
 class Config:
     """Base Flask configuration"""
@@ -194,6 +206,7 @@ class Config:
     # sites that consider that ID guessable or widely known leave it off and
     # reset passwords through an administrator instead.
     SELF_SERVICE_PASSWORD_RESET = _env_bool('SELF_SERVICE_PASSWORD_RESET', False)
+    PASSWORD_RESET_TOKEN_TTL_MINUTES = _reset_token_ttl_minutes()
 
 class DevelopmentConfig(Config):
     """Development configuration"""

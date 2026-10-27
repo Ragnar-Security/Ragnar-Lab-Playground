@@ -97,9 +97,12 @@ Further settings (all documented in `.env.example`):
 PROXMOX_VERIFY_SSL=true
 PROXMOX_CA_BUNDLE=
 
-# Student self-service password reset (default false = ask an admin).
-# true allows reset with only login + SIS ID: low-entropy, see below
+# Student self-service password reset (default false = ask an admin for a
+# reset link). true allows reset with only login + SIS ID: low-entropy, see below
 SELF_SERVICE_PASSWORD_RESET=false
+
+# Lifetime of an admin-issued, single-use password reset link (default 60)
+PASSWORD_RESET_TOKEN_TTL_MINUTES=60
 
 # 1 behind the bundled Caddy (set by docker-compose.prod.yml); 0 if exposed directly
 TRUSTED_PROXY_HOPS=1
@@ -137,6 +140,17 @@ through Caddy, and both flags are forced on in production. Only
 `SELF_SERVICE_PASSWORD_RESET` defaults to `false`. Setting it to `true` lets
 anyone who knows a student's login and SIS ID reset that student's password
 without an administrator, so leave it off unless that risk is acceptable.
+
+Admin-issued reset links are the recommended recovery path and work whatever
+`SELF_SERVICE_PASSWORD_RESET` says. An admin creates one from the key button
+in the Students tab, sees it once, and hands it to the student. Each link is
+single-use, expires after `PASSWORD_RESET_TOKEN_TTL_MINUTES`, and dies when a
+newer one is issued for the same student. The token travels in the URL
+fragment, so neither Caddy's `access.log` nor gunicorn's access log records
+it, and only its SHA-256 is stored. The feature needs the
+`password_reset_tokens` table (`migrate_add_password_reset_tokens.py`).
+Sites that rely on self-service today can keep `SELF_SERVICE_PASSWORD_RESET=true`
+while staff move to links, then turn it off.
 
 Before starting or updating, validate the file:
 
@@ -286,6 +300,8 @@ requires them:
   self-signed certificate;
 - `SELF_SERVICE_PASSWORD_RESET=true` only if the site wants the old
   behavior (see the warning in the environment section);
+- `PASSWORD_RESET_TOKEN_TTL_MINUTES` only to change the 60-minute lifetime of
+  admin-issued reset links;
 - `TRUSTED_PROXY_HOPS` is preset to `1` by `docker-compose.prod.yml`; do not
   set it unless the app is exposed without Caddy.
 
@@ -403,10 +419,13 @@ Adding a column does not break the old code, so this order is correct.
 Skipping one is not safe: `db.create_all()` never adds columns to an existing
 table, and the new code reads `users.session_version` and the
 `vm_records.deletion_*` columns on every request and expiry pass.
+`migrate_add_password_reset_tokens.py` adds a new table the old code never
+reads; `db.create_all()` at startup would also create it, but run it here so
+the schema is complete before the new code serves its first reset link.
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -417,7 +436,7 @@ the migration itself, the file is not there yet. Inject it for this one run:
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration

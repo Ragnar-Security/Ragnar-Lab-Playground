@@ -3,7 +3,7 @@ Page rendering routes
 Simple template rendering for login, register, and main pages
 """
 
-from flask import Blueprint, render_template
+from flask import Blueprint, make_response, render_template
 from ..auth import get_authenticated_user
 
 # Create pages blueprint
@@ -28,7 +28,16 @@ def register_page():
 
 @pages_bp.route('/reset-password')
 def reset_password_page():
-    """Password reset page"""
+    """Password reset page, including the landing page of admin-issued links.
+
+    The link's token sits in the URL fragment, which browsers never send, so
+    this route cannot see it; the page script reads it. no-referrer is
+    defense in depth for the page's CDN requests: a fragment is never part
+    of a Referer, but a later change to the link format must not leak it.
+    """
     if get_authenticated_user() is not None:
-        return render_template('index.html')
-    return render_template('reset_password.html')
+        response = make_response(render_template('index.html'))
+    else:
+        response = make_response(render_template('reset_password.html'))
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    return response

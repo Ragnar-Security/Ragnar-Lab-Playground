@@ -48,6 +48,7 @@ import time
 logger = logging.getLogger(__name__)
 
 from .models import db, User, StudentWhitelist
+from . import password_reset_links
 
 auth = Blueprint('auth', __name__)
 
@@ -131,6 +132,10 @@ class PasswordResetLimiter:
     addresses. The per-address limit stops sweeping many login IDs from one
     address; it is looser because a campus NAT puts a classroom behind one
     address.
+
+    Reset-link guesses count against the per-address limit only. They name
+    no login ID, and a per-link counter would let anyone who knows nothing
+    burn a student's valid link.
     """
 
     WINDOW_SECONDS = 15 * 60
@@ -148,6 +153,12 @@ class PasswordResetLimiter:
         self._by_address.record(address)
         self._by_login.record(login_id)
 
+    def address_blocked(self, address):
+        return self._by_address.blocked(address)
+
+    def record_address_failure(self, address):
+        self._by_address.record(address)
+
 
 def _password_reset_limiter():
     # One limiter per app keeps test apps from sharing counters.
@@ -162,6 +173,18 @@ def _password_reset_limiter():
 # login IDs are on the roster and which accounts have no SIS ID to check.
 _RESET_IDENTITY_FAILED = ('We could not verify that login ID and SIS User ID. '
                           'Check both, or ask an administrator to reset your password.')
+
+# Likewise one message for unknown, expired and used links, so a probe
+# learns nothing about which links exist or were ever issued.
+_RESET_LINK_FAILED = ('This password reset link is invalid, expired, or already used. '
+                      'Ask an administrator for a new link.')
+
+
+def _password_problem(password):
+    """The registration password policy, shared by every path that sets one."""
+    if len(password) < 8:
+        return 'Password must be at least 8 characters'
+    return None
 
 
 def _sis_matches(stored, submitted):
@@ -312,8 +335,9 @@ def register():
         if not login_id or not sis_user_id or not password:
             return jsonify({'success': False, 'error': 'Login ID, SIS User ID, and password are required'})
 
-        if len(password) < 8:
-            return jsonify({'success': False, 'error': 'Password must be at least 8 characters'})
+        problem = _password_problem(password)
+        if problem:
+            return jsonify({'success': False, 'error': problem})
 
         # Check if login ID is in the whitelist
         whitelisted = StudentWhitelist.query.filter_by(login_id=login_id).first()
@@ -504,8 +528,9 @@ def reset_password():
         if not login_id or not sis_user_id or not password:
             return jsonify({'success': False, 'error': 'Login ID, SIS User ID, and new password are required'})
 
-        if len(password) < 8:
-            return jsonify({'success': False, 'error': 'Password must be at least 8 characters'})
+        problem = _password_problem(password)
+        if problem:
+            return jsonify({'success': False, 'error': problem})
 
         # Checked before verification so a correct guess after the limit is
         # refused too; otherwise the limit would only slow wrong guesses.
@@ -540,6 +565,60 @@ def reset_password():
         db.session.rollback()
         logger.error(f"Password reset error for {login_id}: {str(e)}")
         return jsonify({'success': False, 'error': 'An error occurred. Please try again.'})
+
+
+@auth.route('/reset-password/link', methods=['POST'])
+def reset_password_with_link():
+    """Set a new password with an administrator-issued reset link.
+
+    Request Body (JSON):
+        token (str): the value after ``#token=`` in the link
+        password (str): new password (registration policy)
+
+    Works whatever SELF_SERVICE_PASSWORD_RESET says: an administrator
+    issued the link, so it proves more than a roster SIS ID does.
+
+    Status Codes:
+        200: Reset succeeded, or failed with ``success: false``
+        429: Too many failed link attempts from this client address
+
+    Never log the token: it is a working credential until it is used.
+    """
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    password = data.get('password')
+    token = token if isinstance(token, str) else ''
+    password = password.strip() if isinstance(password, str) else ''
+
+    problem = _password_problem(password)
+    if problem:
+        return jsonify({'success': False, 'error': problem})
+
+    limiter = _password_reset_limiter()
+    client_address = request.remote_addr or 'unknown'
+    if limiter.address_blocked(client_address):
+        return jsonify({
+            'success': False,
+            'error': 'Too many password reset attempts. Try again later or ask an administrator.',
+        }), 429
+
+    try:
+        user = password_reset_links.redeem(token, password)
+    except Exception as e:
+        db.session.rollback()
+        # The class only: a driver message can echo statement parameters.
+        logger.error("Password reset link error: %s", type(e).__name__)
+        return jsonify({'success': False, 'error': 'An error occurred. Please try again.'})
+
+    if user is None:
+        limiter.record_address_failure(client_address)
+        return jsonify({'success': False, 'error': _RESET_LINK_FAILED})
+
+    logger.info("Password reset with an admin-issued link for user: %s", user.login_id)
+    return jsonify({
+        'success': True,
+        'message': 'Password reset successfully. You can now login with your new password.'
+    })
 
 
 @auth.route('/logout', methods=['POST'])
