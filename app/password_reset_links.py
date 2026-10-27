@@ -10,7 +10,9 @@ import secrets
 from datetime import datetime, timedelta
 
 from flask import current_app
-from sqlalchemy import update
+from sqlalchemy import delete, update
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from .models import PasswordResetToken, User, db
 
@@ -24,24 +26,52 @@ def _digest(raw_token):
     return hashlib.sha256(raw_token.encode('utf-8')).hexdigest()
 
 
+def _replace_link(dialect, values):
+    """One statement that inserts the user's row or overwrites it in place.
+
+    The unique user_id makes the database serialize issuers: the second
+    writer's statement waits on the first's row and then overwrites it. A
+    delete followed by an insert would leave a window between the two in
+    which another issuer could add its own row.
+    """
+    replacement = {key: value for key, value in values.items() if key != 'user_id'}
+    if dialect.name in ('mysql', 'mariadb'):
+        return mysql_insert(PasswordResetToken).values(**values).on_duplicate_key_update(
+            **replacement)
+    if dialect.name == 'sqlite':
+        return sqlite_insert(PasswordResetToken).values(**values).on_conflict_do_update(
+            index_elements=['user_id'], set_=replacement)
+    raise NotImplementedError(f'password reset links need MySQL or SQLite, not {dialect.name}')
+
+
 def issue(user, created_by):
     """Create a link for `user` and return ``(raw_token, expires_at)``.
 
-    Any earlier unused link for the same user stops working: an admin who
-    issues a second link usually suspects the first went to the wrong place.
+    Any earlier link for the same user stops working: an admin who issues a
+    second link usually suspects the first went to the wrong place. When two
+    admins issue at once, both are shown a link and only the later write's
+    link works.
     """
     now = _now()
     raw_token = secrets.token_urlsafe(32)
-    PasswordResetToken.query.filter_by(user_id=user.id, used_at=None).delete(
-        synchronize_session=False)
+    digest = _digest(raw_token)
     expires_at = now + timedelta(minutes=current_app.config['PASSWORD_RESET_TOKEN_TTL_MINUTES'])
-    db.session.add(PasswordResetToken(
-        user_id=user.id,
-        created_by_user_id=created_by.id if created_by is not None else None,
-        token_hash=_digest(raw_token),
-        created_at=now,
-        expires_at=expires_at,
-    ))
+    db.session.execute(_replace_link(db.session.get_bind().dialect, {
+        'user_id': user.id,
+        'created_by_user_id': created_by.id if created_by is not None else None,
+        'token_hash': digest,
+        'created_at': now,
+        'expires_at': expires_at,
+        'used_at': None,
+    }))
+    # A no-op once migrate_add_password_reset_tokens.py has made user_id
+    # unique. On a MySQL table that predates it, ON DUPLICATE KEY UPDATE finds
+    # no duplicate and inserts beside the old row; this still retires it.
+    db.session.execute(
+        delete(PasswordResetToken)
+        .where(PasswordResetToken.user_id == user.id, PasswordResetToken.token_hash != digest)
+        .execution_options(synchronize_session=False)
+    )
     db.session.commit()
     return raw_token, expires_at
 

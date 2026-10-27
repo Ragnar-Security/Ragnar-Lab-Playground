@@ -151,10 +151,10 @@ def create_admin_account():
     # created, so there is no password to vet.
     existing_admin = User.query.filter_by(login_id=admin_login).first()
     if seed and not existing_admin and is_production():
-        if production_policy.admin_password_problem(configured_password):
+        problem = production_policy.admin_password_problem(configured_password)
+        if problem:
             raise AdminConfigurationError(
-                'Refusing to seed a production admin: set ADMIN_PASSWORD '
-                'to an operator-supplied password that is not a known default.'
+                f'Refusing to seed a production admin: ADMIN_PASSWORD {problem}.'
             )
 
     admin_password = configured_password or 'admin123'

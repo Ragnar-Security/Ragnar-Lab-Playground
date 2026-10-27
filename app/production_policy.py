@@ -15,6 +15,11 @@ import os
 NON_PRODUCTION_ENVS = frozenset({'development', 'testing'})
 
 MIN_SECRET_KEY_LENGTH = 32
+# Stricter than the 8 characters students need: the seeded admin is the one
+# account that controls every VM and every other account, and anyone can
+# try it at /auth/login. Generate one with: python -c 'import secrets;
+# print(secrets.token_urlsafe(24))'
+MIN_ADMIN_PASSWORD_LENGTH = 16
 # Values published in this repository's examples, docs and test stacks.
 # Anyone can read them, so a key or password equal to one is no secret.
 KNOWN_SECRET_KEYS = frozenset({
@@ -91,8 +96,10 @@ def db_password_problem(value):
 
 def admin_password_problem(value):
     password = (value or '').strip()
-    if not password or password.lower() in KNOWN_ADMIN_PASSWORDS:
-        return "must be set to an operator-supplied password that is not a known default"
+    if (not password or password.lower() in KNOWN_ADMIN_PASSWORDS
+            or len(password) < MIN_ADMIN_PASSWORD_LENGTH):
+        return (f"must be an operator-supplied password of at least "
+                f"{MIN_ADMIN_PASSWORD_LENGTH} characters that is not a known default")
     return None
 
 
