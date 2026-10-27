@@ -2,6 +2,7 @@
 
 import base64
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -218,7 +219,8 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
     tmp = next(word for word in delivery.split() if word.endswith(".tmp'"))
     assert f"chgrp 1000 {tmp}" in delivery
     assert f"chmod 640 {tmp}" in delivery
-    assert "644" not in delivery
+    # Match the mode, not the digits: temp names carry a timestamp and PID.
+    assert not re.search(r"chmod\s+0?644\b", delivery), delivery
     assert delivery.index("chmod 640") < delivery.index("mv '")
 
 
