@@ -23,7 +23,7 @@ ACCOUNTS = SCRIPTS / "jumpbox_accounts.sh"
 LOG_CALL = 'printf "%s %s\\n" "$(basename "$0")" "$*" >> "$CALL_LOG"\n'
 MUTATING = (
     "apt-get", "snap", "lvextend", "netplan apply", "netplan try",
-    "systemctl restart", "systemctl reload", "systemctl enable", "systemctl try", "sysctl -p",
+    "systemctl restart", "systemctl reload", "systemctl enable", "systemctl try", "systemctl start", "sysctl -p",
     "qm create", "qm set", "qm resize", "qm start", "qm destroy", "qm stop",
     "curl", "passwd -l", "passwd -u", "chage",
 )
@@ -49,7 +49,7 @@ def _base_env(tmp_path: Path, site_text: str) -> dict:
     site.write_text(site_text)
     env = {
         k: v for k, v in os.environ.items()
-        if not k.startswith("JUMPBOX_") and k not in ("HEADSCALE_URL", "SUDO_USER")
+        if not k.startswith("JUMPBOX_") and k not in ("HEADSCALE_URL", "SUDO_USER", "SSH_CONNECTION", "SSH_CLIENT")
     }
     env.update(
         PATH=f"{bin_dir}:{os.environ['PATH']}",
@@ -411,6 +411,403 @@ def test_ssh_keys_only_disables_password_logins_once_the_admin_has_a_key(tmp_pat
     calls = _calls(tmp_path)
     assert "sshd -t" in calls
     assert "systemctl try-reload-or-restart ssh" in calls
+
+
+# --- staff-only SSH filter ----------------------------------------------------
+
+STAFF = "100.64.0.10, fd7a:115c:a1e0::a 100.64.0.11,fd7a:115c:a1e0::b"
+SSH_NFT = "etc/nftables.d/jumpbox-ssh.nft"
+SSH_UNIT = "etc/systemd/system/jumpbox-ssh-filter.service"
+
+
+def _rules(text: str) -> list:
+    return [l.strip() for l in text.splitlines() if "tcp dport 22" in l]
+
+
+def test_ssh_filter_orders_loopback_management_staff_then_drop_with_mixed_family_sets():
+    ng = _netgen()
+    text = ng.render_ssh_filter("ens18", ["100.64.0.10", "fd7a:115c:a1e0::a", "100.64.0.11"])
+    assert _rules(text) == [
+        'iifname "lo" tcp dport 22 accept',
+        'iifname "ens18" tcp dport 22 accept',
+        'iifname "tailscale0" ip saddr @staff_v4 tcp dport 22 accept',
+        'iifname "tailscale0" ip6 saddr @staff_v6 tcp dport 22 accept',
+        "tcp dport 22 counter drop",
+    ]
+    assert "hook input priority -10; policy accept;" in text
+    # Idempotent load: declare, delete, then recreate.
+    lines = [l for l in text.splitlines() if l.startswith(("table", "delete"))]
+    assert lines == ["table inet jumpbox_ssh", "delete table inet jumpbox_ssh",
+                     "table inet jumpbox_ssh {"]
+    v4 = re.search(r"set staff_v4 \{.*?\n\s*\}", text, re.S).group(0)
+    v6 = re.search(r"set staff_v6 \{.*?\n\s*\}", text, re.S).group(0)
+    assert "ipv4_addr" in v4 and "100.64.0.10" in v4 and "100.64.0.11" in v4 and ":" not in v4.split("{", 1)[1]
+    assert "ipv6_addr" in v6 and "fd7a:115c:a1e0::a" in v6 and "100.64" not in v6
+
+
+def test_ssh_filter_is_deterministic_and_ignores_order_and_duplicates():
+    ng = _netgen()
+    a = ng.render_ssh_filter("ens18", ["100.64.0.11", "fd7a:115c:a1e0::a", "100.64.0.10"])
+    b = ng.render_ssh_filter("ens18", ["100.64.0.10", "100.64.0.10", "100.64.0.11", "fd7a:115c:a1e0::a"])
+    assert a == b == ng.render_ssh_filter("ens18", ["100.64.0.10", "100.64.0.11", "fd7a:115c:a1e0::a"])
+
+
+def test_ssh_filter_with_no_staff_is_still_a_valid_table_for_management_and_loopback_only():
+    ng = _netgen()
+    text = ng.render_ssh_filter("ens18", [])
+    assert "elements" not in text  # nft rejects an empty element list
+    assert _rules(text)[:2] == ['iifname "lo" tcp dport 22 accept', 'iifname "ens18" tcp dport 22 accept']
+    assert _rules(text)[-1] == "tcp dport 22 counter drop"
+    assert text.count("{") == text.count("}")
+
+
+@pytest.mark.parametrize("bad", ["not-an-ip", "100.64.0.999", "100.64.0.10; drop"])
+def test_ssh_filter_rejects_malformed_staff_addresses_and_interface_names(bad):
+    ng = _netgen()
+    with pytest.raises(ValueError):
+        ng.render_ssh_filter("ens18", [bad])
+    with pytest.raises(ValueError):
+        ng.render_ssh_filter('ens18" accept #', [])
+
+
+def test_ssh_filter_unit_loads_before_the_network_and_sshd_and_removes_its_table():
+    ng = _netgen()
+    unit = ng.render_ssh_filter_unit("/etc/nftables.d/jumpbox-ssh.nft")
+    lines = unit.splitlines()
+    for required in ("DefaultDependencies=no",
+                     "Before=network-pre.target ssh.socket ssh.service",
+                     "Type=oneshot", "RemainAfterExit=yes",
+                     "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-ssh.nft",
+                     # Reload swaps the table atomically; a bad file leaves the old one in place.
+                     "ExecReload=/usr/sbin/nft -f /etc/nftables.d/jumpbox-ssh.nft",
+                     # The leading "-" keeps a missing table from failing a stop.
+                     "ExecStop=-/usr/sbin/nft delete table inet jumpbox_ssh",
+                     "WantedBy=multi-user.target"):
+        assert required in lines
+    assert unit == ng.render_ssh_filter_unit("/etc/nftables.d/jumpbox-ssh.nft")
+
+
+def test_netgen_cli_emits_the_filter_and_unit():
+    out = subprocess.run(
+        ["python3", str(NETGEN), "ssh-filter", "--mgmt-if", "ens18", "--staff-ips", STAFF],
+        capture_output=True, text=True, check=True).stdout
+    assert "100.64.0.11" in out and "fd7a:115c:a1e0::b" in out
+    unit = subprocess.run(["python3", str(NETGEN), "ssh-filter-unit"],
+                          capture_output=True, text=True, check=True).stdout
+    assert "jumpbox-ssh.nft" in unit
+
+
+def _ssh_filter_env(tmp_path: Path, staff: str = STAFF):
+    extra = f"JUMPBOX_SSH_STAFF_IPS=\"{staff}\"\n" if staff else ""
+    env, sysroot = _configure_env(tmp_path, extra)
+    bin_dir = tmp_path / "bin"
+    _tool(bin_dir, "nft", LOG_CALL)
+    # No host sshd, no real unit state, no real routing table. Tests set SSHD_PORTS,
+    # SSHD_LISTEN, SSHD_RC, SOCKET_LISTEN, SOCKET_RC, UNIT_ACTIVE, ROUTE_DEV, ROUTE_FAIL.
+    _tool(bin_dir, "sshd", LOG_CALL + (
+        'set -f\nfor p in $SSHD_PORTS; do echo "port $p"; done\n'
+        'for a in $SSHD_LISTEN; do echo "listenaddress $a"; done\nexit ${SSHD_RC:-0}\n'))
+    _tool(bin_dir, "systemctl", LOG_CALL + (
+        'case "$*" in\n'
+        '  "show -p Listen ssh.socket") printf "%b" "$SOCKET_LISTEN"; exit ${SOCKET_RC:-0} ;;\n'
+        '  "is-active --quiet jumpbox-ssh-filter.service") [ -n "$UNIT_ACTIVE" ] || exit 1 ;;\n'
+        'esac\nexit 0\n'))
+    _tool(bin_dir, "ip", (
+        'case "$*" in\n'
+        '  "-o route get "*|"-6 -o route get "*)\n'
+        '    [ -z "$ROUTE_FAIL" ] || exit 1\n'
+        '    for last; do :; done; echo "$last dev ${ROUTE_DEV:-ens18} src 192.0.2.5 uid 0" ;;\n'
+        'esac\nexit 0\n'))
+    env.update(SSHD_PORTS="22", SSHD_LISTEN="", SSHD_RC="", SOCKET_LISTEN="", SOCKET_RC="",
+               UNIT_ACTIVE="", ROUTE_DEV="ens18", ROUTE_FAIL="")
+    return env, sysroot
+
+
+def test_ssh_staff_only_dry_run_writes_and_runs_nothing(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    assert "+        iifname \"tailscale0\" ip saddr @staff_v4 tcp dport 22 accept" in result.stdout
+    assert "would run: systemctl enable jumpbox-ssh-filter.service" in result.stdout
+
+
+def test_ssh_staff_only_apply_installs_file_and_unit_enables_it_and_is_idempotent(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    first = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    nft = (sysroot / SSH_NFT).read_text()
+    assert "100.64.0.10" in nft and "fd7a:115c:a1e0::a" in nft
+    assert 'iifname "ens18" tcp dport 22 accept' in nft
+    assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-ssh.nft" in (sysroot / SSH_UNIT).read_text()
+    calls = _calls(tmp_path).splitlines()
+    assert any(c.startswith("nft -c -f") for c in calls)  # validated before loading
+    check = next(i for i, c in enumerate(calls) if c.startswith("nft -c -f"))
+    enable = calls.index("systemctl enable jumpbox-ssh-filter.service")
+    assert check < enable
+    assert "systemctl start jumpbox-ssh-filter.service" in calls  # inactive: start, never restart
+    assert "systemctl restart jumpbox-ssh-filter.service" not in calls
+
+    converged = _tree(sysroot)
+    (tmp_path / "calls.log").unlink()
+    second = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _tree(sysroot) == converged
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_refuses_a_ruleset_nft_rejects(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    _tool(tmp_path / "bin", "nft", LOG_CALL + 'echo "syntax error" >&2\nexit 1\n')
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "nft" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_refuses_with_no_staff_and_no_management_interface(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path, staff="")
+    Path(env["SITE_ENV_FILE"]).write_text("HEADSCALE_URL=https://vpn.example.edu\nJUMPBOX_TRUNK_IF=ens19\n")
+    _tool(tmp_path / "bin", "ip", "exit 0\n")  # no default route to learn the management NIC from
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "JUMPBOX_SSH_STAFF_IPS" in result.stderr and "lock" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_with_no_staff_but_a_management_interface_is_allowed(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path, staff="")
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    nft = (sysroot / SSH_NFT).read_text()
+    assert 'iifname "ens18" tcp dport 22 accept' in nft and "@staff_v4" in nft
+
+
+def _ports_rules(text):
+    return [l.strip() for l in text.splitlines() if "tcp dport" in l]
+
+
+def test_ssh_filter_covers_every_listening_port_with_a_port_set():
+    ng = _netgen()
+    text = ng.render_ssh_filter("ens18", ["100.64.0.10"], ports=[2222, 22, 2222])
+    assert _ports_rules(text) == [
+        'iifname "lo" tcp dport { 22, 2222 } accept',
+        'iifname "ens18" tcp dport { 22, 2222 } accept',
+        'iifname "tailscale0" ip saddr @staff_v4 tcp dport { 22, 2222 } accept',
+        'iifname "tailscale0" ip6 saddr @staff_v6 tcp dport { 22, 2222 } accept',
+        "tcp dport { 22, 2222 } counter drop",
+    ]
+    assert _ports_rules(ng.render_ssh_filter("ens18", [], ports=[2222]))[-1] == "tcp dport 2222 counter drop"
+    assert _ports_rules(ng.render_ssh_filter("ens18", []))[-1] == "tcp dport 22 counter drop"
+
+
+@pytest.mark.parametrize("bad", [0, 65536, -1, "22x", "ssh", True, 2.5])
+def test_ssh_filter_rejects_invalid_ports(bad):
+    ng = _netgen()
+    with pytest.raises(ValueError):
+        ng.render_ssh_filter("ens18", [], ports=[22, bad])
+
+
+def test_netgen_cli_ports_are_validated():
+    ok = subprocess.run(["python3", str(NETGEN), "ssh-filter", "--mgmt-if", "ens18", "--ports", "22,2222"],
+                        capture_output=True, text=True)
+    assert ok.returncode == 0 and "tcp dport { 22, 2222 } counter drop" in ok.stdout
+    bad = subprocess.run(["python3", str(NETGEN), "ssh-filter", "--mgmt-if", "ens18", "--ports", "22,70000"],
+                         capture_output=True, text=True)
+    assert bad.returncode == 2 and "port" in bad.stderr
+
+
+def test_ssh_staff_only_filters_the_ports_sshd_and_ssh_socket_actually_listen_on(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env["SSHD_PORTS"] = "22 2222"
+    env["SOCKET_LISTEN"] = "Listen=[::]:22 (Stream)\\nListen=0.0.0.0:2022 (Stream)\\nListen=/run/x.sock (Datagram)\\n"
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rules = _ports_rules((sysroot / SSH_NFT).read_text())
+    assert len(rules) == 5
+    assert all("{ 22, 2022, 2222 }" in r for r in rules)
+
+
+def test_ssh_staff_only_defaults_to_port_22_only_when_sshd_is_truly_absent(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    _without_tools(tmp_path, env, "sshd")
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "no sshd or ssh.socket" in result.stdout
+    assert _ports_rules((sysroot / SSH_NFT).read_text())[-1] == "tcp dport 22 counter drop"
+
+
+@pytest.mark.parametrize("listen, expected", [
+    ("0.0.0.0:2222", "{ 22, 2222 }"),
+    ("[::]:2223", "{ 22, 2223 }"),
+    ("[fe80::1%eth0]:2224 192.0.2.7:2225", "{ 22, 2224, 2225 }"),
+    ("0.0.0.0 :: [::] ::1 fe80::1", "22"),  # no port: the port values apply
+])
+def test_ssh_staff_only_adds_the_ports_of_sshd_listen_addresses(tmp_path, listen, expected):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env["SSHD_LISTEN"] = listen
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rules = _ports_rules((sysroot / SSH_NFT).read_text())
+    assert len(rules) == 5
+    match = f"tcp dport {expected}"
+    assert all(f"{match} " in r for r in rules), rules
+
+
+@pytest.mark.parametrize("what", [
+    {"SSHD_RC": "1"},                       # sshd -T fails
+    {"SSHD_PORTS": ""},                     # sshd -T succeeds but reports no port
+    {"SOCKET_RC": "1"},                     # ssh.socket state cannot be read
+])
+def test_ssh_staff_only_fails_closed_when_the_ssh_ports_cannot_be_determined(tmp_path, what):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(what)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "port" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    dry = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "--apply will refuse" in dry.stderr + dry.stdout
+
+
+def test_ssh_staff_only_on_an_active_unit_reloads_and_never_restarts(tmp_path):
+    # A restart runs ExecStop, which deletes the table and leaves SSH open until ExecStart.
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env["UNIT_ACTIVE"] = "1"
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    calls = _calls(tmp_path).splitlines()
+    assert "systemctl reload-or-restart jumpbox-ssh-filter.service" in calls
+    assert not any(c.startswith(("systemctl restart", "systemctl start")) and "jumpbox-ssh-filter" in c
+                   for c in calls)
+
+
+UNLISTED = "198.51.100.7 50000 192.0.2.5 22"
+STAFF_TO_VLAN_GATEWAY = "100.64.0.10 50000 10.100.0.1 22"
+
+
+@pytest.mark.parametrize("session, dev, args, ok", [
+    # Survival follows the interface the session arrives on, not the destination address.
+    (STAFF_TO_VLAN_GATEWAY, "tailscale0", [], True),
+    ("100.64.0.77 50000 192.0.2.5 22", "tailscale0", [], False),   # dest on mgmt, but not staff
+    (UNLISTED, "ens18", [], True),                                 # route back is the management NIC
+    (UNLISTED, "tailscale0", [], False),
+    (UNLISTED, "tailscale0", ["--i-have-console"], True),
+    ("fd7a:115c:a1e0::a 50000 fd7a:115c:a1e0::99 22", "tailscale0", [], True),
+    ("::ffff:100.64.0.10 50000 100.64.0.99 22", "tailscale0", [], True),   # v4-mapped staff source
+    ("::ffff:100.64.0.77 50000 100.64.0.99 22", "tailscale0", [], False),
+    ("127.0.0.1 50000 127.0.0.1 22", "lo", [], True),
+    ("100.64.0.10 50000 10.100.0.1 22", "ens19", [], False),       # staff, but arrived on a VLAN
+])
+def test_ssh_staff_only_apply_over_ssh_survives_only_by_ingress_interface(tmp_path, session, dev, args, ok):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(SSH_CONNECTION=session, ROUTE_DEV=dev)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only", *args], env)
+    if ok:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "running over SSH" in result.stderr
+    else:
+        assert result.returncode != 0
+        assert "--i-have-console" in result.stderr
+        assert _tree(sysroot) == before
+        assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_refuses_when_the_route_back_to_the_session_cannot_be_found(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(SSH_CONNECTION=STAFF_TO_VLAN_GATEWAY, ROUTE_DEV="tailscale0", ROUTE_FAIL="1")
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0 and "--i-have-console" in result.stderr
+    assert _tree(sysroot) == before
+    env["ROUTE_FAIL"] = ""
+    allowed = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only", "--i-have-console"], env)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+
+@pytest.mark.parametrize("session", [
+    "--help 1 2 3",
+    "100.64.0.10 50000 10.100.0.1",             # three fields
+    "100.64.0.10 50000 10.100.0.1 22 extra",    # five fields
+    "100.64.0.10 0 10.100.0.1 22",
+    "100.64.0.10 50000 10.100.0.1 65536",
+    "100.64.0.10 port 10.100.0.1 22",
+    "100.64.0.10 50000 not-an-ip 22",
+    "not-an-ip 50000 10.100.0.1 22",
+    "100.64.0.10 -1 10.100.0.1 22",
+])
+def test_ssh_staff_only_refuses_a_malformed_ssh_connection(tmp_path, session):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(SSH_CONNECTION=session, ROUTE_DEV="tailscale0")
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0 and "--i-have-console" in result.stderr
+    assert _tree(sysroot) == before
+    assert "usage:" not in result.stdout + result.stderr
+
+
+def test_netgen_staff_has_never_reads_an_address_as_an_option():
+    run = lambda *a: subprocess.run(["python3", str(NETGEN), *a], capture_output=True, text=True)
+    assert run("staff-has", "--staff-ips", STAFF, "--", "100.64.0.10").returncode == 0
+    assert run("staff-has", "--staff-ips", STAFF, "--", "::ffff:100.64.0.10").returncode == 0
+    assert run("staff-has", "--staff-ips", STAFF, "--", "100.64.0.99").returncode == 1
+    bad = run("staff-has", "--staff-ips", STAFF, "--", "--help")
+    assert bad.returncode not in (0, 1) and "usage:" not in bad.stdout
+
+
+def test_ssh_staff_only_dry_run_over_ssh_still_only_warns(tmp_path):
+    env, _ = _ssh_filter_env(tmp_path)
+    env["SSH_CONNECTION"] = UNLISTED
+    env["ROUTE_DEV"] = "tailscale0"
+    result = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "running over SSH" in result.stderr
+
+
+def _without_tools(tmp_path: Path, env: dict, *names: str) -> None:
+    """PATH with the fake bin dir plus every real tool except `names`."""
+    hide = tmp_path / "hidden-tools"
+    hide.mkdir(exist_ok=True)
+    for d in os.environ["PATH"].split(os.pathsep):
+        if not os.path.isdir(d):
+            continue
+        for name in os.listdir(d):
+            link = hide / name
+            if name not in names and not os.path.lexists(link):
+                link.symlink_to(Path(d) / name)
+    for name in names:
+        if (tmp_path / "bin" / name).exists():
+            (tmp_path / "bin" / name).unlink()
+    env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{hide}"
+
+
+def _without_nft(tmp_path: Path, env: dict) -> None:
+    _without_tools(tmp_path, env, "nft")
+
+
+def test_ssh_staff_only_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    _without_nft(tmp_path, env)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "nftables" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    dry = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "tcp dport 22 counter drop" in dry.stdout
+    assert "nft not installed" in dry.stdout + dry.stderr
 
 
 def test_monitoring_refuses_a_root_disk_too_small_for_zeek_and_rita(tmp_path):

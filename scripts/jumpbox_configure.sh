@@ -4,7 +4,8 @@
 # router for every lab VLAN. Runs ON the jumpbox, as root.
 #
 # Usage: sudo scripts/jumpbox_configure.sh [--apply] [--no-try]
-#             [--tailscale [--authkey-stdin]] [--ssh-keys-only] [--monitoring]
+#             [--tailscale [--authkey-stdin]] [--ssh-keys-only] [--ssh-staff-only [--i-have-console]]
+#             [--monitoring]
 #
 # Dry run by default: prints a diff of every file it would write and every
 # command it would run, and changes nothing. --apply makes the changes; a
@@ -22,6 +23,14 @@
 #                     it never appears on a command line.
 #   --ssh-keys-only   PasswordAuthentication no. Refuses unless
 #                     JUMPBOX_ADMIN_USER has a usable authorized key.
+#   --ssh-staff-only  nftables table that drops inbound tcp/22 except on lo, the
+#                     management NIC and tailscale0 from JUMPBOX_SSH_STAFF_IPS.
+#                     Forwarded student traffic is untouched. Refuses when
+#                     that list is empty and the management NIC is unknown, when
+#                     nft is missing, and (over SSH) when this session is not
+#                     provably covered by the rules, unless --i-have-console.
+#                     Filters every port sshd/ssh.socket listen on; re-run after
+#                     changing the SSH port.
 #   --monitoring      Zeek on the trunk plus an hourly RITA import. Refuses
 #                     below JUMPBOX_MONITORING_MIN_GB of root disk.
 #   --no-try          use `netplan apply` instead of `netplan try`, which
@@ -42,7 +51,7 @@ load_site_env "$SITE_ENV_FILE" HEADSCALE_URL JUMPBOX_ADMIN_USER JUMPBOX_MGMT_IF 
     JUMPBOX_DHCP_LEASE JUMPBOX_DNS_UPSTREAM JUMPBOX_DHCP_RESERVATIONS \
     JUMPBOX_NETPLAN_FILE JUMPBOX_DNSMASQ_FILE JUMPBOX_NETPLAN_TRY_TIMEOUT \
     JUMPBOX_TS_ROUTES JUMPBOX_TS_TAG JUMPBOX_TS_HOSTNAME JUMPBOX_TS_KEY_DIR \
-    JUMPBOX_MONITORING_MIN_GB JUMPBOX_RITA_VERSION JUMPBOX_RITA_DATABASE
+    JUMPBOX_SSH_STAFF_IPS JUMPBOX_MONITORING_MIN_GB JUMPBOX_RITA_VERSION JUMPBOX_RITA_DATABASE
 
 # The key must not reach any child process's environment or argv.
 TS_KEY="${JUMPBOX_TS_AUTHKEY:-}"
@@ -54,6 +63,9 @@ NETPLAN_FILE="${JUMPBOX_NETPLAN_FILE:-/etc/netplan/60-jumpbox-vlans.yaml}"
 DNSMASQ_FILE="${JUMPBOX_DNSMASQ_FILE:-/etc/dnsmasq.d/jumpbox.conf}"
 SYSCTL_FILE=/etc/sysctl.d/90-jumpbox-router.conf
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-jumpbox-keys-only.conf
+SSH_NFT_FILE=/etc/nftables.d/jumpbox-ssh.nft
+SSH_UNIT_NAME=jumpbox-ssh-filter.service
+SSH_UNIT_FILE=/etc/systemd/system/jumpbox-ssh-filter.service
 TRY_TIMEOUT="${JUMPBOX_NETPLAN_TRY_TIMEOUT:-120}"
 TS_ROUTES="${JUMPBOX_TS_ROUTES:-10.0.0.0/8}"
 TS_TAG="${JUMPBOX_TS_TAG:-tag:jumpbox}"
@@ -62,8 +74,8 @@ RITA_VERSION="${JUMPBOX_RITA_VERSION:-v5.1.1}"
 RITA_DATABASE="${JUMPBOX_RITA_DATABASE:-jumpbox}"
 ZEEK_ETC=/opt/zeek/etc
 
-APPLY=0 NO_TRY=0 DO_TS=0 KEY_STDIN=0 DO_SSH=0 DO_MON=0
-usage() { sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'; }
+APPLY=0 NO_TRY=0 DO_TS=0 KEY_STDIN=0 DO_SSH=0 DO_SSHF=0 DO_MON=0 I_HAVE_CONSOLE=0
+usage() { sed -n '3,41p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --apply) APPLY=1 ;;
@@ -72,6 +84,8 @@ while [ $# -gt 0 ]; do
         --tailscale) DO_TS=1 ;;
         --authkey-stdin) KEY_STDIN=1 ;;
         --ssh-keys-only) DO_SSH=1 ;;
+        --ssh-staff-only) DO_SSHF=1 ;;
+        --i-have-console) I_HAVE_CONSOLE=1 ;;
         --monitoring) DO_MON=1 ;;
         -h|--help) usage; exit 0 ;;
         *) printf 'ERROR: unknown option %s\n' "$1" >&2; usage >&2; exit 2 ;;
@@ -169,6 +183,9 @@ detect_interfaces() {
             count=$((count + 1))
         done
         [ "$count" -eq 1 ] && TRUNK_IF="${candidates# }"
+    fi
+    if [ "$DO_SSHF" -eq 1 ] && [ -z "$MGMT_IF" ] && [ -z "${JUMPBOX_SSH_STAFF_IPS:-}" ]; then
+        die "--ssh-staff-only would lock everyone out of SSH: JUMPBOX_SSH_STAFF_IPS is empty and the management interface cannot be determined. Set one of them (JUMPBOX_MGMT_IF)."
     fi
     [ -n "$MGMT_IF" ] || die "cannot detect the management interface; set JUMPBOX_MGMT_IF"
     [ -n "$TRUNK_IF" ] || die "cannot pick the trunk interface (candidates:${candidates:- none}); set JUMPBOX_TRUNK_IF"
@@ -327,6 +344,114 @@ apply_ssh_keys_only() {
     fi
 }
 
+# Ports sshd listens on: `port` and `listenaddress host:port` lines of sshd -T,
+# plus ssh.socket's stream listeners (socket activation ignores sshd_config's
+# Port). A port left out stays open to everyone, so this fails closed: an
+# sshd or ssh.socket that cannot be read sets SSH_PORT_PROBLEM instead of
+# guessing 22. A bare ListenAddress means the `port` values apply.
+SSH_PORTS="" SSH_PORT_PROBLEM=""
+collect_ssh_ports() {
+    local out sock ports=""
+    if command -v sshd >/dev/null; then
+        if ! out="$(sshd -T 2>/dev/null)"; then SSH_PORT_PROBLEM="sshd -T failed"; return 0; fi
+        ports="$(awk '
+            $1 == "port" { print $2 }
+            $1 == "listenaddress" {
+                a = $2
+                if (substr(a, 1, 1) == "[") { n = index(a, "]:"); if (n) print substr(a, n + 2) }
+                else if (split(a, p, ":") == 2) print p[2]
+            }' <<<"$out")"
+        [ -n "$(printf '%s' "$ports" | tr -d '[:space:]')" ] || { SSH_PORT_PROBLEM="sshd -T reported no port"; return 0; }
+    fi
+    if command -v systemctl >/dev/null; then
+        if ! sock="$(systemctl show -p Listen ssh.socket 2>/dev/null)"; then
+            SSH_PORT_PROBLEM="systemctl show ssh.socket failed"; return 0
+        fi
+        ports="$ports
+$(awk '/^Listen=/ && /\(Stream\)/ { sub(/ .*/, ""); n = split($0, a, ":"); print a[n] }' <<<"$sock")"
+    fi
+    SSH_PORTS="$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+}
+
+# Refuse to apply from an SSH session the new rules could cut off. The session
+# survives when the route back to its source leaves through loopback, the
+# management NIC, or tailscale0 with a listed staff source. Anything that
+# cannot be determined counts as "not provable".
+ssh_session_survives() {
+    local src dev fam=""
+    src="$(python3 "$NETGEN" ssh-source -- "$SSH_CONNECTION" 2>/dev/null)" || return 1
+    case "$src" in *:*) fam="-6" ;; esac
+    command -v ip >/dev/null || return 1
+    # shellcheck disable=SC2086 -- $fam is empty or one option
+    dev="$(ip $fam -o route get "$src" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" || return 1
+    [ -n "$dev" ] || return 1
+    case "$dev" in
+        lo) return 0 ;;
+        "$MGMT_IF") return 0 ;;
+        tailscale0) python3 "$NETGEN" staff-has --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" -- "$src" ;;
+        *) return 1 ;;
+    esac
+}
+
+# nft drops every SSH packet that no rule accepts, including the session
+# running this script, so the plan says who stays reachable.
+plan_ssh_filter() {
+    collect_ssh_ports
+    if [ -n "$SSH_PORT_PROBLEM" ]; then
+        if [ "$APPLY" -eq 1 ]; then
+            block "--ssh-staff-only: cannot determine the SSH port(s) ($SSH_PORT_PROBLEM). Guessing 22 would leave any other SSH listener unfiltered; fix sshd/ssh.socket and re-run."
+            return 0
+        fi
+        say "WARNING: cannot determine the SSH port(s) ($SSH_PORT_PROBLEM); --apply will refuse. Showing port 22." >&2
+    elif [ -z "$SSH_PORTS" ]; then
+        say "ssh:       no sshd or ssh.socket found; assuming port 22"
+    else
+        say "ssh:       filtering tcp port(s) $SSH_PORTS"
+    fi
+    python3 "$NETGEN" ssh-filter --mgmt-if "$MGMT_IF" --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" --ports "$SSH_PORTS" > "$TMP/ssh-filter.nft" \
+        || { block "--ssh-staff-only: could not render the ruleset (check JUMPBOX_SSH_STAFF_IPS, JUMPBOX_MGMT_IF and the SSH ports: ${SSH_PORTS:-22})"; return 0; }
+    python3 "$NETGEN" ssh-filter-unit --nft-file "$SSH_NFT_FILE" > "$TMP/ssh-filter.service"
+    if ! command -v nft >/dev/null; then
+        if [ "$APPLY" -eq 1 ]; then
+            block "--ssh-staff-only: nft is not installed, so the ruleset cannot be validated or loaded. Install the nftables package first."
+            return 0
+        fi
+        say "note: nft not installed; the ruleset below is unvalidated. Install the nftables package before --apply."
+    elif ! nft -c -f "$TMP/ssh-filter.nft"; then
+        block "--ssh-staff-only: nft -c -f rejected the generated ruleset"
+        return 0
+    fi
+    [ -n "${JUMPBOX_SSH_STAFF_IPS:-}" ] || say "WARNING: JUMPBOX_SSH_STAFF_IPS is empty; SSH will work only on loopback and $MGMT_IF" >&2
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        say "WARNING: running over SSH; this session survives only if it arrives on $MGMT_IF or from a listed staff address" >&2
+        if [ "$APPLY" -eq 1 ] && [ "$I_HAVE_CONSOLE" -eq 0 ] && ! ssh_session_survives; then
+            block "--ssh-staff-only: this SSH session is not provably covered by the new rules and would be cut off. Run from the console or a listed staff address, or pass --i-have-console if you can recover without SSH."
+        fi
+    fi
+    stage "$SSH_NFT_FILE" 644 "$TMP/ssh-filter.nft"
+    stage "$SSH_UNIT_FILE" 644 "$TMP/ssh-filter.service"
+}
+
+# Never restart an active unit: ExecStop deletes the table, leaving SSH open
+# until ExecStart reloads it. reload-or-restart runs ExecReload, an atomic swap.
+ssh_filter_activate() {
+    if changed "$SSH_NFT_FILE" || changed "$SSH_UNIT_FILE"; then
+        run systemctl daemon-reload
+        run systemctl enable "$SSH_UNIT_NAME"
+        if systemctl is-active --quiet "$SSH_UNIT_NAME"; then
+            run systemctl reload-or-restart "$SSH_UNIT_NAME"
+        else
+            run systemctl start "$SSH_UNIT_NAME"
+        fi
+    fi
+}
+
+apply_ssh_filter() {
+    changed "$SSH_NFT_FILE" && install_file "$SSH_NFT_FILE" 644 "$TMP/ssh-filter.nft"
+    changed "$SSH_UNIT_FILE" && install_file "$SSH_UNIT_FILE" 644 "$TMP/ssh-filter.service"
+    ssh_filter_activate
+}
+
 # --- monitoring ----------------------------------------------------------------
 
 plan_monitoring() {
@@ -406,6 +531,7 @@ if changed "$NETPLAN_FILE" && [ "$NO_TRY" -eq 0 ] && [ "$APPLY" -eq 1 ] && [ ! -
 fi
 [ "$DO_TS" -eq 1 ] && plan_tailscale
 [ "$DO_SSH" -eq 1 ] && plan_ssh_keys_only
+[ "$DO_SSHF" -eq 1 ] && plan_ssh_filter
 [ "$DO_MON" -eq 1 ] && plan_monitoring
 
 if [ "$BLOCKERS" -gt 0 ]; then
@@ -421,6 +547,7 @@ if [ "$APPLY" -ne 1 ]; then
     if changed "$DNSMASQ_FILE" || changed "$NETPLAN_FILE"; then run systemctl restart dnsmasq; fi
     [ "$DO_TS" -eq 1 ] && apply_tailscale
     if [ "$DO_SSH" -eq 1 ] && changed "$SSHD_DROPIN"; then run systemctl try-reload-or-restart ssh; fi
+    [ "$DO_SSHF" -eq 1 ] && ssh_filter_activate
     say ""
     say "Dry run only. Re-run with --apply to make these changes."
     exit 0
@@ -482,6 +609,7 @@ fi
 
 [ "$DO_TS" -eq 1 ] && apply_tailscale
 [ "$DO_SSH" -eq 1 ] && apply_ssh_keys_only
+[ "$DO_SSHF" -eq 1 ] && apply_ssh_filter
 [ "$DO_MON" -eq 1 ] && apply_monitoring
 
 say ""
