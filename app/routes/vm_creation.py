@@ -1202,7 +1202,6 @@ def create_vm():
             return jsonify({'success': False, 'error': 'No templates configured'})
 
         uptime_minutes = deployment_group.get('uptime_minutes', 4320)
-        expiration_time = datetime.now() + timedelta(minutes=uptime_minutes)
         load_balancing_config = deployment_group.get('load_balancing')
 
         # Determine group_mode vs individual mode and set VLAN / owning identifiers

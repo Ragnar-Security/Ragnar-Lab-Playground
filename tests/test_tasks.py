@@ -736,7 +736,9 @@ class TestManualDeletionReconciliation:
         with app.app_context():
             assert db.session.get(VMRecord, gone_id) is None
             assert db.session.get(VMRecord, kept_id) is not None
-            assert [r.vmid for r in _load_live_vm_records()] == [101]
+            # The retired record no longer counts toward admission.
+            with db.engine.connect() as conn:
+                assert [r.vmid for r in _load_live_vm_records(conn)] == [101]
         alerts = self._reconciled_alerts(app)
         assert [vmid for vmid, _ in alerts] == [100]
         assert "outside the portal" in alerts[0][1]
