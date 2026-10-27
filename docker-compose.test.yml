@@ -18,6 +18,9 @@ services:
       # The integration suite signs in as this student. Only this file asks for
       # the account, so production never seeds it.
       - SEED_TEST_STUDENT=1
+      # Long enough for the password policy: the reset-link test sets a new
+      # password through a link and then restores this one the same way.
+      - TEST_STUDENT_PASSWORD=student-pass-123
     volumes:
       - ./tests/fixtures/templates.yaml:/app/templates.yaml:ro
     command: >

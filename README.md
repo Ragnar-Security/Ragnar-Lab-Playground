@@ -231,7 +231,8 @@ These values normally live in `.env`:
 | `PROXMOX_VERIFY_SSL` | Verify the Proxmox API TLS certificate; defaults to `true`. Set `false` only for a self-signed Proxmox reached over a private tunnel (startup logs a warning); prefer `PROXMOX_CA_BUNDLE` |
 | `PROXMOX_CA_BUNDLE` | Path to a PEM CA certificate, inside the container, used to verify Proxmox; startup fails if the file is missing |
 | `SECRET_KEY` | Flask session signing key. Production refuses to start when it is missing, empty, a value published in the repo's examples or docs, or shorter than 32 characters |
-| `SELF_SERVICE_PASSWORD_RESET` | Student self-service password reset (roster SIS ID check, rate limited); defaults to `false`, which returns 404 and tells students to ask an administrator. `true` lets anyone who knows a student's login and SIS ID reset that password; enable only if that risk is acceptable |
+| `SELF_SERVICE_PASSWORD_RESET` | Student self-service password reset (roster SIS ID check, rate limited); defaults to `false`, which returns 404 and tells students to ask an administrator for a reset link. `true` lets anyone who knows a student's login and SIS ID reset that password; enable only if that risk is acceptable. Admin-issued reset links (see "Password recovery") work either way |
+| `PASSWORD_RESET_TOKEN_TTL_MINUTES` | Lifetime of an admin-issued password reset link, in minutes; defaults to `60`. Values below `1` fall back to the default |
 | `TRUSTED_PROXY_HOPS` | Number of reverse proxies whose `X-Forwarded-For` is trusted; `1` behind the bundled Caddy (set by `docker-compose.prod.yml`), `0` (default) when exposed directly |
 | `SESSION_COOKIE_SECURE` | Secure flag on the session cookie; defaults to on in production, off otherwise. `docker-compose.prod.yml` deliberately does not pass it (forced on in production behind Caddy) |
 | `SESSION_COOKIE_HTTPONLY` | HttpOnly flag; defaults to `true`. Not passed by `docker-compose.prod.yml`; forced on in production |
@@ -341,6 +342,28 @@ keys, so a failure part-way leaves every student with a working key. Registered
 devices stay connected. The portal container must include
 `scripts/update_headscale_keys.py`. See `docs/TERM_CHANGEOVER.md`.
 
+### Password recovery
+
+The recommended path is an admin-issued reset link; it needs no mail server.
+In the admin dashboard's Students tab, the key button on a student's row
+creates a link and shows it once. Hand it to the student out of band (in
+person, the course messaging system). The link:
+
+- works once, and expires after `PASSWORD_RESET_TOKEN_TTL_MINUTES` (default 60);
+- stops working when a newer link is created for the same student;
+- signs the student out everywhere when used, like logout;
+- carries its token in the URL fragment (`/reset-password#token=...`), which
+  browsers never send to the server, so it stays out of gunicorn and Caddy
+  access logs. The database stores only its SHA-256.
+
+Failed link attempts count against the same per-address limit as
+self-service resets. Run `scripts/migrate_add_password_reset_tokens.py` once
+on an existing database before using the feature.
+
+The older self-service reset (login ID plus roster SIS ID) stays available
+behind `SELF_SERVICE_PASSWORD_RESET`; it is weaker because a SIS ID is not a
+secret.
+
 ## Lab Assignment Restrictions
 
 By default every enabled deployment group is visible to all students. When an admin assigns even one student to a group, that group becomes restricted -- only assigned students can see and deploy it. Unassigned groups remain visible to everyone.
@@ -358,7 +381,7 @@ The filtering happens in `GET /templates` at query time; the database stores onl
 
 The admin dashboard (visible when logged in as an admin) provides:
 
-- **Student Management** -- list all users, view active VM counts, toggle admin role, disable/enable accounts
+- **Student Management** -- list all users, view active VM counts, toggle admin role, disable/enable accounts, create one-time password reset links
 - **VM Overview** -- list all VMs across all students with filters by student, group, node, and status
 - **Bulk Destroy** -- select multiple VMs and destroy them in one operation
 - **Bulk Extend** -- select multiple VMs and add time to their expiration
@@ -425,7 +448,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 | POST | `/auth/register` | Register a new student account (whitelist required) |
 | POST | `/auth/login` | Log in with credentials |
 | POST | `/auth/logout` | Log out current session |
-| POST | `/auth/reset-password` | Reset user password |
+| POST | `/auth/reset-password` | Self-service reset with login ID and SIS ID (only with `SELF_SERVICE_PASSWORD_RESET=true`) |
+| POST | `/auth/reset-password/link` | Set a new password with an admin-issued link (`{"token", "password"}`) |
 | GET | `/auth/me` | Get current user info |
 | GET | `/auth/check` | Check authentication status |
 | GET | `/auth/health` | Health check for monitoring |
@@ -459,6 +483,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 | GET | `/admin/students` | List students (id, login_id, name, admin flag) |
 | GET | `/admin/students/full` | List students with VM counts and full details |
 | PUT | `/admin/students/<id>` | Update student (toggle admin, disable/enable) |
+| POST | `/admin/students/<id>/reset-link` | Create a one-time password reset link (JSON body required; returned once) |
 | GET | `/admin/assignments` | List lab assignments (filter by user_id or group) |
 | POST | `/admin/assignments` | Assign a student to a deployment group |
 | DELETE | `/admin/assignments/<id>` | Remove a specific assignment |

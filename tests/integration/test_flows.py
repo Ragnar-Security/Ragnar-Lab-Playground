@@ -8,8 +8,13 @@ These tests verify frontend-to-backend integration by driving a real browser.
 Start the test server first with ``docker compose -f docker-compose.test.yml
 up -d --build`` or run Flask locally as described in this directory's README.
 """
+import re
+
 import pytest
 from playwright.sync_api import Page, expect
+
+# Seeded by docker-compose.test.yml (TEST_STUDENT_PASSWORD).
+TEST_STUDENT_PASSWORD = 'student-pass-123'
 
 
 # ============ AUTH FLOW TESTS ============
@@ -173,7 +178,7 @@ class TestStudentPerspective:
         """Login as student before each test"""
         page.goto(base_url)
         page.fill('#loginUsername', 'teststudent')
-        page.fill('#loginPassword', 'test123')
+        page.fill('#loginPassword', TEST_STUDENT_PASSWORD)
         page.click('button[type="submit"]')
         page.wait_for_selector('#userName', timeout=10000)
         yield
@@ -411,3 +416,88 @@ class TestHostileDataRendering:
         expect(content).to_contain_text(IMG_PAYLOAD)
         expect(content).to_contain_text(SVG_PAYLOAD)
         self._assert_inert(page)
+
+
+# ============ ADMIN-ISSUED RESET LINK ============
+
+class TestAdminResetLink:
+    """An admin creates a reset link in the Students tab and hands it over;
+    the student opens it in their own browser and signs in with the new
+    password. Other tests sign in as teststudent with its seeded password,
+    so this one restores that password through a second link."""
+
+    STUDENT = 'teststudent'
+    NEW_PASSWORD = 'link-reset-pass-9'
+
+    @pytest.fixture(autouse=True)
+    def login_admin(self, page: Page, base_url: str):
+        page.goto(base_url)
+        page.fill('#loginUsername', 'admin')
+        page.fill('#loginPassword', 'testadmin123')
+        page.click('button[type="submit"]')
+        page.wait_for_selector('#userName', timeout=10000)
+        yield
+
+    def _create_link(self, admin: Page) -> str:
+        admin.click('[data-tab="admin-students"]')
+        admin.wait_for_selector('#students-table-container table', timeout=5000)
+        admin.fill('#student-search', self.STUDENT)
+        admin.once('dialog', lambda dialog: dialog.accept())
+        with admin.expect_response('**/reset-link') as issued:
+            admin.click(f'.js-reset-link[data-login="{self.STUDENT}"]')
+        reset_url = issued.value.json()['reset_url']
+        # The panel shows the absolute form of the one link just issued.
+        link = admin.locator('#reset-link-url')
+        expect(link).to_have_value(re.compile(re.escape(reset_url) + '$'))
+        return link.input_value()
+
+    @staticmethod
+    def _submit_new_password(student: Page, url: str, password: str):
+        student.goto(url)
+        expect(student.locator('#tokenResetForm')).to_be_visible()
+        student.fill('#tokenPassword', password)
+        student.fill('#tokenPasswordConfirm', password)
+        student.click('#tokenResetForm button[type="submit"]')
+
+    def _reset_in_fresh_browser(self, browser, url: str, password: str):
+        context = browser.new_context()
+        try:
+            student = context.new_page()
+            self._submit_new_password(student, url, password)
+            expect(student.locator('.alert-success')).to_be_visible()
+        finally:
+            context.close()
+
+    def test_student_uses_link_then_signs_in(self, page: Page, browser, base_url: str):
+        url = self._create_link(page)
+        assert '#token=' in url and '?' not in url
+
+        context = browser.new_context()
+        try:
+            student = context.new_page()
+            self._submit_new_password(student, url, self.NEW_PASSWORD)
+            # Read once, then gone from the address bar and history.
+            assert '#token=' not in student.url
+            expect(student.locator('.alert-success')).to_be_visible()
+
+            student.wait_for_selector('#loginUsername', timeout=10000)
+            student.fill('#loginUsername', self.STUDENT)
+            student.fill('#loginPassword', self.NEW_PASSWORD)
+            student.click('button[type="submit"]')
+            student.wait_for_selector('#userName', timeout=10000)
+            expect(student.locator('#userRole')).to_contain_text('Student')
+        finally:
+            context.close()
+            self._reset_in_fresh_browser(browser, self._create_link(page), TEST_STUDENT_PASSWORD)
+
+    def test_used_link_is_refused(self, page: Page, browser, base_url: str):
+        url = self._create_link(page)
+        self._reset_in_fresh_browser(browser, url, TEST_STUDENT_PASSWORD)
+
+        context = browser.new_context()
+        try:
+            replay = context.new_page()
+            self._submit_new_password(replay, url, 'replayed-pass-7')
+            expect(replay.locator('.alert-danger')).to_contain_text('already used')
+        finally:
+            context.close()

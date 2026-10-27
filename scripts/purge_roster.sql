@@ -8,6 +8,7 @@
 --
 -- WHAT GOES
 --   * every non-admin user, and the whitelist that lets them register
+--   * every password reset link issued for them (ON DELETE CASCADE)
 --   * every student group and its membership
 --   * every destroyed VM record, and every VM owned by a non-admin
 --   * every lab assignment
