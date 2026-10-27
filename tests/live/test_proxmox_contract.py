@@ -57,11 +57,6 @@ def _assert_absent_with_app_semantics(proxmox, guest):
     assert error.status_code in (404, 500), error
     assert is_proxmox_not_found(error), error
     assert confirm_proxmox_absence(proxmox, guest.vmid, error)
-    if error.status_code != 404:
-        warnings.warn(
-            f'missing VMID read returned HTTP {error.status_code}, not 404: '
-            'app.orphan_reaper._is_not_found keys on 404 only, so its '
-            '"vanished" branch reports a failure instead (fail-safe)')
 
 
 def test_cluster_resources_list_the_fields_inventory_reads(live_proxmox, live_config):

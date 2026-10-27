@@ -23,6 +23,8 @@ from .config import (
 from .alert_outbox import enqueue_alert
 from .models import KothBox, VMRecord, db
 from .proxmox_service import (
+    confirm_proxmox_absence,
+    is_proxmox_not_found,
     is_vmid_reserved,
     reset_cluster_vm_index,
     vm_lifecycle_lock,
@@ -168,7 +170,7 @@ def reap_orphaned_vms(proxmox, *, now=None, grace_minutes=None, dry_run=None,
         try:
             vm_config = guest.config.get()
         except Exception as exc:
-            if _is_not_found(exc):
+            if is_proxmox_not_found(exc):
                 logger.info("Orphan reaper skipped VM %s (%s): it vanished before config read",
                             vmid, name)
             else:
@@ -242,7 +244,7 @@ def _recheck_and_reap(proxmox, guest, resource, vmid, node, name, vm_type,
             stop_result = wait_for_proxmox_task(
                 proxmox, node, stop_upid, timeout=60, poll_interval=1)
         except Exception as exc:
-            if _is_not_found(exc):
+            if confirm_proxmox_absence(proxmox, vmid, exc):
                 logger.info("Orphan reaper VM %s (%s) vanished before stop", vmid, name)
                 return {**report, 'status': 'not_found'}
             logger.error("Orphan reaper failed to stop VM %s (%s): %s",
@@ -259,7 +261,7 @@ def _recheck_and_reap(proxmox, guest, resource, vmid, node, name, vm_type,
         delete_result = wait_for_proxmox_task(
             proxmox, node, delete_upid, timeout=120, poll_interval=1)
     except Exception as exc:
-        if _is_not_found(exc):
+        if confirm_proxmox_absence(proxmox, vmid, exc):
             logger.info("Orphan reaper VM %s (%s) was already deleted", vmid, name)
             return {**report, 'status': 'not_found'}
         logger.error("Orphan reaper failed to request delete for VM %s (%s): %s",
@@ -316,12 +318,6 @@ def _past_grace(expires_at, now, grace_minutes):
         comparable_now = now.astimezone(deadline.tzinfo)
     return comparable_now > deadline
 
-
-def _is_not_found(exc):
-    # Proxmoxer ResourceException exposes the HTTP status here. Never search
-    # the message for "404": URLs contain VMIDs such as 404/1404 and caused
-    # live guests to be mistaken for missing in the past.
-    return getattr(exc, 'status_code', None) == 404
 
 
 def _has_live_reference(vmid, node, name):
