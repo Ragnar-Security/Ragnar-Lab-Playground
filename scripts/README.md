@@ -41,6 +41,15 @@ Utility scripts for database management, deployment, and system administration.
   bash scripts/fix_database.sh
   ```
 
+- **rotate_headscale_keys.sh** - Rotate students' Headscale pre-auth keys
+  (dry run unless `--apply`; see `docs/TERM_CHANGEOVER.md`)
+  ```bash
+  bash scripts/rotate_headscale_keys.sh --only <login>
+  ```
+
+- **update_headscale_keys.py** - Store `login,key` rows from stdin in the
+  portal database; run by the rotation script inside the app container
+
 ## Usage
 
 All scripts should be run from the project root directory:

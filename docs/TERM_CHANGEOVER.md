@@ -287,6 +287,68 @@ Wait for the portal health check.
 
 Run the dry command with the restored term export.
 
+## Mid-term or end-of-term key rotation
+
+Each student's reusable Headscale pre-auth key stays valid for `KEY_DAYS`.
+A leaked key lets anyone join the tailnet as that student until it expires.
+Rotate the keys at the end of a semester, or mid-term after a suspected
+leak, without changing the roster:
+
+```bash
+scripts/rotate_headscale_keys.sh                          # dry run: the plan only
+scripts/rotate_headscale_keys.sh --apply --only <login>   # try one account first
+scripts/rotate_headscale_keys.sh --apply                  # asks you to type 'rotate'
+scripts/rotate_headscale_keys.sh --apply --yes            # unattended
+```
+
+It needs `PORTAL_HOST`, `PORTAL_DIR`, `PORTAL_COMPOSE`, `HEADSCALE_HOST`,
+`HEADSCALE_DIR`, `HEADSCALE_KEEP_USER`, `HEADSCALE_STAFF`, `KEY_DAYS`, and
+`REMOTE_BACKUP_DIR`, and stops before contacting a host when one is unset.
+`--apply` without `--yes` asks for confirmation at the terminal and refuses
+when there is no terminal.
+
+The roster is the portal's mounted `data/students_merged.csv`. Logins in
+`HEADSCALE_KEEP_USER` and `HEADSCALE_STAFF` are never rotated, even when they
+appear in that file. `--only` limits the run to the listed logins and refuses
+a login that is not on the roster or is protected.
+
+The dry run prints the students, their count of active keys, and the checks
+below. It shows no key value and changes nothing. It fails, as `--apply`
+would, when a student has no Headscale user or the running portal container
+lacks `scripts/update_headscale_keys.py`.
+
+`--apply` works in this order:
+
+1. Create one new reusable key per student on Headscale, expiring in `KEY_DAYS`.
+2. Write the new `data/students_merged.csv` locally, mode `0600`.
+3. Back up the portal's roster file to
+   `REMOTE_BACKUP_DIR/students_merged-pre-rotation-<stamp>.csv`, then replace it
+   with the same temp-and-`mv` and hash check as the term changeover.
+4. Store the new keys in both `student_whitelist.headscale_key` and
+   `users.headscale_key`, in one transaction, by running
+   `scripts/update_headscale_keys.py` in the `vm-automation` container.
+5. Expire the keys that were active before step 1.
+
+Step 4 is not optional. The dashboard shows the key from the database, and
+`init_db.py` reads the CSV only while the whitelist is empty, so a new CSV
+alone would leave students looking at a key that step 5 is about to expire.
+
+Old keys are expired last because a failure at any earlier step must leave
+every student with a key that works. If the database update fails, the
+script stops with a non-zero exit, and no key is expired. Fix the cause and
+run `--apply` again: each run issues fresh keys and expires every key that
+was active before it, including keys from a failed run. A student on the
+roster but absent from the portal database keeps the old key; the summary
+names them.
+
+Expiring a pre-auth key stops new registrations with it. It does not
+disconnect a device that is already registered. A student needs the new key
+only to add a device or reinstall, and the portal already shows it.
+
+The key values travel only over SSH standard input and output. They never
+appear in command arguments on the workstation or in the script's output.
+Keep the regenerated `data/students_merged.csv` untracked, as always.
+
 ## Human decisions
 
 Review the generated credential file, keep it untracked, and store any

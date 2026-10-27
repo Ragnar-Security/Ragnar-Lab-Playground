@@ -107,6 +107,8 @@ Ragnar-Lab-Playground/
 │   ├── create_student_accounts.sh # Jumpbox account provisioning
 │   ├── configure_jumpbox.sh      # Jumpbox setup
 │   ├── backup-database.sh        # MySQL backup utility
+│   ├── rotate_headscale_keys.sh  # Rotate students' Headscale pre-auth keys (dry run by default)
+│   ├── update_headscale_keys.py  # Store rotated keys in the portal database (run in the app container)
 │   └── migrate_*.py              # Database migration scripts
 ├── .github/workflows/ci.yml     # CI pipeline definition
 ├── docker-compose.yml            # Development environment
@@ -262,10 +264,11 @@ any required value that is missing.
 | `PORTAL_APP_CONTAINER` | Portal application service/container |
 | `HEADSCALE_HOST` | SSH destination for the Headscale host |
 | `HEADSCALE_DIR` | Headscale deployment directory |
-| `HEADSCALE_KEEP_USER` | Infrastructure user preserved at term changeover |
-| `HEADSCALE_STAFF` | Comma-separated staff users preserved at term changeover |
+| `HEADSCALE_KEEP_USER` | Infrastructure user preserved at term changeover and never rotated |
+| `HEADSCALE_STAFF` | Comma-separated staff users preserved at term changeover and never rotated |
 | `EMAIL_DOMAIN` | Student email domain used while building the roster |
 | `REMOTE_BACKUP_DIR` | Remote directory for changeover backups |
+| `KEY_DAYS` | Lifetime of new student pre-auth keys (for example `150d`), used by changeover and key rotation |
 | `HEADSCALE_URL` | Login-server URL used by jumpbox setup |
 | `JUMPBOX_NODE` | Proxmox node on which to create the jumpbox |
 | `JUMPBOX_STORAGE` | Proxmox storage for the jumpbox |
@@ -319,6 +322,23 @@ The CSV must include `SIS Login ID` and `Student` (full name) columns. The impor
 ### Account lifecycle
 
 Admins can disable a student account via `PUT /admin/students/<id>` with `{"disabled": true}`. Disabled students cannot log in or manage VMs until re-enabled.
+
+### Rotating Headscale keys
+
+At the end of a semester, or after a suspected leak, replace every student's
+reusable Headscale pre-auth key without changing the roster:
+
+```bash
+scripts/rotate_headscale_keys.sh                          # dry run: prints the plan, changes nothing
+scripts/rotate_headscale_keys.sh --apply --only <login>   # one account first
+scripts/rotate_headscale_keys.sh --apply --yes            # everyone except HEADSCALE_STAFF/KEEP_USER
+```
+
+It creates the new keys, replaces `data/students_merged.csv` locally and on the
+portal, updates both key columns in the database, and only then expires the old
+keys, so a failure part-way leaves every student with a working key. Registered
+devices stay connected. The portal container must include
+`scripts/update_headscale_keys.py`. See `docs/TERM_CHANGEOVER.md`.
 
 ## Lab Assignment Restrictions
 
