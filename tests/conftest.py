@@ -18,26 +18,31 @@ from app.models import db
 
 @pytest.fixture
 def app():
-    """Create application for testing"""
-    # Create a temporary directory for the test database
+    """Create application for testing, backed by its own SQLite file.
+
+    A file, not create_app(testing=True)'s in-memory default: that engine is
+    one connection shared by every thread, so a background thread returning
+    it to the pool rolls back the request thread's uncommitted writes.
+    """
     db_fd, db_path = tempfile.mkstemp()
-    
-    # Create app with test config
-    app = create_app(testing=True)
-    app.config['TESTING'] = True
-    app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
-    app.config['WTF_CSRF_ENABLED'] = False
-    
+
+    # The URI must be set before init_app, which builds the engine.
+    app = create_app(testing=True, test_config={
+        'SQLALCHEMY_DATABASE_URI': f'sqlite:///{db_path}',
+        'WTF_CSRF_ENABLED': False,
+    })
+
     # Create tables
     with app.app_context():
         db.create_all()
-    
+
     yield app
-    
+
     # Cleanup
     with app.app_context():
         db.session.remove()
         db.drop_all()
+        db.engine.dispose()
     os.close(db_fd)
     os.unlink(db_path)
 
