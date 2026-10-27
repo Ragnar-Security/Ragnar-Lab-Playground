@@ -4,7 +4,7 @@ import pytest
 
 from app import create_app
 from app.models import User, db
-from scripts import init_db
+from scripts import init_db, preflight_env
 
 
 @pytest.fixture
@@ -144,6 +144,50 @@ def test_production_seeds_admin_with_operator_password(app, monkeypatch):
         init_db.create_admin_account()
         admin = User.query.filter_by(login_id="admin").one()
         assert admin.check_password("operator-supplied-strong-password")
+
+
+# Generated, not literal: only the length is under test.
+@pytest.mark.parametrize("length, seeds", [(15, False), (16, True), (32, True)])
+def test_production_admin_password_needs_sixteen_characters(app, monkeypatch, length, seeds):
+    password = "k" * length
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("ADMIN_PASSWORD", password)
+
+    with app.app_context():
+        if seeds:
+            init_db.create_admin_account()
+            assert User.query.filter_by(login_id="admin").one().check_password(password)
+        else:
+            with pytest.raises(RuntimeError, match="ADMIN_PASSWORD") as refused:
+                init_db.create_admin_account()
+            assert "16" in str(refused.value)
+            assert password not in str(refused.value)
+            assert User.query.filter_by(login_id="admin").first() is None
+
+
+@pytest.mark.parametrize("password", [
+    None, "", "admin123", "change-this-password-immediately", "k" * 15, "k" * 16,
+    " " * 4 + "k" * 15 + " " * 4,
+])
+def test_preflight_and_startup_agree_on_admin_password(app, monkeypatch, password):
+    """An .env that passes the host preflight must not then stop the
+    container at startup, and the reverse."""
+    monkeypatch.setenv("FLASK_ENV", "production")
+    if password is None:
+        monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("ADMIN_PASSWORD", password)
+    preflight_refuses = any(line.startswith("ADMIN_PASSWORD:")
+                            for line in preflight_env.problems({"ADMIN_PASSWORD": password}))
+
+    with app.app_context():
+        try:
+            init_db.create_admin_account()
+            startup_refuses = False
+        except init_db.AdminConfigurationError:
+            startup_refuses = True
+
+    assert preflight_refuses == startup_refuses
 
 
 def _raise_validate_config_error():

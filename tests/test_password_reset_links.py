@@ -15,7 +15,12 @@ import pytest
 from flask import Flask
 from gunicorn.config import Config as GunicornConfig
 from gunicorn.glogging import Logger as GunicornLogger
-from sqlalchemy import create_engine, inspect, select, text
+from sqlalchemy import (
+    Column, DateTime, ForeignKey, Integer, MetaData, String, Table,
+    create_engine, inspect, select, text,
+)
+from sqlalchemy.dialects import mysql
+from sqlalchemy.exc import IntegrityError
 
 from app import create_app
 from app import password_reset_links
@@ -246,6 +251,49 @@ def test_new_link_for_one_student_leaves_anothers_alive(app):
     assert _redeem(app.test_client(), token_a).get_json()['success'] is True
 
 
+def test_new_link_after_a_used_one_works(app):
+    assert _redeem(app.test_client(), _issue(app)).get_json()['success'] is True
+
+    again = _issue(app)
+
+    assert _redeem(app.test_client(), again, password='third-pass-33').get_json()['success']
+    assert _password_is('student-a', 'third-pass-33')
+
+
+def test_database_refuses_a_second_link_for_the_same_user(app):
+    """The invariant behind "a newer link retires the earlier one" lives in
+    the schema, so no interleaving of issuers can leave two rows."""
+    now = datetime(2026, 1, 15, 9, 0, 0)
+    for digest in ('a' * 64, 'b' * 64):
+        db.session.add(PasswordResetToken(
+            user_id=_user_id('student-a'), token_hash=digest,
+            created_at=now, expires_at=now + timedelta(hours=1)))
+
+    with pytest.raises(IntegrityError):
+        db.session.commit()
+    db.session.rollback()
+
+
+def test_mysql_issuance_replaces_the_row_in_one_statement():
+    """Production runs MySQL, which these tests cannot reach: check the SQL
+    it would receive. One INSERT ... ON DUPLICATE KEY UPDATE on the unique
+    user_id leaves no window between retiring the old link and adding the
+    new one, and clears used_at so a replaced used link is live again."""
+    statement = password_reset_links._replace_link(mysql.dialect(), {
+        'user_id': 7, 'created_by_user_id': 1, 'token_hash': 'c' * 64,
+        'created_at': datetime(2026, 1, 15), 'expires_at': datetime(2026, 1, 16),
+        'used_at': None,
+    })
+    sql = str(statement.compile(dialect=mysql.dialect()))
+
+    assert sql.startswith('INSERT INTO password_reset_tokens')
+    updated = sql.split('ON DUPLICATE KEY UPDATE', 1)[1]
+    for column in ('created_by_user_id', 'token_hash', 'created_at', 'expires_at', 'used_at'):
+        assert f'{column} = ' in updated
+    assert 'user_id = ' not in updated.replace('created_by_user_id = ', '')
+
+
+
 def test_weak_password_is_refused_and_link_stays_usable(app):
     token = _issue(app)
 
@@ -288,41 +336,85 @@ def test_wrong_tokens_count_against_the_client_limit(app):
     assert elsewhere.get_json()['success'] is True
 
 
-def test_concurrent_double_use_succeeds_exactly_once(tmp_path, wall_clock):
-    """Two tabs, or an attacker racing the student, submit one link at the
-    same moment. A file database gives each thread its own connection, as
-    production's pool does; the in-memory test database would share one."""
+def _file_backed_app(tmp_path, name):
+    """A file database gives each thread its own connection, as production's
+    pool does; the in-memory test database would share one."""
     application = Flask(__name__)
     application.config.update(
-        SQLALCHEMY_DATABASE_URI=f'sqlite:///{tmp_path / "race.db"}',
+        SQLALCHEMY_DATABASE_URI=f'sqlite:///{tmp_path / name}',
         SECRET_KEY='race-test',
         PASSWORD_RESET_TOKEN_TTL_MINUTES=60,
     )
     db.init_app(application)
     application.register_blueprint(auth, url_prefix='/auth')
-
     with application.app_context():
         db.create_all()
-        student = _user('student-a')
-        token, _expires = password_reset_links.issue(student, created_by=None)
+        _user('student-a')
+    return application
 
-    barrier = threading.Barrier(2)
-    results = []
 
-    def submit(password):
-        client = application.test_client()
+def _run_together(*targets):
+    barrier = threading.Barrier(len(targets))
+
+    def at_barrier(target):
         barrier.wait()
-        results.append(_redeem(client, token, password=password).get_json()['success'])
+        target()
 
-    threads = [threading.Thread(target=submit, args=(f'racer-pass-{n}',)) for n in range(2)]
+    threads = [threading.Thread(target=at_barrier, args=(t,)) for t in targets]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=30)
 
+
+def test_concurrent_double_use_succeeds_exactly_once(tmp_path, wall_clock):
+    """Two tabs, or an attacker racing the student, submit one link at the
+    same moment."""
+    application = _file_backed_app(tmp_path, 'race.db')
+    with application.app_context():
+        student = User.query.filter_by(login_id='student-a').one()
+        token, _expires = password_reset_links.issue(student, created_by=None)
+
+    results = []
+
+    def submit(password):
+        return lambda: results.append(
+            _redeem(application.test_client(), token, password=password).get_json()['success'])
+
+    _run_together(*(submit(f'racer-pass-{n}') for n in range(2)))
+
     assert sorted(results) == [False, True]
     with application.app_context():
         db.drop_all()
+
+
+def test_concurrent_issuance_leaves_exactly_one_live_link(tmp_path, wall_clock):
+    """Two admins press the key button for one student at the same moment.
+    Each is shown a link; only the one whose write landed last may work, so
+    the admin whose link lost holds a dead one rather than a second key."""
+    application = _file_backed_app(tmp_path, 'issue-race.db')
+    tokens = []
+
+    def issue():
+        with application.app_context():
+            student = User.query.filter_by(login_id='student-a').one()
+            tokens.append(password_reset_links.issue(student, created_by=None)[0])
+            db.session.remove()
+
+    _run_together(issue, issue)
+
+    assert len(tokens) == 2
+    with application.app_context():
+        [row] = PasswordResetToken.query.all()
+    [winner] = [t for t in tokens if hashlib.sha256(t.encode()).hexdigest() == row.token_hash]
+    [loser] = [t for t in tokens if t != winner]
+    client = application.test_client()
+    assert _redeem(client, loser).get_json()['success'] is False
+    assert _redeem(client, winner).get_json()['success'] is True
+    with application.app_context():
+        db.drop_all()
+
+
 
 
 # ---- the page ----
@@ -441,13 +533,108 @@ def test_migration_creates_table_matching_model_and_is_idempotent(tmp_path):
     assert set(migrated) == {c.name for c in model}
     for column in model:
         assert migrated[column.name]['nullable'] == column.nullable, column.name
+    unique = _unique_column_sets(inspector)
+    assert ('token_hash',) in unique
+    assert ('user_id',) in unique
+    assert _unique_column_sets(inspect(_model_engine(tmp_path))) == unique
+    with engine.connect() as conn:
+        assert conn.execute(text('SELECT login_id FROM users')).scalar_one() == 'student'
+
+
+def _unique_column_sets(inspector):
+    """Unique column sets however the dialect reports them: SQLite lists a
+    UNIQUE constraint and a unique index separately, MySQL lists both."""
     unique = {tuple(i['column_names']) for i in inspector.get_indexes('password_reset_tokens')
               if i['unique']}
     unique |= {tuple(u['column_names'])
                for u in inspector.get_unique_constraints('password_reset_tokens')}
-    assert ('token_hash',) in unique
+    return unique
+
+
+def _model_engine(tmp_path):
+    """What db.create_all() makes of the model at container start."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'model.db'}")
+    db.metadata.create_all(engine, tables=[User.__table__, PasswordResetToken.__table__])
+    return engine
+
+
+def _create_previous_release_table(database_url):
+    """password_reset_tokens as the first release of the migration, and
+    db.create_all() of that release's model, made it: user_id indexed but
+    not unique. Spelled out because the migration no longer contains it."""
+    engine = create_engine(database_url)
+    metadata = MetaData()
+    Table('users', metadata, Column('id', Integer, primary_key=True))
+    previous = Table(
+        'password_reset_tokens', metadata,
+        Column('id', Integer, primary_key=True),
+        Column('user_id', Integer, ForeignKey('users.id', ondelete='CASCADE'),
+               nullable=False, index=True),
+        Column('created_by_user_id', Integer, ForeignKey('users.id', ondelete='SET NULL'),
+               nullable=True),
+        Column('token_hash', String(64), unique=True, nullable=False),
+        Column('created_at', DateTime, nullable=False),
+        Column('expires_at', DateTime, nullable=False),
+        Column('used_at', DateTime, nullable=True),
+    )
+    with engine.begin() as conn:
+        conn.execute(text('CREATE TABLE users (id INTEGER PRIMARY KEY)'))
+        conn.execute(text('INSERT INTO users (id) VALUES (1), (2), (3)'))
+        previous.create(conn)
+        # Student 1 holds two live links, the state the issuance race left
+        # behind, plus a used one; student 3's two links tie on created_at.
+        conn.execute(text(
+            "INSERT INTO password_reset_tokens (id, user_id, token_hash, created_at,"
+            " expires_at, used_at) VALUES"
+            " (1, 1, 'used', '2026-01-15 09:00:00', '2026-01-15 10:00:00', '2026-01-15 09:30:00'),"
+            " (2, 1, 'older-live', '2026-01-15 10:00:00', '2026-01-15 11:00:00', NULL),"
+            " (3, 1, 'newest', '2026-01-15 11:00:00', '2026-01-15 12:00:00', NULL),"
+            " (4, 2, 'only', '2026-01-15 10:00:00', '2026-01-15 11:00:00', NULL),"
+            " (6, 3, 'tie-later-id', '2026-01-15 10:00:00', '2026-01-15 11:00:00', NULL),"
+            " (5, 3, 'tie-earlier-id', '2026-01-15 10:00:00', '2026-01-15 11:00:00', NULL)"))
+    return engine
+
+
+def test_migration_upgrades_previous_release_keeping_each_users_newest_link(tmp_path):
+    migration = _load_migration()
+    database_url = f"sqlite:///{tmp_path / 'previous.db'}"
+    engine = _create_previous_release_table(database_url)
+
+    migration.run_migration(database_url)
+    migration.run_migration(database_url)
+
     with engine.connect() as conn:
-        assert conn.execute(text('SELECT login_id FROM users')).scalar_one() == 'student'
+        rows = set(conn.execute(text('SELECT user_id, token_hash FROM password_reset_tokens')))
+    assert rows == {(1, 'newest'), (2, 'only'), (3, 'tie-later-id')}
+    inspector = inspect(engine)
+    assert ('user_id',) in _unique_column_sets(inspector)
+    # The plain index on user_id is redundant once the unique one exists.
+    assert not [i for i in inspector.get_indexes('password_reset_tokens')
+                if i['column_names'] == ['user_id'] and not i['unique']]
+    with pytest.raises(IntegrityError), engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, created_at, expires_at)"
+            " VALUES (1, 'second', '2026-01-15 12:00:00', '2026-01-15 13:00:00')"))
+
+
+def test_migration_on_previous_release_without_duplicates_keeps_every_link(tmp_path, capsys):
+    migration = _load_migration()
+    database_url = f"sqlite:///{tmp_path / 'clean.db'}"
+    engine = _create_previous_release_table(database_url)
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM password_reset_tokens WHERE id IN (1, 2, 5)"))
+
+    migration.run_migration(database_url)
+    first = capsys.readouterr().out
+    migration.run_migration(database_url)
+    second = capsys.readouterr().out
+
+    with engine.connect() as conn:
+        count = conn.execute(text('SELECT COUNT(*) FROM password_reset_tokens')).scalar_one()
+    assert count == 3
+    assert 'up to date' not in first
+    assert 'up to date' in second
+    assert 'Removed 0 superseded' in first
 
 
 def test_purging_students_takes_their_links_with_them(tmp_path):

@@ -119,7 +119,7 @@ PERMANENT_SESSION_LIFETIME=7200
   32 characters;
 - the database password (`DATABASE_URL` or `MYSQL_PASSWORD`) is empty or a
   published example value;
-- `ADMIN_PASSWORD` is missing or a known weak default and the admin account is about to be seeded (`SEED_ADMIN_ACCOUNT` is not `false` and the account does not exist yet);
+- `ADMIN_PASSWORD` is missing, a known default, or shorter than 16 characters and the admin account is about to be seeded (`SEED_ADMIN_ACCOUNT` is not `false` and the account does not exist yet);
 - `PROXMOX_CA_BUNDLE` is set but the file does not exist;
 - `SESSION_COOKIE_SAMESITE` is not a valid value.
 
@@ -145,10 +145,11 @@ Admin-issued reset links are the recommended recovery path and work whatever
 `SELF_SERVICE_PASSWORD_RESET` says. An admin creates one from the key button
 in the Students tab, sees it once, and hands it to the student. Each link is
 single-use, expires after `PASSWORD_RESET_TOKEN_TTL_MINUTES`, and dies when a
-newer one is issued for the same student. The token travels in the URL
-fragment, so neither Caddy's `access.log` nor gunicorn's access log records
-it, and only its SHA-256 is stored. The feature needs the
-`password_reset_tokens` table (`migrate_add_password_reset_tokens.py`).
+newer one is issued for the same student; the database holds at most one link
+per student, so two admins issuing at once leave only the later link working.
+The token travels in the URL fragment, so neither Caddy's `access.log` nor
+gunicorn's access log records it, and only its SHA-256 is stored. The feature
+needs the `password_reset_tokens` table (`migrate_add_password_reset_tokens.py`).
 Sites that rely on self-service today can keep `SELF_SERVICE_PASSWORD_RESET=true`
 while staff move to links, then turn it off.
 
@@ -162,9 +163,10 @@ The script is stdlib-only and runs on the host (default file `./.env`). It
 prints one `KEY: problem` line per issue, never the values, and exits 1 on
 problems or 2 if the file is unreadable. It checks `SECRET_KEY`,
 `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` and `ADMIN_PASSWORD` (present and not
-a known default), `SESSION_COOKIE_SAMESITE`, and that `PROXMOX_CA_BUNDLE` is
-readable on the host when verification is on. Mount the PEM into the container
-at the same path it has on the host.
+a known default; `ADMIN_PASSWORD` also at least 16 characters),
+`SESSION_COOKIE_SAMESITE`, and that `PROXMOX_CA_BUNDLE` is readable on the
+host when verification is on. Mount the PEM into the container at the same
+path it has on the host.
 
 Registration and self-service reset both refuse roster rows with an empty SIS
 ID. `init_db` fails immediately on configuration errors instead of retrying as
@@ -258,10 +260,10 @@ The test student is created only when `SEED_TEST_STUDENT=1`. Production must
 leave this variable unset because that account has a known password.
 
 Production startup refuses to seed the admin when `ADMIN_PASSWORD` is
-missing or is a known weak default. Set a unique password before starting
-the stack. If staff sign in with personal accounts listed in `ADMIN_USERS`,
-set `SEED_ADMIN_ACCOUNT=false` instead: no generic account is created and
-`ADMIN_PASSWORD` is not required. An account that already exists is left as
+missing, a known default, or shorter than 16 characters. Set a unique password
+before starting the stack. If staff sign in with personal accounts listed in
+`ADMIN_USERS`, set `SEED_ADMIN_ACCOUNT=false` instead: no generic account is
+created and `ADMIN_PASSWORD` is not required. An account that already exists is left as
 it is; disable it from another admin session with `PUT /admin/students/<id>`
 and `{"disabled": true}`.
 
@@ -425,7 +427,10 @@ table, and the new code reads `users.session_version` and the
 `vm_records.deletion_*` columns on every request and expiry pass.
 `migrate_add_password_reset_tokens.py` adds a new table the old code never
 reads; `db.create_all()` at startup would also create it, but run it here so
-the schema is complete before the new code serves its first reset link.
+the schema is complete before the new code serves its first reset link. On a
+table an earlier release created it also makes `user_id` unique, first
+deleting all but each student's newest link (the ones a newer link had
+already retired, or that the old issuance race left live).
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \

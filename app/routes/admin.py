@@ -205,7 +205,7 @@ def create_reset_link(user_id):
     """Issue a single-use password reset link for a user and return it once.
 
     The admin hands the link to the student out of band. Issuing a link
-    retires any earlier unused one for the same user.
+    retires any earlier one for the same user.
 
     CSRF: like every admin POST here, this relies on the session cookie's
     SameSite=Lax, which a cross-site POST does not carry. It also refuses
