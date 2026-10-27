@@ -2,6 +2,7 @@
 
 import base64
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -141,6 +142,88 @@ def test_term_changeover_forwards_headscale_config_to_remote_helper(tmp_path):
     assert "HEADSCALE_STAFF=staff-one, staff-two" in forwarded
     assert "EMAIL_DOMAIN=example.edu" in forwarded
     assert "KEY_DAYS=45d" in forwarded
+
+
+def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tmp_path):
+    # The live roster holds reusable VPN keys. The app container runs as
+    # uid/gid 1000 (Dockerfile.prod), so group 1000 + 0640 is enough for it
+    # and keeps the file away from every other account on the portal host.
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "data").mkdir()
+    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
+        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    config = tmp_path / "site.env"
+    config.write_text(
+        "\n".join(
+            [
+                "PORTAL_HOST=portal-host",
+                "PORTAL_DIR=/opt/lab-playground",
+                "PORTAL_COMPOSE=docker-compose.prod.yml",
+                "PORTAL_APP_CONTAINER=lab-playground",
+                "HEADSCALE_HOST=headscale-host",
+                "HEADSCALE_DIR=/opt/headscale",
+                "HEADSCALE_KEEP_USER=keep-user",
+                "HEADSCALE_STAFF=staff-one",
+                "EMAIL_DOMAIN=example.edu",
+                f"REMOTE_BACKUP_DIR={tmp_path / 'backups'}",
+                "KEY_DAYS=45d",
+            ]
+        )
+        + "\n"
+    )
+    roster = tmp_path / "roster.csv"
+    roster.write_text("SIS User ID,SIS Login ID\n1001,student1\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh_log = tmp_path / "ssh.log"
+    key_line = "student1,student1@example.edu,fake-key\n"
+    users = base64.b64encode(b'[{"name":"keep-user"},{"name":"student1"}]').decode()
+    keys = base64.b64encode(key_line.encode()).decode()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n=====\\n' \"$*\" >> \"$SSH_LOG\"\n"
+        "case \"$*\" in\n"
+        "  *\"python3 -c\"*) printf 'to remove: 0 users\\n' ;;\n"
+        f"  *\"base64 -w0 && printf\"*) printf '%s\\n%s\\n' '{users}' '{keys}' ;;\n"
+        f"  *\"base64 -w0 students_with_keys.csv\"*) printf '%s' '{keys}' ;;\n"
+        f"  *\"cat '\"*) printf '%s' '{key_line}' ;;\n"
+        "  *sha256sum*) printf 'missing' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC)
+    scp = bin_dir / "scp"
+    scp.write_text("#!/bin/sh\nexit 0\n")
+    scp.chmod(scp.stat().st_mode | stat.S_IEXEC)
+
+    env = _clean_env(
+        tmp_path,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        SITE_ENV_FILE=str(config),
+        SSH_LOG=str(ssh_log),
+    )
+    subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    delivery = next(
+        call
+        for call in ssh_log.read_text().split("\n=====\n")
+        if "mv '" in call and "students_merged.csv" in call
+    )
+    tmp = next(word for word in delivery.split() if word.endswith(".tmp'"))
+    assert f"chgrp 1000 {tmp}" in delivery
+    assert f"chmod 640 {tmp}" in delivery
+    assert "644" not in delivery
+    assert delivery.index("chmod 640") < delivery.index("mv '")
+
 
 
 def test_jumpbox_accounts_get_unique_random_passwords_in_private_file(tmp_path):

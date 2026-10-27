@@ -8,10 +8,19 @@ leaves every student with a key that still works:
 
   1. create a new reusable key per student on Headscale;
   2. write the new data/students_merged.csv locally (mode 0600);
-  3. back up the portal's roster file and replace it atomically;
+  3. back up the portal's roster file and replace it atomically (mode 0640,
+     group APP_GID: the app container's group, see Dockerfile.prod);
   4. store the new keys in the portal database
      (scripts/update_headscale_keys.py inside the app container);
   5. only then expire the keys that were active before step 1.
+
+--apply holds an exclusive lock on both hosts from before it reads the roster
+until after step 5, so two rotations never interleave. Each lock is a
+directory made with mkdir (atomic) holding an owner file with a random token;
+every mutating command first checks that the token is still this run's, so a
+run whose lock was broken stops instead of racing the run that broke it. A
+login the portal database does not know keeps its old key and fails the run
+unless --allow-partial is given.
 
 Expiring a pre-auth key does not disconnect a node that already registered
 with it; it only stops new registrations. Students who reinstall or add a
@@ -27,11 +36,14 @@ no copy of this repository. That side uses only the standard library and the
 
 import argparse
 import csv
+import getpass
 import hashlib
 import io
 import json
 import os
+import secrets
 import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -43,6 +55,14 @@ FIELDNAMES = ['SIS User ID', 'SIS Login ID', 'email', 'headscale_key']
 APP_SERVICE = 'vm-automation'
 UPDATE_SCRIPT = 'scripts/update_headscale_keys.py'
 SSH_OPTIONS = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10']
+# The app container runs as uid/gid 1000 (Dockerfile.prod pins both). The live
+# roster carries reusable VPN keys, so it is delivered as mode 0640 with this
+# group: the container can read it, other accounts on the portal host cannot.
+APP_GID = 1000
+LOCK_NAME = '.rotate.lock'
+# A lock this old belongs to a run that died; --break-stale-lock may take it.
+# No real rotation comes close: it takes minutes, plus the confirmation prompt.
+STALE_LOCK_HOURS = 6
 REQUIRED = (
     'PORTAL_HOST', 'PORTAL_DIR', 'PORTAL_COMPOSE',
     'HEADSCALE_HOST', 'HEADSCALE_DIR', 'HEADSCALE_KEEP_USER', 'HEADSCALE_STAFF',
@@ -187,16 +207,129 @@ def _relay(stderr, secrets=()):
         print('  ' + stderr.replace('\n', '\n  '), file=sys.stderr)
 
 
+def _operator():
+    try:
+        user = getpass.getuser()
+    except Exception:  # no login name in this environment
+        user = 'unknown'
+    return (f"{user}@{socket.gethostname()} pid={os.getpid()} "
+            f"started={time.strftime('%Y-%m-%d %H:%M:%S %z')}")
+
+
+class HostLock:
+    """An exclusive rotation lock on one host, held across many SSH calls.
+
+    The lock is a directory: mkdir either creates it or fails, atomically. Its
+    `owner` file names the run (operator, workstation, pid, start time) and a
+    random token. Staleness is the directory's age on the host itself, so a
+    workstation's clock cannot make a live lock look stale.
+    """
+
+    def __init__(self, host, directory, token, label):
+        self.host, self.label, self.token = host, label, token
+        self.path = directory.rstrip('/') + '/' + LOCK_NAME
+        self.q_path = shlex.quote(self.path)
+        self.q_owner = shlex.quote(self.path + '/owner')
+        self.held = False
+
+    def where(self):
+        return f"{self.host}:{self.path}"
+
+    def fence(self, cleanup=''):
+        """Shell line that stops a command unless this run still owns the lock."""
+        lost = f"the rotation lock {self.path} is no longer held by this run; stopping"
+        cleanup = f"{cleanup}; " if cleanup else ''
+        return (f"[ \"$(sed -n 's/^token=//p' {self.q_owner} 2>/dev/null)\" = "
+                f"{shlex.quote(self.token)} ] || "
+                f"{{ {cleanup}printf '%s\\n' {shlex.quote(lost)} >&2; exit 75; }}")
+
+    def acquire(self, break_stale):
+        minutes = STALE_LOCK_HOURS * 60
+        proc = _ssh(self.host, f"""lock={self.q_path}
+            owner={self.q_owner}
+            stale() {{ [ -n "$(find "$lock" -maxdepth 0 -mmin +{minutes} 2>/dev/null)" ]; }}
+            take() {{
+                mkdir -m 700 "$lock" 2>/dev/null || return 1
+                printf 'token=%s\\nby=%s\\n' {shlex.quote(self.token)} {shlex.quote(_operator())} > "$owner"
+            }}
+            if take; then echo ACQUIRED; exit 0; fi
+            if [ {int(bool(break_stale))} = 1 ] && stale; then
+                echo BROKE
+                cat "$owner" 2>/dev/null || true
+                rm -rf "$lock"
+                if take; then exit 0; fi
+            fi
+            if stale; then echo STALE; else echo HELD; fi
+            cat "$owner" 2>/dev/null || true
+            exit 3""")
+        lines = proc.stdout.splitlines()
+        if proc.returncode == 0 and lines and lines[0] in ('ACQUIRED', 'BROKE'):
+            self.held = True
+            if lines[0] == 'BROKE':
+                print(f"  WARNING: broke the stale rotation lock {self.where()} "
+                      f"({self._owner(lines[1:])})", file=sys.stderr)
+            return
+        markers = [i for i, line in enumerate(lines) if line in ('HELD', 'STALE')]
+        if proc.returncode != 3 or not markers:
+            _relay(proc.stderr)
+            raise Abort(f"could not take the rotation lock {self.where()}. Nothing was changed.")
+        state, owner = lines[markers[-1]], self._owner(lines[markers[-1] + 1:])
+        message = (f"another key rotation holds the {self.label} lock {self.where()} "
+                   f"({owner}). Nothing was changed. ")
+        if state == 'STALE':
+            message += (f"The lock is older than {STALE_LOCK_HOURS} hours. If that run is no "
+                        "longer running, re-run with --break-stale-lock.")
+        else:
+            message += (f"Wait for it to finish. A lock left by a run that died can be broken "
+                        f"with --break-stale-lock once it is {STALE_LOCK_HOURS} hours old, or "
+                        f"removed by hand (rm -r {self.path}) after confirming no rotation runs.")
+        raise Abort(message)
+
+    @staticmethod
+    def _owner(lines):
+        by = [line[3:] for line in lines if line.startswith('by=')]
+        return 'held by ' + by[0] if by else 'owner unknown'
+
+    def release(self):
+        """Remove the lock only if it is still ours; never raise."""
+        if not self.held:
+            return
+        self.held = False
+        proc = _ssh(self.host, f"""if [ "$(sed -n 's/^token=//p' {self.q_owner} 2>/dev/null)" = {shlex.quote(self.token)} ]; then
+                rm -rf {self.q_path}
+            else
+                echo NOT-OURS
+            fi""")
+        if proc.returncode != 0:
+            print(f"  WARNING: could not release the rotation lock {self.where()}; remove it "
+                  "by hand after confirming no rotation runs.", file=sys.stderr)
+        elif 'NOT-OURS' in proc.stdout:
+            print(f"  WARNING: the rotation lock {self.where()} now belongs to another run; "
+                  "left it in place.", file=sys.stderr)
+
+
 class Rotation:
-    def __init__(self, env, only, apply):
+    def __init__(self, env, only, apply, allow_partial=False, break_stale_lock=False):
         self.env = env
         self.apply = apply
         self.only = only
+        self.allow_partial = allow_partial
+        self.break_stale_lock = break_stale_lock
         self.q = {name: shlex.quote(env[name]) for name in REQUIRED}
         self.repo_root = Path(__file__).resolve().parent.parent
         self.local_csv = self.repo_root / 'data' / 'students_merged.csv'
         self.portal_csv = env['PORTAL_DIR'].rstrip('/') + '/data/students_merged.csv'
         self.new_keys = {}
+        # One token for both hosts identifies this run in each lock's owner file.
+        token = secrets.token_hex(16)
+        self.headscale_lock = HostLock(env['HEADSCALE_HOST'], env['HEADSCALE_DIR'], token, 'Headscale')
+        self.portal_lock = HostLock(env['PORTAL_HOST'], env['PORTAL_DIR'].rstrip('/') + '/data',
+                                    token, 'portal')
+
+    @staticmethod
+    def fenced(lock, command, cleanup=''):
+        """Prefix a remote command with the lock check while the lock is held."""
+        return f"{lock.fence(cleanup)}\n{command}" if lock.held else command
 
     # Headscale host --------------------------------------------------------
     # What a failure at each Headscale step leaves behind, for the error message.
@@ -212,6 +345,7 @@ class Rotation:
         source = Path(__file__).read_text(encoding='utf-8')
         command = (f"cd {self.q['HEADSCALE_DIR']} && "
                    f"python3 -c {shlex.quote(source)} --remote {step}")
+        command = self.fenced(self.headscale_lock, command)
         proc = _ssh(self.env['HEADSCALE_HOST'], command, json.dumps(payload))
         _relay(proc.stderr, self.new_keys.values())
         try:
@@ -252,12 +386,12 @@ class Rotation:
         backup = f"{backup_dir.rstrip('/')}/students_merged-pre-rotation-{stamp}.csv"
         remote_tmp = f"{self.env['PORTAL_DIR'].rstrip('/')}/data/.students_merged-rotation-{stamp}.tmp"
         live, q_backup = shlex.quote(self.portal_csv), shlex.quote(backup)
-        proc = _ssh(self.env['PORTAL_HOST'], f"""set -e
+        proc = _ssh(self.env['PORTAL_HOST'], self.fenced(self.portal_lock, f"""set -e
             umask 077
             mkdir -p {self.q['REMOTE_BACKUP_DIR']}
             chmod 700 {self.q['REMOTE_BACKUP_DIR']}
             cp {live} {q_backup}
-            chmod 600 {q_backup}""")
+            chmod 600 {q_backup}"""))
         if proc.returncode != 0:
             _relay(proc.stderr)
             raise Abort("backing up the portal roster failed. Headscale has unused new keys; "
@@ -268,10 +402,16 @@ class Rotation:
         tmp = shlex.quote(remote_tmp)
         # The same temp-then-mv as term_changeover.sh: the container never sees
         # a half-written roster, and the hash proves the bytes arrived intact.
-        proc = scp if scp.returncode != 0 else _ssh(self.env['PORTAL_HOST'], f"""set -e
-            chmod 644 {tmp}
+        # chgrp needs the SSH account to own the file and belong to APP_GID
+        # (or be root); if it cannot, set -e stops before the live file changes.
+        replace = f"""set -e
+            trap {shlex.quote('rm -f ' + tmp)} EXIT
+            chgrp {APP_GID} {tmp}
+            chmod 640 {tmp}
             mv {tmp} {live}
-            test "$(sha256sum {live} | cut -d' ' -f1)" = {digest}""")
+            test "$(sha256sum {live} | cut -d' ' -f1)" = {digest}"""
+        proc = scp if scp.returncode != 0 else _ssh(
+            self.env['PORTAL_HOST'], self.fenced(self.portal_lock, replace, cleanup=f"rm -f {tmp}"))
         if proc.returncode != 0:
             _relay(proc.stderr, self.new_keys.values())
             raise Abort("replacing the portal roster failed. The database still holds the old "
@@ -282,7 +422,9 @@ class Rotation:
         writer = csv.writer(rows)
         for login in targets:
             writer.writerow([login, self.new_keys[login]])
-        proc = _ssh(self.env['PORTAL_HOST'], self.compose_exec('python', UPDATE_SCRIPT), rows.getvalue())
+        proc = _ssh(self.env['PORTAL_HOST'],
+                    self.fenced(self.portal_lock, self.compose_exec('python', UPDATE_SCRIPT)),
+                    rows.getvalue())
         _relay(proc.stderr, self.new_keys.values())
         try:
             if proc.returncode != 0:
@@ -321,6 +463,20 @@ class Rotation:
 
     def run(self, yes):
         print(f"Mode: {'APPLY' if self.apply else 'DRY RUN (read-only)'}")
+        # A dry run writes nothing, so it takes no lock. --apply takes both
+        # locks before it reads the roster and keeps them through the expiry:
+        # a run that read the roster before another run replaced it would
+        # write stale keys back over the newer ones.
+        try:
+            if self.apply:
+                self.headscale_lock.acquire(self.break_stale_lock)
+                self.portal_lock.acquire(self.break_stale_lock)
+            self._rotate(yes)
+        finally:
+            self.portal_lock.release()
+            self.headscale_lock.release()
+
+    def _rotate(self, yes):
         fields, rows = self.read_roster()
         protected = {self.env['HEADSCALE_KEEP_USER'].strip().lower()}
         protected |= {s.strip().lower() for s in self.env['HEADSCALE_STAFF'].split(',') if s.strip()}
@@ -367,7 +523,9 @@ class Rotation:
         if not yes:
             self.confirm(len(targets))
 
-        stamp = time.strftime('%Y%m%d-%H%M%S')
+        # pid + randomness: two runs in the same second never share a temp
+        # file or overwrite each other's backup.
+        stamp = f"{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}-{secrets.token_hex(4)}"
         print("\n[1/5] Creating new keys on Headscale")
         created = self.headscale('create', {
             'users': {login: users[login]['id'] for login in targets},
@@ -406,13 +564,26 @@ class Rotation:
 
         print("\nSummary")
         print(f"  rotated: {len(self.new_keys)} students; new keys in {self.local_csv}")
+        failures = []
         if result['unknown']:
-            print("  WARNING: not in the portal database, old keys left active: "
-                  + ', '.join(result['unknown']))
+            # Logins only, never keys. Their old keys stay live: expiring a key
+            # the portal cannot replace would strand the student.
+            unknown = ', '.join(result['unknown'])
+            if self.allow_partial:
+                print("  WARNING (--allow-partial): not in the portal database, old keys left "
+                      "active: " + unknown)
+            else:
+                failures.append(
+                    "not in the portal database, so their old keys were left active: " + unknown
+                    + ". Add them to the portal and re-run --apply --only <logins>, or accept "
+                    "this with --allow-partial")
         if outcome['failed']:
-            raise Abort("expiring old keys failed for: " + ', '.join(sorted(outcome['failed']))
-                        + ". Those students already have new keys; their old keys still work. "
-                        "Re-run --apply --only <logins> to finish.")
+            failures.append(
+                "expiring old keys failed for: " + ', '.join(sorted(outcome['failed']))
+                + ". Those students already have new keys; their old keys still work. "
+                "Re-run --apply --only <logins> to finish")
+        if failures:
+            raise Abort('the rotation is incomplete; ' + '. '.join(failures) + '.')
 
 
 def parse_args(argv):
@@ -423,6 +594,12 @@ def parse_args(argv):
     parser.add_argument('--yes', action='store_true', help='skip the interactive confirmation')
     parser.add_argument('--only', metavar='LOGIN,...',
                         help='rotate only these roster logins (e.g. one test account)')
+    parser.add_argument('--allow-partial', action='store_true',
+                        help='exit 0 even when a roster login is missing from the portal '
+                             'database (its old key stays active)')
+    parser.add_argument('--break-stale-lock', action='store_true',
+                        help=f'take over a rotation lock older than {STALE_LOCK_HOURS} hours '
+                             'left by a run that died')
     args = parser.parse_args(argv)
     if args.only is not None:
         args.only = [s.strip().lower() for s in args.only.split(',') if s.strip()]
@@ -447,7 +624,8 @@ def main(argv):
         print("ERROR: --apply needs --yes when no one is at the terminal to confirm.",
               file=sys.stderr)
         return 1
-    rotation = Rotation(os.environ, args.only, args.apply)
+    rotation = Rotation(os.environ, args.only, args.apply,
+                        allow_partial=args.allow_partial, break_stale_lock=args.break_stale_lock)
     try:
         rotation.run(args.yes)
     except Abort as error:

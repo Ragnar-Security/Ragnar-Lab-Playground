@@ -10,6 +10,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -73,6 +74,13 @@ def shown(k):
 
 if args[:2] == ["users", "list"]:
     log("headscale users list")
+    pause = os.environ.get("HS_PAUSE")
+    if pause:
+        # Hold this run mid-rotation so a test can act while it owns the lock.
+        open(pause + ".waiting", "w").close()
+        deadline = time.time() + 30
+        while not os.path.exists(pause) and time.time() < deadline:
+            time.sleep(0.05)
     print(json.dumps(state["users"], indent="\t"))
 elif args[:2] == ["preauthkeys", "list"]:
     uid = int(opt("-u", "--user"))
@@ -143,7 +151,16 @@ while args[i].startswith("-"):
 host, command = args[i], " ".join(args[i + 1:])
 with open(os.environ["CALL_LOG"], "a") as handle:
     handle.write(f"ssh {host}\n")
+with open(os.environ["SSH_COMMANDS"], "a") as handle:
+    handle.write(command + "\n=====\n")
 os.execvp("sh", ["sh", "-c", command])
+'''
+
+# The test account cannot join group 1000; record the request instead.
+FAKE_CHGRP = r'''
+import os, sys
+with open(os.environ["CALL_LOG"], "a") as handle:
+    handle.write("chgrp " + " ".join(sys.argv[1:]) + "\n")
 '''
 
 FAKE_SCP = r'''
@@ -261,9 +278,14 @@ class Rig:
         _tool(self.bin, "ssh", FAKE_SSH)
         _tool(self.bin, "scp", FAKE_SCP)
         _tool(self.bin, "sha256sum", FAKE_SHA256SUM)
+        _tool(self.bin, "chgrp", FAKE_CHGRP)
         (self.bin / "python3").symlink_to(sys.executable)
         self.log = tmp_path / "calls.log"
         self.log.touch()
+        self.ssh_log = tmp_path / "ssh_commands.log"
+        self.ssh_log.touch()
+        self.headscale_lock = self.headscale_dir / ".rotate.lock"
+        self.portal_lock = self.portal / "data" / ".rotate.lock"
 
         self.site_env = tmp_path / "site.env"
         self.site_env.write_text(
@@ -291,6 +313,7 @@ class Rig:
             PATH=f"{self.bin}:{os.environ['PATH']}",
             SITE_ENV_FILE=str(self.site_env),
             CALL_LOG=str(self.log),
+            SSH_COMMANDS=str(self.ssh_log),
             HS_STATE=str(self.hs_state),
             REAL_SCRIPTS=str(ROOT / "scripts"),
             LOCAL_CSV=str(self.local_csv),
@@ -308,6 +331,30 @@ class Rig:
             text=True,
             timeout=60,
         )
+
+    def start(self, *args, **extra):
+        return subprocess.Popen(
+            ["bash", str(self.repo / "scripts" / "rotate_headscale_keys.sh"), *args],
+            env=self.env(**extra),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def hold(self, lock: Path, age_hours: float = 0, token: str = "someone-else"):
+        """Leave a lock as another operator's run would."""
+        lock.mkdir()
+        (lock / "owner").write_text(f"token={token}\nby=other-operator@elsewhere pid=4242\n")
+        if age_hours:
+            then = time.time() - age_hours * 3600
+            os.utime(lock, (then, then))
+
+    def portal_commands(self):
+        """Shell commands sent over SSH, minus the Headscale steps (which
+        carry the script's own source and would match any pattern in it)."""
+        sent = self.ssh_log.read_text().split("\n=====\n")
+        return [c for c in sent if c.strip() and "python3 -c" not in c]
 
     def calls(self):
         return self.log.read_text().splitlines()
@@ -492,7 +539,179 @@ def test_student_unknown_to_the_portal_database_keeps_the_old_key(rig):
 
     result = rig.run("--apply", "--yes")
 
+    assert result.returncode != 0
+    assert OLD["bob"] in rig.active_keys(4)
+    assert OLD["alice"] not in rig.active_keys(3)
+    assert "bob" in result.stdout + result.stderr
+    _assert_no_key_leaked(rig, result)
+
+
+def test_unknown_student_fails_the_run_after_expiring_only_stored_logins(rig):
+    # A partial rotation leaves a live old credential behind: that is not
+    # success, and the operator must see it in the exit status.
+    with rig.engine.begin() as conn:
+        conn.execute(text("DELETE FROM student_whitelist WHERE login_id = 'bob'"))
+
+    result = rig.run("--apply", "--yes")
+
+    assert result.returncode != 0
+    assert "headscale preauthkeys expire 3 4" in rig.calls()
+    assert not [c for c in rig.calls() if c.startswith("headscale preauthkeys expire 4")]
+    assert "bob" in result.stderr
+    assert "--allow-partial" in result.stderr
+    _assert_no_key_leaked(rig, result)
+
+
+def test_allow_partial_accepts_a_student_unknown_to_the_portal_database(rig):
+    with rig.engine.begin() as conn:
+        conn.execute(text("DELETE FROM student_whitelist WHERE login_id = 'bob'"))
+
+    result = rig.run("--apply", "--yes", "--allow-partial")
+
     assert result.returncode == 0, result.stdout + result.stderr
     assert OLD["bob"] in rig.active_keys(4)
     assert OLD["alice"] not in rig.active_keys(3)
     assert "bob" in result.stdout + result.stderr
+    _assert_no_key_leaked(rig, result)
+
+
+def test_portal_roster_is_readable_only_by_its_owner_and_the_app_group(rig):
+    result = rig.run("--apply", "--yes")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert stat.S_IMODE(rig.portal_csv.stat().st_mode) == 0o640
+    delivery = next(c for c in rig.portal_commands() if "mv " in c)
+    tmp = re.search(r"chgrp 1000 (\S+\.tmp)", delivery)
+    assert tmp, delivery
+    assert f"chmod 640 {tmp.group(1)}" in delivery
+    assert "644" not in delivery
+    assert delivery.index("chmod 640") < delivery.index("mv ")
+    assert any(c.startswith("chgrp 1000 ") for c in rig.calls())
+
+
+def test_backup_and_temp_names_carry_pid_and_randomness(rig):
+    # Two runs in the same second must never share a temp or backup path.
+    result = rig.run("--apply", "--yes")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    [backup] = list(rig.backups.iterdir())
+    assert re.fullmatch(r"students_merged-pre-rotation-\d{8}-\d{6}-\d+-[0-9a-f]{8}\.csv", backup.name)
+    tmp = re.search(r"\.students_merged-rotation-(\S+?)\.tmp", "\n".join(rig.portal_commands()))
+    assert tmp and re.fullmatch(r"\d{8}-\d{6}-\d+-[0-9a-f]{8}", tmp.group(1))
+
+
+def test_locks_are_released_after_a_successful_rotation(rig):
+    result = rig.run("--apply", "--yes")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not rig.headscale_lock.exists()
+    assert not rig.portal_lock.exists()
+
+
+def test_locks_are_released_after_a_failed_rotation(rig):
+    result = rig.run("--apply", "--yes", FAIL_DB_UPDATE="1")
+
+    assert result.returncode != 0
+    assert not rig.headscale_lock.exists()
+    assert not rig.portal_lock.exists()
+
+
+def test_a_second_concurrent_rotation_refuses_while_the_first_holds_the_lock(rig, tmp_path):
+    pause = tmp_path / "resume"
+    first = rig.start("--apply", "--yes", HS_PAUSE=str(pause))
+    try:
+        deadline = time.time() + 30
+        while not Path(str(pause) + ".waiting").exists():
+            assert first.poll() is None, first.communicate()
+            assert time.time() < deadline
+            time.sleep(0.05)
+
+        second = rig.run("--apply", "--yes")
+
+        assert second.returncode != 0
+        assert "lock" in second.stderr.lower()
+        assert not [c for c in rig.calls() if " create " in c]
+    finally:
+        pause.touch()
+        out, err = first.communicate(timeout=60)
+    assert first.returncode == 0, out + err
+    # The refused run left the first run's lock alone, so the first finished.
+    assert not rig.headscale_lock.exists()
+    assert not rig.portal_lock.exists()
+
+
+@pytest.mark.parametrize("side", ["headscale", "portal"])
+def test_a_held_lock_stops_apply_before_anything_changes(rig, side):
+    held = rig.headscale_lock if side == "headscale" else rig.portal_lock
+    rig.hold(held)
+
+    result = rig.run("--apply", "--yes")
+
+    assert result.returncode != 0
+    assert "other-operator@elsewhere" in result.stderr
+    assert rig.mutations() == []
+    assert rig.portal_csv.read_bytes() == rig.portal_csv_before
+    # The other run's lock stays; ours, if taken, is given back.
+    assert (held / "owner").read_text().startswith("token=someone-else")
+    other = rig.portal_lock if side == "headscale" else rig.headscale_lock
+    assert not other.exists()
+
+
+def test_a_stale_lock_is_broken_only_with_the_explicit_flag(rig):
+    rig.hold(rig.headscale_lock, age_hours=7)
+
+    refused = rig.run("--apply", "--yes")
+
+    assert refused.returncode != 0
+    assert "--break-stale-lock" in refused.stderr
+    assert rig.mutations() == []
+    assert rig.headscale_lock.exists()
+
+    result = rig.run("--apply", "--yes", "--break-stale-lock")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not rig.headscale_lock.exists()
+    assert OLD["alice"] not in rig.active_keys(3)
+
+
+def test_break_stale_lock_never_breaks_a_fresh_lock(rig):
+    rig.hold(rig.portal_lock, age_hours=1)
+
+    result = rig.run("--apply", "--yes", "--break-stale-lock")
+
+    assert result.returncode != 0
+    assert rig.mutations() == []
+    assert (rig.portal_lock / "owner").read_text().startswith("token=someone-else")
+
+
+def test_a_run_whose_lock_was_taken_over_stops_before_creating_keys(rig, tmp_path):
+    # Fencing: if someone breaks this run's lock mid-flight, every later step
+    # sees the foreign token and refuses instead of interleaving with them.
+    pause = tmp_path / "resume"
+    run = rig.start("--apply", "--yes", HS_PAUSE=str(pause))
+    try:
+        deadline = time.time() + 30
+        while not Path(str(pause) + ".waiting").exists():
+            assert run.poll() is None, run.communicate()
+            assert time.time() < deadline
+            time.sleep(0.05)
+        (rig.headscale_lock / "owner").write_text("token=usurper\nby=other-operator@elsewhere\n")
+    finally:
+        pause.touch()
+        out, err = run.communicate(timeout=60)
+
+    assert run.returncode != 0
+    assert not [c for c in rig.calls() if " create " in c]
+    assert rig.portal_csv.read_bytes() == rig.portal_csv_before
+    assert (rig.headscale_lock / "owner").read_text().startswith("token=usurper")
+    assert not rig.portal_lock.exists()
+
+
+def test_dry_run_takes_no_lock_and_ignores_one(rig):
+    rig.hold(rig.headscale_lock)
+
+    result = rig.run()
+
+    assert result.returncode == 0, result.stderr
+    assert not rig.portal_lock.exists()
+    assert (rig.headscale_lock / "owner").read_text().startswith("token=someone-else")

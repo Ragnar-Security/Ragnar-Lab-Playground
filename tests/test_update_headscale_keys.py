@@ -5,6 +5,7 @@ Key rotation only reaches students if both key columns change together:
 `users.headscale_key` is what a registered student sees on the dashboard.
 """
 
+import io
 import json
 import os
 import subprocess
@@ -145,3 +146,41 @@ def test_cli_rejects_bad_input_without_touching_the_database(engine, tmp_path, s
     assert result.returncode != 0
     assert _keys(engine, "student_whitelist")["alice"] == "old-alice"
     assert _keys(engine, "users")["alice"] == "old-alice"
+
+
+def test_cli_database_error_names_the_error_class_but_never_a_key(engine, tmp_path):
+    # The helper is documented as directly runnable; a traceback or a
+    # SQLAlchemy message would quote the bound key in "[parameters: ...]".
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "CREATE TRIGGER block_users BEFORE UPDATE ON users "
+                "BEGIN SELECT RAISE(ABORT, 'users is locked'); END"
+            )
+        )
+
+    result = _run_cli(tmp_path, "alice,new-alice-secret\nbob,new-bob-secret\n")
+
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "secret" not in output
+    assert "Traceback" not in output
+    assert "IntegrityError" in result.stderr
+    assert _keys(engine, "student_whitelist")["alice"] == "old-alice"
+
+
+def test_cli_engine_hides_bound_parameters(engine, tmp_path, monkeypatch):
+    seen = {}
+    real = update_headscale_keys.create_engine
+
+    def spy(url, **kwargs):
+        seen.update(kwargs)
+        return real(url, **kwargs)
+
+    monkeypatch.setattr(update_headscale_keys, "create_engine", spy)
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{tmp_path / 'portal.db'}")
+    monkeypatch.setattr(sys, "stdin", io.StringIO("alice,new-alice\n"))
+
+    update_headscale_keys.main()
+
+    assert seen.get("hide_parameters") is True

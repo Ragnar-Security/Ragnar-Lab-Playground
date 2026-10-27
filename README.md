@@ -337,10 +337,14 @@ scripts/rotate_headscale_keys.sh --apply --yes            # everyone except HEAD
 ```
 
 It creates the new keys, replaces `data/students_merged.csv` locally and on the
-portal, updates both key columns in the database, and only then expires the old
-keys, so a failure part-way leaves every student with a working key. Registered
-devices stay connected. The portal container must include
-`scripts/update_headscale_keys.py`. See `docs/TERM_CHANGEOVER.md`.
+portal (mode `0640`, group `1000`: the app container's gid), updates both key
+columns in the database, and only then expires the old keys, so a failure
+part-way leaves every student with a working key. Registered devices stay
+connected. `--apply` holds a lock on both hosts for the whole run, so a second
+rotation refuses to start. A roster login missing from the portal database
+keeps its old key and makes the run exit non-zero unless `--allow-partial` is
+given. The portal container must include `scripts/update_headscale_keys.py`.
+See `docs/TERM_CHANGEOVER.md`.
 
 ### Password recovery
 
