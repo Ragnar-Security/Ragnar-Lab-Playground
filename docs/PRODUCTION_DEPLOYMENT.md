@@ -774,9 +774,12 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d --build
 
-# Update Python dependencies
-pip list --outdated
-# Review and update requirements.txt as needed
+# Update Python dependencies. uv.lock is the authority; requirements.txt is
+# generated from it and is what the images install (with --require-hashes).
+uv lock --upgrade-package <name>
+uv export --frozen --no-dev --no-emit-project -o requirements.txt
+# Commit pyproject.toml, uv.lock and requirements.txt together; CI fails if
+# they disagree.
 ```
 
 ## Troubleshooting

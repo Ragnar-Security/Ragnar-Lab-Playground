@@ -228,8 +228,8 @@ class KothAdminRoutesTestCase(unittest.TestCase):
             template_name='x/box1', student_name='admin',
             memory=2048, cores=2, storage=20,
             koth_game_id=ended.id, destroyed=True,
-            destroyed_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(days=1),
+            destroyed_at=datetime.now(),
+            expires_at=datetime.now() + timedelta(days=1),
         )
         db.session.add(vm); db.session.flush()
         # KothBox referencing the VMRecord — this is what was missing in the
@@ -272,7 +272,7 @@ class KothAdminRoutesTestCase(unittest.TestCase):
             template_name='x/final-dc', student_name=str(g.id),
             memory=2048, cores=2, storage=20,
             koth_game_id=g.id, destroyed=False,
-            expires_at=datetime.utcnow() + timedelta(days=1),
+            expires_at=datetime.now() + timedelta(days=1),
         )
         db.session.add(vm); db.session.flush()
         box = KothBox(game_id=g.id, vm_record_id=vm.id, name='final-dc',
@@ -306,8 +306,8 @@ class KothAdminRoutesTestCase(unittest.TestCase):
             template_name='x/dead', student_name=str(g.id),
             memory=2048, cores=2, storage=20,
             koth_game_id=g.id, destroyed=True,
-            destroyed_at=datetime.utcnow(),
-            expires_at=datetime.utcnow() + timedelta(days=1),
+            destroyed_at=datetime.now(),
+            expires_at=datetime.now() + timedelta(days=1),
         )
         db.session.add(vm); db.session.flush()
         box = KothBox(game_id=g.id, vm_record_id=vm.id, name='dead',
@@ -439,7 +439,7 @@ class KothAdminRoutesTestCase(unittest.TestCase):
         # Flip to active manually so we don't run the full deploy path.
         g.status = 'active'
         g.is_active = True
-        g.started_at = started_at or datetime.utcnow()
+        g.started_at = started_at or datetime.now()
         db.session.commit()
         return g
 

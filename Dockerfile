@@ -11,9 +11,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
+# requirements.txt is exported from uv.lock (every package, direct and
+# transitive, pinned with hashes; CI fails on drift). --require-hashes makes
+# pip refuse anything that is not exactly what the lock pins.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --require-hashes -r requirements.txt
 
 # Copy application files
 COPY app/ app/

@@ -30,9 +30,22 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+
+      # uv.lock is the single authority; requirements.txt (what both Docker
+      # images install, with --require-hashes) is generated from it. Fail the
+      # build if pyproject.toml, the lock, or requirements.txt disagree.
+      - name: Check lock and requirements.txt are in sync
+        run: |
+          uv lock --check
+          uv export --frozen --no-dev --no-emit-project -o /tmp/requirements.check
+          diff <(grep -v '^#' requirements.txt) <(grep -v '^#' /tmp/requirements.check) \
+            || { echo "requirements.txt drifted from uv.lock; run: uv export --frozen --no-dev --no-emit-project -o requirements.txt"; exit 1; }
+
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install --require-hashes -r requirements.txt
 
       - name: Run unit tests
         env:

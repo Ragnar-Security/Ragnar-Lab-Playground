@@ -33,7 +33,7 @@ class TestFullCloneOption(unittest.TestCase):
         with patch('app.routes.vm_creation.wait_for_proxmox_task',
                    return_value={'success': True}):
             create_qemu_vm(proxmox, 'pve', 'pve', 9001, 'student-x-win', 9696,
-                           cfg, datetime.utcnow() + timedelta(hours=4),
+                           cfg, datetime.now() + timedelta(hours=4),
                            internal_vlan_tag=201, entry_vlan_tag=101)
         return proxmox.nodes.return_value.qemu.return_value.clone.post.call_args.kwargs
 
@@ -71,7 +71,7 @@ class TestInternalNicOption(unittest.TestCase):
         with patch('app.routes.vm_creation.wait_for_proxmox_task',
                    return_value={'success': True}):
             create_qemu_vm(proxmox, 'pve', 'pve', 9001, 'student-x-win', 9696,
-                           cfg, datetime.utcnow() + timedelta(hours=4),
+                           cfg, datetime.now() + timedelta(hours=4),
                            internal_vlan_tag=201, entry_vlan_tag=101)
         put = proxmox.nodes.return_value.qemu.return_value.config.put
         return [c.kwargs for c in put.call_args_list]
@@ -189,7 +189,7 @@ class TestLegacyTemplateIsUnchanged(unittest.TestCase):
         with patch('app.routes.vm_creation.wait_for_proxmox_task',
                    return_value={'success': True}):
             create_qemu_vm(proxmox, 'pve', 'pve', 9001, 'student-x-legacy', 9000,
-                           cfg, datetime.utcnow() + timedelta(hours=4),
+                           cfg, datetime.now() + timedelta(hours=4),
                            internal_vlan_tag=201, entry_vlan_tag=101)
         vm = proxmox.nodes.return_value.qemu.return_value
         self.assertEqual(vm.clone.post.call_args.kwargs['full'], 1)
