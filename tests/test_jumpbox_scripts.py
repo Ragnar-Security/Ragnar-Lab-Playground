@@ -502,21 +502,24 @@ def _ssh_filter_env(tmp_path: Path, staff: str = STAFF):
     env, sysroot = _configure_env(tmp_path, extra)
     bin_dir = tmp_path / "bin"
     _tool(bin_dir, "nft", LOG_CALL)
-    # No host sshd, no real unit state: tests set SSHD_PORTS / SOCKET_LISTEN / UNIT_ACTIVE.
-    _tool(bin_dir, "sshd", LOG_CALL + 'for p in $SSHD_PORTS; do echo "port $p"; done\nexit 0\n')
+    # No host sshd, no real unit state, no real routing table. Tests set SSHD_PORTS,
+    # SSHD_LISTEN, SSHD_RC, SOCKET_LISTEN, SOCKET_RC, UNIT_ACTIVE, ROUTE_DEV, ROUTE_FAIL.
+    _tool(bin_dir, "sshd", LOG_CALL + (
+        'set -f\nfor p in $SSHD_PORTS; do echo "port $p"; done\n'
+        'for a in $SSHD_LISTEN; do echo "listenaddress $a"; done\nexit ${SSHD_RC:-0}\n'))
     _tool(bin_dir, "systemctl", LOG_CALL + (
         'case "$*" in\n'
-        '  "show -p Listen ssh.socket") printf "%s" "$SOCKET_LISTEN" ;;\n'
+        '  "show -p Listen ssh.socket") printf "%b" "$SOCKET_LISTEN"; exit ${SOCKET_RC:-0} ;;\n'
         '  "is-active --quiet jumpbox-ssh-filter.service") [ -n "$UNIT_ACTIVE" ] || exit 1 ;;\n'
         'esac\nexit 0\n'))
     _tool(bin_dir, "ip", (
         'case "$*" in\n'
-        '  "-o addr show dev ens18") echo "2: ens18    inet 192.0.2.5/24 brd 192.0.2.255 scope global ens18" ;;\n'
-        '  "-o addr show dev tailscale0")\n'
-        '    echo "3: tailscale0    inet 100.64.0.99/32 scope global tailscale0"\n'
-        '    echo "3: tailscale0    inet6 fd7a:115c:a1e0::99/128 scope global" ;;\n'
+        '  "-o route get "*|"-6 -o route get "*)\n'
+        '    [ -z "$ROUTE_FAIL" ] || exit 1\n'
+        '    for last; do :; done; echo "$last dev ${ROUTE_DEV:-ens18} src 192.0.2.5 uid 0" ;;\n'
         'esac\nexit 0\n'))
-    env.update(SSHD_PORTS="22", SOCKET_LISTEN="", UNIT_ACTIVE="")
+    env.update(SSHD_PORTS="22", SSHD_LISTEN="", SSHD_RC="", SOCKET_LISTEN="", SOCKET_RC="",
+               UNIT_ACTIVE="", ROUTE_DEV="ens18", ROUTE_FAIL="")
     return env, sysroot
 
 
@@ -623,7 +626,7 @@ def test_netgen_cli_ports_are_validated():
 def test_ssh_staff_only_filters_the_ports_sshd_and_ssh_socket_actually_listen_on(tmp_path):
     env, sysroot = _ssh_filter_env(tmp_path)
     env["SSHD_PORTS"] = "22 2222"
-    env["SOCKET_LISTEN"] = "Listen=[::]:22 (Stream)\nListen=0.0.0.0:2022 (Stream)\nListen=/run/x.sock (Datagram)\n"
+    env["SOCKET_LISTEN"] = "Listen=[::]:22 (Stream)\\nListen=0.0.0.0:2022 (Stream)\\nListen=/run/x.sock (Datagram)\\n"
     result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
     assert result.returncode == 0, result.stdout + result.stderr
     rules = _ports_rules((sysroot / SSH_NFT).read_text())
@@ -631,12 +634,49 @@ def test_ssh_staff_only_filters_the_ports_sshd_and_ssh_socket_actually_listen_on
     assert all("{ 22, 2022, 2222 }" in r for r in rules)
 
 
-def test_ssh_staff_only_defaults_to_port_22_when_nothing_reports_a_port(tmp_path):
+def test_ssh_staff_only_defaults_to_port_22_only_when_sshd_is_truly_absent(tmp_path):
     env, sysroot = _ssh_filter_env(tmp_path)
-    env["SSHD_PORTS"] = ""
+    _without_tools(tmp_path, env, "sshd")
     result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "no sshd or ssh.socket" in result.stdout
     assert _ports_rules((sysroot / SSH_NFT).read_text())[-1] == "tcp dport 22 counter drop"
+
+
+@pytest.mark.parametrize("listen, expected", [
+    ("0.0.0.0:2222", "{ 22, 2222 }"),
+    ("[::]:2223", "{ 22, 2223 }"),
+    ("[fe80::1%eth0]:2224 192.0.2.7:2225", "{ 22, 2224, 2225 }"),
+    ("0.0.0.0 :: [::] ::1 fe80::1", "22"),  # no port: the port values apply
+])
+def test_ssh_staff_only_adds_the_ports_of_sshd_listen_addresses(tmp_path, listen, expected):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env["SSHD_LISTEN"] = listen
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    rules = _ports_rules((sysroot / SSH_NFT).read_text())
+    assert len(rules) == 5
+    match = f"tcp dport {expected}"
+    assert all(f"{match} " in r for r in rules), rules
+
+
+@pytest.mark.parametrize("what", [
+    {"SSHD_RC": "1"},                       # sshd -T fails
+    {"SSHD_PORTS": ""},                     # sshd -T succeeds but reports no port
+    {"SOCKET_RC": "1"},                     # ssh.socket state cannot be read
+])
+def test_ssh_staff_only_fails_closed_when_the_ssh_ports_cannot_be_determined(tmp_path, what):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(what)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "port" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    dry = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "--apply will refuse" in dry.stderr + dry.stdout
 
 
 def test_ssh_staff_only_on_an_active_unit_reloads_and_never_restarts(tmp_path):
@@ -651,22 +691,26 @@ def test_ssh_staff_only_on_an_active_unit_reloads_and_never_restarts(tmp_path):
                    for c in calls)
 
 
-SESSION_UNLISTED_VIA_TAILSCALE = "198.51.100.7 50000 100.64.0.99 22"
+UNLISTED = "198.51.100.7 50000 192.0.2.5 22"
+STAFF_TO_VLAN_GATEWAY = "100.64.0.10 50000 10.100.0.1 22"
 
 
-@pytest.mark.parametrize("session, args, ok", [
-    (SESSION_UNLISTED_VIA_TAILSCALE, [], False),
-    ("198.51.100.7 50000 192.0.2.5 22", [], True),               # arrived on the management NIC
-    (SESSION_UNLISTED_VIA_TAILSCALE, ["--i-have-console"], True),
-    ("100.64.0.10 50000 100.64.0.99 22", [], True),              # listed staff over tailscale0
-    ("fd7a:115c:a1e0::a 50000 fd7a:115c:a1e0::99 22", [], True),
-    ("127.0.0.1 50000 127.0.0.1 22", [], True),
-    ("100.64.0.77 50000 100.64.0.99 22", [], False),             # tailnet but not listed
-    ("100.64.0.10 50000 203.0.113.9 22", [], False),             # dest is on neither NIC
+@pytest.mark.parametrize("session, dev, args, ok", [
+    # Survival follows the interface the session arrives on, not the destination address.
+    (STAFF_TO_VLAN_GATEWAY, "tailscale0", [], True),
+    ("100.64.0.77 50000 192.0.2.5 22", "tailscale0", [], False),   # dest on mgmt, but not staff
+    (UNLISTED, "ens18", [], True),                                 # route back is the management NIC
+    (UNLISTED, "tailscale0", [], False),
+    (UNLISTED, "tailscale0", ["--i-have-console"], True),
+    ("fd7a:115c:a1e0::a 50000 fd7a:115c:a1e0::99 22", "tailscale0", [], True),
+    ("::ffff:100.64.0.10 50000 100.64.0.99 22", "tailscale0", [], True),   # v4-mapped staff source
+    ("::ffff:100.64.0.77 50000 100.64.0.99 22", "tailscale0", [], False),
+    ("127.0.0.1 50000 127.0.0.1 22", "lo", [], True),
+    ("100.64.0.10 50000 10.100.0.1 22", "ens19", [], False),       # staff, but arrived on a VLAN
 ])
-def test_ssh_staff_only_apply_over_ssh_refuses_a_session_it_cannot_prove_survives(tmp_path, session, args, ok):
+def test_ssh_staff_only_apply_over_ssh_survives_only_by_ingress_interface(tmp_path, session, dev, args, ok):
     env, sysroot = _ssh_filter_env(tmp_path)
-    env["SSH_CONNECTION"] = session
+    env.update(SSH_CONNECTION=session, ROUTE_DEV=dev)
     before = _tree(sysroot)
     result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only", *args], env)
     if ok:
@@ -679,26 +723,76 @@ def test_ssh_staff_only_apply_over_ssh_refuses_a_session_it_cannot_prove_survive
         assert _mutations(_calls(tmp_path)) == []
 
 
+def test_ssh_staff_only_refuses_when_the_route_back_to_the_session_cannot_be_found(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(SSH_CONNECTION=STAFF_TO_VLAN_GATEWAY, ROUTE_DEV="tailscale0", ROUTE_FAIL="1")
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0 and "--i-have-console" in result.stderr
+    assert _tree(sysroot) == before
+    env["ROUTE_FAIL"] = ""
+    allowed = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only", "--i-have-console"], env)
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+
+
+@pytest.mark.parametrize("session", [
+    "--help 1 2 3",
+    "100.64.0.10 50000 10.100.0.1",             # three fields
+    "100.64.0.10 50000 10.100.0.1 22 extra",    # five fields
+    "100.64.0.10 0 10.100.0.1 22",
+    "100.64.0.10 50000 10.100.0.1 65536",
+    "100.64.0.10 port 10.100.0.1 22",
+    "100.64.0.10 50000 not-an-ip 22",
+    "not-an-ip 50000 10.100.0.1 22",
+    "100.64.0.10 -1 10.100.0.1 22",
+])
+def test_ssh_staff_only_refuses_a_malformed_ssh_connection(tmp_path, session):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    env.update(SSH_CONNECTION=session, ROUTE_DEV="tailscale0")
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0 and "--i-have-console" in result.stderr
+    assert _tree(sysroot) == before
+    assert "usage:" not in result.stdout + result.stderr
+
+
+def test_netgen_staff_has_never_reads_an_address_as_an_option():
+    run = lambda *a: subprocess.run(["python3", str(NETGEN), *a], capture_output=True, text=True)
+    assert run("staff-has", "--staff-ips", STAFF, "--", "100.64.0.10").returncode == 0
+    assert run("staff-has", "--staff-ips", STAFF, "--", "::ffff:100.64.0.10").returncode == 0
+    assert run("staff-has", "--staff-ips", STAFF, "--", "100.64.0.99").returncode == 1
+    bad = run("staff-has", "--staff-ips", STAFF, "--", "--help")
+    assert bad.returncode not in (0, 1) and "usage:" not in bad.stdout
+
+
 def test_ssh_staff_only_dry_run_over_ssh_still_only_warns(tmp_path):
     env, _ = _ssh_filter_env(tmp_path)
-    env["SSH_CONNECTION"] = SESSION_UNLISTED_VIA_TAILSCALE
+    env["SSH_CONNECTION"] = UNLISTED
+    env["ROUTE_DEV"] = "tailscale0"
     result = _run(CONFIGURE, ["--ssh-staff-only"], env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "running over SSH" in result.stderr
 
 
-def _without_nft(tmp_path: Path, env: dict) -> None:
-    hide = tmp_path / "nonft"
-    hide.mkdir()
+def _without_tools(tmp_path: Path, env: dict, *names: str) -> None:
+    """PATH with the fake bin dir plus every real tool except `names`."""
+    hide = tmp_path / "hidden-tools"
+    hide.mkdir(exist_ok=True)
     for d in os.environ["PATH"].split(os.pathsep):
         if not os.path.isdir(d):
             continue
         for name in os.listdir(d):
             link = hide / name
-            if name != "nft" and not link.exists():
+            if name not in names and not os.path.lexists(link):
                 link.symlink_to(Path(d) / name)
-    (tmp_path / "bin" / "nft").unlink()
+    for name in names:
+        if (tmp_path / "bin" / name).exists():
+            (tmp_path / "bin" / name).unlink()
     env["PATH"] = f"{tmp_path / 'bin'}{os.pathsep}{hide}"
+
+
+def _without_nft(tmp_path: Path, env: dict) -> None:
+    _without_tools(tmp_path, env, "nft")
 
 
 def test_ssh_staff_only_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_path):

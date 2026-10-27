@@ -256,6 +256,29 @@ def _ports(ports):
     return sorted(out) or [22]
 
 
+def _normalize_address(value):
+    """ip_address with IPv4-mapped IPv6 (::ffff:a.b.c.d) folded to IPv4, so a
+    tailnet client seen through a dual-stack socket still matches the v4 set."""
+    addr = ipaddress.ip_address(value)
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        return addr.ipv4_mapped
+    return addr
+
+
+def session_source(value):
+    """Source address of an SSH_CONNECTION value ("SRC SPORT DST DPORT"), or
+    ValueError. Strict: exactly four fields, two IPs and two ports."""
+    fields = (value or "").split()
+    if len(fields) != 4:
+        raise ValueError("SSH_CONNECTION must have exactly four fields")
+    source = _normalize_address(fields[0])
+    _normalize_address(fields[2])
+    for port in (fields[1], fields[3]):
+        if not re.fullmatch(r"[0-9]{1,5}", port) or not 1 <= int(port) <= 65535:
+            raise ValueError(f"invalid port {port!r} in SSH_CONNECTION")
+    return source
+
+
 def render_ssh_filter(mgmt_if, staff_ips, ports=(22,)):
     """nftables table that limits inbound SSH (every port in `ports`) to loopback, the management NIC
     and listed staff tailnet addresses.
@@ -332,7 +355,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
         "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "ssh-filter",
-        "ssh-filter-unit", "staff-has", "diff"])
+        "ssh-filter-unit", "staff-has", "ssh-source", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -368,8 +391,11 @@ def main(argv=None):
         elif args.what == "staff-has":
             # Exit status only: is ADDRESS one of the staff addresses/networks?
             nets = [ipaddress.ip_network(n) for n in sum(_staff_networks(_split(args.staff_ips)), [])]
-            addr = ipaddress.ip_address(args.files[0])
+            addr = _normalize_address(args.files[0])
             return 0 if any(addr in n for n in nets if n.version == addr.version) else 1
+        elif args.what == "ssh-source":
+            # Normalized source of the SSH_CONNECTION value given after `--`.
+            out = f"{session_source(args.files[0] if len(args.files) == 1 else '')}\n"
         elif args.what == "ssh-filter-unit":
             out = render_ssh_filter_unit(args.nft_file)
         elif args.what == "zeek-node":

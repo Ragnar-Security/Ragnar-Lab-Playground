@@ -344,47 +344,72 @@ apply_ssh_keys_only() {
     fi
 }
 
-# Ports sshd listens on, from its effective config and from ssh.socket (Ubuntu
-# socket activation ignores sshd_config's Port). A port left out stays open.
-ssh_ports() {
-    {
-        if command -v sshd >/dev/null; then sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true; fi
-        if command -v systemctl >/dev/null; then
-            systemctl show -p Listen ssh.socket 2>/dev/null \
-                | awk '/^Listen=/ && /\(Stream\)/ { sub(/ .*/, ""); n = split($0, a, ":"); if (a[n] ~ /^[0-9]+$/) print a[n] }' || true
-        fi
-    } | sort -un | tr '\n' ' '
-}
-
-# iface_addrs <iface>: its IP addresses, one per line, prefix length removed.
-iface_addrs() {
-    command -v ip >/dev/null || return 0
-    ip -o addr show dev "$1" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "inet" || $i == "inet6") {sub(/\/.*/, "", $(i + 1)); print $(i + 1)}}'
-}
-
-# Refuse to apply from an SSH session the new rules could cut off. Provable
-# survivors: loopback, arrival on the management NIC, or a listed staff source
-# arriving on tailscale0 (approximated by the local address being tailscale0's).
-ssh_session_survives() {
-    local src _sport dst _dport
-    read -r src _sport dst _dport <<<"$SSH_CONNECTION"
-    case "$src" in 127.*|::1) return 0 ;; esac
-    iface_addrs "$MGMT_IF" | grep -qxF "$dst" && return 0
-    if iface_addrs tailscale0 | grep -qxF "$dst" \
-        && python3 "$NETGEN" staff-has --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" "$src"; then
-        return 0
+# Ports sshd listens on: `port` and `listenaddress host:port` lines of sshd -T,
+# plus ssh.socket's stream listeners (socket activation ignores sshd_config's
+# Port). A port left out stays open to everyone, so this fails closed: an
+# sshd or ssh.socket that cannot be read sets SSH_PORT_PROBLEM instead of
+# guessing 22. A bare ListenAddress means the `port` values apply.
+SSH_PORTS="" SSH_PORT_PROBLEM=""
+collect_ssh_ports() {
+    local out sock ports=""
+    if command -v sshd >/dev/null; then
+        if ! out="$(sshd -T 2>/dev/null)"; then SSH_PORT_PROBLEM="sshd -T failed"; return 0; fi
+        ports="$(awk '
+            $1 == "port" { print $2 }
+            $1 == "listenaddress" {
+                a = $2
+                if (substr(a, 1, 1) == "[") { n = index(a, "]:"); if (n) print substr(a, n + 2) }
+                else if (split(a, p, ":") == 2) print p[2]
+            }' <<<"$out")"
+        [ -n "$(printf '%s' "$ports" | tr -d '[:space:]')" ] || { SSH_PORT_PROBLEM="sshd -T reported no port"; return 0; }
     fi
-    return 1
+    if command -v systemctl >/dev/null; then
+        if ! sock="$(systemctl show -p Listen ssh.socket 2>/dev/null)"; then
+            SSH_PORT_PROBLEM="systemctl show ssh.socket failed"; return 0
+        fi
+        ports="$ports
+$(awk '/^Listen=/ && /\(Stream\)/ { sub(/ .*/, ""); n = split($0, a, ":"); print a[n] }' <<<"$sock")"
+    fi
+    SSH_PORTS="$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
+}
+
+# Refuse to apply from an SSH session the new rules could cut off. The session
+# survives when the route back to its source leaves through loopback, the
+# management NIC, or tailscale0 with a listed staff source. Anything that
+# cannot be determined counts as "not provable".
+ssh_session_survives() {
+    local src dev fam=""
+    src="$(python3 "$NETGEN" ssh-source -- "$SSH_CONNECTION" 2>/dev/null)" || return 1
+    case "$src" in *:*) fam="-6" ;; esac
+    command -v ip >/dev/null || return 1
+    # shellcheck disable=SC2086 -- $fam is empty or one option
+    dev="$(ip $fam -o route get "$src" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')" || return 1
+    [ -n "$dev" ] || return 1
+    case "$dev" in
+        lo) return 0 ;;
+        "$MGMT_IF") return 0 ;;
+        tailscale0) python3 "$NETGEN" staff-has --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" -- "$src" ;;
+        *) return 1 ;;
+    esac
 }
 
 # nft drops every SSH packet that no rule accepts, including the session
 # running this script, so the plan says who stays reachable.
 plan_ssh_filter() {
-    local ports
-    ports="$(ssh_ports)"
-    say "ssh:       filtering tcp port(s) ${ports:-22}"
-    python3 "$NETGEN" ssh-filter --mgmt-if "$MGMT_IF" --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" --ports "$ports" > "$TMP/ssh-filter.nft" \
-        || { block "--ssh-staff-only: could not render the ruleset (check JUMPBOX_SSH_STAFF_IPS, JUMPBOX_MGMT_IF and the SSH ports: ${ports:-22})"; return 0; }
+    collect_ssh_ports
+    if [ -n "$SSH_PORT_PROBLEM" ]; then
+        if [ "$APPLY" -eq 1 ]; then
+            block "--ssh-staff-only: cannot determine the SSH port(s) ($SSH_PORT_PROBLEM). Guessing 22 would leave any other SSH listener unfiltered; fix sshd/ssh.socket and re-run."
+            return 0
+        fi
+        say "WARNING: cannot determine the SSH port(s) ($SSH_PORT_PROBLEM); --apply will refuse. Showing port 22." >&2
+    elif [ -z "$SSH_PORTS" ]; then
+        say "ssh:       no sshd or ssh.socket found; assuming port 22"
+    else
+        say "ssh:       filtering tcp port(s) $SSH_PORTS"
+    fi
+    python3 "$NETGEN" ssh-filter --mgmt-if "$MGMT_IF" --staff-ips "${JUMPBOX_SSH_STAFF_IPS:-}" --ports "$SSH_PORTS" > "$TMP/ssh-filter.nft" \
+        || { block "--ssh-staff-only: could not render the ruleset (check JUMPBOX_SSH_STAFF_IPS, JUMPBOX_MGMT_IF and the SSH ports: ${SSH_PORTS:-22})"; return 0; }
     python3 "$NETGEN" ssh-filter-unit --nft-file "$SSH_NFT_FILE" > "$TMP/ssh-filter.service"
     if ! command -v nft >/dev/null; then
         if [ "$APPLY" -eq 1 ]; then
@@ -400,7 +425,7 @@ plan_ssh_filter() {
     if [ -n "${SSH_CONNECTION:-}" ]; then
         say "WARNING: running over SSH; this session survives only if it arrives on $MGMT_IF or from a listed staff address" >&2
         if [ "$APPLY" -eq 1 ] && [ "$I_HAVE_CONSOLE" -eq 0 ] && ! ssh_session_survives; then
-            block "--ssh-staff-only: this SSH session (${SSH_CONNECTION%% *}) is not provably covered by the new rules and would be cut off. Run from the console or a listed staff address, or pass --i-have-console if you can recover without SSH."
+            block "--ssh-staff-only: this SSH session is not provably covered by the new rules and would be cut off. Run from the console or a listed staff address, or pass --i-have-console if you can recover without SSH."
         fi
     fi
     stage "$SSH_NFT_FILE" 644 "$TMP/ssh-filter.nft"

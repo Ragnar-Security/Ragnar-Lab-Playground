@@ -274,20 +274,27 @@ in. An empty staff list otherwise leaves SSH on loopback and the management
 interface only.
 
 **Ports.** The script collects every port sshd really listens on: the `port`
-lines of `sshd -T` and the `ListenStream` entries of `ssh.socket` (`systemctl
-show -p Listen ssh.socket`; with socket activation sshd_config's `Port` is
-ignored). All of them go into the rules, defaulting to 22. A listener on any
-other port would bypass the filter, so **changing the SSH port requires
-re-running `jumpbox_configure.sh --apply --ssh-staff-only`.**
+and `listenaddress host:port` lines of `sshd -T` (`0.0.0.0:2222`, `[::]:2222`;
+a bare address means the `port` values apply) and the `ListenStream` entries of
+`ssh.socket` (with socket activation sshd_config's `Port` is ignored). All of
+them go into the rules. It fails closed: if sshd is installed but `sshd -T`
+fails or reports no port, or `systemctl show ssh.socket` fails, `--apply`
+refuses rather than assume 22 (a dry run warns). Only when neither sshd nor the
+socket exists does it use 22. A listener on any port outside the rules would
+bypass the filter, so **changing the SSH port requires re-running
+`jumpbox_configure.sh --apply --ssh-staff-only`.**
 
 **Requirements and lockout guard.** `--apply` needs `nft` (install the
 `nftables` package) and always checks the ruleset with `nft -c -f` before
-installing it. If you run it from an SSH session, the script refuses unless the
-session provably survives: it comes from loopback, arrives on the management
-interface, or comes from a listed staff address on `tailscale0`. Any other
-session would be dropped mid-run. From the console, or if you can recover
-without SSH, pass `--i-have-console`. Test a login from a listed device before
-closing your console.
+installing it. If you run it from an SSH session, the script takes the source
+address from `SSH_CONNECTION` (it must be exactly `SRC SPORT DST DPORT`, valid
+IPs and ports; IPv4-mapped IPv6 sources are folded to IPv4) and asks `ip route
+get` which interface the route back leaves through. The session is kept only if
+that is `lo`, the management interface, or `tailscale0` with a listed staff
+source. If the interface cannot be determined, or the value is malformed, it
+refuses. From the console, or if you can recover without SSH, pass
+`--i-have-console`. Test a login from a listed device before closing your
+console.
 
 **Add a staff device:** append its tailnet addresses (`tailscale ip` on that
 device) to `JUMPBOX_SSH_STAFF_IPS`, then `--apply --ssh-staff-only` again (or
