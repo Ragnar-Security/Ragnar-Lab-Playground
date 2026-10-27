@@ -70,8 +70,13 @@ tests/
 ├── test_auth_routes.py      # Authentication tests
 ├── test_api_routes.py       # API endpoint tests
 ├── test_template_manager.py # Template config tests
-└── test_tasks.py           # Background task tests (NEW)
+├── test_tasks.py           # Background task tests (NEW)
+├── integration/             # Browser flows against a running stack
+└── live/                    # Opt-in contract run against a real Proxmox cluster
 ```
+
+`tests/live/` is skipped unless `LIVE_PROXMOX=1` and its environment are set,
+so `pytest tests/` and CI skip it. See `tests/live/README.md`.
 
 ## Key Test Fixtures
 
