@@ -574,30 +574,43 @@ rollback target. A host without a checkout uses the release's deploy bundle
 instead; its `DEPLOY-FROM-RELEASE.md` has the steps.
 
 Check out the release tag, so that the compose files and migrations match
-the image, and name the version in `.env`:
+the image, and set both keys in `.env`. With `COMPOSE_FILE` set, a plain
+`docker compose` (no `-f`) uses the release image for every command:
 
 ```bash
 git fetch --tags origin
 git checkout vX.Y.Z
-echo 'LAB_PLAYGROUND_VERSION=X.Y.Z' >> .env
+cat >> .env <<'EOF'
+COMPOSE_FILE=docker-compose.prod.yml:docker-compose.release.yml
+LAB_PLAYGROUND_VERSION=X.Y.Z
+EOF
 gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:X.Y.Z \
   -R Ragnar-Security/Ragnar-Lab-Playground \
   --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
   --source-ref refs/tags/vX.Y.Z
 ```
 
+`LAB_PLAYGROUND_VERSION` may pin the digest too (`X.Y.Z@sha256:<digest>`,
+from the release notes); the preflight refuses a moving tag such as `latest`.
 Then follow steps 1, 3 and 5 of the redeploy above, and replace step 4 with:
 
 ```bash
-docker compose -f docker-compose.prod.yml -f docker-compose.release.yml pull vm-automation
-docker compose -f docker-compose.prod.yml -f docker-compose.release.yml up -d
+docker compose pull vm-automation
+docker compose up -d
 curl -s https://lab.example.edu/auth/health   # "version": "X.Y.Z", "revision": "<commit>"
 ```
 
-A source build reports `"revision": null`. To roll back, set
-`LAB_PLAYGROUND_VERSION` to the previous release and run the same `up -d`.
-Any command given with only `-f docker-compose.prod.yml ... --build` goes
-back to building from the checkout.
+A source build reports `"revision": null`. To upgrade or roll back, change
+`LAB_PLAYGROUND_VERSION`, then `docker compose pull vm-automation` and
+`docker compose up -d`.
+
+**On such a host, never pass `-f docker-compose.prod.yml` alone to `up`.**
+An explicit `-f` replaces `COMPOSE_FILE`, so the app service gets its
+`build:` back: `up --build` builds from the checkout, and a plain `up -d`
+silently switches to whatever locally built image is still on the host. The
+other commands in this guide that name `-f docker-compose.prod.yml` (`exec`,
+`logs`, the backup script's `exec db`) never recreate a container and are
+safe; dropping the `-f` is simpler.
 
 ### Watch a King of the Hill game
 
