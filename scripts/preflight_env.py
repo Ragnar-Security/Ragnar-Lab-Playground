@@ -15,10 +15,14 @@ other dependencies.
 """
 
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+# An exact release version, optionally pinned to its image digest.
+RELEASE_VERSION = re.compile(
+    r'\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:@sha256:[0-9a-f]{64})?')
 
 
 def _load_policy():
@@ -92,6 +96,13 @@ def problems(env):
         # path on the host, so mount it at an identical path.
         problem = policy.ca_bundle_problem(bundle)
         check('PROXMOX_CA_BUNDLE', problem and f'{bundle!r} {problem} on this host')
+
+    release = env.get('LAB_PLAYGROUND_VERSION') or ''
+    if release and not RELEASE_VERSION.fullmatch(release):
+        # docker-compose.release.yml pulls this tag. A moving one such as
+        # `latest` would let any restart change what production runs.
+        check('LAB_PLAYGROUND_VERSION', 'must be an exact release such as '
+              '1.2.3 or 1.2.3@sha256:<digest>, not a moving tag')
     return found
 
 
