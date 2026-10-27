@@ -431,10 +431,18 @@ the schema is complete before the new code serves its first reset link. On a
 table an earlier release created it also makes `user_id` unique, first
 deleting all but each student's newest link (the ones a newer link had
 already retired, or that the old issuance race left live).
+`migrate_add_coordination_tables.py` adds the tables that hold node-memory
+and VMID reservations, the VMID high-water mark and reset-failure counts, and
+seeds their lock rows. The old code never reads them; the new code would also
+create them at startup, but run it here so the first deploy after the
+restart does not race to create the lock rows. The tables start empty: any
+reservation the old process held disappears with it, exactly as on every
+restart before this release.
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
+                 migrate_add_coordination_tables.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -445,7 +453,8 @@ the migration itself, the file is not there yet. Inject it for this one run:
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
+                 migrate_add_coordination_tables.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration
@@ -511,8 +520,8 @@ docker compose -f docker-compose.prod.yml down && \
   docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-The migrations in this release only ADD columns and an index. The old code
-ignores them. A code rollback alone is therefore sufficient, and the
+The migrations in this release only ADD columns, indexes and tables. The old
+code ignores them. A code rollback alone is therefore sufficient, and the
 database restore is only for a migration that changes existing data.
 
 ### Watch a King of the Hill game
@@ -867,7 +876,9 @@ expiry loop and another APScheduler. Restart the existing container instead.
 Production must run exactly one gevent worker, as configured in
 `gunicorn.conf.py`. APScheduler and the SSE event bus both keep state in the
 worker process. More than one worker runs competing schedulers and splits
-SSE delivery across separate subscriber sets.
+SSE delivery across separate subscriber sets. Node-memory admission, VMID
+allocation, VM lifecycle locks and the password-reset limiter are shared
+through the database and are not a reason for the limit.
 
 ### Database Optimization
 

@@ -121,12 +121,19 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
    `docker-compose.test.yml` sets it, because the integration suite signs in
    as `teststudent` with a known password. Production must never seed that
    account. `create_test_student()` refuses to run without the variable.
-10. **Admission, VMID allocation and the password-reset limiter keep
-    in-process ledgers.**
-    `select_best_node` reserves node memory, and VMID allocation reserves
-    ID blocks, each under a module lock with a TTL; the self-service
-    password-reset rate limiter counts failures in process memory. All are
-    correct only with one worker. Node memory is `memory.available` (MemAvailable), never
+10. **Admission, VMID allocation, VM lifecycle locks and the password-reset
+    limiter are shared through the database; the scheduler and SSE bus are
+    not.** `app/coordination.py` keeps node-memory reservations, VMID
+    reservations plus the VMID high-water mark, and reset-failure stamps in
+    tables. Each check-and-reserve runs in one transaction that locks a
+    `coordination_state` row (`SELECT ... FOR UPDATE`). `vm_lifecycle_lock`
+    holds MySQL `GET_LOCK('vm-lifecycle-<vmid>')` on a dedicated connection;
+    on SQLite it is a process lock only, and during a database outage it
+    falls back to the process lock so cleanup can still remove guests.
+    These no longer limit the worker count. APScheduler and the SSE event
+    bus still do (rules 1 and 6), so `workers` stays 1. Leases use
+    `time.time()` epoch seconds, not local DateTimes.
+    Node memory is `memory.available` (MemAvailable), never
     `memory.free`: ZFS ARC and page cache can leave MemFree low even when
     reclaimable memory is available. See `docs/LOAD_BALANCING.md`.
 11. **Logout revokes through `User.session_version`.** Sessions are signed
@@ -226,6 +233,9 @@ tests/                      # unit tests; tests/integration runs against real Pr
   **Do not append a bare `Z`** — that was the old rule, it asserts UTC
   about a value that is local, and it masked the bug above by making the
   countdown look right while the server-side gate was wrong.
+  The coordination tables' `expires_at` / `failed_at` are not DateTimes:
+  they are `time.time()` epoch seconds in DOUBLE columns, compared across
+  workers and never shown to anyone.
 - **Migrations** must be idempotent (check `information_schema` before
   altering). Filename pattern: `scripts/migrate_<topic>.py`.
 - **`templates.yaml`** is operator-owned, untracked, and bind-mounted

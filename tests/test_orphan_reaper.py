@@ -227,11 +227,13 @@ def test_active_vmid_reservation_protects_expired_orphan_in_dry_run(app):
     allocator_view.cluster.resources.get.return_value = [{'vmid': 699}]
     _clear_vmid_reservations()
     try:
-        assert get_next_available_vmid(
-            allocator_view,
-            reservation_id='active-create',
-        ) == 700
+        # The create path reserves through the app database, which is what
+        # the reaper (possibly in another worker) reads.
         with app.app_context():
+            assert get_next_available_vmid(
+                allocator_view,
+                reservation_id='active-create',
+            ) == 700
             results = _run(boundary, dry_run=True)
         assert results == []
         boundary.assert_untouched(700)

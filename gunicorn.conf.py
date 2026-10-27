@@ -14,6 +14,11 @@ backlog = 2048
 # first one — and the in-memory event_bus only fans out to subscribers in
 # the same process anyway, so multi-worker would also break SSE delivery.
 #
+# Node-memory admission, VMID allocation, VM lifecycle locks and the
+# password-reset limiter are NOT reasons any more: their state is in the
+# database (app/coordination.py) and every worker shares it. Only the
+# scheduler and the SSE bus above still pin this to one worker.
+#
 # worker_class=gevent: each open SSE client (KOTH live scoreboard) used
 # to cost one OS thread (~8 MB stack + 1 FD). With 22 teams × 2-3 tabs
 # the gthread model exhausted the container's 1024-FD ulimit and crashed
