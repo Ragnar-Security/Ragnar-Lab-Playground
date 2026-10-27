@@ -18,7 +18,11 @@ whitelist is empty.
 
 A login present in neither table is reported as unknown and left alone; the
 rotation script keeps that student's old key alive because the portal could
-not hand out the new one. Re-running with the same keys changes nothing.
+not hand out the new one, and fails the run unless --allow-partial is given.
+Re-running with the same keys changes nothing.
+
+A database error exits non-zero naming only the error class: the engine hides
+bound parameters and no traceback is printed, so no key reaches the terminal.
 
 The last stdout line is a JSON summary of logins (never keys):
     {"updated": [...], "unchanged": [...], "unknown": [...]}
@@ -29,7 +33,7 @@ import json
 import os
 import sys
 
-from sqlalchemy import bindparam, create_engine, text
+from sqlalchemy import bindparam, create_engine, exc, text
 
 TABLES = ('student_whitelist', 'users')
 
@@ -95,9 +99,15 @@ def main():
     except ValueError as error:
         sys.exit(f"Error: {error}. Nothing was written.")
 
-    engine = create_engine(url)
+    # hide_parameters keeps bound keys out of SQLAlchemy error messages; the
+    # except clause keeps the driver's message and any traceback (which can
+    # still quote a value) off the terminal and out of captured job logs.
+    engine = create_engine(url, hide_parameters=True)
     try:
         result = update_keys(engine, keys)
+    except exc.SQLAlchemyError as error:
+        sys.exit(f"Error: the database update failed ({type(error).__name__}); "
+                 "it rolled back, so nothing was written.")
     finally:
         engine.dispose()
 

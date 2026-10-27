@@ -4,6 +4,8 @@
 #   scripts/rotate_headscale_keys.sh                       # dry run: plan only
 #   scripts/rotate_headscale_keys.sh --apply               # asks to confirm
 #   scripts/rotate_headscale_keys.sh --apply --yes --only <login>
+#   scripts/rotate_headscale_keys.sh --apply --yes --allow-partial     # exit 0 despite logins unknown to the portal
+#   scripts/rotate_headscale_keys.sh --apply --yes --break-stale-lock  # take over a lock older than 6 hours
 #
 # The work happens in rotate_headscale_keys.py. This wrapper loads site.env the
 # way the other operator scripts do, so all of them read one configuration and

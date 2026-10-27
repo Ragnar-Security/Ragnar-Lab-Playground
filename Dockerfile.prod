@@ -24,8 +24,10 @@ COPY run_prod.py .
 COPY gunicorn.conf.py .
 COPY scripts/ scripts/
 
-# Create non-root user for security
-RUN useradd -m -u 1000 appuser
+# Create non-root user for security. uid AND gid are pinned to 1000: the
+# operator scripts deliver the bind-mounted data/students_merged.csv as mode
+# 0640 with group 1000, so this group is what lets the app read it.
+RUN groupadd -g 1000 appuser && useradd -m -u 1000 -g 1000 appuser
 
 # Create directory for data and logs with proper permissions
 RUN mkdir -p /app/data && \

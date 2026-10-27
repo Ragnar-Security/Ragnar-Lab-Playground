@@ -136,6 +136,23 @@ It must remain untracked. `.gitignore` excludes it and every other CSV under
 `data/`; never force-add a roster, Canvas export, or key file. Transfer and
 back it up only through the changeover procedure.
 
+The production copy is delivered as mode `0640` with group `1000`. The app
+container runs as `appuser`, uid and gid `1000` (pinned in `Dockerfile.prod`),
+so the group bit lets it read the bind-mounted file while every other account
+on the portal host is shut out. `0600` would need the file owned by uid
+`1000`, which only root can arrange; a group needs only that the SSH account
+owns the file and belongs to group `1000` (on a stock Ubuntu host the first
+account is uid/gid `1000`) or is root. When `chgrp` fails the delivery stops
+before the live file changes.
+
+A roster delivered by an older version of these scripts is world-readable
+(`0644`). Tighten it once on the portal host; the container reads it either way:
+
+```bash
+chgrp 1000 /opt/lab-playground/data/students_merged.csv
+chmod 640 /opt/lab-playground/data/students_merged.csv
+```
+
 ### 3. Purge and seed the production database
 
 The script first compares the live whitelist with the requested roster.
@@ -263,7 +280,8 @@ Restore the production CSV before restarting the portal.
 ssh <portal-host>
 cp <remote-backup-dir>/students_merged-YYYYMMDD-HHMMSS.csv \
   /opt/lab-playground/data/students_merged.csv
-chmod 644 /opt/lab-playground/data/students_merged.csv
+chgrp 1000 /opt/lab-playground/data/students_merged.csv
+chmod 640 /opt/lab-playground/data/students_merged.csv
 ```
 
 Restore the local CSV from the printed `.git/term-changeover-backups/` path.
@@ -299,6 +317,8 @@ scripts/rotate_headscale_keys.sh                          # dry run: the plan on
 scripts/rotate_headscale_keys.sh --apply --only <login>   # try one account first
 scripts/rotate_headscale_keys.sh --apply                  # asks you to type 'rotate'
 scripts/rotate_headscale_keys.sh --apply --yes            # unattended
+scripts/rotate_headscale_keys.sh --apply --yes --allow-partial      # see "Partial rotation"
+scripts/rotate_headscale_keys.sh --apply --yes --break-stale-lock   # see "Rotation lock"
 ```
 
 It needs `PORTAL_HOST`, `PORTAL_DIR`, `PORTAL_COMPOSE`, `HEADSCALE_HOST`,
@@ -322,8 +342,9 @@ lacks `scripts/update_headscale_keys.py`.
 1. Create one new reusable key per student on Headscale, expiring in `KEY_DAYS`.
 2. Write the new `data/students_merged.csv` locally, mode `0600`.
 3. Back up the portal's roster file to
-   `REMOTE_BACKUP_DIR/students_merged-pre-rotation-<stamp>.csv`, then replace it
-   with the same temp-and-`mv` and hash check as the term changeover.
+   `REMOTE_BACKUP_DIR/students_merged-pre-rotation-<stamp>-<pid>-<random>.csv`,
+   then replace it with the same temp-and-`mv` and hash check as the term
+   changeover, mode `0640` and group `1000` as described above.
 4. Store the new keys in both `student_whitelist.headscale_key` and
    `users.headscale_key`, in one transaction, by running
    `scripts/update_headscale_keys.py` in the `vm-automation` container.
@@ -337,9 +358,7 @@ Old keys are expired last because a failure at any earlier step must leave
 every student with a key that works. If the database update fails, the
 script stops with a non-zero exit, and no key is expired. Fix the cause and
 run `--apply` again: each run issues fresh keys and expires every key that
-was active before it, including keys from a failed run. A student on the
-roster but absent from the portal database keeps the old key; the summary
-names them.
+was active before it, including keys from a failed run.
 
 Expiring a pre-auth key stops new registrations with it. It does not
 disconnect a device that is already registered. A student needs the new key
@@ -348,6 +367,35 @@ only to add a device or reinstall, and the portal already shows it.
 The key values travel only over SSH standard input and output. They never
 appear in command arguments on the workstation or in the script's output.
 Keep the regenerated `data/students_merged.csv` untracked, as always.
+
+### Partial rotation
+
+A student on the roster but absent from the portal database keeps the old
+key, because expiring it would leave them with no key the portal can show.
+That old key is still a live credential, so the run exits non-zero after
+expiring the other students' old keys, and names the affected logins (never
+keys). Add those students to the portal and re-run
+`--apply --only <logins>`, or pass `--allow-partial` to accept the gap and
+exit 0; the summary still names them.
+
+### Rotation lock
+
+`--apply` takes an exclusive lock on both hosts before it reads the roster and
+holds it until the old keys are expired:
+`HEADSCALE_DIR/.rotate.lock` on the Headscale host and
+`PORTAL_DIR/data/.rotate.lock` on the portal. Each is a directory created with
+`mkdir`, which is atomic, holding an `owner` file with the operator, workstation,
+pid, start time, and a random token. A second rotation refuses to start and
+names the holder. Every later step checks that the token is still its own, so a
+run whose lock was taken over stops instead of interleaving. The locks are
+removed when the run ends, whether it succeeded or failed. The dry run takes no
+lock.
+
+A run killed outright (power loss, `kill -9`) leaves its lock behind. Once the
+lock directory is more than 6 hours old, measured on that host,
+`--break-stale-lock` replaces it and prints whose lock it broke; it never breaks
+a younger lock. To retry sooner, confirm that no rotation is running and remove
+the directory by hand.
 
 ## Human decisions
 
