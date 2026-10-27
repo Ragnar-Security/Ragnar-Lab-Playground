@@ -1,11 +1,15 @@
+import tempfile
 import threading
 import unittest
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
-from app import create_app
+from flask import Flask
+from sqlalchemy import event
+
 from app.models import VMRecord, db
 from app.routes.vm_creation import (
     DeployFailed, create_single_vm_task, deploy_bundle)
@@ -242,7 +246,19 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
     def setUp(self):
         _clear_node_reservations()
         _clear_vmid_reservations()
-        self.app = create_app(testing=True)
+        # A file, not create_app(testing=True)'s in-memory database: that one
+        # is a single connection shared by every thread, so the failed-deploy
+        # heartbeat's rollback-on-return could discard the request thread's
+        # uncommitted rows. Production pools give each thread its own
+        # connection, and so does this.
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.app = Flask(__name__)
+        self.app.config.update(
+            TESTING=True,
+            SQLALCHEMY_DATABASE_URI=(
+                f"sqlite:///{Path(self.tempdir.name) / 'admission.sqlite'}"),
+        )
+        db.init_app(self.app)
         self.context = self.app.app_context()
         self.context.push()
         db.create_all()
@@ -252,7 +268,9 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
         _clear_vmid_reservations()
         db.session.remove()
         db.drop_all()
+        db.engine.dispose()
         self.context.pop()
+        self.tempdir.cleanup()
 
     def _proxmox_for_create(self, clone_side_effect):
         proxmox = _proxmox(available_gib=4)
@@ -708,6 +726,120 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
         survivor = VMRecord.query.one()
         self.assertEqual(survivor.vm_name, 'student-student-windows-0')
         self.assertLessEqual(survivor.expires_at, datetime.now())
+
+    def test_heartbeat_connection_return_cannot_discard_survivor_insert(self):
+        # Replays the interleaving that made the survivor tests flaky on a
+        # single shared connection: the failed-deploy heartbeat commits a
+        # lease renewal, the request thread INSERTs the survivor row, and the
+        # heartbeat's rollback-on-return runs before the request commits.
+        proxmox = _proxmox(available_gib=4)
+        templates = [
+            {
+                'name': f'windows-{index}',
+                'type': 'qemu',
+                'memory': 1024,
+                'cores': 1,
+                'storage': 20,
+                'template_locations': {'pve': 9706},
+            }
+            for index in range(2)
+        ]
+
+        def create_result(index, template, vmid, *args, **kwargs):
+            if index == 2:
+                return {
+                    'success': False,
+                    'template_name': template['name'],
+                    'error': 'clone failed',
+                    'vm_index': index,
+                    '_reservation_id': None,
+                }
+            return {
+                'success': True,
+                'vm_index': index,
+                'vmid': vmid,
+                'vm_name': 'student-student-windows-0',
+                'vm_display_name': template['name'],
+                'vm_type': 'qemu',
+                'node': 'pve',
+                'memory': 1024,
+                'cores': 1,
+                'storage': 20,
+                'is_entry_point': False,
+                '_reservation_id': None,
+            }
+
+        heartbeat_returning = threading.Event()
+        survivor_inserted = threading.Event()
+        heartbeat_returned = threading.Event()
+
+        def on_heartbeat():
+            return (threading.current_thread().name
+                    == 'failed-deploy-reservation-heartbeat')
+
+        def is_survivor_insert(statement):
+            return statement.lstrip().upper().startswith(
+                'INSERT INTO VM_RECORDS')
+
+        def pause_heartbeat_return(dbapi_connection, record, reset_state):
+            if on_heartbeat() and not heartbeat_returning.is_set():
+                heartbeat_returning.set()
+                survivor_inserted.wait(timeout=5)
+
+        def heartbeat_checked_in(dbapi_connection, record):
+            if on_heartbeat() and heartbeat_returning.is_set():
+                heartbeat_returned.set()
+
+        def insert_after_heartbeat_commit(
+                conn, cursor, statement, parameters, context, executemany):
+            if is_survivor_insert(statement) and not on_heartbeat():
+                heartbeat_returning.wait(timeout=5)
+
+        def commit_after_heartbeat_return(
+                conn, cursor, statement, parameters, context, executemany):
+            if is_survivor_insert(statement) and not on_heartbeat():
+                survivor_inserted.set()
+                heartbeat_returned.wait(timeout=5)
+
+        listeners = [
+            (db.engine.pool, 'reset', pause_heartbeat_return),
+            (db.engine.pool, 'checkin', heartbeat_checked_in),
+            (db.engine, 'before_cursor_execute',
+             insert_after_heartbeat_commit),
+            (db.engine, 'after_cursor_execute',
+             commit_after_heartbeat_return),
+        ]
+        for target, name, listener in listeners:
+            event.listen(target, name, listener)
+        try:
+            with patch('app.proxmox_service.ProxmoxAPI',
+                       return_value=proxmox), \
+                 patch(
+                     'app.routes.vm_creation.create_single_vm_task',
+                     side_effect=create_result,
+                 ), patch(
+                     'app.routes.vm_creation._cleanup_with_sweep',
+                     return_value=set(),
+                 ):
+                with self.assertRaises(DeployFailed):
+                    deploy_bundle(
+                        deployment_group_name='windows-lab',
+                        templates=templates,
+                        owning_identifier='student',
+                        entry_vlan=101,
+                        internal_vlan=201,
+                        uptime_minutes=60,
+                        user_id=None,
+                        load_balancing_config=LB_ON,
+                    )
+        finally:
+            for target, name, listener in listeners:
+                event.remove(target, name, listener)
+
+        self.assertTrue(survivor_inserted.is_set())
+        self.assertTrue(heartbeat_returned.is_set())
+        survivor = VMRecord.query.one()
+        self.assertEqual(survivor.vm_name, 'student-student-windows-0')
 
     def test_db_rollback_leaves_no_partially_committed_bundle_records(self):
         proxmox = self._proxmox_for_create(
