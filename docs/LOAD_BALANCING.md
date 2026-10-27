@@ -134,11 +134,12 @@ where:
   `available` overstates headroom for several minutes. Only this app's VMs are
   counted. Instructor VMs started by hand do not shrink student capacity.
 - **reserved.** A class pressing Deploy together would otherwise all read the
-  same snapshot. Selection and reservation happen under one lock. A
-  reservation is released when the VMRecord is committed or cleanup finishes,
-  renewed every minute while a clone waits, and expires after 15 minutes if a
-  code path leaks it. The ledger is in-process, which is valid only because
-  production runs a single gunicorn worker.
+  same snapshot. Selection and reservation happen in one database
+  transaction that locks the admission row. A reservation is released when
+  the VMRecord is committed or cleanup finishes, renewed every minute while a
+  clone waits, and expires after 15 minutes if a code path leaks it. The
+  ledger is the `node_memory_reservations` table, so every gunicorn worker
+  admits against the same reservations.
 
 Each selection logs one line per node:
 

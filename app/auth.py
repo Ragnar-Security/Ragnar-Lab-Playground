@@ -40,15 +40,18 @@ from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from functools import wraps
 from typing import Callable, Any, Union, Tuple
+import hashlib
 import hmac
 import logging
 import threading
 import time
 
+from sqlalchemy import delete, func, insert, select
+
 logger = logging.getLogger(__name__)
 
-from .models import db, User, StudentWhitelist
-from . import password_reset_links
+from .models import db, User, StudentWhitelist, PasswordResetFailure
+from . import coordination, password_reset_links
 
 auth = Blueprint('auth', __name__)
 
@@ -120,13 +123,98 @@ class _SlidingWindow:
             stamps.append(now)
 
 
+class _SharedSlidingWindow:
+    """`_SlidingWindow`'s contract, kept in the application database.
+
+    Every gunicorn worker counts the same failures, so adding a worker no
+    longer multiplies the allowance. Writes take the limiter's coordination
+    row, so the key cap holds exactly however workers interleave; reads
+    need no lock. Keys are stored hashed (see PasswordResetFailure).
+    """
+
+    MAX_KEYS = _SlidingWindow.MAX_KEYS
+
+    def __init__(self, scope, limit, window, clock, max_keys=None):
+        self.scope = scope
+        self.limit = limit
+        self.window = window
+        self.clock = clock
+        self.max_keys = self.MAX_KEYS if max_keys is None else max_keys
+        self._table = PasswordResetFailure.__table__
+
+    @staticmethod
+    def _hash(key):
+        return hashlib.sha256(str(key).encode('utf-8')).hexdigest()
+
+    def _live(self, cutoff):
+        table = self._table
+        return (table.c.scope == self.scope) & (table.c.failed_at > cutoff)
+
+    def __len__(self):
+        table = self._table
+        with db.engine.connect() as conn:
+            return conn.execute(
+                select(func.count(func.distinct(table.c.key_hash)))
+                .where(self._live(self.clock() - self.window))).scalar()
+
+    def blocked(self, key):
+        table = self._table
+        with db.engine.connect() as conn:
+            failures = conn.execute(
+                select(func.count()).select_from(table)
+                .where(self._live(self.clock() - self.window),
+                       table.c.key_hash == self._hash(key))).scalar()
+        return failures >= self.limit
+
+    def record(self, key):
+        key_hash = self._hash(key)
+        coordination.run_locked(
+            db.engine, coordination.PASSWORD_RESET_LIMITER,
+            lambda conn: self._record(conn, key_hash))
+
+    def _record(self, conn, key_hash):
+        table = self._table
+        now = self.clock()
+        in_scope = table.c.scope == self.scope
+        conn.execute(delete(table).where(
+            in_scope, table.c.failed_at <= now - self.window))
+
+        mine = in_scope & (table.c.key_hash == key_hash)
+        if conn.execute(select(table.c.id).where(mine).limit(1)).first() is None:
+            tracked = conn.execute(
+                select(func.count(func.distinct(table.c.key_hash)))
+                .where(in_scope)).scalar()
+            if tracked >= self.max_keys:
+                # Forget the keys whose latest failure is oldest, as the
+                # in-process window does.
+                latest = func.max(table.c.failed_at)
+                oldest = conn.execute(
+                    select(table.c.key_hash)
+                    .where(in_scope)
+                    .group_by(table.c.key_hash)
+                    .order_by(latest, table.c.key_hash)
+                    .limit(tracked - self.max_keys + 1)).scalars().all()
+                conn.execute(delete(table).where(
+                    in_scope, table.c.key_hash.in_(oldest)))
+        else:
+            # Keep the newest limit - 1 stamps; the insert below makes limit.
+            stale = conn.execute(
+                select(table.c.id)
+                .where(mine)
+                .order_by(table.c.failed_at.desc(), table.c.id.desc())
+                .offset(self.limit - 1)).scalars().all()
+            if stale:
+                conn.execute(delete(table).where(table.c.id.in_(stale)))
+        conn.execute(insert(table).values(
+            scope=self.scope, key_hash=key_hash, failed_at=now))
+
+
 class PasswordResetLimiter:
     """Caps failed reset attempts per login ID and per client address.
 
-    In-process on purpose: production runs exactly one gunicorn worker
-    (see gunicorn.conf.py and CLAUDE.md), so this process sees every reset
-    request. A second worker would get its own counters and multiply the
-    allowance; moving to several workers needs a shared store first.
+    The app's limiter is `shared`: its counts live in the database, so
+    every gunicorn worker enforces one allowance. `shared=False` keeps the
+    counts in this process only.
 
     The per-login limit stops guessing one student's SIS ID from many
     addresses. The per-address limit stops sweeping many login IDs from one
@@ -142,9 +230,15 @@ class PasswordResetLimiter:
     PER_LOGIN = 5
     PER_ADDRESS = 20
 
-    def __init__(self, clock=time.monotonic):
-        self._by_login = _SlidingWindow(self.PER_LOGIN, self.WINDOW_SECONDS, clock)
-        self._by_address = _SlidingWindow(self.PER_ADDRESS, self.WINDOW_SECONDS, clock)
+    def __init__(self, clock=time.monotonic, shared=False):
+        if shared:
+            self._by_login = _SharedSlidingWindow(
+                'login', self.PER_LOGIN, self.WINDOW_SECONDS, clock)
+            self._by_address = _SharedSlidingWindow(
+                'address', self.PER_ADDRESS, self.WINDOW_SECONDS, clock)
+        else:
+            self._by_login = _SlidingWindow(self.PER_LOGIN, self.WINDOW_SECONDS, clock)
+            self._by_address = _SlidingWindow(self.PER_ADDRESS, self.WINDOW_SECONDS, clock)
 
     def blocked(self, address, login_id):
         return self._by_address.blocked(address) or self._by_login.blocked(login_id)
@@ -161,10 +255,12 @@ class PasswordResetLimiter:
 
 
 def _password_reset_limiter():
-    # One limiter per app keeps test apps from sharing counters.
+    # The counts live in the app's database, so two apps share them exactly
+    # when they share a database, as two gunicorn workers do.
     limiter = current_app.extensions.get('password_reset_limiters')
     if limiter is None:
-        limiter = current_app.extensions['password_reset_limiters'] = PasswordResetLimiter()
+        limiter = current_app.extensions['password_reset_limiters'] = PasswordResetLimiter(
+            clock=coordination.lease_clock, shared=True)
     return limiter
 
 

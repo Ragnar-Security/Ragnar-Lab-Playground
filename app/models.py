@@ -815,3 +815,77 @@ class KothScoreSnapshot(db.Model):
 
     def __repr__(self):
         return f'<KothScoreSnapshot game={self.game_id} team={self.team_id} iter={self.iteration} score={self.score}>'
+
+
+# ---- Cross-worker coordination (see app/coordination.py) -------------------
+#
+# Leases and failure stamps are epoch seconds from time.time(), not naive
+# local DateTimes: one worker writes them and another compares them, and a
+# lease must not stretch or shrink by an hour across a DST change.
+
+class CoordinationState(db.Model):
+    """Named rows that serialize a check-and-reserve across workers.
+
+    Each operation locks its row first (SELECT ... FOR UPDATE on MySQL).
+    `vmid_allocator` also stores the VMID high-water mark, so a released
+    block is never handed out again while its clone may still exist.
+    """
+
+    __tablename__ = 'coordination_state'
+
+    name = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.BigInteger, nullable=False, default=0)
+
+
+class NodeMemoryReservation(db.Model):
+    """Memory promised to a create between node selection and its VMRecord."""
+
+    __tablename__ = 'node_memory_reservations'
+
+    reservation_id = db.Column(db.String(64), primary_key=True)
+    node = db.Column(db.String(255), nullable=False)
+    memory_bytes = db.Column(db.BigInteger, nullable=False)
+    expires_at = db.Column(db.Double, nullable=False)
+
+    __table_args__ = (
+        Index('ix_node_memory_reservations_expires_at', 'expires_at'),
+    )
+
+
+class VMIDReservation(db.Model):
+    """One VMID held for a create until its VMRecord commits.
+
+    The primary key is the VMID itself, so the database refuses a duplicate
+    allocation even if the allocator's lock were bypassed.
+    """
+
+    __tablename__ = 'vmid_reservations'
+
+    vmid = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    reservation_id = db.Column(db.String(64), nullable=False)
+    expires_at = db.Column(db.Double, nullable=False)
+
+    __table_args__ = (
+        Index('ix_vmid_reservations_reservation_id', 'reservation_id'),
+        Index('ix_vmid_reservations_expires_at', 'expires_at'),
+    )
+
+
+class PasswordResetFailure(db.Model):
+    """One failed self-service reset attempt, for the sliding-window limiter.
+
+    Keys are stored as SHA-256: they are attacker-supplied login IDs and
+    client addresses, of any length, and the table needs only equality.
+    """
+
+    __tablename__ = 'password_reset_failures'
+
+    id = db.Column(db.Integer, primary_key=True)
+    scope = db.Column(db.String(16), nullable=False)
+    key_hash = db.Column(db.String(64), nullable=False)
+    failed_at = db.Column(db.Double, nullable=False)
+
+    __table_args__ = (
+        Index('ix_password_reset_failures_key', 'scope', 'key_hash', 'failed_at'),
+        Index('ix_password_reset_failures_failed_at', 'failed_at'),
+    )
