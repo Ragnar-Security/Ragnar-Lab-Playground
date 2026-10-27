@@ -5,7 +5,6 @@ sweeper only acts when Proxmox still has an app-named guest but no database or
 KOTH reference survived the deploy that created it.
 """
 
-import json
 import logging
 import re
 import threading
@@ -21,7 +20,8 @@ from .config import (
     ORPHAN_REAPER_MAX_PASS_GUESTS,
     ORPHAN_REAPER_MAX_PASS_SECONDS,
 )
-from .models import AdminAlert, KothBox, VMRecord, db
+from .alert_outbox import enqueue_alert
+from .models import KothBox, VMRecord, db
 from .proxmox_service import (
     is_vmid_reserved,
     reset_cluster_vm_index,
@@ -349,26 +349,30 @@ def _has_live_reference(vmid, node, name):
 
 
 def _record_reaped_alert(vmid, name, node, vm_type, expires_at):
-    """Create one admin-visible alert for a VM positively reaped."""
+    """Queue one admin-visible alert for a VM positively reaped.
+
+    Database channel only: the reaper has never emailed or paged anyone.
+    """
     message = (f"Orphan reaper destroyed expired {vm_type} VM {vmid} "
                f"({name}) on node {node}.")
     try:
-        db.session.add(AdminAlert(
+        enqueue_alert(
             alert_type='vm_orphan_reaped',
             severity='warning',
             message=message,
             vmid=vmid,
             vm_name=name,
-            details=json.dumps({
+            details={
                 'vm_type': vm_type,
                 'node': node,
                 'expires_at': expires_at.isoformat(),
-            }),
-        ))
+            },
+            channels=('database',),
+        )
         db.session.commit()
-        logger.info("Orphan reaper created admin alert for VM %s", vmid)
+        logger.info("Orphan reaper queued admin alert for VM %s", vmid)
     except Exception:
         # The VM is already gone. Preserve that truthful outcome while making
         # the lost notification visible to operators in application logs.
         db.session.rollback()
-        logger.exception("Orphan reaper could not create admin alert for VM %s", vmid)
+        logger.exception("Orphan reaper could not queue admin alert for VM %s", vmid)

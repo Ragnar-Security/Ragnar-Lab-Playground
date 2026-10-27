@@ -56,6 +56,9 @@ services:
       # Per-sweep budget so orphan cleanup cannot hold up expiry.
       - ORPHAN_REAPER_MAX_PASS_SECONDS=${ORPHAN_REAPER_MAX_PASS_SECONDS:-120}
       - ORPHAN_REAPER_MAX_PASS_GUESTS=${ORPHAN_REAPER_MAX_PASS_GUESTS:-10}
+      # Failed-deploy survivors recorded while the database was down
+      # (app/untracked_survivors.py). Must stay under /app/data.
+      - UNTRACKED_SURVIVORS_FILE=${UNTRACKED_SURVIVORS_FILE:-}
       # Alert notification settings
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}

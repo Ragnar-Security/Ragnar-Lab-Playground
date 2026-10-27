@@ -113,6 +113,18 @@ ORPHAN_REAPER_GRACE_MINUTES = _env_number('ORPHAN_REAPER_GRACE_MINUTES', 60, int
 ORPHAN_REAPER_MAX_PASS_SECONDS = _env_number('ORPHAN_REAPER_MAX_PASS_SECONDS', 120, int)
 ORPHAN_REAPER_MAX_PASS_GUESTS = _env_number('ORPHAN_REAPER_MAX_PASS_GUESTS', 10, int)
 
+
+def untracked_survivors_file():
+    """Append-only JSONL of failed-deploy survivors whose VMRecord could not be
+    committed. It must live on persistent storage; the default is the
+    bind-mounted data/ directory. Read per call so tests can redirect it."""
+    path = Path(os.getenv('UNTRACKED_SURVIVORS_FILE')
+                or 'data/untracked-survivors.jsonl')
+    if not path.is_absolute():
+        path = APP_ROOT / path
+    return str(path)
+
+
 # ============ DATABASE CONFIGURATION ============
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///instance/app.db')
 

@@ -452,11 +452,10 @@ def test_expiry_delete_waits_for_task_success(mock_api, app):
     )
 
 
-@patch("app.tasks._send_deletion_failure_alert")
 @patch("app.proxmox_service.ProxmoxAPI")
-def test_expiry_keeps_retrying_and_alerts_only_once(
-        mock_api, mock_alert, app):
+def test_expiry_keeps_retrying_and_alerts_only_once(mock_api, app):
     """Five failures alert once without dropping the only tracking row."""
+    from app.models import AlertOutbox
     vm_id, _ = _expired_vm(app, retry_count=4)
     _, endpoints = _proxmox_with_qemu_endpoints(mock_api, [100])
     endpoints[100].status.stop.post.side_effect = Exception("cluster locked")
@@ -477,7 +476,8 @@ def test_expiry_keeps_retrying_and_alerts_only_once(
         vm = db.session.get(VMRecord, vm_id)
         assert vm is not None
         assert vm.deletion_retry_count == 6
-    assert mock_alert.call_count == 1
+        assert AlertOutbox.query.filter_by(
+            alert_type="vm_deletion_failed").count() == 1
 
 
 @patch("app.proxmox_service.ProxmoxAPI")

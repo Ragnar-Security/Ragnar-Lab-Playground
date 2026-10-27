@@ -18,6 +18,8 @@ from .proxmox_service import (
     wait_for_proxmox_task, VM_GUEST_ABSENT, VM_GUEST_MATCH,
 )
 from .orphan_reaper import maybe_reap_orphaned_vms
+from .alert_outbox import dispatch_pending_alerts, enqueue_alert
+from .untracked_survivors import recover_untracked_survivors
 from .models import db, VMRecord, AdminAlert
 
 logger = logging.getLogger(__name__)
@@ -152,6 +154,18 @@ def reconcile_missing_vm_records(proxmox):
 ALERT_LOG_FILE = "/app/data/failed_vms.log"
 
 
+def _drain_durable_queues():
+    """Import survivors recorded during a database outage, then deliver
+    queued alerts. Runs before any Proxmox call so a Proxmox outage cannot
+    hold back the alerts that matter most during one."""
+    for step in (recover_untracked_survivors, dispatch_pending_alerts):
+        try:
+            step()
+        except Exception:
+            db.session.rollback()
+            logger.exception("%s failed; retrying next pass", step.__name__)
+
+
 def initialize_vm_monitoring(app):
     """
     Initialize VM monitoring on app startup
@@ -164,6 +178,9 @@ def initialize_vm_monitoring(app):
     """
     try:
         with app.app_context():
+            # Before listing: a survivor recorded while the database was
+            # down becomes a tracked, already-expired VM here.
+            recover_untracked_survivors()
             logger.info("Initializing VM monitoring from database...")
             active_vms = VMRecord.query.filter_by(destroyed=False).all()
             if active_vms:
@@ -204,7 +221,8 @@ def check_and_destroy_expired_vms(app):
             
             with app.app_context():
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Worker {worker_id}] Checking for expired VMs...")
-                
+                _drain_durable_queues()
+
                 proxmox = get_proxmox_connection()
                 
                 # Check all active VMs in database for expiration
@@ -282,13 +300,14 @@ def check_and_destroy_expired_vms(app):
                             )
                             if should_alert:
                                 vm_record.deletion_alert_sent = True
+                                # Same commit as the flag: a crash after it
+                                # can no longer swallow the only alert.
+                                _enqueue_deletion_failure_alert(vm_record)
                             db.session.commit()
                             logger.info(
                                 f"[Worker {worker_id}] VM {vmid} deletion "
                                 f"failed (attempt {retry_count}); record "
                                 "retained for retry")
-                            if should_alert:
-                                _send_deletion_failure_alert(vm_record)
                     time.sleep(1)
 
                 reconcile_missing_vm_records(proxmox)
@@ -384,43 +403,63 @@ def _delete_vm(proxmox, vm_record):
         return False
 
 
-def _send_deletion_failure_alert(vm_record):
-    """
-    Send alerts to admins when a VM fails to delete after max retries
-    Uses all configured alert methods: file logging, database, email, webhook
-    
+def _deletion_alert_details(vm_record):
+    return {
+        'vm_type': vm_record.vm_type,
+        'node': vm_record.node,
+        'student_name': vm_record.student_name,
+        'template_name': vm_record.template_name,
+        'retry_attempts': vm_record.deletion_retry_count,
+        'created_at': vm_record.created_at.isoformat(),
+        'expires_at': vm_record.expires_at.isoformat()
+    }
+
+
+def _enqueue_deletion_failure_alert(vm_record):
+    """Queue the stuck-VM alert for every channel (file, database, email,
+    webhook) in the caller's transaction; app/alert_outbox.py delivers it.
+
     Args:
         vm_record (VMRecord): The VM that failed to delete
     """
-    alert_message = (f"VM {vm_record.vmid} ({vm_record.vm_name}) on node {vm_record.node} "
-                     f"failed to delete after {VM_DELETION_MAX_RETRIES} attempts. "
-                     f"Manual intervention required.")
-    
-    logger.info(f"ALERT: {alert_message}")
-    
-    # 1. File Logging (always works)
-    _log_alert_to_file(vm_record, alert_message)
-    
-    # 2. Database Alert (always works if DB is accessible)
-    _create_database_alert(vm_record, alert_message)
-    
-    # 3. Email Notification (optional - only if configured)
-    _send_email_alert(vm_record, alert_message)
-    
-    # 4. Webhook Notification (optional - only if configured)
-    _send_webhook_alert(vm_record, alert_message)
+    message = (f"VM {vm_record.vmid} ({vm_record.vm_name}) on node {vm_record.node} "
+               f"failed to delete after {VM_DELETION_MAX_RETRIES} attempts. "
+               f"Manual intervention required.")
+    logger.info(f"ALERT queued: {message}")
+    details = _deletion_alert_details(vm_record)
+    enqueue_alert(
+        alert_type='vm_deletion_failed',
+        severity='critical',
+        message=message,
+        vmid=vm_record.vmid,
+        vm_name=vm_record.vm_name,
+        details=details,
+        vm={
+            'vmid': vm_record.vmid,
+            'vm_name': vm_record.vm_name,
+            'vm_type': vm_record.vm_type,
+            'node': vm_record.node,
+            'student_name': vm_record.student_name,
+            'template_name': vm_record.template_name,
+            'deletion_retry_count': vm_record.deletion_retry_count,
+            'created_at': details['created_at'],
+            'expires_at': details['expires_at'],
+        },
+    )
 
 
 def _log_alert_to_file(vm_record, message):
-    """Log alert to file"""
+    """Log alert to file. Returns whether the entry was written."""
     try:
         with open(ALERT_LOG_FILE, 'a') as f:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             f.write(f"[{timestamp}] CRITICAL: {message}\n")
             f.write(f"  Details: VMID={vm_record.vmid}, Type={vm_record.vm_type}, Node={vm_record.node}, Student={vm_record.student_name}\n")
         logger.info(f"Alert logged to {ALERT_LOG_FILE}")
+        return True
     except Exception as e:
         logger.error(f"Error logging alert to file: {str(e)}")
+        return False
 
 
 def _create_database_alert(vm_record, message):
@@ -432,15 +471,7 @@ def _create_database_alert(vm_record, message):
             message=message,
             vmid=vm_record.vmid,
             vm_name=vm_record.vm_name,
-            details=json.dumps({
-                'vm_type': vm_record.vm_type,
-                'node': vm_record.node,
-                'student_name': vm_record.student_name,
-                'template_name': vm_record.template_name,
-                'retry_attempts': vm_record.deletion_retry_count,
-                'created_at': vm_record.created_at.isoformat(),
-                'expires_at': vm_record.expires_at.isoformat()
-            })
+            details=json.dumps(_deletion_alert_details(vm_record))
         )
         db.session.add(alert)
         db.session.commit()
@@ -451,7 +482,8 @@ def _create_database_alert(vm_record, message):
 
 
 def _send_email_alert(vm_record, message):
-    """Send email alert if SMTP is configured"""
+    """Send email alert if SMTP is configured. Returns False only when a
+    configured send failed, so the alert outbox retries it."""
     try:
         # Get email settings from environment
         smtp_server = os.environ.get('SMTP_SERVER')
@@ -463,7 +495,7 @@ def _send_email_alert(vm_record, message):
         
         if not all([smtp_server, smtp_username, smtp_password, smtp_from]) or not admin_emails[0]:
             logger.info("Email notifications not configured - skipping email alert")
-            return
+            return True
         
         # Create email
         msg = MIMEMultipart()
@@ -500,19 +532,22 @@ Please manually delete this VM from the Proxmox web interface or investigate why
             server.send_message(msg)
         
         logger.info(f"Email alert sent to {len(admin_emails)} recipient(s)")
+        return True
     except Exception as e:
         logger.error(f"Error sending email alert: {str(e)}")
+        return False
 
 
 def _send_webhook_alert(vm_record, message):
-    """Send webhook alert (Slack, Discord, etc.) if configured"""
+    """Send webhook alert (Slack, Discord, etc.) if configured. Returns False
+    only when a configured send failed, so the alert outbox retries it."""
     try:
         webhook_url = os.environ.get('ALERT_WEBHOOK_URL')
         webhook_type = os.environ.get('ALERT_WEBHOOK_TYPE', 'slack')  # 'slack' or 'discord'
         
         if not webhook_url:
             logger.info("Webhook notifications not configured - skipping webhook alert")
-            return
+            return True
         
         # Format message for webhook type
         if webhook_type == 'discord':
@@ -548,5 +583,7 @@ def _send_webhook_alert(vm_record, message):
         response = requests.post(webhook_url, json=payload, timeout=10)
         response.raise_for_status()
         logger.info(f"Webhook alert sent successfully ({webhook_type})")
+        return True
     except Exception as e:
         logger.error(f"Error sending webhook alert: {str(e)}")
+        return False

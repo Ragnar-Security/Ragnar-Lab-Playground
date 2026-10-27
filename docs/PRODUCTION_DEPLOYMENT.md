@@ -439,10 +439,14 @@ restart does not race to create the lock rows. The tables start empty: any
 reservation the old process held disappears with it, exactly as on every
 restart before this release.
 
+`migrate_add_alert_outbox.py` adds the `alert_outbox` table. The new expiry
+loop writes deletion-failure and orphan-reaped alerts there and delivers them
+from it, so the table must exist before the new code's first expiry pass.
+
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -454,7 +458,7 @@ the migration itself, the file is not there yet. Inject it for this one run:
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration
@@ -520,9 +524,12 @@ docker compose -f docker-compose.prod.yml down && \
   docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-The migrations in this release only ADD columns, indexes and tables. The old
+The migrations in this release only ADD columns, an index and a table. The old
 code ignores them. A code rollback alone is therefore sufficient, and the
-database restore is only for a migration that changes existing data.
+database restore is only for a migration that changes existing data. The old
+code does not deliver alerts still queued in `alert_outbox`
+(`SELECT * FROM alert_outbox WHERE status = 'pending'`), so read those by hand
+after a rollback.
 
 ### Watch a King of the Hill game
 
@@ -612,6 +619,26 @@ docker compose -f docker-compose.prod.yml logs --tail=100 vm-automation
 # Export logs for analysis
 docker logs proxmox-vm-automation-prod > app-logs-$(date +%Y%m%d).log
 ```
+
+### Failed-deploy survivors recorded during a database outage
+
+A failed deploy can leave a guest that cleanup could not delete. Normally the
+app records it as an already-expired VM and the expiry loop destroys it. If
+the database is down at that moment, the app appends the guest (vmid, node,
+name, type, owner and reason, no credentials) to
+`data/untracked-survivors.jsonl`, mode 0600. `UNTRACKED_SURVIVORS_FILE`
+overrides the path. The file must stay on the persistent `data/` mount, and
+`data/` must be writable by uid 1000. The deploy still fails, and the guest's
+admission reservation stays held until its lease runs out.
+
+At startup and on every expiry pass, the app imports pending lines into the
+database once it answers. It skips vmids that already have a live record,
+then deletes the file. If the database is still down, the file is left for
+the next pass. A line that cannot be parsed is logged and moved to
+`data/untracked-survivors.jsonl.corrupt`. Check each of those guests in
+Proxmox by hand. A log line saying the guests are `UNTRACKED` means the
+file could not be written either. Until someone removes those guests, only
+the orphan reaper (after their `Expires:` time plus grace) will.
 
 ### Resource Monitoring
 

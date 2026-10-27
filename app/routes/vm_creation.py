@@ -38,6 +38,7 @@ from ..auth import login_required, get_authenticated_user
 from ..utils import sanitize_name
 from ..template_manager import load_template_config, get_deployment_group_by_name, get_group_mode
 from ..models import StudentGroup, StudentGroupMember
+from ..untracked_survivors import record_untracked_survivors, track_survivor
 
 # Create blueprint
 vm_creation_bp = Blueprint('vm_creation', __name__)
@@ -806,7 +807,12 @@ def _heartbeat_deployment_reservations(vm_results, vmid_reservation_id):
 def _persist_failed_deploy_leftovers(
         vm_results, destroyed_vmids, *, deployment_group_name,
         owning_identifier, user_id, owner_group_id=None, koth_game_id=None):
-    """Commit promptly-expiring records for every uncertain cleanup result."""
+    """Commit promptly-expiring records for every uncertain cleanup result.
+
+    If the database refuses the commit, the survivors go to the durable
+    fallback file (app/untracked_survivors.py) for import once it is back,
+    and the error still propagates so their admission reservations stay held.
+    """
     survivors = []
     seen_vmids = set()
     for vm_info in vm_results:
@@ -821,52 +827,56 @@ def _persist_failed_deploy_leftovers(
     if not survivors:
         return []
 
+    marker_group = f"failed-deploy-leftover/{deployment_group_name}"
+    entries = [
+        {
+            'vmid': vm_info['vmid'],
+            'node': vm_info['node'],
+            'vm_name': vm_info['vm_name'],
+            'vm_type': vm_info['vm_type'],
+            'template_name': (
+                f"{marker_group}/"
+                f"{vm_info.get('vm_display_name', 'unknown')}"),
+            'student_name': owning_identifier,
+            'created_by_user_id': user_id,
+            'owner_group_id': owner_group_id,
+            'koth_game_id': koth_game_id,
+            'memory': vm_info.get('memory'),
+            'cores': vm_info.get('cores'),
+            'storage': vm_info.get('storage'),
+            'is_entry_point': bool(vm_info.get('is_entry_point', False)),
+        }
+        for vm_info in survivors
+    ]
     retry_at = datetime.now() - timedelta(seconds=1)
     try:
-        for vm_info in survivors:
-            record = VMRecord.query.filter_by(vmid=vm_info['vmid']).first()
-            marker_group = (
-                f"failed-deploy-leftover/{deployment_group_name}")
-            if record is None:
-                record = log_vm_to_database(
-                    vm_info,
-                    marker_group,
-                    owning_identifier,
-                    retry_at,
-                    user_id,
-                    owner_group_id,
-                    koth_game_id,
-                )
-            else:
-                record.vm_name = vm_info['vm_name']
-                record.vm_type = vm_info['vm_type']
-                record.node = vm_info['node']
-                record.template_name = (
-                    f"{marker_group}/"
-                    f"{vm_info.get('vm_display_name', 'unknown')}")
-                record.student_name = owning_identifier
-                record.memory = vm_info.get('memory')
-                record.cores = vm_info.get('cores')
-                record.storage = vm_info.get('storage')
-                record.expires_at = retry_at
-                record.created_by_user_id = user_id
-                record.is_entry_point = vm_info.get(
-                    'is_entry_point', False)
-                record.owner_group_id = owner_group_id
-                record.koth_game_id = koth_game_id
-                record.destroyed = False
-                record.destroyed_at = None
-                record.deletion_retry_count = 0
-                record.deletion_last_attempt_at = None
-                record.deletion_alert_sent = False
+        for entry in entries:
+            track_survivor(
+                entry, retry_at,
+                record=VMRecord.query.filter_by(vmid=entry['vmid']).first())
         db.session.commit()
-    except Exception:
+    except Exception as error:
         db.session.rollback()
         logger.exception(
             "Could not commit cleanup tracking for surviving VMIDs %s; "
             "their admission reservations remain held",
             sorted(seen_vmids),
         )
+        try:
+            path = record_untracked_survivors(
+                entries,
+                reason=f"tracking commit failed ({type(error).__name__})")
+        except Exception:
+            logger.critical(
+                "Surviving VMIDs %s are UNTRACKED: neither the database nor "
+                "the fallback file took them. Only the orphan reaper, after "
+                "the guests' Expires: time plus grace, will remove them.",
+                sorted(seen_vmids), exc_info=True)
+        else:
+            logger.error(
+                "Recorded surviving VMIDs %s in %s; they are imported for "
+                "immediate expiry once the database answers",
+                sorted(seen_vmids), path)
         raise
     return survivors
 
