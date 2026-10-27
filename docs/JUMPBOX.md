@@ -262,7 +262,8 @@ This writes `/etc/nftables.d/jumpbox-ssh.nft` and
 `/etc/systemd/system/jumpbox-ssh-filter.service` (a oneshot that loads the file
 before the network and `ssh.socket`/`ssh.service`) and enables the unit. The
 file is its own table, `inet jumpbox_ssh`, with an input hook at priority -10
-and policy accept. It touches only `tcp dport 22`, in this order: accept on
+and policy accept. It touches only SSH ports (`tcp dport 22`, or a set such as
+`{ 22, 2222 }`), in this order: accept on
 `lo`; accept on the management interface (`JUMPBOX_MGMT_IF`); accept on
 `tailscale0` from the two staff sets (`staff_v4`, `staff_v6`); count and drop
 everything else. Forwarding and ICMP are untouched, so students' routed
@@ -272,13 +273,30 @@ and the management interface cannot be determined, since nobody could then log
 in. An empty staff list otherwise leaves SSH on loopback and the management
 interface only.
 
-Dropped packets include your own session if it arrives from an address that is
-neither on the management interface nor listed. Keep a console open and test a
-login from a listed device before closing it.
+**Ports.** The script collects every port sshd really listens on: the `port`
+lines of `sshd -T` and the `ListenStream` entries of `ssh.socket` (`systemctl
+show -p Listen ssh.socket`; with socket activation sshd_config's `Port` is
+ignored). All of them go into the rules, defaulting to 22. A listener on any
+other port would bypass the filter, so **changing the SSH port requires
+re-running `jumpbox_configure.sh --apply --ssh-staff-only`.**
+
+**Requirements and lockout guard.** `--apply` needs `nft` (install the
+`nftables` package) and always checks the ruleset with `nft -c -f` before
+installing it. If you run it from an SSH session, the script refuses unless the
+session provably survives: it comes from loopback, arrives on the management
+interface, or comes from a listed staff address on `tailscale0`. Any other
+session would be dropped mid-run. From the console, or if you can recover
+without SSH, pass `--i-have-console`. Test a login from a listed device before
+closing your console.
 
 **Add a staff device:** append its tailnet addresses (`tailscale ip` on that
-device) to `JUMPBOX_SSH_STAFF_IPS` and re-run with `--apply --ssh-staff-only`.
-The table is replaced in one load.
+device) to `JUMPBOX_SSH_STAFF_IPS`, then `--apply --ssh-staff-only` again (or
+`sudo systemctl reload jumpbox-ssh-filter.service` after editing the generated
+file's sets, or `sudo nft -f /etc/nftables.d/jumpbox-ssh.nft`). Reload swaps
+the table in one transaction, and a bad file leaves the old table in place.
+**Never `systemctl restart` the unit**: stop deletes the table, so SSH is
+unfiltered until start loads it again. The script uses `reload-or-restart` on
+an active unit for the same reason.
 
 **Roll back:**
 

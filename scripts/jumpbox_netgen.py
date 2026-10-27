@@ -243,8 +243,21 @@ def _staff_networks(addresses):
     return fmt(v4), fmt(v6)
 
 
-def render_ssh_filter(mgmt_if, staff_ips):
-    """nftables table that limits inbound SSH to loopback, the management NIC
+def _ports(ports):
+    """Validated, sorted, de-duplicated TCP ports; empty means the default 22."""
+    out = set()
+    for raw in ports or ():
+        if isinstance(raw, (bool, float)):
+            raise ValueError(f"invalid port {raw!r}")
+        text = str(raw).strip()
+        if not re.fullmatch(r"[0-9]{1,5}", text) or not 1 <= int(text) <= 65535:
+            raise ValueError(f"invalid port {raw!r}")
+        out.add(int(text))
+    return sorted(out) or [22]
+
+
+def render_ssh_filter(mgmt_if, staff_ips, ports=(22,)):
+    """nftables table that limits inbound SSH (every port in `ports`) to loopback, the management NIC
     and listed staff tailnet addresses.
 
     Students route THROUGH the jumpbox and never log in to it, but its own
@@ -254,6 +267,9 @@ def render_ssh_filter(mgmt_if, staff_ips):
     """
     mgmt_if = _ifname(mgmt_if)
     v4, v6 = _staff_networks(staff_ips)
+    ports = _ports(ports)
+    match = f"tcp dport {ports[0]}" if len(ports) == 1 else \
+        "tcp dport { " + ", ".join(map(str, ports)) + " }"
     lines = [f"# {HEADER}",
              f"table inet {SSH_TABLE}",
              f"delete table inet {SSH_TABLE}",
@@ -267,11 +283,11 @@ def render_ssh_filter(mgmt_if, staff_ips):
     lines += [
         "    chain input {",
         "        type filter hook input priority -10; policy accept;",
-        '        iifname "lo" tcp dport 22 accept',
-        f'        iifname "{mgmt_if}" tcp dport 22 accept',
-        f'        iifname "{SSH_STAFF_IF}" ip saddr @staff_v4 tcp dport 22 accept',
-        f'        iifname "{SSH_STAFF_IF}" ip6 saddr @staff_v6 tcp dport 22 accept',
-        "        tcp dport 22 counter drop",
+        f'        iifname "lo" {match} accept',
+        f'        iifname "{mgmt_if}" {match} accept',
+        f'        iifname "{SSH_STAFF_IF}" ip saddr @staff_v4 {match} accept',
+        f'        iifname "{SSH_STAFF_IF}" ip6 saddr @staff_v6 {match} accept',
+        f"        {match} counter drop",
         "    }",
         "}",
     ]
@@ -292,7 +308,10 @@ def render_ssh_filter_unit(nft_file=SSH_NFT_FILE):
         "Type=oneshot",
         "RemainAfterExit=yes",
         f"ExecStart=/usr/sbin/nft -f {nft_file}",
-        f"ExecStop=/usr/sbin/nft delete table inet {SSH_TABLE}",
+        # Reload replaces the table in one transaction, so there is no open window;
+        # a restart would run ExecStop first and leave SSH unfiltered until ExecStart.
+        f"ExecReload=/usr/sbin/nft -f {nft_file}",
+        f"ExecStop=-/usr/sbin/nft delete table inet {SSH_TABLE}",
         "",
         "[Install]",
         "WantedBy=multi-user.target",
@@ -313,7 +332,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
         "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "ssh-filter",
-        "ssh-filter-unit", "diff"])
+        "ssh-filter-unit", "staff-has", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -324,6 +343,7 @@ def main(argv=None):
     parser.add_argument("--lease", default=DEFAULT_LEASE)
     parser.add_argument("--routes", default="10.0.0.0/8")
     parser.add_argument("--staff-ips", default="", help="ssh-filter: comma/space separated")
+    parser.add_argument("--ports", default="", help="ssh-filter: comma/space separated, default 22")
     parser.add_argument("--nft-file", default=SSH_NFT_FILE)
     parser.add_argument("--label", help="diff: path shown in the header")
     parser.add_argument("files", nargs="*", help="diff: CURRENT GENERATED")
@@ -344,7 +364,12 @@ def main(argv=None):
         if args.what == "sysctl":
             out = render_sysctl()
         elif args.what == "ssh-filter":
-            out = render_ssh_filter(args.mgmt_if, _split(args.staff_ips))
+            out = render_ssh_filter(args.mgmt_if, _split(args.staff_ips), _split(args.ports))
+        elif args.what == "staff-has":
+            # Exit status only: is ADDRESS one of the staff addresses/networks?
+            nets = [ipaddress.ip_network(n) for n in sum(_staff_networks(_split(args.staff_ips)), [])]
+            addr = ipaddress.ip_address(args.files[0])
+            return 0 if any(addr in n for n in nets if n.version == addr.version) else 1
         elif args.what == "ssh-filter-unit":
             out = render_ssh_filter_unit(args.nft_file)
         elif args.what == "zeek-node":
