@@ -31,7 +31,7 @@ A reusable Flask lab portal for deploying, managing, and destroying Proxmox virt
 ### Infrastructure
 - **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%)
 - **Cross-node template sync** -- `sync_template.sh` replicates templates between nodes using vzdump/qmrestore (no NFS)
-- **Automatic cleanup** -- background task destroys expired VMs every 5 minutes; orphaned DB records are cleaned on list
+- **Automatic cleanup** -- a background task destroys expired VMs every minute; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record
 - **Per-student VLAN isolation** -- entry VLAN (100-200) and internal VLAN (200-300) per student
 - **Startup config validation** -- templates.yaml is validated at boot; mismatches are caught before any VM is created
 
@@ -473,7 +473,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 | GET | `/templates` | List enabled deployment groups (filtered by assignment restrictions) |
 | POST | `/create` | Create VMs for a deployment group |
 | GET | `/list` | List VMs grouped by student and deployment group |
-| POST | `/extend` | Extend deployment group lifetime |
+| POST | `/extend` | Extend deployment group lifetime (`deployment_scope=individual\|group` picks between same-named deployments) |
 | POST | `/destroy` | Destroy a deployment group |
 | GET | `/time-remaining` | Check VM expiration time |
 | GET | `/api/vms` | List VMs (flat, filterable by active status) |

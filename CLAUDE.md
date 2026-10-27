@@ -144,7 +144,9 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     removes expired `student-`/`group-` guests that have no VMRecord. Keep
     the app naming and the `Expires:` line in clone descriptions stable, or
     it stops recognising (safe) or misjudges (unsafe) guests.
-    `ORPHAN_REAPER_DRY_RUN=true` logs decisions only.
+    `ORPHAN_REAPER_DRY_RUN=true` logs decisions only. A sweep runs after
+    the expiry pass and stops starting guests past
+    `ORPHAN_REAPER_MAX_PASS_SECONDS` / `_GUESTS`, so it cannot starve expiry.
 13. **Site-specific identities and infrastructure never belong in tracked
     files.** Real hosts, domains, usernames, node/storage names, VMIDs, and
     credentials live only in operator-owned `.env`, `templates.yaml`,
@@ -259,3 +261,6 @@ tests/                      # unit tests; tests/integration runs against real Pr
   snapshot taken with `allow_stale=False` — may trigger cleanup. A deleted
   VM and a corrupted config give the *same* HTTP 500 "does not exist", so
   the config endpoint alone can never answer this question.
+  The expiry loop's `reconcile_missing_vm_records` retires a live record
+  only after that answer held for `ORPHAN_CONFIRM_SECONDS`, the last read
+  under `vm_lifecycle_lock`; any other answer restarts the count.

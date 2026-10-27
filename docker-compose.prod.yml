@@ -53,6 +53,9 @@ services:
       - ORPHAN_REAPER_ENABLED=${ORPHAN_REAPER_ENABLED:-true}
       - ORPHAN_REAPER_DRY_RUN=${ORPHAN_REAPER_DRY_RUN:-false}
       - ORPHAN_REAPER_GRACE_MINUTES=${ORPHAN_REAPER_GRACE_MINUTES:-60}
+      # Per-sweep budget so orphan cleanup cannot hold up expiry.
+      - ORPHAN_REAPER_MAX_PASS_SECONDS=${ORPHAN_REAPER_MAX_PASS_SECONDS:-120}
+      - ORPHAN_REAPER_MAX_PASS_GUESTS=${ORPHAN_REAPER_MAX_PASS_GUESTS:-10}
       # Alert notification settings
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}
