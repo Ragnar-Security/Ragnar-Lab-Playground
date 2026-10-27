@@ -489,7 +489,9 @@ anyone.
 
 For an authenticated check without a password, drive the app's own test
 client inside the container. `PYTHONPATH=/app` is required, because the
-script does not live in the application directory.
+script does not live in the application directory. Pick an **enabled** admin:
+a disabled account (for example the built-in `admin` after it is disabled)
+is correctly refused with `401`, which would look like a failed deploy.
 
 ```bash
 docker compose -f docker-compose.prod.yml exec -T -e PYTHONPATH=/app \
@@ -498,13 +500,13 @@ from app import create_app
 from app.models import User
 app = create_app()
 with app.app_context():
-    admin = User.query.filter_by(is_admin=True).first()
+    admin = User.query.filter_by(is_admin=True, disabled=False).first()
 c = app.test_client()
 with c.session_transaction() as s:
     s['user_id'] = admin.id
     s['session_version'] = admin.session_version
-print('_diag', c.get('/koth/api/_diag').status_code)
-print('list ', c.get('/list').status_code)
+print('_diag', c.get('/koth/api/_diag').status_code)   # 200
+print('list ', c.get('/list').status_code)             # 200
 PY
 ```
 
