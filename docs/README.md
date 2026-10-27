@@ -27,6 +27,9 @@ Start here to get the application up and running:
   - Maintenance schedules
   - Performance tuning
 
+- **[DEPLOY-FROM-RELEASE.md](DEPLOY-FROM-RELEASE.md)** - Run a published release image from its deploy bundle (shipped in every release)
+- **[RELEASING.md](RELEASING.md)** - Maintainer checklist for cutting a `vX.Y.Z` release
+
 ### Development
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** - Comprehensive development guide
   - Local setup with Docker
