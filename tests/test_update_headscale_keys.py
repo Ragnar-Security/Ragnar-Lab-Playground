@@ -27,7 +27,9 @@ from scripts import update_headscale_keys  # noqa: E402
 def engine(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'portal.db'}")
     db.Model.metadata.create_all(engine)
-    now = datetime.now()
+    # ISO text, not a datetime: Python 3.12 deprecates sqlite3's implicit
+    # datetime adapter, and a raw text() INSERT bypasses SQLAlchemy's type.
+    now = datetime.now().isoformat(sep=" ")
     with engine.begin() as conn:
         for login, key in [("alice", "old-alice"), ("bob", "old-bob"), ("carol", "old-carol")]:
             conn.execute(

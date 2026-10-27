@@ -239,7 +239,7 @@ class Rig:
         self.db_path = tmp_path / "portal.db"
         self.engine = create_engine(f"sqlite:///{self.db_path}")
         db.Model.metadata.create_all(self.engine)
-        now = datetime.now()
+        now = datetime.now().isoformat(sep=" ")  # see test_update_headscale_keys.py
         with self.engine.begin() as conn:
             for login in ("alice", "bob", "staffer", "infra"):
                 conn.execute(
