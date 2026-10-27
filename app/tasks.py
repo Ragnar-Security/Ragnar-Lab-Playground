@@ -84,9 +84,7 @@ def reconcile_missing_vm_records(proxmox):
     read is never evidence: it restarts the count. Returns retired VMIDs.
     """
     # Lazy import: app.routes imports this module.
-    from .routes.utils import (
-        note_vm_state, VM_MISSING, VM_PRESENT, VM_UNKNOWN,
-    )
+    from .routes.utils import note_vm_state, VM_PRESENT
 
     now = datetime.now()
     live = [(vm.id, vm.vmid, vm.node) for vm in
@@ -106,49 +104,66 @@ def reconcile_missing_vm_records(proxmox):
         if int(vmid) in index:
             note_vm_state(node, vmid, VM_PRESENT)
             continue
-        with vm_lifecycle_lock(vmid):
-            # Fresh transaction under the lock: a concurrent destroy or
-            # replacement must be visible before deciding.
-            db.session.rollback()
-            vm_record = db.session.get(VMRecord, record_id)
-            if (vm_record is None or vm_record.destroyed
-                    or vm_record.vmid != vmid):
-                continue
-            absent = confirm_proxmox_absence(proxmox, vmid)
-            if not note_vm_state(node, vmid,
-                                 VM_MISSING if absent else VM_UNKNOWN):
-                if absent:
-                    logger.warning(
-                        "VM %s (%s) is not in the cluster inventory; keeping "
-                        "its record until a later sighting confirms it",
-                        vmid, vm_record.vm_name)
-                continue
-
-            message = (f"VM {vmid} ({vm_record.vm_name}) on node {node} was "
-                       "deleted outside the portal: the Proxmox cluster "
-                       "inventory no longer lists it. Its record has been "
-                       "retired before its expiry.")
-            db.session.add(AdminAlert(
-                alert_type='vm_record_reconciled',
-                severity='warning',
-                message=message,
-                vmid=vmid,
-                vm_name=vm_record.vm_name,
-                details=json.dumps({
-                    'reason': 'absent_from_cluster_inventory',
-                    'vm_type': vm_record.vm_type,
-                    'node': node,
-                    'student_name': vm_record.student_name,
-                    'template_name': vm_record.template_name,
-                    'expires_at': vm_record.expires_at.isoformat(),
-                }),
-            ))
-            _retire_vm_record(vm_record)
-            db.session.commit()
-            _forget_vm_caches(node, vmid)
-            logger.warning("Retired record for VM %s: %s", vmid, message)
+        if reconcile_missing_vm_record(proxmox, record_id, vmid, node):
             retired.append(vmid)
     return retired
+
+
+def reconcile_missing_vm_record(proxmox, record_id, vmid, node):
+    """Retire one record the cluster inventory no longer lists.
+
+    Decides under the VMID lifecycle lock on the row as it stands there,
+    re-confirms the absence against fresh inventory, and counts that as a
+    sighting; only a sighting that completes the ORPHAN_CONFIRM_SECONDS
+    window retires the record, with a `vm_record_reconciled` AdminAlert in
+    the same commit. Shared by the reconcile pass and `/list`. Returns
+    whether the record was retired.
+    """
+    # Lazy import: app.routes imports this module.
+    from .routes.utils import note_vm_state, VM_MISSING, VM_UNKNOWN
+
+    with vm_lifecycle_lock(vmid):
+        # Fresh transaction under the lock: a concurrent destroy or
+        # replacement must be visible before deciding.
+        db.session.rollback()
+        vm_record = db.session.get(VMRecord, record_id)
+        if (vm_record is None or vm_record.destroyed
+                or vm_record.vmid != vmid or vm_record.node != node):
+            return False
+        absent = confirm_proxmox_absence(proxmox, vmid)
+        if not note_vm_state(node, vmid,
+                             VM_MISSING if absent else VM_UNKNOWN):
+            if absent:
+                logger.warning(
+                    "VM %s (%s) is not in the cluster inventory; keeping "
+                    "its record until a later sighting confirms it",
+                    vmid, vm_record.vm_name)
+            return False
+
+        message = (f"VM {vmid} ({vm_record.vm_name}) on node {node} was "
+                   "deleted outside the portal: the Proxmox cluster "
+                   "inventory no longer lists it. Its record has been "
+                   "retired before its expiry.")
+        db.session.add(AdminAlert(
+            alert_type='vm_record_reconciled',
+            severity='warning',
+            message=message,
+            vmid=vmid,
+            vm_name=vm_record.vm_name,
+            details=json.dumps({
+                'reason': 'absent_from_cluster_inventory',
+                'vm_type': vm_record.vm_type,
+                'node': node,
+                'student_name': vm_record.student_name,
+                'template_name': vm_record.template_name,
+                'expires_at': vm_record.expires_at.isoformat(),
+            }),
+        ))
+        _retire_vm_record(vm_record)
+        db.session.commit()
+        _forget_vm_caches(node, vmid)
+        logger.warning("Retired record for VM %s: %s", vmid, message)
+        return True
 
 # Alert file path
 ALERT_LOG_FILE = "/app/data/failed_vms.log"

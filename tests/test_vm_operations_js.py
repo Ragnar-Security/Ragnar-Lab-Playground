@@ -1,9 +1,10 @@
-"""Run the real My Labs script under Node and observe what Extend posts.
+"""Run the real My Labs script under Node and observe what each button posts.
 
-The /extend route can only extend the deployment the browser names, so the
-request body is the contract (ops#44). The harness stubs just enough DOM for
-static/js/utils.js and static/js/vm-operations.js to render a /list payload,
-then clicks each rendered Extend button and records the form it submits.
+/extend and /destroy can only act on the deployment the browser names, so
+the request body is the contract (ops#44). The harness stubs just enough DOM
+for static/js/utils.js and static/js/vm-operations.js to render a /list
+payload, then clicks each rendered Extend and Destroy button and records the
+form it submits.
 """
 
 import json
@@ -81,21 +82,24 @@ vm.runInContext(fs.readFileSync(opsPath, 'utf8'), context);
 vm.runInContext('loadVMList()', context);
 
 setImmediate(() => setImmediate(() => {
-  for (const button of context.document.querySelectorAll('.extend-lab-btn')) {
-    for (const handler of button.handlers) handler.call(button);
+  for (const name of ['.extend-lab-btn', '.destroy-lab-btn']) {
+    for (const button of context.document.querySelectorAll(name)) {
+      for (const handler of button.handlers) handler.call(button);
+    }
   }
   process.stdout.write(JSON.stringify(posts));
 }));
 """
 
 
-def _card(scope, *, student_name):
+def _card(scope, *, student_name, group_id=None):
     return {
         'student_name': student_name,
         'created_by_user_id': 1,
         'deployment_groups': [{
             'group_name': 'homework1',
             'deployment_scope': scope,
+            'group_id': group_id,
             'vm_count': 1,
             'time_remaining_seconds': 600,
             'vms': [],
@@ -103,7 +107,7 @@ def _card(scope, *, student_name):
     }
 
 
-def _extend_posts(payload):
+def _button_posts(payload):
     node = shutil.which('node')
     if node is None:
         pytest.skip('node is required to execute static/js')
@@ -117,18 +121,36 @@ def _extend_posts(payload):
     return json.loads(result.stdout)
 
 
-def test_each_extend_button_posts_its_own_deployment_scope():
-    payload = {'success': True, 'students': [
-        _card('individual', student_name='alice'),
-        _card('group', student_name='team1'),
-    ]}
-
-    posts = _extend_posts(payload)
-
-    assert [post['url'] for post in posts] == ['/extend', '/extend']
-    assert [(post['form']['deployment_group'],
+def _identities(posts, url):
+    return [(post['form']['deployment_group'],
              post['form']['student_name'],
-             post['form'].get('deployment_scope')) for post in posts] == [
-        ('homework1', 'alice', 'individual'),
-        ('homework1', 'team1', 'group'),
+             post['form'].get('deployment_scope'),
+             post['form'].get('group_id'))
+            for post in posts if post['url'] == url]
+
+
+_PAYLOAD = {'success': True, 'students': [
+    _card('individual', student_name='alice'),
+    _card('group', student_name='team1', group_id=7),
+    _card('group', student_name='team2', group_id=8),
+]}
+
+
+def test_each_extend_button_posts_its_own_deployment():
+    posts = _button_posts(_PAYLOAD)
+
+    assert _identities(posts, '/extend') == [
+        ('homework1', 'alice', 'individual', ''),
+        ('homework1', 'team1', 'group', '7'),
+        ('homework1', 'team2', 'group', '8'),
+    ]
+
+
+def test_each_destroy_button_posts_its_own_deployment():
+    posts = _button_posts(_PAYLOAD)
+
+    assert _identities(posts, '/destroy') == [
+        ('homework1', 'alice', 'individual', ''),
+        ('homework1', 'team1', 'group', '7'),
+        ('homework1', 'team2', 'group', '8'),
     ]

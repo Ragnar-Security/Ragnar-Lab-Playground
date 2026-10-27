@@ -478,8 +478,8 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 | GET | `/templates` | List enabled deployment groups (filtered by assignment restrictions) |
 | POST | `/create` | Create VMs for a deployment group |
 | GET | `/list` | List VMs grouped by student and deployment group |
-| POST | `/extend` | Extend deployment group lifetime (`deployment_scope=individual\|group` picks between same-named deployments) |
-| POST | `/destroy` | Destroy a deployment group |
+| POST | `/extend` | Extend one deployment's lifetime (`deployment_scope=individual\|group` and `group_id` pick between same-named deployments; an ambiguous request is refused) |
+| POST | `/destroy` | Destroy one deployment (same `deployment_scope` / `group_id` selection as `/extend`) |
 | GET | `/time-remaining` | Check VM expiration time |
 | GET | `/api/vms` | List VMs (flat, filterable by active status) |
 | GET | `/api/vms/<vmid>` | Get detailed info for a single VM |

@@ -12,12 +12,16 @@ CLUSTER INVENTORY positively confirms the vmid is absent. Everything
 else keeps the row.
 """
 
+import time
 import unittest
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch
 
+from sqlalchemy import update
+
 from app import create_app
-from app.models import db, User, VMRecord
+from app.models import db, AdminAlert, User, VMRecord
 import app.routes.utils as route_utils
 from app.routes.utils import (
     VM_CONFIG_ERROR, VM_MISSING, VM_PRESENT, VM_UNKNOWN, _verify_vm_exists,
@@ -252,6 +256,53 @@ class ListOrphanCleanupTests(unittest.TestCase):
         entries = self._vm_entries(resp)
         self.assertEqual(entries[0]['status'], 'running')
         self.assertFalse(entries[0]['has_config_issues'])
+
+    def _list_after_confirmed_absence(self, lock):
+        """Render twice, ORPHAN_CONFIRM_SECONDS apart, the VM gone both times."""
+        self._list((VM_MISSING, 'gone'))
+        route_utils._missing_since[('pve', 700)] = (
+            time.monotonic() - route_utils.ORPHAN_CONFIRM_SECONDS - 1)
+        with patch('app.tasks.vm_lifecycle_lock', lock):
+            return self._list((VM_MISSING, 'gone'))
+
+    def test_confirmed_missing_record_is_retired_under_its_lock_with_alert(self):
+        """/list retires through the reconcile pass, not a second path."""
+        acquired = []
+        record_id = self.vm.id
+
+        @contextmanager
+        def recording_lock(vmid):
+            acquired.append(vmid)
+            yield
+
+        resp = self._list_after_confirmed_absence(recording_lock)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(acquired, [700])
+        self.assertIsNone(db.session.get(VMRecord, record_id))
+        alerts = AdminAlert.query.filter_by(
+            alert_type='vm_record_reconciled').all()
+        self.assertEqual([alert.vmid for alert in alerts], [700])
+
+    def test_record_changed_while_waiting_for_the_lock_is_kept(self):
+        """The decision is made on the row as it stands under the lock."""
+        record_id = self.vm.id
+
+        @contextmanager
+        def lock_won_by_a_replacement(vmid):
+            # Another request re-pointed the record while /list waited.
+            db.session.execute(update(VMRecord)
+                               .where(VMRecord.id == record_id)
+                               .values(vmid=701))
+            db.session.commit()
+            yield
+
+        self._list_after_confirmed_absence(lock_won_by_a_replacement)
+
+        db.session.expire_all()
+        self.assertIsNotNone(db.session.get(VMRecord, record_id))
+        self.assertEqual(AdminAlert.query.filter_by(
+            alert_type='vm_record_reconciled').count(), 0)
 
 
 class OrphanConfirmationTests(unittest.TestCase):

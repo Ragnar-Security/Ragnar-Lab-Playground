@@ -687,6 +687,184 @@ class TestAPIRoutes(unittest.TestCase):
             ('homework1', 'individual', [120]),
             ('homework1', 'group', [121]),
         ])
+
+    def _destroy(self, **form):
+        with patch('app.routes.vm_lifecycle.get_proxmox_connection',
+                   return_value=MagicMock()), \
+             patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+                   return_value={'success': True, 'status': 'stopped'}):
+            return self.client.post(
+                '/destroy', data={'deployment_group': 'homework1', **form})
+
+    def test_student_destroy_individual_scope_leaves_group_deployment(self):
+        """The individual card's Destroy must not wipe the team's lab."""
+        individual_id, group_id, _ = self._same_named_deployments()
+
+        response = self._destroy(deployment_scope='individual')
+
+        body = response.get_json()
+        self.assertTrue(body['success'], body)
+        self.assertEqual(body['destroyed_count'], 1)
+        self.assertIsNone(db.session.get(VMRecord, individual_id))
+        self.assertIsNotNone(db.session.get(VMRecord, group_id))
+
+    def test_student_destroy_group_scope_leaves_individual_deployment(self):
+        individual_id, group_id, _ = self._same_named_deployments()
+
+        response = self._destroy(deployment_scope='group')
+
+        body = response.get_json()
+        self.assertTrue(body['success'], body)
+        self.assertEqual(body['destroyed_count'], 1)
+        self.assertIsNone(db.session.get(VMRecord, group_id))
+        self.assertIsNotNone(db.session.get(VMRecord, individual_id))
+
+    def test_student_destroy_without_scope_refuses_ambiguous_name(self):
+        """A cached pre-fix page must not destroy two deployments at once."""
+        individual_id, group_id, _ = self._same_named_deployments()
+
+        with patch('app.routes.vm_lifecycle.get_proxmox_connection') as prox:
+            response = self.client.post(
+                '/destroy', data={'deployment_group': 'homework1'})
+
+        body = response.get_json()
+        self.assertFalse(body['success'])
+        self.assertIn('reload', body['error'].lower())
+        prox.assert_not_called()
+        self.assertIsNotNone(db.session.get(VMRecord, individual_id))
+        self.assertIsNotNone(db.session.get(VMRecord, group_id))
+
+    def test_destroy_rejects_unknown_scope(self):
+        individual_id, group_id, _ = self._same_named_deployments()
+
+        response = self._destroy(deployment_scope='everything')
+
+        self.assertFalse(response.get_json()['success'])
+        self.assertIsNotNone(db.session.get(VMRecord, individual_id))
+        self.assertIsNotNone(db.session.get(VMRecord, group_id))
+
+    def _two_groups_with_same_lab(self):
+        """testuser deployed homework1 in team1, then moved to team2, which
+        also runs homework1.
+
+        Membership is unique per student, but the team1 lab still matches
+        the student's query through created_by_user_id, so a group-scoped
+        request names two group deployments.
+        """
+        expires_at = datetime.now() + timedelta(minutes=30)
+        ids = []
+        for vmid, slug in ((130, 'team1'), (131, 'team2')):
+            group = StudentGroup(name=slug, display_name=slug)
+            db.session.add(group)
+            db.session.flush()
+            record = VMRecord(
+                vmid=vmid, vm_name=f'group-{slug}-vm', vm_type='qemu',
+                node='pve1', template_name='homework1/vm', student_name=slug,
+                expires_at=expires_at, created_by_user_id=self.test_user.id,
+                owner_group_id=group.id,
+            )
+            db.session.add(record)
+            db.session.flush()
+            ids.append((group.id, record.id))
+        db.session.add(StudentGroupMember(group_id=ids[1][0],
+                                          user_id=self.test_user.id))
+        db.session.commit()
+        return ids, expires_at
+
+    def test_extend_group_scope_refuses_when_two_groups_share_the_lab(self):
+        [(_, first_id), (_, second_id)], expires_at = \
+            self._two_groups_with_same_lab()
+
+        response = self._extend(deployment_scope='group')
+
+        body = response.get_json()
+        self.assertFalse(body['success'])
+        self.assertIn('reload', body['error'].lower())
+        self.assertEqual(db.session.get(VMRecord, first_id).expires_at,
+                         expires_at)
+        self.assertEqual(db.session.get(VMRecord, second_id).expires_at,
+                         expires_at)
+
+    def test_extend_group_scope_with_group_id_extends_only_that_group(self):
+        [(_, first_id), (second_group, second_id)], expires_at = \
+            self._two_groups_with_same_lab()
+
+        response = self._extend(deployment_scope='group',
+                                group_id=str(second_group))
+
+        body = response.get_json()
+        self.assertTrue(body['success'], body)
+        self.assertEqual(db.session.get(VMRecord, second_id).expires_at,
+                         expires_at + timedelta(minutes=60))
+        self.assertEqual(db.session.get(VMRecord, first_id).expires_at,
+                         expires_at)
+
+    def test_destroy_group_scope_refuses_when_two_groups_share_the_lab(self):
+        [(_, first_id), (_, second_id)], _ = self._two_groups_with_same_lab()
+
+        response = self._destroy(deployment_scope='group')
+
+        body = response.get_json()
+        self.assertFalse(body['success'])
+        self.assertIn('reload', body['error'].lower())
+        self.assertIsNotNone(db.session.get(VMRecord, first_id))
+        self.assertIsNotNone(db.session.get(VMRecord, second_id))
+
+    def test_destroy_group_scope_with_group_id_destroys_only_that_group(self):
+        [(_, first_id), (second_group, second_id)], _ = \
+            self._two_groups_with_same_lab()
+
+        response = self._destroy(deployment_scope='group',
+                                 group_id=str(second_group))
+
+        body = response.get_json()
+        self.assertTrue(body['success'], body)
+        self.assertEqual(body['destroyed_count'], 1)
+        self.assertIsNone(db.session.get(VMRecord, second_id))
+        self.assertIsNotNone(db.session.get(VMRecord, first_id))
+
+    def test_group_id_of_a_group_the_student_left_is_refused(self):
+        [(first_group, first_id), (_, second_id)], _ = \
+            self._two_groups_with_same_lab()
+
+        response = self._destroy(deployment_scope='group',
+                                 group_id=str(first_group))
+
+        self.assertFalse(response.get_json()['success'])
+        self.assertIsNotNone(db.session.get(VMRecord, first_id))
+        self.assertIsNotNone(db.session.get(VMRecord, second_id))
+
+    def test_malformed_group_id_is_refused(self):
+        [(_, first_id), (_, second_id)], _ = self._two_groups_with_same_lab()
+
+        response = self._destroy(deployment_scope='group', group_id='team1')
+
+        self.assertFalse(response.get_json()['success'])
+        self.assertIsNotNone(db.session.get(VMRecord, first_id))
+        self.assertIsNotNone(db.session.get(VMRecord, second_id))
+
+    def test_list_card_names_the_group_that_owns_it(self):
+        """The buttons can only send the group id the list gave the card."""
+        [(first_group, _), (second_group, _)], _ = \
+            self._two_groups_with_same_lab()
+
+        with patch('app.routes.vm_listing.get_proxmox_connection'), \
+             patch('app.routes.vm_listing._verify_vm_exists',
+                   return_value=(VM_PRESENT, None)), \
+             patch('app.routes.vm_listing._get_vm_ip_addresses',
+                   return_value=[]):
+            response = self.client.get('/list')
+
+        cards = [
+            (card['deployment_scope'], card['group_id'],
+             [vm['vmid'] for vm in card['vms']])
+            for student in response.get_json()['students']
+            for card in student['deployment_groups']
+        ]
+        self.assertCountEqual(cards, [
+            ('group', first_group, [130]),
+            ('group', second_group, [131]),
+        ])
     
     @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})

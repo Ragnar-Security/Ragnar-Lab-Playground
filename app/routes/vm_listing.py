@@ -3,23 +3,24 @@ VM Listing routes module.
 Handles displaying and querying VM information.
 
 Orphaned-record cleanup: when /list is called, each DB record is verified
-against Proxmox. If the VM no longer exists (manually deleted, failed cleanup,
-etc.), the DB record is deleted on the spot so the dashboard stays accurate.
-This is the primary self-healing mechanism for DB/Proxmox drift.
+against Proxmox. A record whose VM the cluster inventory has not listed for
+ORPHAN_CONFIRM_SECONDS (manually deleted, failed cleanup, etc.) is retired
+through the reconcile pass's helper, under the VMID lifecycle lock and with
+an admin alert, so the dashboard stays accurate.
 """
 
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime
 import logging
 
+from .. import tasks
 from ..models import db, VMRecord, StudentGroupMember
 from ..proxmox_service import get_proxmox_connection, get_cluster_vm_index
 from ..auth import login_required, get_authenticated_user
 from ..template_manager import load_template_config, get_template_for_vm
 from .utils import (
     _verify_vm_exists, _get_vm_ip_addresses, _format_time_remaining,
-    _ip_cache_get, invalidate_vm_ip_cache, mask_ip_address, note_vm_state,
-    forget_vm_state, user_can_access_vm,
+    _ip_cache_get, mask_ip_address, note_vm_state, user_can_access_vm,
     ORPHAN_CONFIRM_SECONDS, VM_CONFIG_ERROR, VM_MISSING, VM_UNKNOWN,
 )
 from .admin import _send_config_issue_webhook
@@ -159,15 +160,18 @@ def list_vms():
                 }
 
             # One card per deployment. A student's own lab and their group's
-            # lab can share a name; the card's scope is what its Extend
-            # button sends, so one card must never mix the two.
+            # lab can share a name, as can the labs of a group the student
+            # left and the one they joined; the card's scope and group id are
+            # what its Extend and Destroy buttons send, so one card must
+            # never mix two deployments.
             deployment_scope = 'individual' if record.owner_group_id is None else 'group'
-            card_key = (group_name, deployment_scope)
+            card_key = (group_name, deployment_scope, record.owner_group_id)
             if card_key not in students[student_key]['deployment_groups']:
                 remaining_secs = int((record.expires_at - datetime.now()).total_seconds()) if record.expires_at else 0
                 students[student_key]['deployment_groups'][card_key] = {
                     'group_name': group_name,
                     'deployment_scope': deployment_scope,
+                    'group_id': record.owner_group_id,
                     'vm_count': 0,
                     'created_at': record.created_at.isoformat() if record.created_at else None,
                     'expires_at': record.expires_at.isoformat() if record.expires_at else None,
@@ -233,25 +237,20 @@ def list_vms():
         # updating the database. Only a CONFIRMED VM_MISSING reaches this
         # list. A VM we merely failed to reach, or saw missing once, must
         # never land here: the expiry daemon tracks VMs by database row, so
-        # deleting the row of a live VM leaks it permanently.
+        # deleting the row of a live VM leaks it permanently. The reconcile
+        # pass's helper makes the final decision under the VMID lifecycle
+        # lock and raises the same admin alert.
         if orphaned_records:
-            logger.info(f"Cleaning up {len(orphaned_records)} orphaned database records...")
-            for orphaned_record in orphaned_records:
+            # Capture identities first: the helper's rollback expires the
+            # loaded rows.
+            targets = [(r.id, r.vmid, r.node) for r in orphaned_records]
+            for record_id, vmid, node in targets:
                 try:
-                    db.session.delete(orphaned_record)
-                    # vmids are reissued, so leave nothing keyed to this one.
-                    forget_vm_state(orphaned_record.node, orphaned_record.vmid)
-                    invalidate_vm_ip_cache(orphaned_record.node, orphaned_record.vmid)
-                    logger.info(f"Deleted orphaned record for VM {orphaned_record.vmid} ({orphaned_record.vm_name})")
+                    tasks.reconcile_missing_vm_record(
+                        proxmox, record_id, vmid, node)
                 except Exception as cleanup_error:
-                    logger.error(f"Error cleaning up orphaned record {orphaned_record.vmid}: {str(cleanup_error)}")
-
-            try:
-                db.session.commit()
-                logger.info(f"Successfully cleaned up {len(orphaned_records)} orphaned records")
-            except Exception as commit_error:
-                logger.error(f"Error committing orphaned record cleanup: {str(commit_error)}")
-                db.session.rollback()
+                    db.session.rollback()
+                    logger.error(f"Error cleaning up orphaned record {vmid}: {cleanup_error}")
 
         # Convert to list format
         students_list = []

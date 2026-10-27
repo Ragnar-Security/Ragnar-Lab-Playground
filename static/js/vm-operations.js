@@ -367,10 +367,10 @@ function loadVMList() {
                                     ? '<span class="badge bg-danger fs-6">EXPIRED</span>'
                                     : `<span class="countdown-timer badge ${timerClass} fs-6" data-remaining="${escapeHtml(group.time_remaining_seconds)}">...</span>`
                                 }
-                                <button class="btn btn-sm btn-warning extend-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}" data-scope="${escapeHtml(group.deployment_scope)}" ${!isLow && !isExpired ? 'disabled' : ''}>
+                                <button class="btn btn-sm btn-warning extend-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}" data-scope="${escapeHtml(group.deployment_scope)}" data-group-id="${escapeHtml(group.group_id)}" ${!isLow && !isExpired ? 'disabled' : ''}>
                                     <i class="bi bi-clock"></i> Extend
                                 </button>
-                                <button class="btn btn-sm btn-danger destroy-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}">
+                                <button class="btn btn-sm btn-danger destroy-lab-btn" data-group="${escapeHtml(group.group_name)}" data-student="${escapeHtml(student.student_name)}" data-scope="${escapeHtml(group.deployment_scope)}" data-group-id="${escapeHtml(group.group_id)}">
                                     <i class="bi bi-trash"></i> Destroy
                                 </button>
                             </div>
@@ -430,8 +430,10 @@ function loadVMList() {
                     formData.append('deployment_group', group);
                     formData.append('student_name', student);
                     // A student's own lab and their group's lab can share a
-                    // name; the scope tells /extend which one this card is.
+                    // name, as can an old group's lab and the current one's;
+                    // scope and group id tell /extend which one this card is.
                     formData.append('deployment_scope', this.dataset.scope);
+                    formData.append('group_id', this.dataset.groupId);
                     this.disabled = true;
                     this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Extending...';
                     fetch('/extend', { method: 'POST', body: formData })
@@ -462,6 +464,10 @@ function loadVMList() {
                     const formData = new FormData();
                     formData.append('deployment_group', group);
                     formData.append('student_name', student);
+                    // Same identification as Extend: a click on one card
+                    // must never destroy a same-named lab on another.
+                    formData.append('deployment_scope', this.dataset.scope);
+                    formData.append('group_id', this.dataset.groupId);
                     this.disabled = true;
                     this.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Destroying...';
                     fetch('/destroy', { method: 'POST', body: formData })
