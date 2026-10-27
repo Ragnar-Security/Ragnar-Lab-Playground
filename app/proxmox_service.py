@@ -4,15 +4,20 @@ Handles all interactions with the Proxmox API
 """
 
 from contextlib import contextmanager
+import hashlib
 import threading
 import time
 import logging
 from typing import Optional, Dict, List, Any, Tuple
 from proxmoxer import ProxmoxAPI
+from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy.exc import SQLAlchemyError
+from . import coordination
 from .config import (
-    PROXMOX_HOST, PROXMOX_USER, PROXMOX_PASSWORD, PROXMOX_TOKEN_ID,
-    PROXMOX_TOKEN_SECRET, proxmox_tls_verify,
+    DISTRIBUTED_VM_LOCKS, PROXMOX_HOST, PROXMOX_USER, PROXMOX_PASSWORD,
+    PROXMOX_TOKEN_ID, PROXMOX_TOKEN_SECRET, proxmox_tls_verify,
 )
+from .models import NodeMemoryReservation, VMIDReservation, VMRecord, db
 
 logger = logging.getLogger(__name__)
 
@@ -21,39 +26,51 @@ logger = logging.getLogger(__name__)
 # to survive one five-minute clone plus transient scheduler stalls, while a
 # crashed path eventually heals without a process restart.
 RESERVATION_TTL_SECONDS = 15 * 60
-_node_reservations: Dict[str, Dict[str, Any]] = {}
-_node_reservations_lock = threading.Lock()
 
-# VMID allocations bridge the gap between taking a cluster/DB inventory and
-# committing VMRecord rows. Production intentionally runs one gevent worker,
-# so this process-wide ledger covers every concurrent deploy.
-_vmid_reservations: Dict[str, Dict[str, Any]] = {}
-_vmid_reservations_lock = threading.Lock()
-_vmid_high_water_mark = 0
+# Node-memory and VMID reservations live in the application database (see
+# app/coordination.py), so every worker admits and allocates against the
+# same ledger. VMID reservations bridge the gap between taking a cluster/DB
+# inventory and committing VMRecord rows.
+_NODE_RESERVATIONS = NodeMemoryReservation.__table__
+_VMID_RESERVATIONS = VMIDReservation.__table__
 
+# Longer than any lifecycle body (a stop plus a destroy, each bounded by
+# wait_for_proxmox_task's 300 s), so only a stuck holder makes a waiter fail.
+VM_LIFECYCLE_LOCK_TIMEOUT_SECONDS = 30 * 60
 
-
-# Every mutation of a guest is serialized by VMID. Production uses one
-# gevent worker, where monkey-patched threading locks coordinate greenlets as
-# well as helper threads. Entries are reference-counted so the table does not
-# grow forever as the allocation high-water mark advances.
+# Every mutation of a guest is serialized by VMID. Greenlets of one worker
+# queue on a process lock (monkey-patched threading locks coordinate
+# greenlets as well as helper threads); with DISTRIBUTED_VM_LOCKS on MySQL a
+# named server lock then excludes other workers. Entries are
+# reference-counted so the table does not grow forever as the allocation
+# high-water mark advances.
 _vm_lifecycle_locks: Dict[int, Dict[str, Any]] = {}
 _vm_lifecycle_locks_guard = threading.Lock()
 
 
 @contextmanager
-def vm_lifecycle_lock(vmid: int):
-    """Serialize allocation/destruction decisions for one VMID."""
-    key = int(vmid)
+def _process_vm_lifecycle_lock(key: int):
+    # Under gevent's monkey patching get_ident() names the greenlet.
+    me = threading.get_ident()
     with _vm_lifecycle_locks_guard:
         entry = _vm_lifecycle_locks.get(key)
+        if entry is not None and entry['owner'] == me:
+            # The lock is not reentrant: waiting here would wait for itself
+            # forever, with the VMID locked for every other path too.
+            raise RuntimeError(
+                f'vm_lifecycle_lock({key}) is already held by this greenlet; '
+                'nested acquisition of the same VMID would never return')
         if entry is None:
-            entry = {'lock': threading.Lock(), 'users': 0}
+            entry = {'lock': threading.Lock(), 'users': 0, 'owner': None}
             _vm_lifecycle_locks[key] = entry
         entry['users'] += 1
     try:
         with entry['lock']:
-            yield
+            entry['owner'] = me
+            try:
+                yield
+            finally:
+                entry['owner'] = None
     finally:
         with _vm_lifecycle_locks_guard:
             entry['users'] -= 1
@@ -61,117 +78,146 @@ def vm_lifecycle_lock(vmid: int):
                 _vm_lifecycle_locks.pop(key)
 
 
+def _mysql_engine_or_none():
+    from flask import has_app_context
+    if not has_app_context():
+        return None
+    engine = db.engine
+    return engine if engine.dialect.name == 'mysql' else None
+
+
+def _vm_lifecycle_lock_name(engine, key: int) -> str:
+    """GET_LOCK names are global to the MySQL server, so a staging database
+    on the same server must not share them. A database name too long for
+    MySQL's limit is replaced by a digest of it."""
+    database = engine.url.database or ''
+    name = f'vm-lifecycle-{database}-{key}'
+    if len(name) > coordination.MYSQL_LOCK_NAME_MAX_LENGTH:
+        digest = hashlib.sha256(database.encode()).hexdigest()[:16]
+        name = f'vm-lifecycle-{digest}-{key}'
+    return name
+
+
+@contextmanager
+def vm_lifecycle_lock(vmid: int):
+    """Serialize allocation/destruction decisions for one VMID.
+
+    With DISTRIBUTED_VM_LOCKS on MySQL this also holds
+    GET_LOCK('vm-lifecycle-<database>-<vmid>') across workers, on a second
+    pool connection. Otherwise (the one-worker default, SQLite, callers
+    without an app context) it is the process lock only. Re-entering a VMID
+    this greenlet already holds raises RuntimeError.
+    """
+    key = int(vmid)
+    with _process_vm_lifecycle_lock(key):
+        engine = _mysql_engine_or_none() if DISTRIBUTED_VM_LOCKS else None
+        if engine is None:
+            yield
+            return
+        with coordination.mysql_named_lock(
+                engine, _vm_lifecycle_lock_name(engine, key),
+                VM_LIFECYCLE_LOCK_TIMEOUT_SECONDS):
+            yield
+
+
 def _clear_vmid_reservations() -> None:
-    """Clear process-local VMID allocation state for deterministic tests."""
-    global _vmid_high_water_mark
-    with _vmid_reservations_lock:
-        _vmid_reservations.clear()
-        _vmid_high_water_mark = 0
+    """Clear VMID reservations and the high-water mark for deterministic tests."""
+    coordination.reset_for_tests(
+        [_VMID_RESERVATIONS], state_rows=[coordination.VMID_ALLOCATOR])
 
 
 def release_vmid_reservation(reservation_id: Optional[str]) -> bool:
     """Release VMIDs after their VMRecords commit or cleanup completes."""
     if not reservation_id:
         return False
-    with _vmid_reservations_lock:
-        return _vmid_reservations.pop(reservation_id, None) is not None
+    return coordination.release_lease(_VMID_RESERVATIONS, reservation_id)
 
 
 def renew_vmid_reservation(reservation_id: Optional[str]) -> bool:
     """Keep an active VMID allocation alive for another TTL window."""
     if not reservation_id:
         return False
-    now = time.monotonic()
-    with _vmid_reservations_lock:
-        reservation = _vmid_reservations.get(reservation_id)
-        if reservation is None:
-            return False
-        if reservation['expires_at'] <= now:
-            _vmid_reservations.pop(reservation_id)
-            return False
-        reservation['expires_at'] = now + RESERVATION_TTL_SECONDS
-        return True
+    return coordination.renew_lease(
+        _VMID_RESERVATIONS, reservation_id, RESERVATION_TTL_SECONDS)
 
 
-def _reserved_vmids_locked(now: float) -> set[int]:
-    expired = [
-        reservation_id
-        for reservation_id, reservation in _vmid_reservations.items()
-        if reservation['expires_at'] <= now
-    ]
-    for reservation_id in expired:
-        reservation = _vmid_reservations.pop(reservation_id)
-        logger.warning(
-            "Expired leaked VMID reservation %s (%s)",
-            reservation_id,
-            sorted(reservation['vmids']),
-        )
-    return {
-        vmid
-        for reservation in _vmid_reservations.values()
-        for vmid in reservation['vmids']
-    }
+def _purge_expired_vmid_reservations(conn, now: float) -> None:
+    expired = conn.execute(
+        select(_VMID_RESERVATIONS.c.reservation_id,
+               _VMID_RESERVATIONS.c.vmid)
+        .where(_VMID_RESERVATIONS.c.expires_at <= now)).all()
+    if not expired:
+        return
+    leaked: Dict[str, List[int]] = {}
+    for reservation_id, vmid in expired:
+        leaked.setdefault(reservation_id, []).append(vmid)
+    for reservation_id, vmids in leaked.items():
+        logger.warning("Expired leaked VMID reservation %s (%s)",
+                       reservation_id, sorted(vmids))
+    conn.execute(delete(_VMID_RESERVATIONS)
+                 .where(_VMID_RESERVATIONS.c.expires_at <= now))
+
+
 def is_vmid_reserved(vmid: int) -> bool:
-    """Return whether an unexpired in-process create owns ``vmid``."""
+    """Return whether an unexpired create in any worker owns ``vmid``.
+
+    Fails closed: if the ledger cannot be read, the orphan reaper must keep
+    the guest.
+    """
     try:
         normalized_vmid = int(vmid)
     except (TypeError, ValueError):
         return False
-    now = time.monotonic()
-    with _vmid_reservations_lock:
-        return normalized_vmid in _reserved_vmids_locked(now)
-
-
+    now = coordination.lease_clock()
+    try:
+        with coordination.current_engine().connect() as conn:
+            row = conn.execute(
+                select(_VMID_RESERVATIONS.c.vmid)
+                .where(_VMID_RESERVATIONS.c.vmid == normalized_vmid,
+                       _VMID_RESERVATIONS.c.expires_at > now)).first()
+    except SQLAlchemyError:
+        logger.warning("Could not read VMID reservations; treating VM %s as "
+                       "reserved", normalized_vmid, exc_info=True)
+        return True
+    return row is not None
 
 
 def _clear_node_reservations() -> None:
-    """Clear process-local reservations (used to isolate deterministic tests)."""
-    with _node_reservations_lock:
-        _node_reservations.clear()
+    """Clear admission reservations (used to isolate deterministic tests)."""
+    coordination.reset_for_tests([_NODE_RESERVATIONS])
 
 
 def release_node_reservation(reservation_id: Optional[str]) -> bool:
     """Release a pending admission reservation after success or failure."""
     if not reservation_id:
         return False
-    with _node_reservations_lock:
-        return _node_reservations.pop(reservation_id, None) is not None
+    return coordination.release_lease(_NODE_RESERVATIONS, reservation_id)
 
 
 def renew_node_reservation(reservation_id: Optional[str]) -> bool:
     """Keep an active creation reservation alive for another TTL window."""
     if not reservation_id:
         return False
-    now = time.monotonic()
-    with _node_reservations_lock:
-        reservation = _node_reservations.get(reservation_id)
-        if reservation is None:
-            return False
-        if reservation['expires_at'] <= now:
-            _node_reservations.pop(reservation_id)
-            return False
-        reservation['expires_at'] = now + RESERVATION_TTL_SECONDS
-        return True
+    return coordination.renew_lease(
+        _NODE_RESERVATIONS, reservation_id, RESERVATION_TTL_SECONDS)
 
 
-def _reservation_totals_locked(now: float) -> Dict[str, int]:
-    expired = [
-        reservation_id
-        for reservation_id, reservation in _node_reservations.items()
-        if reservation['expires_at'] <= now
-    ]
-    for reservation_id in expired:
-        reservation = _node_reservations.pop(reservation_id)
+def _reservation_totals_locked(conn, now: float) -> Dict[str, int]:
+    table = _NODE_RESERVATIONS
+    expired = conn.execute(
+        select(table.c.reservation_id, table.c.node, table.c.memory_bytes)
+        .where(table.c.expires_at <= now)).all()
+    for reservation_id, node, memory_bytes in expired:
         logger.warning(
             "Expired leaked admission reservation %s on %s (%.2fGB)",
-            reservation_id, reservation['node'],
-            reservation['memory_bytes'] / (1024 ** 3))
+            reservation_id, node, memory_bytes / (1024 ** 3))
+    if expired:
+        conn.execute(delete(table).where(table.c.expires_at <= now))
 
-    totals: Dict[str, int] = {}
-    for reservation in _node_reservations.values():
-        node = reservation['node']
-        totals[node] = totals.get(node, 0) + reservation['memory_bytes']
-    return totals
+    rows = conn.execute(
+        select(table.c.node, func.sum(table.c.memory_bytes))
+        .group_by(table.c.node)).all()
+    return {node: int(total) for node, total in rows}
 
 
 def _apply_memory_admission(
@@ -215,15 +261,20 @@ def _apply_memory_admission(
     return annotated
 
 
-def _load_live_vm_records() -> List[Any]:
-    # Direct selection unit tests have no Flask context and supply no records.
-    # Every production create worker enters a fresh app context so its query
-    # sees VMRecords committed immediately before reservation release.
-    from flask import has_app_context
-    if not has_app_context():
+def _load_live_vm_records(conn) -> List[Any]:
+    # Read inside the admission transaction, which began after the admission
+    # lock: every VMRecord committed before another worker released its
+    # reservation is visible, so that memory is counted once, not zero times.
+    # The process-local store (no app context) has no VMRecords.
+    if not coordination.is_application_database(conn.engine):
         return []
-    from .models import VMRecord
-    return VMRecord.query.filter_by(destroyed=False).all()
+    records = VMRecord.__table__
+    return conn.execute(
+        select(records.c.vmid, records.c.node, records.c.memory,
+               records.c.destroyed)
+        .where(records.c.destroyed == False)).all()  # noqa: E712
+
+
 def is_proxmox_not_found(exc: Exception) -> bool:
     """Return whether an error hints that the requested VM may be absent.
 
@@ -546,9 +597,11 @@ def get_next_available_vmid(
         reservation_id: str) -> int:
     """Reserve and return the first VMID in a contiguous free block.
 
-    The lock covers the inventory reads and ledger insert. Without that
-    atomic boundary, different students can observe the same maximum before
-    either clone becomes visible in Proxmox or the database.
+    The block comes from one transaction holding the allocator row, which
+    also stores the high-water mark, so two workers or greenlets can never
+    receive overlapping blocks. The mark, not the inventory snapshot,
+    serializes the app's own allocations; the Proxmox read therefore runs
+    before the lock and never holds it across a network call.
 
     ``reservation_id`` may be reused to extend a deployment's reservation
     when a defensive duplicate-VMID retry needs a fresh ID. Callers release
@@ -559,44 +612,52 @@ def get_next_available_vmid(
     if not reservation_id:
         raise ValueError('VMID reservation identifier is required')
 
-    global _vmid_high_water_mark
-    now = time.monotonic()
-    with _vmid_reservations_lock:
-        reserved_vmids = _reserved_vmids_locked(now)
-
-        rows = proxmox.cluster.resources.get(type='vm')
-        max_vmid = _vmid_high_water_mark
-        for row in rows or []:
-            try:
-                max_vmid = max(max_vmid, int(row['vmid']))
-            except (KeyError, TypeError, ValueError):
-                continue
-
-        # Destroyed rows remain unique-indexed, so the database is part of the
-        # allocation namespace even after the Proxmox guest is gone.
+    inventory_max = 0
+    for row in proxmox.cluster.resources.get(type='vm') or []:
         try:
-            from .models import db, VMRecord
-            db_max = db.session.query(db.func.max(VMRecord.vmid)).scalar()
+            inventory_max = max(inventory_max, int(row['vmid']))
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    engine = coordination.current_engine()
+    table = _VMID_RESERVATIONS
+
+    def allocate(conn) -> int:
+        now = coordination.lease_clock()
+        _purge_expired_vmid_reservations(conn, now)
+        max_vmid = max(
+            inventory_max,
+            coordination.read_state(conn, coordination.VMID_ALLOCATOR))
+        # Destroyed rows remain unique-indexed, so the database is part of
+        # the allocation namespace even after the Proxmox guest is gone.
+        if coordination.is_application_database(engine):
+            db_max = conn.execute(
+                select(func.max(VMRecord.__table__.c.vmid))).scalar()
             if db_max is not None:
                 max_vmid = max(max_vmid, int(db_max))
-        except Exception:
-            # Scripts without an app context can still allocate safely against
-            # Proxmox plus the process-local ledger.
-            pass
+        reserved_max = conn.execute(select(func.max(table.c.vmid))).scalar()
+        if reserved_max is not None:
+            max_vmid = max(max_vmid, int(reserved_max))
 
-        if reserved_vmids:
-            max_vmid = max(max_vmid, max(reserved_vmids))
         base_vmid = max_vmid + 1
-        block = set(range(base_vmid, base_vmid + count))
+        expires_at = now + RESERVATION_TTL_SECONDS
+        conn.execute(insert(table), [
+            {'vmid': vmid, 'reservation_id': reservation_id,
+             'expires_at': expires_at}
+            for vmid in range(base_vmid, base_vmid + count)
+        ])
+        # A reused identifier keeps one expiry for all of its VMIDs.
+        conn.execute(
+            update(table)
+            .where(table.c.reservation_id == reservation_id)
+            .values(expires_at=expires_at))
+        coordination.write_state(
+            conn, coordination.VMID_ALLOCATOR, base_vmid + count - 1)
+        return base_vmid
 
-        reservation = _vmid_reservations.get(reservation_id)
-        if reservation is None:
-            reservation = {'vmids': set(), 'expires_at': 0.0}
-            _vmid_reservations[reservation_id] = reservation
-        reservation['vmids'].update(block)
-        reservation['expires_at'] = now + RESERVATION_TTL_SECONDS
-        _vmid_high_water_mark = base_vmid + count - 1
-
+    base_vmid = coordination.run_locked(
+        engine, coordination.VMID_ALLOCATOR, allocate)
+    coordination.remember_lease_engine(table, reservation_id, engine)
     return base_vmid
 
 
@@ -679,7 +740,13 @@ def get_node_resources(proxmox: ProxmoxAPI, node_name: str) -> Dict[str, Any]:
         # MemAvailable, while retaining the old memory_free key as an alias
         # because the admin JSON endpoint already exposes that name.
         memory_linux_free = memory.get('free', 0)
-        memory_available = memory.get('available', memory_total - memory_used)
+        # A missing or null 'available' falls back to total - used; a real 0
+        # stays 0. Clamp bad data into [0, total] so a corrupt report can
+        # neither go negative nor claim more memory than the node has.
+        memory_available = memory.get('available')
+        if memory_available is None:
+            memory_available = memory_total - memory_used
+        memory_available = max(0, min(memory_available, memory_total))
         memory_usage = (memory_used / memory_total * 100) if memory_total > 0 else 0
         
         # Node is online if we can get its status and it has valid uptime
@@ -773,7 +840,7 @@ def _filter_suitable_nodes(all_nodes: List[Dict[str, Any]],
 
         # Preserve the existing 10% headroom, but apply it to effective
         # availability after app-owned ramp-up commitments and reservations.
-        required_memory_bytes = required_memory_mb * 1024 * 1024 * 1.1
+        required_memory_bytes = max(0, required_memory_mb) * 1024 * 1024 * 1.1
         effective = node.get(
             'memory_effective_available',
             node.get('memory_available', node.get('memory_free', 0)))
@@ -945,17 +1012,25 @@ def select_best_node(proxmox: ProxmoxAPI,
             return None
 
 
-    required_memory_bytes = required_memory_mb * 1024 * 1024
-    now = time.monotonic()
-    with _node_reservations_lock:
-        if reservation_id and reservation_id in _node_reservations:
+    # A negative size must never become a negative reservation, which would
+    # hand capacity to every later caller.
+    required_memory_bytes = max(0, required_memory_mb) * 1024 * 1024
+    engine = coordination.current_engine()
+    reservations = _NODE_RESERVATIONS
+
+    def admit(conn):
+        now = coordination.lease_clock()
+        if reservation_id and conn.execute(
+                select(reservations.c.reservation_id)
+                .where(reservations.c.reservation_id == reservation_id)
+        ).first():
             raise ValueError(
                 f"Duplicate node reservation identifier: {reservation_id}")
 
-        reserved_by_node = _reservation_totals_locked(now)
+        reserved_by_node = _reservation_totals_locked(conn, now)
         nodes_with_admission = _apply_memory_admission(
             all_nodes,
-            _load_live_vm_records(),
+            _load_live_vm_records(conn),
             guest_resources,
             reserved_by_node,
         )
@@ -976,8 +1051,7 @@ def select_best_node(proxmox: ProxmoxAPI,
             nodes_with_admission, required_memory_mb, required_cores,
             cpu_threshold, memory_threshold)
         if not suitable_nodes:
-            logger.info("No suitable nodes found")
-            return None
+            return None, []
 
         scored_nodes = _score_nodes(suitable_nodes)
         best_node = (
@@ -986,11 +1060,22 @@ def select_best_node(proxmox: ProxmoxAPI,
         )
 
         if reservation_id:
-            _node_reservations[reservation_id] = {
-                'node': best_node['node'],
-                'memory_bytes': required_memory_bytes,
-                'expires_at': now + RESERVATION_TTL_SECONDS,
-            }
+            conn.execute(insert(reservations).values(
+                reservation_id=reservation_id,
+                node=best_node['node'],
+                memory_bytes=required_memory_bytes,
+                expires_at=now + RESERVATION_TTL_SECONDS,
+            ))
+        return best_node, scored_nodes
+
+    best_node, scored_nodes = coordination.run_locked(
+        engine, coordination.NODE_ADMISSION, admit)
+    if best_node is None:
+        logger.info("No suitable nodes found")
+        return None
+    if reservation_id:
+        coordination.remember_lease_engine(
+            reservations, reservation_id, engine)
 
     logger.info(
         "Selected node %s (CPU %.1f%%, memory %.1f%%, score %.2f%s)",

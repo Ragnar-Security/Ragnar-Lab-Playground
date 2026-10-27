@@ -9,10 +9,21 @@ backlog = 2048
 
 # Worker processes.
 #
-# Stay at workers=1 on purpose: APScheduler runs the KOTH scoring tick
-# in-process. A second worker would spawn a second scheduler racing the
-# first one — and the in-memory event_bus only fans out to subscribers in
-# the same process anyway, so multi-worker would also break SSE delivery.
+# Stay at workers=1 on purpose. This state still lives in one process:
+#   - APScheduler runs the KOTH scoring tick in-process. A second worker
+#     would spawn a second scheduler racing the first one.
+#   - The in-memory event_bus only fans SSE out to subscribers in the same
+#     process, so multi-worker would break SSE delivery.
+#   - The orphan reaper's sweep schedule, so every worker would sweep.
+#   - The note_vm_state sighting counters that reconcile and /list use to
+#     confirm a guest is missing.
+#   - Alert outbox delivery reads pending rows without claiming them, so
+#     every worker's expiry loop would send each alert.
+#
+# Node-memory admission, VMID allocation, VM lifecycle locks, the
+# password-reset limiter (app/coordination.py) and the untracked-survivors
+# file (fcntl.flock) are coordinated across processes. That takes them off
+# this list; it does not make a second worker safe.
 #
 # worker_class=gevent: each open SSE client (KOTH live scoreboard) used
 # to cost one OS thread (~8 MB stack + 1 FD). With 22 teams × 2-3 tabs

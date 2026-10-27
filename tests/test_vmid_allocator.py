@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from flask import Flask
 
-from app.models import VMRecord, db
+from app.models import VMIDReservation, VMRecord, db
 from app import proxmox_service
 from app.routes.vm_creation import DeployFailed, deploy_bundle
 
@@ -205,12 +205,12 @@ class VMIDAllocatorTestCase(unittest.TestCase):
 
     def test_expired_reservation_does_not_lower_process_high_water_mark(self):
         proxmox = FakeProxmox()
-        with patch('app.proxmox_service.time.monotonic',
+        with patch('app.proxmox_service.time.time',
                    return_value=10.0):
             first = proxmox_service.get_next_available_vmid(
                 proxmox, count=1, reservation_id='leaked')
         with patch(
-            'app.proxmox_service.time.monotonic',
+            'app.proxmox_service.time.time',
             return_value=10.0 + proxmox_service.RESERVATION_TTL_SECONDS + 1,
         ):
             replacement = proxmox_service.get_next_available_vmid(
@@ -286,7 +286,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
 
         self.assertEqual([record.vmid for record in records],
                          [9707, 9708, 9709])
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_duplicate_clone_retries_once_with_fresh_reservation(self):
         original_clone = self.proxmox.clone
@@ -325,7 +325,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
 
         self.assertEqual([record.vmid for record in records], [9709])
         self.assertEqual(self.proxmox.clone_attempts, [9707, 9709])
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_duplicate_clone_is_retried_only_once(self):
         def duplicate(vmid, name):
@@ -347,7 +347,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
         self.assertNotIn('vmid', failed_results[0])
         self.assertEqual(VMRecord.query.count(), 0)
         self.assertEqual(self.proxmox.clone_attempts, [9707, 9708])
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_failed_bundle_releases_vmid_reservation_after_cleanup(self):
         def fail_clone(vmid, name):
@@ -360,7 +360,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
             with self.assertRaises(DeployFailed):
                 self._deploy([self.template])
 
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_node_enumeration_failure_releases_vmid_reservation(self):
         with patch('app.proxmox_service.ProxmoxAPI',
@@ -374,7 +374,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
                     RuntimeError, 'node inventory unavailable'):
                 self._deploy([self.template])
 
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_executor_setup_failure_releases_vmid_reservation(self):
         with patch('app.proxmox_service.ProxmoxAPI',
@@ -386,7 +386,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'executor unavailable'):
                 self._deploy([self.template])
 
-        self.assertEqual(proxmox_service._vmid_reservations, {})
+        self.assertEqual(VMIDReservation.query.count(), 0)
 
     def test_five_students_deploy_concurrently_with_distinct_vmids(self):
         barrier = threading.Barrier(self.STUDENT_COUNT)

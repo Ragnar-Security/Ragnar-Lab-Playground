@@ -35,6 +35,8 @@ jumpbox-credentials*.csv
 *.db
 *.sqlite
 instance/
+# Failed-deploy survivors recorded during a database outage (student logins).
+data/untracked-survivors.jsonl*
 
 # Backups and dumps.
 backups/

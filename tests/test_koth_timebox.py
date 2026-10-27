@@ -11,11 +11,17 @@ assert on the stored values and on the actual auto-end, not on display.
 """
 
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from app import create_app, koth_scorer
 from app.models import db, User, StudentGroup, KothGame, KothTeam, KothBox
+
+
+def _naive_utc():
+    """The old `utcnow()` value, spelled without the deprecated API. The
+    mixed-convention tests need a UTC-stamped naive datetime on purpose."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _skew():
@@ -26,7 +32,7 @@ def _skew():
     and the mixed-convention assertions are the ones that actually catch
     a regression on a non-UTC host.
     """
-    return (datetime.now() - datetime.utcnow()).total_seconds()
+    return (datetime.now() - _naive_utc()).total_seconds()
 
 
 class TimeboxTestCase(unittest.TestCase):
@@ -131,7 +137,7 @@ class TimeboxTestCase(unittest.TestCase):
             self.skipTest('host runs on UTC; the two conventions coincide')
         from app.routes.koth_admin import _compute_ends_at
         g = self._game(duration_minutes=1,
-                       started_at=datetime.utcnow() - timedelta(minutes=2))
+                       started_at=_naive_utc() - timedelta(minutes=2))
         g.ends_at = _compute_ends_at(g)
         db.session.commit()
         koth_scorer.run_tick(g.id)

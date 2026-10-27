@@ -27,12 +27,103 @@ logger = logging.getLogger(__name__)
 # Create blueprint
 vm_lifecycle_bp = Blueprint('vm_lifecycle', __name__)
 
+DEPLOYMENT_SCOPES = ('', 'individual', 'group')
+
+
+def _select_deployment(user, action):
+    """Find the live records of the one deployment a My Labs card names.
+
+    Returns (vm_records, deployment_group_name, error_response); when
+    error_response is set, nothing was selected and the route returns it.
+
+    One name can cover several deployments: a student's own lab and their
+    group's lab may share it, a student who changed groups still matches
+    the old group's lab through created_by_user_id, and for an admin a group
+    slug may equal a student's name. deployment_scope and group_id pick one
+    of them. A request that still names more than one is refused rather
+    than applied to all of them.
+    """
+    deployment_group_name = request.form.get('deployment_group', '').strip()
+    student_name = request.form.get('student_name', '').strip()
+    deployment_scope = request.form.get('deployment_scope', '').strip().lower()
+    raw_group_id = request.form.get('group_id', '').strip()
+
+    def refuse(message, status=200):
+        return [], deployment_group_name, (
+            jsonify({'success': False, 'error': message}), status)
+
+    if not deployment_group_name:
+        return refuse('Deployment group name required')
+    if deployment_scope not in DEPLOYMENT_SCOPES:
+        return refuse('deployment_scope must be "individual" or "group"')
+    group_id = None
+    if raw_group_id:
+        try:
+            group_id = int(raw_group_id)
+        except ValueError:
+            return refuse('group_id must be a number')
+        if deployment_scope == 'individual':
+            return refuse('group_id names a group deployment, not an '
+                          'individual one')
+    if user.is_admin and not student_name:
+        return refuse(f'Admin must specify student_name to {action} '
+                      'deployment group')
+
+    query = VMRecord.query.filter(
+        VMRecord.template_name.like(f"{deployment_group_name}/%"),
+        VMRecord.destroyed == False,
+    )
+    if user.is_admin:
+        # Without the student filter, an admin acting on one dashboard row
+        # acted on every student's copy of the same lab.
+        query = query.filter(VMRecord.student_name == student_name)
+    else:
+        member_group_ids = [row.group_id for row in
+                            StudentGroupMember.query.filter_by(user_id=user.id).all()]
+        if member_group_ids:
+            query = query.filter(or_(
+                VMRecord.created_by_user_id == user.id,
+                VMRecord.owner_group_id.in_(member_group_ids),
+            ))
+        else:
+            query = query.filter(VMRecord.created_by_user_id == user.id)
+    if deployment_scope == 'individual':
+        query = query.filter(VMRecord.owner_group_id.is_(None))
+    elif deployment_scope == 'group':
+        query = query.filter(VMRecord.owner_group_id.isnot(None))
+    if group_id is not None:
+        query = query.filter(VMRecord.owner_group_id == group_id)
+    vm_records = query.all()
+
+    # Pages loaded before a field existed omit it; such a request is
+    # refused when the name is ambiguous.
+    if len({vm.owner_group_id for vm in vm_records}) > 1:
+        return refuse(f'"{deployment_group_name}" names more than one of '
+                      'your deployments. Reload the page and use the '
+                      f'{action.capitalize()} button on the one you want.')
+
+    if not vm_records:
+        if user.is_admin:
+            return refuse(f'No VMs found for student "{student_name}" in '
+                          f'deployment group "{deployment_group_name}"')
+        return refuse('No VMs found in deployment group '
+                      f'"{deployment_group_name}"')
+
+    if not user.is_admin:
+        for vm_record in vm_records:
+            if not user_can_access_vm(user, vm_record):
+                return refuse(f'You can only {action} your own deployment '
+                              'groups', 403)
+
+    return vm_records, deployment_group_name, None
+
+
 
 @vm_lifecycle_bp.route('/extend', methods=['POST'])
 @login_required
 def extend_vm():
     """
-    Extend VM lifetime for one student's active deployment group.
+    Extend VM lifetime for one student's active deployment.
 
     Non-admin users can only extend VMs they may access. Admin users must
     identify the student whose deployment is being extended.
@@ -40,66 +131,22 @@ def extend_vm():
     Expected form data:
         - deployment_group: str - Deployment group name to extend
         - student_name: str - Student name (required for admins)
+        - deployment_scope: 'individual' | 'group' - which of the same-named
+          deployments to extend
+        - group_id: int - the owning group, for a group deployment
+        See _select_deployment for how these pick one deployment.
 
     Returns:
         JSON: { success: bool, new_expiration: str, extended_count: int }
     """
     user = get_authenticated_user()
-    user_id = user.id
-
-    deployment_group_name = request.form.get('deployment_group', '').strip()
-    student_name = request.form.get('student_name', '').strip()
-    if not deployment_group_name:
-        return jsonify({'success': False, 'error': 'Deployment group name required'})
-
-    if user.is_admin and not student_name:
-        return jsonify({
-            'success': False,
-            'error': 'Admin must specify student_name to extend deployment group',
-        })
 
     try:
-        # Scope the deployment before checking its extension window. Without
-        # the student filter, an admin extending one dashboard row extended
-        # every student's copy of the same lab.
-        if user.is_admin:
-            vm_records = VMRecord.query.filter(
-                VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                VMRecord.student_name == student_name,
-                VMRecord.destroyed == False,
-            ).all()
-        else:
-            member_group_ids = [row.group_id for row in
-                                StudentGroupMember.query.filter_by(user_id=user_id).all()]
-            if member_group_ids:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                    or_(
-                        VMRecord.created_by_user_id == user_id,
-                        VMRecord.owner_group_id.in_(member_group_ids),
-                    ),
-                    VMRecord.destroyed == False,
-                ).all()
-            else:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                    VMRecord.created_by_user_id == user_id,
-                    VMRecord.destroyed == False,
-                ).all()
-
-        if not vm_records:
-            if user.is_admin:
-                return jsonify({
-                    'success': False,
-                    'error': f'No live VMs found for student "{student_name}" in deployment group "{deployment_group_name}"',
-                })
-            return jsonify({'success': False, 'error': f'No VMs found in deployment group "{deployment_group_name}"'})
-
-        # Check authorization for non-admins
-        if not user.is_admin:
-            for vm_record in vm_records:
-                if not user_can_access_vm(user, vm_record):
-                    return jsonify({'success': False, 'error': 'You can only extend your own deployment groups'}), 403
+        # Scope the deployment before checking its extension window.
+        vm_records, deployment_group_name, error = _select_deployment(
+            user, 'extend')
+        if error:
+            return error
 
         # Check if any VM has less than 60 minutes remaining
         can_extend = False
@@ -126,31 +173,50 @@ def extend_vm():
         if deployment_group:
             extend_minutes = deployment_group.get('extend_time_minutes', 1440)
 
-        # Extend all VMs in the deployment group
+        # Extend each VM under its lifecycle lock, re-reading the row first.
+        # The expiry worker decides and destroys under the same lock, so an
+        # extension either commits before its expiry re-check (and the VM
+        # survives) or waits until the destroy finished (and finds no row),
+        # never in between.
         proxmox = get_proxmox_connection()
         extended_count = 0
         new_expiration = None
 
-        for vm_record in vm_records:
-            # Update expiration time
-            new_expiration = vm_record.expires_at + timedelta(minutes=extend_minutes)
-            vm_record.expires_at = new_expiration
+        # Capture identities first: each rollback below expires the loaded
+        # objects, and touching one whose row was retired would raise.
+        targets = [(vm.id, vm.vmid) for vm in vm_records]
+        for record_id, vmid in targets:
+            with vm_lifecycle_lock(vmid):
+                # End MySQL's REPEATABLE READ snapshot under the lock.
+                db.session.rollback()
+                vm_record = db.session.get(VMRecord, record_id)
+                if (vm_record is None or vm_record.destroyed
+                        or vm_record.vmid != vmid):
+                    continue
 
-            # Update VM description in Proxmox
-            try:
-                if vm_record.vm_type == 'lxc':
-                    proxmox.nodes(vm_record.node).lxc(vm_record.vmid).config.put(
-                        description=f"Expires: {new_expiration.isoformat()}"
-                    )
-                else:
-                    proxmox.nodes(vm_record.node).qemu(vm_record.vmid).config.put(
-                        description=f"Expires: {new_expiration.isoformat()}"
-                    )
-                extended_count += 1
-            except Exception as e:
-                logger.warning(f"Warning: Could not update Proxmox description for VM {vm_record.vmid}: {str(e)}")
+                new_expiration = vm_record.expires_at + timedelta(minutes=extend_minutes)
+                vm_record.expires_at = new_expiration
 
-        db.session.commit()
+                # Update VM description in Proxmox
+                try:
+                    if vm_record.vm_type == 'lxc':
+                        proxmox.nodes(vm_record.node).lxc(vm_record.vmid).config.put(
+                            description=f"Expires: {new_expiration.isoformat()}"
+                        )
+                    else:
+                        proxmox.nodes(vm_record.node).qemu(vm_record.vmid).config.put(
+                            description=f"Expires: {new_expiration.isoformat()}"
+                        )
+                    extended_count += 1
+                except Exception as e:
+                    logger.warning(f"Warning: Could not update Proxmox description for VM {vm_record.vmid}: {str(e)}")
+                db.session.commit()
+
+        if new_expiration is None:
+            return jsonify({
+                'success': False,
+                'error': f'No live VMs left to extend in deployment group "{deployment_group_name}"',
+            })
 
         return jsonify({
             'success': True,
@@ -167,71 +233,29 @@ def extend_vm():
 @login_required
 def destroy_vm():
     """
-    Destroy an entire deployment group.
+    Destroy one deployment.
 
-    Non-admin users: Can only destroy their own deployment groups (deployment_group param only)
-    Admin users: Must specify both student_name and deployment_group
+    Non-admin users can only destroy VMs they may access. Admin users must
+    identify the student whose deployment is being destroyed.
 
     Expected form data:
         - deployment_group: str - Deployment group name to destroy (required)
-        - student_name: str - Student name (required for admin, ignored for non-admin)
+        - student_name: str - Student name (required for admins)
+        - deployment_scope: 'individual' | 'group' - which of the same-named
+          deployments to destroy
+        - group_id: int - the owning group, for a group deployment
+        See _select_deployment for how these pick one deployment.
 
     Returns:
         JSON: { success: bool, output: str, destroyed_count: int }
     """
     user = get_authenticated_user()
-    user_id = user.id
-
-    deployment_group_name = request.form.get('deployment_group', '').strip()
-    student_name = request.form.get('student_name', '').strip()
 
     try:
-        if not deployment_group_name:
-            return jsonify({'success': False, 'error': 'Deployment group name required'})
-
-        # Admin must specify student_name
-        if user.is_admin and not student_name:
-            return jsonify({'success': False, 'error': 'Admin must specify student_name to destroy deployment group'})
-
-        # Find all VMs in this deployment group
-        if user.is_admin:
-            # Admin destroys specific student's deployment group
-            vm_records = VMRecord.query.filter(
-                VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                VMRecord.student_name == student_name,
-                VMRecord.destroyed == False,
-            ).all()
-        else:
-            # Students can destroy their own groups or their group's VMs
-            member_group_ids = [row.group_id for row in
-                                StudentGroupMember.query.filter_by(user_id=user_id).all()]
-            if member_group_ids:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                    VMRecord.destroyed == False,
-                    or_(
-                        VMRecord.created_by_user_id == user_id,
-                        VMRecord.owner_group_id.in_(member_group_ids),
-                    ),
-                ).all()
-            else:
-                vm_records = VMRecord.query.filter(
-                    VMRecord.template_name.like(f"{deployment_group_name}/%"),
-                    VMRecord.destroyed == False,
-                    VMRecord.created_by_user_id == user_id,
-                ).all()
-
-        if not vm_records:
-            if user.is_admin:
-                return jsonify({'success': False, 'error': f'No VMs found for student "{student_name}" in deployment group "{deployment_group_name}"'})
-            else:
-                return jsonify({'success': False, 'error': f'No VMs found in deployment group "{deployment_group_name}"'})
-
-        # Check authorization for non-admins
-        if not user.is_admin:
-            for vm_record in vm_records:
-                if not user_can_access_vm(user, vm_record):
-                    return jsonify({'success': False, 'error': 'You can only destroy your own deployment groups'}), 403
+        vm_records, deployment_group_name, error = _select_deployment(
+            user, 'destroy')
+        if error:
+            return error
 
         proxmox = get_proxmox_connection()
         destroyed_vms = []

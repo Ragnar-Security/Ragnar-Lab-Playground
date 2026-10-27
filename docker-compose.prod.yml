@@ -53,6 +53,16 @@ services:
       - ORPHAN_REAPER_ENABLED=${ORPHAN_REAPER_ENABLED:-true}
       - ORPHAN_REAPER_DRY_RUN=${ORPHAN_REAPER_DRY_RUN:-false}
       - ORPHAN_REAPER_GRACE_MINUTES=${ORPHAN_REAPER_GRACE_MINUTES:-60}
+      # Per-sweep budget so orphan cleanup cannot hold up expiry.
+      - ORPHAN_REAPER_MAX_PASS_SECONDS=${ORPHAN_REAPER_MAX_PASS_SECONDS:-120}
+      - ORPHAN_REAPER_MAX_PASS_GUESTS=${ORPHAN_REAPER_MAX_PASS_GUESTS:-10}
+      # VM lifecycle locks across workers (MySQL GET_LOCK, one extra pool
+      # connection per holder). Must be true before running more than one
+      # gunicorn worker; the default single worker needs only its process lock.
+      - DISTRIBUTED_VM_LOCKS=${DISTRIBUTED_VM_LOCKS:-false}
+      # Failed-deploy survivors recorded while the database was down
+      # (app/untracked_survivors.py). Must stay under /app/data.
+      - UNTRACKED_SURVIVORS_FILE=${UNTRACKED_SURVIVORS_FILE:-}
       # Alert notification settings
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}
@@ -62,6 +72,9 @@ services:
       - ADMIN_ALERT_EMAILS=${ADMIN_ALERT_EMAILS}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
       - ALERT_WEBHOOK_TYPE=${ALERT_WEBHOOK_TYPE}
+      # Per-pass budget so alert delivery cannot hold up expiry.
+      - ALERT_DISPATCH_MAX_PASS_SECONDS=${ALERT_DISPATCH_MAX_PASS_SECONDS:-20}
+      - ALERT_DISPATCH_MAX_PASS_ALERTS=${ALERT_DISPATCH_MAX_PASS_ALERTS:-50}
     volumes:
       - ./data:/app/data
       - type: bind
@@ -112,8 +125,8 @@ services:
     networks:
       - vm-automation
     # max_connections raised from MySQL default (151) so the app's
-    # SQLALCHEMY_ENGINE_OPTIONS pool (50 + 50 overflow = 100) has room
-    # alongside migrations, mysqldump backups, and the occasional manual
+    # SQLALCHEMY_ENGINE_OPTIONS pool (50 + 100 overflow = 150 per worker) has
+    # room alongside migrations, mysqldump backups, and the occasional manual
     # mysql shell session during a class without hitting "Too many connections".
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --max-connections=300
     healthcheck:

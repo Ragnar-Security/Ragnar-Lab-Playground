@@ -105,6 +105,42 @@ MEMORY_THRESHOLD = _env_number('MEMORY_THRESHOLD', '85.0', float)
 ORPHAN_REAPER_ENABLED = (os.environ.get('ORPHAN_REAPER_ENABLED') or 'true').lower() == 'true'
 ORPHAN_REAPER_DRY_RUN = (os.environ.get('ORPHAN_REAPER_DRY_RUN') or 'false').lower() == 'true'
 ORPHAN_REAPER_GRACE_MINUTES = _env_number('ORPHAN_REAPER_GRACE_MINUTES', 60, int)
+# A sweep runs inline in the expiry loop, after that loop's expiry pass. One
+# hung guest can cost 60 s (stop) + 120 s (delete), so a backlog would hold
+# up the next expiry pass. A sweep starts no new guest once it has run
+# MAX_PASS_SECONDS or acted on MAX_PASS_GUESTS; the rest wait for the next
+# sweep. Worst-case sweep length: MAX_PASS_SECONDS + 180 s.
+ORPHAN_REAPER_MAX_PASS_SECONDS = _env_number('ORPHAN_REAPER_MAX_PASS_SECONDS', 120, int)
+ORPHAN_REAPER_MAX_PASS_GUESTS = _env_number('ORPHAN_REAPER_MAX_PASS_GUESTS', 10, int)
+
+# ============ ALERT OUTBOX CONFIGURATION ============
+# Alert delivery runs inline in the expiry loop, after expiry and reconcile.
+# A pass starts no new alert once it has run MAX_PASS_SECONDS or attempted
+# MAX_PASS_ALERTS; the rest stay due, attempts unchanged, for the next pass.
+# One alert can still take its own channels' timeouts (email 10 s per SMTP
+# step, webhook 10 s) past the budget.
+ALERT_DISPATCH_MAX_PASS_SECONDS = _env_number('ALERT_DISPATCH_MAX_PASS_SECONDS', 20, int)
+ALERT_DISPATCH_MAX_PASS_ALERTS = _env_number('ALERT_DISPATCH_MAX_PASS_ALERTS', 50, int)
+
+# ============ VM LIFECYCLE LOCKS ============
+# Off (default): vm_lifecycle_lock is a process lock, which excludes every
+# other holder while gunicorn runs one worker. On: each holder also takes
+# MySQL GET_LOCK on a second pool connection, so workers exclude each other.
+# MUST be true before running more than one worker; otherwise two workers
+# can stop, delete or retire the same VMID at once.
+DISTRIBUTED_VM_LOCKS = (os.environ.get('DISTRIBUTED_VM_LOCKS') or 'false').lower() == 'true'
+
+
+def untracked_survivors_file():
+    """Append-only JSONL of failed-deploy survivors whose VMRecord could not be
+    committed. It must live on persistent storage; the default is the
+    bind-mounted data/ directory. Read per call so tests can redirect it."""
+    path = Path(os.getenv('UNTRACKED_SURVIVORS_FILE')
+                or 'data/untracked-survivors.jsonl')
+    if not path.is_absolute():
+        path = APP_ROOT / path
+    return str(path)
+
 
 # ============ DATABASE CONFIGURATION ============
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///instance/app.db')
@@ -221,13 +257,21 @@ class ProductionConfig(Config):
     # parked a connection. Pair with the explicit db.session.remove() in
     # the SSE handler so this headroom isn't burned by the same bug.
     #
-    # MySQL 8 default max_connections is 151. 80 + 80 = 160 ceiling cuts it
-    # close, so capped at 100 total to leave headroom for migrations,
-    # mysqldump backups, and the second worker process if we ever add one.
-    # pool_pre_ping recycles connections the server closed (wait_timeout).
+    # MySQL 8's default max_connections is 151; docker-compose.prod.yml
+    # raises it to 300. Each lifecycle-lock holder keeps its session
+    # connection checked out through the Proxmox stop and delete (up to
+    # ~180 s), and with DISTRIBUTED_VM_LOCKS a second one for GET_LOCK. A
+    # class-wide destroy wave of 45 students plus the expiry thread is then
+    # 2 * 46 = 92 connections, plus about 45 /list renders that also hold
+    # one across Proxmox calls: ~137. 50 + 100 = 150 covers it; one worker
+    # at a full pool leaves 150 of MySQL's 300 for migrations, mysqldump and
+    # a shell, and two workers at a full pool still fit (300). With the flag
+    # off the same wave needs ~92. tests/test_cross_worker_coordination.py
+    # holds this budget. pool_pre_ping recycles connections the server
+    # closed (wait_timeout).
     SQLALCHEMY_ENGINE_OPTIONS = {
         'pool_size': 50,
-        'max_overflow': 50,
+        'max_overflow': 100,
         'pool_pre_ping': True,
         'pool_recycle': 3600,
         'pool_timeout': 10,

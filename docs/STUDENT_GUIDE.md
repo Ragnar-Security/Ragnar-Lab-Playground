@@ -48,14 +48,16 @@ registration URL from your instructor and verify that Tailscale reports
 
 ### Step 3: Verify Connection
 
-Once connected, locate the lab jumpbox in your Tailscale network and note
-the hostname or VPN address provided by your instructor.
+Once connected, your computer can reach the lab networks (`10.x.x.x`)
+directly. The lab jumpbox routes that traffic for you.
 
 ---
 
 ## Accessing the Jumpbox via SSH
 
-The jumpbox is your gateway to lab resources.
+Skip this section unless your instructor gave you a jumpbox account. Most
+courses do not use jumpbox accounts: connect straight to your VM's IP from
+your own computer while Tailscale is connected.
 
 ### Your Credentials
 
@@ -167,7 +169,12 @@ If your lab has less than 60 minutes remaining:
 
 ### Connecting to Your Lab
 
-**Via SSH from the Jumpbox:**
+**Directly over the VPN** (with Tailscale connected):
+```bash
+ssh <vm-username>@<entry-point-ip>
+```
+
+**Via SSH from the Jumpbox** (only if you have a jumpbox account):
 ```bash
 # SSH to jumpbox first
 ssh <your-username>@jumpbox-name
@@ -185,8 +192,8 @@ ssh <vm-username>@<entry-point-ip>
 
 **Example:**
 ```bash
-# From jumpbox
-ssh ubuntu@10.0.X.X
+# Directly, or from the jumpbox
+ssh ubuntu@<entry-point-ip>
 ```
 
 ### Connecting with Remote Desktop

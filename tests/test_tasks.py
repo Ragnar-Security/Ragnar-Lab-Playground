@@ -6,10 +6,11 @@ Tests VM expiration checking, deletion retry logic, and admin alerts
 import pytest
 import os
 import json
+import requests
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from app.tasks import (
-    _stop_vm, _delete_vm, _send_deletion_failure_alert,
+    _stop_vm, _delete_vm,
     _log_alert_to_file, _create_database_alert,
     VM_DELETION_MAX_RETRIES
 )
@@ -315,7 +316,7 @@ class TestAdminAlerts:
                 _send_email_alert(vm_record, message)
                 
                 # Verify SMTP was called
-                mock_smtp.assert_called_once_with('smtp.gmail.com', 587)
+                mock_smtp.assert_called_once_with('smtp.gmail.com', 587, timeout=10)
     
     @patch('app.tasks.requests.post')
     def test_send_webhook_alert_discord(self, mock_post, app):
@@ -443,3 +444,450 @@ class TestVMRecordRetryField:
             vm_dict = vm.to_dict()
             assert 'deletion_retry_count' in vm_dict
             assert vm_dict['deletion_retry_count'] == 3
+
+
+# ---------------------------------------------------------------------------
+# Expiry worker versus concurrent extension / manual deletion
+# ---------------------------------------------------------------------------
+
+import threading
+from contextlib import contextmanager
+
+import app.tasks as vm_tasks
+from app import proxmox_service
+from app.models import User
+from app.proxmox_service import reset_cluster_vm_index
+
+
+class _StopExpiryLoop(BaseException):
+    pass
+
+
+def _run_one_expiry_pass(app):
+    """Run exactly one iteration of the forever-loop expiry worker."""
+    minute_sleeps = 0
+
+    def fake_sleep(seconds):
+        nonlocal minute_sleeps
+        if seconds == 60:
+            minute_sleeps += 1
+            if minute_sleeps == 2:
+                raise _StopExpiryLoop
+
+    with patch("app.tasks.time.sleep", side_effect=fake_sleep):
+        try:
+            vm_tasks.check_and_destroy_expired_vms(app)
+        except _StopExpiryLoop:
+            pass
+
+
+def _cluster_with_guest(mock_api, *, vmid=100, name="student-student-vm"):
+    """ProxmoxAPI boundary fake: one running qemu guest whose tasks succeed."""
+    proxmox = MagicMock()
+    mock_api.return_value = proxmox
+    endpoint = MagicMock(name=f"qemu-{vmid}")
+    endpoint.status.stop.post.return_value = f"stop-{vmid}"
+    endpoint.delete.return_value = f"delete-{vmid}"
+    proxmox.nodes.return_value.qemu.side_effect = lambda requested: endpoint
+    proxmox.cluster.resources.get.return_value = [
+        {"vmid": vmid, "name": name, "node": "pve", "type": "qemu",
+         "status": "running"},
+    ]
+    task = MagicMock()
+    task.status.get.return_value = {"status": "stopped", "exitstatus": "OK"}
+    proxmox.nodes.return_value.tasks.return_value = task
+    reset_cluster_vm_index()
+    return proxmox, endpoint
+
+
+def _student_with_vm(app, *, expires_in):
+    with app.app_context():
+        student = User(login_id="student", full_name="Student")
+        student.set_password("studentpass")
+        db.session.add(student)
+        db.session.flush()
+        vm = VMRecord(
+            vmid=100, vm_name="student-student-vm", vm_type="qemu",
+            node="pve", template_name="homework/vm", student_name="student",
+            created_by_user_id=student.id,
+            expires_at=datetime.now() + expires_in,
+        )
+        db.session.add(vm)
+        db.session.commit()
+        return vm.id
+
+
+def _login_student(client):
+    response = client.post(
+        "/auth/login", json={"login_id": "student", "password": "studentpass"})
+    assert response.status_code == 200
+
+
+class TestExpiryExtensionRace:
+    """ops#38: an extension that lands mid-pass must win over expiry."""
+
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_extension_after_selection_stops_the_destroy(
+            self, mock_api, app, client):
+        vm_id = _student_with_vm(app, expires_in=-timedelta(minutes=5))
+        _, endpoint = _cluster_with_guest(mock_api)
+        selected = threading.Event()
+        extended = threading.Event()
+        real_lock = proxmox_service.vm_lifecycle_lock
+
+        @contextmanager
+        def lock_after_extension(vmid):
+            # The worker has loaded its expired batch; hold it here until
+            # the student's extension has committed.
+            selected.set()
+            extended.wait(timeout=5)
+            with real_lock(vmid):
+                yield
+
+        def worker():
+            with patch("app.tasks.vm_lifecycle_lock",
+                       side_effect=lock_after_extension):
+                _run_one_expiry_pass(app)
+
+        worker_thread = threading.Thread(target=worker)
+        worker_thread.start()
+        try:
+            assert selected.wait(timeout=5), "worker never selected the VM"
+            _login_student(client)
+            response = client.post(
+                "/extend", data={"deployment_group": "homework"})
+        finally:
+            extended.set()
+            worker_thread.join(timeout=10)
+
+        assert response.get_json()["success"] is True
+        endpoint.status.stop.post.assert_not_called()
+        endpoint.delete.assert_not_called()
+        with app.app_context():
+            vm = db.session.get(VMRecord, vm_id)
+            assert vm is not None, "extended VM's record was retired"
+            assert vm.expires_at > datetime.now()
+
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_extend_waits_for_inflight_expiry_destroy(self, mock_api, app):
+        vm_id = _student_with_vm(app, expires_in=-timedelta(minutes=5))
+        _, endpoint = _cluster_with_guest(mock_api)
+        stopping = threading.Event()
+        release_stop = threading.Event()
+        extend_waiting = threading.Event()
+        real_lock = proxmox_service.vm_lifecycle_lock
+        response_data = {}
+
+        def blocking_stop():
+            stopping.set()
+            release_stop.wait(timeout=5)
+            return "stop-100"
+
+        endpoint.status.stop.post.side_effect = blocking_stop
+
+        @contextmanager
+        def observed_lock(vmid):
+            extend_waiting.set()
+            with real_lock(vmid):
+                yield
+
+        def request_extend():
+            with app.test_client() as thread_client:
+                _login_student(thread_client)
+                with patch("app.routes.vm_lifecycle.vm_lifecycle_lock",
+                           side_effect=observed_lock):
+                    response = thread_client.post(
+                        "/extend", data={"deployment_group": "homework"})
+                    response_data.update(response.get_json())
+
+        worker_thread = threading.Thread(
+            target=_run_one_expiry_pass, args=(app,))
+        worker_thread.start()
+        extend_thread = None
+        try:
+            assert stopping.wait(timeout=5), "worker never began the stop"
+            extend_thread = threading.Thread(target=request_extend)
+            extend_thread.start()
+            reached_lock = extend_waiting.wait(timeout=5)
+        finally:
+            release_stop.set()
+            worker_thread.join(timeout=10)
+            if extend_thread is not None:
+                extend_thread.join(timeout=10)
+
+        assert reached_lock, "extend never took the VMID lifecycle lock"
+        assert response_data["success"] is False, (
+            "student was told a VM being destroyed had been extended")
+        endpoint.config.put.assert_not_called()
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is None
+
+
+class TestExpiryNotStarvedByReaper:
+    """ops#46: orphan cleanup must not hold up ordinary expiry."""
+
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_blocked_reaper_does_not_delay_the_expiry_pass(self, mock_api, app):
+        vm_id = _student_with_vm(app, expires_in=-timedelta(minutes=5))
+        _, endpoint = _cluster_with_guest(mock_api)
+        deleted = threading.Event()
+        reaper_entered = threading.Event()
+        release_reaper = threading.Event()
+
+        def record_delete():
+            deleted.set()
+            return "delete-100"
+
+        def blocked_reaper(_proxmox):
+            # Stands in for a backlog of orphans each waiting on a hung task.
+            reaper_entered.set()
+            release_reaper.wait(timeout=5)
+            return []
+
+        endpoint.delete.side_effect = record_delete
+
+        def worker():
+            with patch("app.tasks.maybe_reap_orphaned_vms",
+                       side_effect=blocked_reaper):
+                _run_one_expiry_pass(app)
+
+        worker_thread = threading.Thread(target=worker)
+        worker_thread.start()
+        try:
+            expired_while_reaper_blocked = deleted.wait(timeout=5)
+        finally:
+            release_reaper.set()
+            worker_thread.join(timeout=10)
+
+        assert expired_while_reaper_blocked, (
+            "expired VM waited behind the orphan reaper")
+        assert reaper_entered.is_set(), "the reaper still runs every pass"
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is None
+
+
+def _queue_webhook_alerts(app, count):
+    from tests.test_alert_outbox import _queue_alerts
+    with app.app_context():
+        _queue_alerts(count)
+
+
+class TestExpiryNotStarvedByAlerts:
+    """Alert delivery must never stand between an expired VM and its destroy."""
+
+    @pytest.fixture(autouse=True)
+    def _webhook_configured(self, monkeypatch):
+        monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hooks.example.edu/a")
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_hung_alert_sends_do_not_delay_the_expiry_pass(
+            self, mock_api, _reaper, app):
+        """A storage fault queued many alerts and the webhook hangs on each."""
+        vm_id = _student_with_vm(app, expires_in=-timedelta(minutes=5))
+        _, endpoint = _cluster_with_guest(mock_api)
+        _queue_webhook_alerts(app, 5)
+        deleted = threading.Event()
+        sending = threading.Event()
+        release_sends = threading.Event()
+
+        def record_delete():
+            deleted.set()
+            return "delete-100"
+
+        def hung_post(url, json=None, timeout=None):
+            sending.set()
+            release_sends.wait(timeout=5)
+            raise requests.Timeout("no answer")
+
+        endpoint.delete.side_effect = record_delete
+
+        def worker():
+            with patch("app.tasks.requests.post", side_effect=hung_post):
+                _run_one_expiry_pass(app)
+
+        worker_thread = threading.Thread(target=worker)
+        worker_thread.start()
+        try:
+            expired_while_sends_hung = deleted.wait(timeout=5)
+        finally:
+            release_sends.set()
+            worker_thread.join(timeout=60)
+
+        assert expired_while_sends_hung, (
+            "expired VM waited behind hung alert sends")
+        assert sending.is_set(), "alerts are still dispatched every pass"
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is None
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.tasks.get_proxmox_connection",
+           side_effect=RuntimeError("Proxmox unreachable"))
+    def test_proxmox_outage_still_delivers_queued_alerts(
+            self, _connect, _reaper, app):
+        """The alerts that matter most during an outage still go out."""
+        from app.models import AlertOutbox
+        _queue_webhook_alerts(app, 1)
+        response = MagicMock()
+        with patch("app.tasks.requests.post",
+                   return_value=response) as post:
+            _run_one_expiry_pass(app)
+        assert post.call_count == 1
+        with app.app_context():
+            assert AlertOutbox.query.one().status == "sent"
+
+
+class TestManualDeletionReconciliation:
+    """ops#43: a guest deleted by hand in Proxmox stops holding capacity."""
+
+    @pytest.fixture(autouse=True)
+    def _immediate_confirmation(self):
+        # Two sightings normally have to be ORPHAN_CONFIRM_SECONDS apart;
+        # the passes below run back to back, so only the count matters here.
+        with patch("app.routes.utils.ORPHAN_CONFIRM_SECONDS", 0.0), \
+                patch.dict("app.routes.utils._missing_since", clear=True):
+            yield
+
+    @staticmethod
+    def _live_vm(app, vmid, name, *, koth=False):
+        with app.app_context():
+            vm = VMRecord(
+                vmid=vmid, vm_name=name, vm_type="qemu", node="pve",
+                template_name="homework/vm", student_name="student",
+                expires_at=datetime.now() + timedelta(hours=2),
+            )
+            db.session.add(vm)
+            db.session.commit()
+            return vm.id
+
+    @staticmethod
+    def _inventory(mock_api, listings):
+        """Each cluster inventory read returns the next listing in turn."""
+        proxmox = MagicMock()
+        mock_api.return_value = proxmox
+        reads = iter(listings)
+
+        def read_inventory(**_kwargs):
+            listing = next(reads)
+            if isinstance(listing, Exception):
+                raise listing
+            return [
+                {"vmid": vmid, "name": name, "node": "pve", "type": "qemu",
+                 "status": "running"}
+                for vmid, name in listing
+            ]
+
+        proxmox.cluster.resources.get.side_effect = read_inventory
+        reset_cluster_vm_index()
+        return proxmox
+
+    @staticmethod
+    def _reconciled_alerts(app):
+        with app.app_context():
+            return [(a.vmid, a.message) for a in
+                    AdminAlert.query.filter_by(
+                        alert_type="vm_record_reconciled").all()]
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_confirmed_absence_retires_record_and_releases_capacity(
+            self, mock_api, _reaper, app):
+        from app.proxmox_service import _load_live_vm_records
+        gone_id = self._live_vm(app, 100, "student-student-gone")
+        kept_id = self._live_vm(app, 101, "student-student-kept")
+        neighbour = [(101, "student-student-kept")]
+        # Pass 1: snapshot + confirmation; pass 2: snapshot + confirmation.
+        proxmox = self._inventory(mock_api, [neighbour] * 4)
+
+        _run_one_expiry_pass(app)
+        with app.app_context():
+            assert db.session.get(VMRecord, gone_id) is not None, (
+                "one sighting must never retire a record")
+        _run_one_expiry_pass(app)
+
+        with app.app_context():
+            assert db.session.get(VMRecord, gone_id) is None
+            assert db.session.get(VMRecord, kept_id) is not None
+            # The retired record no longer counts toward admission.
+            with db.engine.connect() as conn:
+                assert [r.vmid for r in _load_live_vm_records(conn)] == [101]
+        alerts = self._reconciled_alerts(app)
+        assert [vmid for vmid, _ in alerts] == [100]
+        assert "outside the portal" in alerts[0][1]
+        proxmox.nodes.return_value.qemu.return_value.delete.assert_not_called()
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_koth_record_is_marked_destroyed_not_deleted(
+            self, mock_api, _reaper, app):
+        from app.models import KothBox, KothGame
+        with app.app_context():
+            game = KothGame(name="Game", deployment_group_name="koth-lab",
+                            entry_vlan_tag=300, internal_vlan_tag=400)
+            db.session.add(game)
+            db.session.flush()
+            vm = VMRecord(
+                vmid=100, vm_name="koth-box", vm_type="qemu", node="pve",
+                template_name="koth-lab/box", student_name="koth",
+                koth_game_id=game.id,
+                expires_at=datetime.now() + timedelta(hours=2),
+            )
+            db.session.add(vm)
+            db.session.flush()
+            db.session.add(KothBox(game_id=game.id, vm_record_id=vm.id,
+                                   name="box"))
+            db.session.commit()
+            vm_id = vm.id
+        self._inventory(mock_api, [[]] * 4)
+
+        _run_one_expiry_pass(app)
+        _run_one_expiry_pass(app)
+
+        with app.app_context():
+            vm = db.session.get(VMRecord, vm_id)
+            assert vm is not None and vm.destroyed is True
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_transient_inventory_miss_keeps_record(
+            self, mock_api, _reaper, app):
+        vm_id = self._live_vm(app, 100, "student-student-vm")
+        listed = [(100, "student-student-vm")]
+        # Missing, listed again, then missing once more: never two in a row.
+        self._inventory(mock_api, [[], [], listed, [], []])
+
+        for _ in range(3):
+            _run_one_expiry_pass(app)
+
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is not None
+        assert self._reconciled_alerts(app) == []
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_failed_inventory_read_keeps_record(self, mock_api, _reaper, app):
+        vm_id = self._live_vm(app, 100, "student-student-vm")
+        outage = RuntimeError("cluster/resources unavailable")
+        # Snapshot shows it missing, then every confirmation read fails.
+        self._inventory(mock_api, [[], outage, [], outage, [], outage])
+
+        for _ in range(3):
+            _run_one_expiry_pass(app)
+
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is not None
+        assert self._reconciled_alerts(app) == []
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_vmid_reused_by_another_guest_keeps_record(
+            self, mock_api, _reaper, app):
+        """Absence is decided by VMID: a reused VMID is not proof of deletion."""
+        vm_id = self._live_vm(app, 100, "student-student-vm")
+        self._inventory(mock_api, [[(100, "group-team1-other")]] * 4)
+
+        _run_one_expiry_pass(app)
+        _run_one_expiry_pass(app)
+
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is not None

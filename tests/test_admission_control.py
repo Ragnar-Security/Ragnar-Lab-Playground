@@ -174,7 +174,7 @@ class ReservationLedgerTestCase(unittest.TestCase):
     def test_expired_reservation_no_longer_consumes_capacity(self):
         proxmox = _proxmox(available_gib=4)
 
-        with patch('app.proxmox_service.time.monotonic', return_value=10.0):
+        with patch('app.proxmox_service.time.time', return_value=10.0):
             first = select_best_node(
                 proxmox,
                 required_memory_mb=3072,
@@ -184,7 +184,7 @@ class ReservationLedgerTestCase(unittest.TestCase):
                 reservation_id='abandoned',
             )
         with patch(
-            'app.proxmox_service.time.monotonic',
+            'app.proxmox_service.time.time',
             return_value=10.0 + RESERVATION_TTL_SECONDS + 1,
         ):
             replacement = select_best_node(
@@ -202,7 +202,7 @@ class ReservationLedgerTestCase(unittest.TestCase):
     def test_renewal_keeps_an_active_reservation_past_its_original_ttl(self):
         proxmox = _proxmox(available_gib=4)
 
-        with patch('app.proxmox_service.time.monotonic', return_value=10.0):
+        with patch('app.proxmox_service.time.time', return_value=10.0):
             self.assertEqual(
                 select_best_node(
                     proxmox,
@@ -215,12 +215,12 @@ class ReservationLedgerTestCase(unittest.TestCase):
                 'pve',
             )
         with patch(
-            'app.proxmox_service.time.monotonic',
+            'app.proxmox_service.time.time',
             return_value=10.0 + RESERVATION_TTL_SECONDS - 1,
         ):
             self.assertTrue(renew_node_reservation('long-running'))
         with patch(
-            'app.proxmox_service.time.monotonic',
+            'app.proxmox_service.time.time',
             return_value=10.0 + RESERVATION_TTL_SECONDS + 1,
         ):
             contender = select_best_node(

@@ -516,7 +516,7 @@ ports 80 and 443.
 1. **Use version control**: Commit changes frequently
 2. **Never commit .env**: It's in .gitignore for a reason
 3. **Test before pushing**: Verify changes work in development
-4. **Keep dependencies updated**: Regularly update requirements.txt
+4. **Keep dependencies updated**: change `pyproject.toml`, run `uv lock`, then regenerate `requirements.txt` with `uv export --frozen --no-dev --no-emit-project -o requirements.txt` (never hand-edit it)
 5. **Document changes**: Update relevant .md files
 6. **Short VM lifetimes**: Use 8 minutes in dev for quick testing
 7. **Check logs often**: Catch errors early

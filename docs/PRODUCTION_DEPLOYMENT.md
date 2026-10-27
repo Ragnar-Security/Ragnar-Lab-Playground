@@ -431,10 +431,22 @@ the schema is complete before the new code serves its first reset link. On a
 table an earlier release created it also makes `user_id` unique, first
 deleting all but each student's newest link (the ones a newer link had
 already retired, or that the old issuance race left live).
+`migrate_add_coordination_tables.py` adds the tables that hold node-memory
+and VMID reservations, the VMID high-water mark and reset-failure counts, and
+seeds their lock rows. The old code never reads them; the new code would also
+create them at startup, but run it here so the first deploy after the
+restart does not race to create the lock rows. The tables start empty: any
+reservation the old process held disappears with it, exactly as on every
+restart before this release.
+
+`migrate_add_alert_outbox.py` adds the `alert_outbox` table. The new expiry
+loop writes deletion-failure and orphan-reaped alerts there and delivers them
+from it, so the table must exist before the new code's first expiry pass.
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -445,7 +457,8 @@ the migration itself, the file is not there yet. Inject it for this one run:
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration
@@ -511,9 +524,41 @@ docker compose -f docker-compose.prod.yml down && \
   docker compose -f docker-compose.prod.yml up -d --build
 ```
 
-The migrations in this release only ADD columns and an index. The old code
-ignores them. A code rollback alone is therefore sufficient, and the
-database restore is only for a migration that changes existing data.
+The migrations in this release only ADD columns, an index and a table. The old
+code ignores them. A code rollback alone is therefore sufficient, and the
+database restore is only for a migration that changes existing data. The old
+code does not deliver alerts still queued in `alert_outbox`
+(`SELECT * FROM alert_outbox WHERE status = 'pending'`), so read those by hand
+after a rollback.
+
+The old code also never reads the failed-deploy survivor files (see
+[Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage)).
+After a rollback, check for them on the host:
+
+```bash
+ls -l data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing \
+      data/untracked-survivors.jsonl.corrupt 2>/dev/null
+cat data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing 2>/dev/null
+```
+
+`.jsonl` holds lines not yet imported. `.importing` holds lines that an
+import took over but did not finish, usually because the database was down.
+Both can list the same guest. Each line names one guest that may still be
+running with no `vm_records` row, so the old code's expiry loop never
+destroys it. Choose one of these:
+
+- **Redeploying the new release soon:** leave both files. It imports them
+  at startup, skips any vmid that already has a live record, and its
+  expiry loop destroys the rest.
+- **Staying on the old release:** for each line, find the guest in Proxmox
+  by `vmid` and `node`. Remove it by hand only if its name and type match
+  the line; the old code may have given that vmid to a new guest since.
+  Then delete `.jsonl` and `.importing`, so a later upgrade does not import
+  stale lines. The orphan reaper may remove such guests after their
+  `Expires:` time plus grace, but do not rely on it.
+
+The `.lock` and `.import.lock` files beside them are empty lock files. They
+are harmless, and can be deleted whenever the app is stopped.
 
 ### Watch a King of the Hill game
 
@@ -603,6 +648,32 @@ docker compose -f docker-compose.prod.yml logs --tail=100 vm-automation
 # Export logs for analysis
 docker logs proxmox-vm-automation-prod > app-logs-$(date +%Y%m%d).log
 ```
+
+### Failed-deploy survivors recorded during a database outage
+
+A failed deploy can leave a guest that cleanup could not delete. Normally the
+app records it as an already-expired VM and the expiry loop destroys it. If
+the database is down at that moment, the app appends the guest (vmid, node,
+name, type, owner and reason, no credentials) to
+`data/untracked-survivors.jsonl`, mode 0600. `UNTRACKED_SURVIVORS_FILE`
+overrides the path. The file must stay on the persistent `data/` mount, and
+`data/` must be writable by uid 1000. The deploy still fails, and the guest's
+admission reservation stays held until its lease runs out.
+
+At startup and on every expiry pass, the app imports pending lines into the
+database once it answers. It skips vmids that already have a live record,
+then deletes the file. If the database is still down, the file is left for
+the next pass. A line that cannot be parsed is logged and moved to
+`data/untracked-survivors.jsonl.corrupt`. Check each of those guests in
+Proxmox by hand. A log line saying the guests are `UNTRACKED` means the
+file could not be written either. Until someone removes those guests, only
+the orphan reaper (after their `Expires:` time plus grace) will.
+
+Appends and the import hold `flock` locks on the sidecar files
+`data/untracked-survivors.jsonl.lock` and `.import.lock`, so no line is lost
+between processes. Only one process imports at a time; another one skips
+that pass. While an import runs, its lines sit in
+`data/untracked-survivors.jsonl.importing`.
 
 ### Resource Monitoring
 
@@ -774,9 +845,12 @@ docker compose -f docker-compose.prod.yml up -d
 docker compose -f docker-compose.prod.yml pull
 docker compose -f docker-compose.prod.yml up -d --build
 
-# Update Python dependencies
-pip list --outdated
-# Review and update requirements.txt as needed
+# Update Python dependencies. uv.lock is the authority; requirements.txt is
+# generated from it and is what the images install (with --require-hashes).
+uv lock --upgrade-package <name>
+uv export --frozen --no-dev --no-emit-project -o requirements.txt
+# Commit pyproject.toml, uv.lock and requirements.txt together; CI fails if
+# they disagree.
 ```
 
 ## Troubleshooting
@@ -864,7 +938,9 @@ expiry loop and another APScheduler. Restart the existing container instead.
 Production must run exactly one gevent worker, as configured in
 `gunicorn.conf.py`. APScheduler and the SSE event bus both keep state in the
 worker process. More than one worker runs competing schedulers and splits
-SSE delivery across separate subscriber sets.
+SSE delivery across separate subscriber sets. Node-memory admission, VMID
+allocation, VM lifecycle locks and the password-reset limiter are shared
+through the database and are not a reason for the limit.
 
 ### Database Optimization
 

@@ -134,11 +134,12 @@ where:
   `available` overstates headroom for several minutes. Only this app's VMs are
   counted. Instructor VMs started by hand do not shrink student capacity.
 - **reserved.** A class pressing Deploy together would otherwise all read the
-  same snapshot. Selection and reservation happen under one lock. A
-  reservation is released when the VMRecord is committed or cleanup finishes,
-  renewed every minute while a clone waits, and expires after 15 minutes if a
-  code path leaks it. The ledger is in-process, which is valid only because
-  production runs a single gunicorn worker.
+  same snapshot. Selection and reservation happen in one database
+  transaction that locks the admission row. A reservation is released when
+  the VMRecord is committed or cleanup finishes, renewed every minute while a
+  clone waits, and expires after 15 minutes if a code path leaks it. The
+  ledger is the `node_memory_reservations` table, so every gunicorn worker
+  admits against the same reservations.
 
 Each selection logs one line per node:
 
@@ -286,7 +287,9 @@ GET /nodes/resources
       "node": "node1",
       "cpu_usage": 45.32,
       "memory_usage": 62.15,
+      "memory_available_gb": 24.5,
       "memory_free_gb": 24.5,
+      "memory_linux_free_gb": 1.2,
       "memory_total_gb": 64.0,
       "cpu_count": 8,
       "online": true
@@ -295,14 +298,31 @@ GET /nodes/resources
       "node": "node2",
       "cpu_usage": 78.90,
       "memory_usage": 85.30,
+      "memory_available_gb": 4.8,
       "memory_free_gb": 4.8,
+      "memory_linux_free_gb": 0.9,
       "memory_total_gb": 32.0,
       "cpu_count": 4,
       "online": true
     }
-  ]
+  ],
+  "deprecated_fields": {"memory_free_gb": "memory_available_gb"}
 }
 ```
+
+**Memory fields.**
+
+| Field | Meaning |
+|-------|---------|
+| `memory_available_gb` | Proxmox `memory.available` (Linux MemAvailable: free memory plus reclaimable page cache and ZFS ARC). If the node does not report it (field missing or null), `total - used`. Clamped to `[0, memory_total_gb]`; a reported `0` stays `0`. |
+| `memory_free_gb` | **Deprecated.** Despite the name this is *not* Linux MemFree. It is always identical to `memory_available_gb` (same value, same fallback, same clamp). Kept only so existing clients keep working; migrate to `memory_available_gb`. A test pins this equality. |
+| `memory_linux_free_gb` | Real Linux MemFree (`memory.free`). Usually far below available on ZFS hosts. Informational only. |
+
+The endpoint does not report `memory_effective_available`, the figure that
+admission actually uses (`memory_available` minus memory committed by this
+app's still-ramping VMs and pending reservations; see above). Treat
+`memory_available_gb` as the node's raw headroom, not as what the scheduler will
+let you place.
 
 ### Checking Logs
 

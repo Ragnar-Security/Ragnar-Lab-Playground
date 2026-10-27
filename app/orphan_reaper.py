@@ -5,7 +5,6 @@ sweeper only acts when Proxmox still has an app-named guest but no database or
 KOTH reference survived the deploy that created it.
 """
 
-import json
 import logging
 import re
 import threading
@@ -18,8 +17,11 @@ from .config import (
     ORPHAN_REAPER_DRY_RUN,
     ORPHAN_REAPER_ENABLED,
     ORPHAN_REAPER_GRACE_MINUTES,
+    ORPHAN_REAPER_MAX_PASS_GUESTS,
+    ORPHAN_REAPER_MAX_PASS_SECONDS,
 )
-from .models import AdminAlert, KothBox, VMRecord, db
+from .alert_outbox import enqueue_alert
+from .models import KothBox, VMRecord, db
 from .proxmox_service import (
     is_vmid_reserved,
     reset_cluster_vm_index,
@@ -75,16 +77,28 @@ def maybe_reap_orphaned_vms(proxmox, *, monotonic_now=None):
         return []
 
 
-def reap_orphaned_vms(proxmox, *, now=None, grace_minutes=None, dry_run=None):
+def reap_orphaned_vms(proxmox, *, now=None, grace_minutes=None, dry_run=None,
+                      max_seconds=None, max_candidates=None, clock=None):
     """Run one conservative cluster-wide orphan sweep.
 
     Returns one report entry for each guest that reached the stop phase. Guests
     rejected by a safety guard are logged and omitted from the report.
+
+    The sweep starts no further guest once ``max_seconds`` have elapsed or
+    ``max_candidates`` guests reached the stop phase (None: the configured
+    pass budget). Guests left over are found again by the next sweep.
     """
     current_time = datetime.now() if now is None else now
     grace = (ORPHAN_REAPER_GRACE_MINUTES
              if grace_minutes is None else grace_minutes)
     is_dry_run = ORPHAN_REAPER_DRY_RUN if dry_run is None else dry_run
+    budget_seconds = (ORPHAN_REAPER_MAX_PASS_SECONDS
+                      if max_seconds is None else max_seconds)
+    budget_guests = (ORPHAN_REAPER_MAX_PASS_GUESTS
+                     if max_candidates is None else max_candidates)
+    monotonic = time.monotonic if clock is None else clock
+    started = monotonic()
+    attempted = 0
 
     # This direct call is intentionally not served from the shared inventory
     # cache: every destructive sweep needs one coherent, current cluster view.
@@ -140,6 +154,16 @@ def reap_orphaned_vms(proxmox, *, now=None, grace_minutes=None, dry_run=None):
                         vmid, name)
             continue
 
+        # Checked before the first network call for this guest: the expiry
+        # pass of the next loop iteration waits for this sweep to return.
+        elapsed = monotonic() - started
+        if elapsed >= budget_seconds or attempted >= budget_guests:
+            logger.warning(
+                "Orphan reaper stopped this sweep after %.0fs and %d guest(s) "
+                "(budget %ss / %d); remaining guests wait for the next sweep",
+                elapsed, attempted, budget_seconds, budget_guests)
+            break
+
         guest = getattr(proxmox.nodes(node), vm_type)(vmid)
         try:
             vm_config = guest.config.get()
@@ -169,6 +193,7 @@ def reap_orphaned_vms(proxmox, *, now=None, grace_minutes=None, dry_run=None):
             report = _recheck_and_reap(proxmox, guest, resource, vmid, node,
                                        name, vm_type, expires_at, is_dry_run)
         if report is not None:
+            attempted += 1
             reports.append(report)
 
     return reports
@@ -324,26 +349,30 @@ def _has_live_reference(vmid, node, name):
 
 
 def _record_reaped_alert(vmid, name, node, vm_type, expires_at):
-    """Create one admin-visible alert for a VM positively reaped."""
+    """Queue one admin-visible alert for a VM positively reaped.
+
+    Database channel only: the reaper has never emailed or paged anyone.
+    """
     message = (f"Orphan reaper destroyed expired {vm_type} VM {vmid} "
                f"({name}) on node {node}.")
     try:
-        db.session.add(AdminAlert(
+        enqueue_alert(
             alert_type='vm_orphan_reaped',
             severity='warning',
             message=message,
             vmid=vmid,
             vm_name=name,
-            details=json.dumps({
+            details={
                 'vm_type': vm_type,
                 'node': node,
                 'expires_at': expires_at.isoformat(),
-            }),
-        ))
+            },
+            channels=('database',),
+        )
         db.session.commit()
-        logger.info("Orphan reaper created admin alert for VM %s", vmid)
+        logger.info("Orphan reaper queued admin alert for VM %s", vmid)
     except Exception:
         # The VM is already gone. Preserve that truthful outcome while making
         # the lost notification visible to operators in application logs.
         db.session.rollback()
-        logger.exception("Orphan reaper could not create admin alert for VM %s", vmid)
+        logger.exception("Orphan reaper could not queue admin alert for VM %s", vmid)

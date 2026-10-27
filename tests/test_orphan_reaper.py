@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.alert_outbox import dispatch_pending_alerts
 from app.models import AdminAlert, KothBox, KothGame, VMRecord, db
 from app.proxmox_service import (
     _clear_vmid_reservations,
@@ -182,6 +183,7 @@ def test_expired_orphan_is_stopped_deleted_awaited_and_alerted(app, vm_type):
     boundary = ProxmoxBoundary([_resource(vm_type=vm_type)])
     with app.app_context():
         results = _run(boundary)
+        dispatch_pending_alerts()
         alerts = AdminAlert.query.filter_by(alert_type="vm_orphan_reaped").all()
 
     guest = boundary.guests[700]
@@ -227,11 +229,13 @@ def test_active_vmid_reservation_protects_expired_orphan_in_dry_run(app):
     allocator_view.cluster.resources.get.return_value = [{'vmid': 699}]
     _clear_vmid_reservations()
     try:
-        assert get_next_available_vmid(
-            allocator_view,
-            reservation_id='active-create',
-        ) == 700
+        # The create path reserves through the app database, which is what
+        # the reaper (possibly in another worker) reads.
         with app.app_context():
+            assert get_next_available_vmid(
+                allocator_view,
+                reservation_id='active-create',
+            ) == 700
             results = _run(boundary, dry_run=True)
         assert results == []
         boundary.assert_untouched(700)
@@ -405,3 +409,77 @@ def test_periodic_hook_honors_kill_switch_and_ten_minute_throttle(app):
         orphan_reaper.maybe_reap_orphaned_vms(proxmox, monotonic_now=600.0)
         orphan_reaper.maybe_reap_orphaned_vms(proxmox, monotonic_now=601.0)
     assert sweep.call_count == 2
+
+
+class _SlowTaskClock:
+    """Fake monotonic clock that Proxmox task waits advance by their maximum.
+
+    Each orphan's stop and delete waits use their full 60 s / 120 s timeouts,
+    the worst case a hung Proxmox task can cost one sweep.
+    """
+
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def wait_for_task(self, _proxmox, _node, _upid, *, timeout, poll_interval):
+        self.now += timeout
+        return {"success": True, "status": "stopped"}
+
+
+def _many_orphans(count):
+    return ProxmoxBoundary([
+        _resource(vmid=700 + index, name=f"student-s{index}-web")
+        for index in range(count)
+    ])
+
+
+def test_slow_orphans_cannot_hold_a_sweep_past_its_time_budget(app):
+    boundary = _many_orphans(20)
+    clock = _SlowTaskClock()
+    with app.app_context(), patch.object(
+            orphan_reaper, "wait_for_proxmox_task",
+            side_effect=clock.wait_for_task):
+        results = _run(boundary, max_seconds=300, clock=clock)
+
+    # A guest is only started inside the budget; the one in flight when the
+    # budget runs out may finish its own stop (60 s) + delete (120 s) waits.
+    assert clock.now <= 300 + 180
+    assert [r["status"] for r in results] == ["reaped", "reaped"]
+    for vmid in range(702, 720):
+        boundary.assert_untouched(vmid)
+        boundary.guests[vmid].config.get.assert_not_called()
+
+
+def test_sweep_stops_after_its_guest_budget(app):
+    boundary = _many_orphans(20)
+    with app.app_context():
+        results = _run(boundary, max_candidates=3)
+
+    assert [r["vmid"] for r in results] == [700, 701, 702]
+    for vmid in range(703, 720):
+        boundary.assert_untouched(vmid)
+
+
+def test_default_budget_leaves_a_normal_sweep_unchanged(app):
+    boundary = _many_orphans(3)
+    with app.app_context():
+        results = _run(boundary)
+
+    assert [r["status"] for r in results] == ["reaped"] * 3
+
+
+def test_periodic_sweep_honours_configured_guest_budget(app):
+    boundary = _many_orphans(5)
+    with app.app_context(), boundary.connection(), \
+            patch.object(orphan_reaper, "ORPHAN_REAPER_ENABLED", True), \
+            patch.object(orphan_reaper, "ORPHAN_REAPER_MAX_PASS_GUESTS", 2):
+        orphan_reaper.reset_reaper_schedule()
+        results = orphan_reaper.maybe_reap_orphaned_vms(
+            get_proxmox_connection(), monotonic_now=1.0)
+
+    assert [r["vmid"] for r in results] == [700, 701]
+    for vmid in range(702, 705):
+        boundary.assert_untouched(vmid)

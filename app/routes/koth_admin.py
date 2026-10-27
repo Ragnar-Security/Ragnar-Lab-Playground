@@ -1202,7 +1202,7 @@ def diagnostics():
         'scheduler_running': koth_scorer._scheduler is not None,
         'game': None,
     }
-    engine = db.get_engine() if hasattr(db, 'get_engine') else db.engine
+    engine = db.engine
     pool = getattr(engine, 'pool', None)
     if pool is not None and hasattr(pool, 'checkedout'):
         body['db_pool'] = {

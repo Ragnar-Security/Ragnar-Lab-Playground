@@ -584,7 +584,9 @@ def test_portal_roster_is_readable_only_by_its_owner_and_the_app_group(rig):
     tmp = re.search(r"chgrp 1000 (\S+\.tmp)", delivery)
     assert tmp, delivery
     assert f"chmod 640 {tmp.group(1)}" in delivery
-    assert "644" not in delivery
+    # Match the mode, not the digits: temp names carry a timestamp, a PID and
+    # random hex, any of which can contain "644" by chance.
+    assert not re.search(r"chmod\s+0?644\b", delivery), delivery
     assert delivery.index("chmod 640") < delivery.index("mv ")
     assert any(c.startswith("chgrp 1000 ") for c in rig.calls())
 

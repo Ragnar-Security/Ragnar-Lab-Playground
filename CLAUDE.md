@@ -71,7 +71,7 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
   subscriber set. Concurrency comes from greenlets, not threads.
   Configured in `gunicorn.conf.py`.
 - **db** (`mysql:8.0`) — `--max-connections=300` so the SQLAlchemy pool
-  (50 + 50 overflow) plus migrations + backups don't hit the cap.
+  (50 + 100 overflow) plus migrations + backups don't hit the cap.
 - **ulimits**: `nofile: 65536` on `vm-automation` (Docker default of 1024
   was the EMFILE crash root cause).
 
@@ -121,12 +121,27 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
    `docker-compose.test.yml` sets it, because the integration suite signs in
    as `teststudent` with a known password. Production must never seed that
    account. `create_test_student()` refuses to run without the variable.
-10. **Admission, VMID allocation and the password-reset limiter keep
-    in-process ledgers.**
-    `select_best_node` reserves node memory, and VMID allocation reserves
-    ID blocks, each under a module lock with a TTL; the self-service
-    password-reset rate limiter counts failures in process memory. All are
-    correct only with one worker. Node memory is `memory.available` (MemAvailable), never
+10. **Admission, VMID allocation, VM lifecycle locks and the password-reset
+    limiter are shared through the database; the scheduler and SSE bus are
+    not.** `app/coordination.py` keeps node-memory reservations, VMID
+    reservations plus the VMID high-water mark, and reset-failure stamps in
+    tables. Each check-and-reserve runs in one transaction that locks a
+    `coordination_state` row (`SELECT ... FOR UPDATE`). `vm_lifecycle_lock`
+    is a process lock; with `DISTRIBUTED_VM_LOCKS=true` (required before a
+    second worker; default false) it also holds MySQL
+    `GET_LOCK('vm-lifecycle-<database>-<vmid>')` on a dedicated connection,
+    falling back to the process lock during a database outage so cleanup
+    can still remove guests. Re-entering a held VMID raises RuntimeError.
+    That does not make a second worker safe. This state still lives in one
+    process, so `workers` stays 1 (rule 1): APScheduler (rule 6); the SSE
+    event bus fan-out; the orphan reaper's sweep schedule; the
+    `note_vm_state` sighting counters that reconcile and `/list` use to
+    confirm a guest missing; and alert outbox delivery, which reads pending
+    rows without claiming them, so every worker's expiry loop would send
+    each alert. The untracked-survivors file is safe across processes
+    (`fcntl.flock` on sidecar lock files). Leases use `time.time()` epoch
+    seconds, not local DateTimes.
+    Node memory is `memory.available` (MemAvailable), never
     `memory.free`: ZFS ARC and page cache can leave MemFree low even when
     reclaimable memory is available. See `docs/LOAD_BALANCING.md`.
 11. **Logout revokes through `User.session_version`.** Sessions are signed
@@ -137,7 +152,12 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     removes expired `student-`/`group-` guests that have no VMRecord. Keep
     the app naming and the `Expires:` line in clone descriptions stable, or
     it stops recognising (safe) or misjudges (unsafe) guests.
-    `ORPHAN_REAPER_DRY_RUN=true` logs decisions only.
+    `ORPHAN_REAPER_DRY_RUN=true` logs decisions only. A sweep runs after
+    the expiry pass and stops starting guests past
+    `ORPHAN_REAPER_MAX_PASS_SECONDS` / `_GUESTS`, so it cannot starve expiry.
+    Alert outbox delivery follows the same rule: it runs after expiry and
+    reconcile, and stops starting alerts past
+    `ALERT_DISPATCH_MAX_PASS_SECONDS` / `_ALERTS`.
 13. **Site-specific identities and infrastructure never belong in tracked
     files.** Real hosts, domains, usernames, node/storage names, VMIDs, and
     credentials live only in operator-owned `.env`, `templates.yaml`,
@@ -226,6 +246,9 @@ tests/                      # unit tests; tests/integration runs against real Pr
   **Do not append a bare `Z`** — that was the old rule, it asserts UTC
   about a value that is local, and it masked the bug above by making the
   countdown look right while the server-side gate was wrong.
+  The coordination tables' `expires_at` / `failed_at` are not DateTimes:
+  they are `time.time()` epoch seconds in DOUBLE columns, compared across
+  workers and never shown to anyone.
 - **Migrations** must be idempotent (check `information_schema` before
   altering). Filename pattern: `scripts/migrate_<topic>.py`.
 - **`templates.yaml`** is operator-owned, untracked, and bind-mounted
@@ -249,3 +272,6 @@ tests/                      # unit tests; tests/integration runs against real Pr
   snapshot taken with `allow_stale=False` — may trigger cleanup. A deleted
   VM and a corrupted config give the *same* HTTP 500 "does not exist", so
   the config endpoint alone can never answer this question.
+  The expiry loop's `reconcile_missing_vm_records` retires a live record
+  only after that answer held for `ORPHAN_CONFIRM_SECONDS`, the last read
+  under `vm_lifecycle_lock`; any other answer restarts the count.
