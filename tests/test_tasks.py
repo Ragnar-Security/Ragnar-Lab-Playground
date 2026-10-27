@@ -6,6 +6,7 @@ Tests VM expiration checking, deletion retry logic, and admin alerts
 import pytest
 import os
 import json
+import requests
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from app.tasks import (
@@ -315,7 +316,7 @@ class TestAdminAlerts:
                 _send_email_alert(vm_record, message)
                 
                 # Verify SMTP was called
-                mock_smtp.assert_called_once_with('smtp.gmail.com', 587)
+                mock_smtp.assert_called_once_with('smtp.gmail.com', 587, timeout=10)
     
     @patch('app.tasks.requests.post')
     def test_send_webhook_alert_discord(self, mock_post, app):
@@ -663,6 +664,77 @@ class TestExpiryNotStarvedByReaper:
         assert reaper_entered.is_set(), "the reaper still runs every pass"
         with app.app_context():
             assert db.session.get(VMRecord, vm_id) is None
+
+
+def _queue_webhook_alerts(app, count):
+    from tests.test_alert_outbox import _queue_alerts
+    with app.app_context():
+        _queue_alerts(count)
+
+
+class TestExpiryNotStarvedByAlerts:
+    """Alert delivery must never stand between an expired VM and its destroy."""
+
+    @pytest.fixture(autouse=True)
+    def _webhook_configured(self, monkeypatch):
+        monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://hooks.example.edu/a")
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.proxmox_service.ProxmoxAPI")
+    def test_hung_alert_sends_do_not_delay_the_expiry_pass(
+            self, mock_api, _reaper, app):
+        """A storage fault queued many alerts and the webhook hangs on each."""
+        vm_id = _student_with_vm(app, expires_in=-timedelta(minutes=5))
+        _, endpoint = _cluster_with_guest(mock_api)
+        _queue_webhook_alerts(app, 5)
+        deleted = threading.Event()
+        sending = threading.Event()
+        release_sends = threading.Event()
+
+        def record_delete():
+            deleted.set()
+            return "delete-100"
+
+        def hung_post(url, json=None, timeout=None):
+            sending.set()
+            release_sends.wait(timeout=5)
+            raise requests.Timeout("no answer")
+
+        endpoint.delete.side_effect = record_delete
+
+        def worker():
+            with patch("app.tasks.requests.post", side_effect=hung_post):
+                _run_one_expiry_pass(app)
+
+        worker_thread = threading.Thread(target=worker)
+        worker_thread.start()
+        try:
+            expired_while_sends_hung = deleted.wait(timeout=5)
+        finally:
+            release_sends.set()
+            worker_thread.join(timeout=60)
+
+        assert expired_while_sends_hung, (
+            "expired VM waited behind hung alert sends")
+        assert sending.is_set(), "alerts are still dispatched every pass"
+        with app.app_context():
+            assert db.session.get(VMRecord, vm_id) is None
+
+    @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
+    @patch("app.tasks.get_proxmox_connection",
+           side_effect=RuntimeError("Proxmox unreachable"))
+    def test_proxmox_outage_still_delivers_queued_alerts(
+            self, _connect, _reaper, app):
+        """The alerts that matter most during an outage still go out."""
+        from app.models import AlertOutbox
+        _queue_webhook_alerts(app, 1)
+        response = MagicMock()
+        with patch("app.tasks.requests.post",
+                   return_value=response) as post:
+            _run_one_expiry_pass(app)
+        assert post.call_count == 1
+        with app.app_context():
+            assert AlertOutbox.query.one().status == "sent"
 
 
 class TestManualDeletionReconciliation:

@@ -531,6 +531,35 @@ code does not deliver alerts still queued in `alert_outbox`
 (`SELECT * FROM alert_outbox WHERE status = 'pending'`), so read those by hand
 after a rollback.
 
+The old code also never reads the failed-deploy survivor files (see
+[Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage)).
+After a rollback, check for them on the host:
+
+```bash
+ls -l data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing \
+      data/untracked-survivors.jsonl.corrupt 2>/dev/null
+cat data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing 2>/dev/null
+```
+
+`.jsonl` holds lines not yet imported. `.importing` holds lines that an
+import took over but did not finish, usually because the database was down.
+Both can list the same guest. Each line names one guest that may still be
+running with no `vm_records` row, so the old code's expiry loop never
+destroys it. Choose one of these:
+
+- **Redeploying the new release soon:** leave both files. It imports them
+  at startup, skips any vmid that already has a live record, and its
+  expiry loop destroys the rest.
+- **Staying on the old release:** for each line, find the guest in Proxmox
+  by `vmid` and `node`. Remove it by hand only if its name and type match
+  the line; the old code may have given that vmid to a new guest since.
+  Then delete `.jsonl` and `.importing`, so a later upgrade does not import
+  stale lines. The orphan reaper may remove such guests after their
+  `Expires:` time plus grace, but do not rely on it.
+
+The `.lock` and `.import.lock` files beside them are empty lock files. They
+are harmless, and can be deleted whenever the app is stopped.
+
 ### Watch a King of the Hill game
 
 `GET /koth/api/_diag` is admin-only and reports live numbers. Read it during
@@ -639,6 +668,12 @@ the next pass. A line that cannot be parsed is logged and moved to
 Proxmox by hand. A log line saying the guests are `UNTRACKED` means the
 file could not be written either. Until someone removes those guests, only
 the orphan reaper (after their `Expires:` time plus grace) will.
+
+Appends and the import hold `flock` locks on the sidecar files
+`data/untracked-survivors.jsonl.lock` and `.import.lock`, so no line is lost
+between processes. Only one process imports at a time; another one skips
+that pass. While an import runs, its lines sit in
+`data/untracked-survivors.jsonl.importing`.
 
 ### Resource Monitoring
 

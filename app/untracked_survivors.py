@@ -12,12 +12,18 @@ guest: vmid, node, name, type, owner, and the reason. It holds no
 credentials. `recover_untracked_survivors()` runs at startup and on every
 expiry pass. It imports the lines as already-expired VMRecords once the
 database answers, and removes the file only after that commit.
+
+Two sidecar lock files make this safe across processes (`fcntl.flock`):
+`<file>.lock` serializes appends against recovery's hand-off of the file,
+and `<file>.import.lock` lets one importer at a time own `<file>.importing`.
 """
 
+import fcntl
 import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 
 from .config import untracked_survivors_file
@@ -27,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Serializes appends against recovery's hand-off of the file. Never held
 # across a database call, so a hung database cannot stall a failing deploy.
+# The thread lock is taken before the flock: flock() conflicts between two
+# descriptors of one process too, and a greenlet blocked in flock() would
+# stall the whole gevent worker, including the greenlet holding it.
 _file_lock = threading.Lock()
 
 _OPTIONAL_INTS = ('created_by_user_id', 'owner_group_id', 'koth_game_id',
@@ -75,7 +84,7 @@ def record_untracked_survivors(entries, reason):
                    sort_keys=True) + '\n'
         for entry in entries
     ).encode()
-    with _file_lock:
+    with _appending(path):
         _append(path, data)
     return path
 
@@ -86,15 +95,32 @@ def recover_untracked_survivors():
     Returns ``{'imported', 'already_tracked', 'corrupt'}`` (corrupt is a list
     of line numbers), or None when the database could not take the import;
     the lines then stay on disk for the next pass. A vmid that already has a
-    live record is left alone, so a repeated import changes nothing.
+    live record is left alone, so a repeated import changes nothing. While
+    another process or greenlet imports, this returns the empty report at
+    once and leaves the lines for the next pass.
     """
     path = untracked_survivors_file()
-    importing = path + '.importing'
     report = {'imported': 0, 'already_tracked': 0, 'corrupt': []}
+    # The usual case: nothing recorded, so no lock file is created either. A
+    # line appended after this check is picked up by the next pass.
+    if not (os.path.exists(path) or os.path.exists(path + '.importing')):
+        return report
+    # Non-blocking: this lock is held across the database import, and a
+    # greenlet waiting in flock() would stall its whole worker.
+    with _flocked(path + '.import.lock', blocking=False) as owned:
+        if not owned:
+            logger.info("Untracked survivors are being imported elsewhere; "
+                        "skipping this pass")
+            return report
+        return _import(path, report)
+
+
+def _import(path, report):
+    importing = path + '.importing'
 
     # Hand new lines over to the import file under the lock, so an append
     # racing this pass lands in a file that is read in full afterwards.
-    with _file_lock:
+    with _appending(path):
         try:
             with open(path, 'rb') as handle:
                 pending = handle.read()
@@ -143,8 +169,8 @@ def recover_untracked_survivors():
 
     if corrupt_lines:
         rejected = path + '.corrupt'
-        with _file_lock:
-            _append(rejected, b'\n'.join(corrupt_lines) + b'\n')
+        # Only the import-lock holder writes this file.
+        _append(rejected, b'\n'.join(corrupt_lines) + b'\n')
         logger.error("Moved %d corrupt untracked-survivor line(s) to %s; "
                      "check those guests by hand", len(corrupt_lines), rejected)
     os.unlink(importing)
@@ -152,6 +178,32 @@ def recover_untracked_survivors():
         logger.warning("Imported %d untracked failed-deploy survivor(s) for "
                        "immediate expiry", report['imported'])
     return report
+
+
+@contextmanager
+def _appending(path):
+    """Exclusive right to append to `path` or hand it over, across threads,
+    greenlets and processes. Held only for local file I/O."""
+    with _file_lock, _flocked(path + '.lock'):
+        yield
+
+
+@contextmanager
+def _flocked(lock_path, blocking=True):
+    """Hold an exclusive flock() on `lock_path`. Yields False instead when
+    `blocking` is off and another descriptor holds it. The lock file is never
+    removed: unlinking it would let two holders lock different inodes."""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)  # releases the lock
 
 
 def _append(path, data):

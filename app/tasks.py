@@ -154,16 +154,14 @@ def reconcile_missing_vm_records(proxmox):
 ALERT_LOG_FILE = "/app/data/failed_vms.log"
 
 
-def _drain_durable_queues():
-    """Import survivors recorded during a database outage, then deliver
-    queued alerts. Runs before any Proxmox call so a Proxmox outage cannot
-    hold back the alerts that matter most during one."""
-    for step in (recover_untracked_survivors, dispatch_pending_alerts):
-        try:
-            step()
-        except Exception:
-            db.session.rollback()
-            logger.exception("%s failed; retrying next pass", step.__name__)
+def _run_durable_step(step):
+    """Run a durable-queue step (survivor import, alert delivery). Its
+    failure is logged and never ends the expiry pass."""
+    try:
+        step()
+    except Exception:
+        db.session.rollback()
+        logger.exception("%s failed; retrying next pass", step.__name__)
 
 
 def initialize_vm_monitoring(app):
@@ -216,12 +214,15 @@ def check_and_destroy_expired_vms(app):
     logger.info(f"VM expiration checker thread started (Worker: {worker_id}, PID: {os.getpid()})")
     
     while True:
+        alerts_dispatched = False
         try:
             time.sleep(60)  # Check every 60 seconds
             
             with app.app_context():
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Worker {worker_id}] Checking for expired VMs...")
-                _drain_durable_queues()
+                # A survivor recorded while the database was down becomes a
+                # tracked, already-expired VM that this pass destroys.
+                _run_durable_step(recover_untracked_survivors)
 
                 proxmox = get_proxmox_connection()
                 
@@ -312,6 +313,14 @@ def check_and_destroy_expired_vms(app):
 
                 reconcile_missing_vm_records(proxmox)
 
+                # Alert delivery runs after expiry and reconcile and is
+                # time-boxed (ALERT_DISPATCH_MAX_PASS_*): hung SMTP or webhook
+                # sends must never stand between an expired VM and its
+                # destroy. Before the reaper, so an alert raised by this
+                # pass's expiry goes out in this pass.
+                alerts_dispatched = True
+                _run_durable_step(dispatch_pending_alerts)
+
                 # Orphan cleanup runs after expiry and is time-boxed
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
                 # never stand between an expired VM and its destroy.
@@ -321,6 +330,11 @@ def check_and_destroy_expired_vms(app):
             logger.error(f"Error in expiration checker: {str(e)}")
             import traceback
             traceback.print_exc()
+            if not alerts_dispatched:
+                # A Proxmox outage ends the pass before delivery; the alerts
+                # that matter most during one must still go out.
+                with app.app_context():
+                    _run_durable_step(dispatch_pending_alerts)
 
 
 def _stop_vm(proxmox, vm_record):
@@ -487,14 +501,21 @@ def _send_email_alert(vm_record, message):
     try:
         # Get email settings from environment
         smtp_server = os.environ.get('SMTP_SERVER')
-        smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+        smtp_port = os.environ.get('SMTP_PORT', '').strip()
         smtp_username = os.environ.get('SMTP_USERNAME')
         smtp_password = os.environ.get('SMTP_PASSWORD')
         smtp_from = os.environ.get('SMTP_FROM_EMAIL')
         admin_emails = os.environ.get('ADMIN_ALERT_EMAILS', '').split(',')
         
-        if not all([smtp_server, smtp_username, smtp_password, smtp_from]) or not admin_emails[0]:
+        # Compose passes SMTP_PORT=${SMTP_PORT}, so an unset port is ''.
+        if (not all([smtp_server, smtp_port, smtp_username, smtp_password, smtp_from])
+                or not admin_emails[0]):
             logger.info("Email notifications not configured - skipping email alert")
+            return True
+        if not (smtp_port.isascii() and smtp_port.isdigit()):
+            # A retry cannot fix configuration; the file and database
+            # channels still carry the alert.
+            logger.error("SMTP_PORT is not a port number - skipping email alert")
             return True
         
         # Create email
@@ -525,8 +546,9 @@ Please manually delete this VM from the Proxmox web interface or investigate why
         
         msg.attach(MIMEText(body, 'plain'))
         
-        # Send email
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
+        # Send email. The timeout bounds every SMTP step: a blackholed port
+        # would otherwise wait for the kernel's connect timeout (~2 min).
+        with smtplib.SMTP(smtp_server, int(smtp_port), timeout=10) as server:
             server.starttls()
             server.login(smtp_username, smtp_password)
             server.send_message(msg)

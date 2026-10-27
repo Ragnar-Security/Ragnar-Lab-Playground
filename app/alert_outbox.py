@@ -2,7 +2,8 @@
 
 A caller stages an alert with `enqueue_alert()` in the same transaction as
 the state change that raised it, then commits once. `dispatch_pending_alerts()`
-runs from the expiry loop and fans each row out to its channels:
+runs from the expiry loop, after expiry and reconcile, and fans each row out
+to its channels:
 
 - ``file``     -> tasks._log_alert_to_file
 - ``database`` -> an AdminAlert row, committed with the channel's completion
@@ -14,13 +15,19 @@ channel is retried with exponential backoff while the delivered ones are not
 repeated. The database channel is exactly-once; email and webhook are
 at-least-once, because a crash between the remote send and its commit
 resends that one channel on the next pass.
+
+A pass is time-boxed (`ALERT_DISPATCH_MAX_PASS_SECONDS` /
+`ALERT_DISPATCH_MAX_PASS_ALERTS`): a blackholed SMTP port or a hung webhook
+must never hold up the next expiry pass.
 """
 
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
+from .config import ALERT_DISPATCH_MAX_PASS_ALERTS, ALERT_DISPATCH_MAX_PASS_SECONDS
 from .models import AdminAlert, AlertOutbox, db
 
 logger = logging.getLogger(__name__)
@@ -34,7 +41,6 @@ STATUS_ABANDONED = 'abandoned'
 # permanently broken channel stops being attempted.
 MAX_ATTEMPTS = 30
 MAX_BACKOFF_MINUTES = 60
-DISPATCH_BATCH = 50
 
 
 def enqueue_alert(*, alert_type, severity, message, vmid=None, vm_name=None,
@@ -65,20 +71,32 @@ def enqueue_alert(*, alert_type, severity, message, vmid=None, vm_name=None,
     return row
 
 
-def dispatch_pending_alerts(now=None, limit=DISPATCH_BATCH):
+def dispatch_pending_alerts(now=None, *, max_seconds=None, max_alerts=None,
+                            clock=None):
     """Deliver due alerts. Returns how many were fully delivered.
+
+    Starts no further alert once ``max_seconds`` have elapsed or
+    ``max_alerts`` alerts were attempted (None: the configured pass budget).
+    An alert not attempted keeps its attempt count and stays due, so it goes
+    first on the next pass.
 
     Never raises for delivery or database trouble: the rows stay pending and
     the next pass retries them.
     """
     now = now or datetime.now()
+    budget_seconds = (ALERT_DISPATCH_MAX_PASS_SECONDS
+                      if max_seconds is None else max_seconds)
+    budget_alerts = (ALERT_DISPATCH_MAX_PASS_ALERTS
+                     if max_alerts is None else max_alerts)
+    monotonic = time.monotonic if clock is None else clock
+    started = monotonic()
     try:
         rows = (
             AlertOutbox.query
             .filter(AlertOutbox.status == STATUS_PENDING,
                     AlertOutbox.next_attempt_at <= now)
             .order_by(AlertOutbox.id)
-            .limit(limit)
+            .limit(budget_alerts)
             .all()
         )
     except Exception:
@@ -87,7 +105,16 @@ def dispatch_pending_alerts(now=None, limit=DISPATCH_BATCH):
         return 0
 
     delivered = 0
-    for row in rows:
+    for attempted, row in enumerate(rows):
+        # Checked before each alert's first network call.
+        elapsed = monotonic() - started
+        if elapsed >= budget_seconds:
+            logger.warning(
+                "Alert outbox stopped this pass after %.0fs and %d alert(s) "
+                "(budget %ss / %d); %d due alert(s) wait for the next pass",
+                elapsed, attempted, budget_seconds, budget_alerts,
+                len(rows) - attempted)
+            break
         row_id = row.id
         try:
             if _deliver(row, now):

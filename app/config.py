@@ -113,6 +113,15 @@ ORPHAN_REAPER_GRACE_MINUTES = _env_number('ORPHAN_REAPER_GRACE_MINUTES', 60, int
 ORPHAN_REAPER_MAX_PASS_SECONDS = _env_number('ORPHAN_REAPER_MAX_PASS_SECONDS', 120, int)
 ORPHAN_REAPER_MAX_PASS_GUESTS = _env_number('ORPHAN_REAPER_MAX_PASS_GUESTS', 10, int)
 
+# ============ ALERT OUTBOX CONFIGURATION ============
+# Alert delivery runs inline in the expiry loop, after expiry and reconcile.
+# A pass starts no new alert once it has run MAX_PASS_SECONDS or attempted
+# MAX_PASS_ALERTS; the rest stay due, attempts unchanged, for the next pass.
+# One alert can still take its own channels' timeouts (email 10 s per SMTP
+# step, webhook 10 s) past the budget.
+ALERT_DISPATCH_MAX_PASS_SECONDS = _env_number('ALERT_DISPATCH_MAX_PASS_SECONDS', 20, int)
+ALERT_DISPATCH_MAX_PASS_ALERTS = _env_number('ALERT_DISPATCH_MAX_PASS_ALERTS', 50, int)
+
 
 def untracked_survivors_file():
     """Append-only JSONL of failed-deploy survivors whose VMRecord could not be
