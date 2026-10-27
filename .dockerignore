@@ -1,0 +1,46 @@
+# The build context must never carry operator secrets, site data or student
+# records into an image: anything COPY picks up (scripts/, tests/) would be
+# baked into every layer pushed or cached afterwards. Patterns match from the
+# context root; `**/` reaches into subdirectories.
+
+# Environment files, the example included (the image reads its environment
+# from Compose, not from a file).
+.env*
+**/.env*
+
+# Operator-owned deployment files (CLAUDE.md rule 13). The test stack mounts
+# its catalog from tests/fixtures, which stays in the context.
+scripts/site.env
+config/headscale-acl.json
+templates.yaml
+templates.yaml.bak
+
+# Student data, credentials, databases, backups and dumps.
+data/
+backups/
+instance/
+**/*.csv
+**/jumpbox-credentials*
+**/*.sql*
+**/*.db
+**/*.sqlite
+**/*.bak
+**/*.backup
+**/*.dump
+
+# Local tooling and build leftovers.
+.git
+.venv
+venv/
+.claude/
+.worktrees/
+**/__pycache__
+**/*.pyc
+.pytest_cache
+**/.pytest_cache
+
+# Integration-run artifacts (Playwright traces, screenshots, reports).
+test-results/
+playwright-report/
+tests/integration/test-results/
+tests/integration/playwright-report/

@@ -1,0 +1,77 @@
+services:
+  vm-automation:
+    build: .
+    container_name: proxmox-vm-automation
+    ports:
+      - "127.0.0.1:5001:5000"
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=mysql+pymysql://vmuser:vmpassword@db:3306/vmdatabase
+      - MYSQL_HOST=db
+      - MYSQL_DATABASE=vmdatabase
+      - MYSQL_USER=vmuser
+      - MYSQL_PASSWORD=vmpassword
+      - PROXMOX_HOST=${PROXMOX_HOST}
+      - PROXMOX_USER=${PROXMOX_USER}
+      - PROXMOX_PASSWORD=${PROXMOX_PASSWORD}
+      - PROXMOX_TOKEN_ID=${PROXMOX_TOKEN_ID}
+      - PROXMOX_TOKEN_SECRET=${PROXMOX_TOKEN_SECRET}
+      - SECRET_KEY=${SECRET_KEY}
+      - ADMIN_LOGIN_ID=${ADMIN_LOGIN_ID}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ADMIN_USERS=${ADMIN_USERS}
+      - ENABLE_LOAD_BALANCING=${ENABLE_LOAD_BALANCING}
+      - FIXED_NODE=${FIXED_NODE}
+      - CPU_THRESHOLD=${CPU_THRESHOLD}
+      - MEMORY_THRESHOLD=${MEMORY_THRESHOLD}
+      - TEMPLATES_FILE=${TEMPLATES_FILE:-/app/templates.yaml}
+      - SITE_NAME=${SITE_NAME:-}
+      - SITE_BRAND_TAG=${SITE_BRAND_TAG:-}
+      - SITE_ORG=${SITE_ORG:-}
+      - VPN_LOGIN_SERVER=${VPN_LOGIN_SERVER:-}
+      # Alert notification settings
+      - SMTP_SERVER=${SMTP_SERVER}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL}
+      - ADMIN_ALERT_EMAILS=${ADMIN_ALERT_EMAILS}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
+      - ALERT_WEBHOOK_TYPE=${ALERT_WEBHOOK_TYPE}
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env:ro
+      - type: bind
+        source: ./templates.yaml
+        target: /app/templates.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      - db
+    restart: unless-stopped
+    networks:
+      - vm-automation
+
+  db:
+    image: mysql:8.0
+    container_name: mysql-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: vmdatabase
+      MYSQL_USER: vmuser
+      MYSQL_PASSWORD: vmpassword
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+    networks:
+      - vm-automation
+
+networks:
+  vm-automation:
+    driver: bridge
+
+volumes:
+  db_data:

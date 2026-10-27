@@ -1,0 +1,240 @@
+"""Operator scripts must reject incomplete site config before touching hosts."""
+
+import base64
+import os
+import stat
+import subprocess
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+TERM_CHANGEOVER = ROOT / "scripts" / "term_changeover.sh"
+HEADSCALE_CHANGEOVER = ROOT / "scripts" / "headscale_term_changeover.sh"
+JUMPBOX = ROOT / "scripts" / "configure_jumpbox.sh"
+
+TERM_REQUIRED = [
+    "PORTAL_HOST",
+    "PORTAL_DIR",
+    "PORTAL_COMPOSE",
+    "PORTAL_APP_CONTAINER",
+    "HEADSCALE_HOST",
+    "HEADSCALE_DIR",
+    "HEADSCALE_KEEP_USER",
+    "HEADSCALE_STAFF",
+    "EMAIL_DOMAIN",
+    "REMOTE_BACKUP_DIR",
+    "KEY_DAYS",
+]
+HEADSCALE_REQUIRED = [
+    "HEADSCALE_KEEP_USER",
+    "HEADSCALE_STAFF",
+    "EMAIL_DOMAIN",
+    "KEY_DAYS",
+]
+
+
+def _clean_env(tmp_path: Path, **values: str) -> dict[str, str]:
+    env = dict(os.environ)
+    for name in set(TERM_REQUIRED + HEADSCALE_REQUIRED):
+        env.pop(name, None)
+    env.update(values)
+    env.setdefault("SITE_ENV_FILE", str(tmp_path / "missing-site.env"))
+    return env
+
+
+@pytest.mark.parametrize("missing_index", range(len(TERM_REQUIRED)))
+def test_term_changeover_names_each_missing_site_variable(tmp_path, missing_index):
+    supplied = {name: "configured" for name in TERM_REQUIRED[:missing_index]}
+    result = subprocess.run(
+        ["bash", str(TERM_CHANGEOVER)],
+        env=_clean_env(tmp_path, **supplied),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    missing = TERM_REQUIRED[missing_index]
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+@pytest.mark.parametrize("missing_index", range(len(HEADSCALE_REQUIRED)))
+def test_headscale_changeover_names_each_missing_site_variable(tmp_path, missing_index):
+    supplied = {name: "configured" for name in HEADSCALE_REQUIRED[:missing_index]}
+    result = subprocess.run(
+        ["bash", str(HEADSCALE_CHANGEOVER)],
+        env=_clean_env(tmp_path, **supplied),
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    missing = HEADSCALE_REQUIRED[missing_index]
+    assert result.returncode != 0
+    assert missing in result.stderr
+
+
+def test_term_changeover_forwards_headscale_config_to_remote_helper(tmp_path):
+    config = tmp_path / "site.env"
+    config.write_text(
+        "\n".join(
+            [
+                "PORTAL_HOST=portal-host",
+                "PORTAL_DIR=/opt/lab-playground",
+                "PORTAL_COMPOSE=docker-compose.prod.yml",
+                "PORTAL_APP_CONTAINER=lab-playground",
+                "HEADSCALE_HOST=headscale-host",
+                "HEADSCALE_DIR=/opt/headscale",
+                "HEADSCALE_KEEP_USER=keep-user",
+                "HEADSCALE_STAFF='staff-one, staff-two'",
+                "EMAIL_DOMAIN=example.edu",
+                "REMOTE_BACKUP_DIR=/var/backups/lab-playground",
+                "KEY_DAYS=45d",
+            ]
+        )
+        + "\n"
+    )
+    roster = tmp_path / "roster.csv"
+    roster.write_text("SIS User ID,SIS Login ID\n1001,student1\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh_log = tmp_path / "ssh.log"
+    users = base64.b64encode(b'[{"name":"keep-user"},{"name":"staff-two"}]').decode()
+    keys = base64.b64encode(b"student1,student1@example.edu,fake-key\n").decode()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$*\" >> \"$SSH_LOG\"\n"
+        "case \"$*\" in\n"
+        "  *\"python3 -c\"*) printf 'to remove: 0 users\\n' ;;\n"
+        f"  *\"base64 -w0 && printf\"*) printf '%s\\n%s\\n' '{users}' '{keys}' ;;\n"
+        f"  *\"base64 -w0 students_with_keys.csv\"*) printf '%s' '{keys}' ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC)
+
+    env = _clean_env(
+        tmp_path,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        SITE_ENV_FILE=str(config),
+        SSH_LOG=str(ssh_log),
+    )
+    result = subprocess.run(
+        ["bash", str(TERM_CHANGEOVER), str(roster)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert "Headscale counts disagree" not in result.stderr
+    helper_call = next(
+        line for line in ssh_log.read_text().splitlines() if "python3 -c" in line
+    )
+    forwarded = helper_call.replace("\\,", ",").replace("\\ ", " ")
+    assert "HEADSCALE_KEEP_USER=keep-user" in forwarded
+    assert "HEADSCALE_STAFF=staff-one, staff-two" in forwarded
+    assert "EMAIL_DOMAIN=example.edu" in forwarded
+    assert "KEY_DAYS=45d" in forwarded
+
+
+def test_jumpbox_accounts_get_unique_random_passwords_in_private_file(tmp_path):
+    config = tmp_path / "site.env"
+    config.write_text("HEADSCALE_URL=https://vpn.example.edu\n")
+    students = tmp_path / "students.txt"
+    students.write_text("alice\nbob\n")
+    creds = tmp_path / "creds.csv"
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh_log = tmp_path / "ssh.log"
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "#!/bin/sh\n"
+        "printf 'ARGS: %s\\n' \"$*\" >> \"$SSH_LOG\"\n"
+        "for last; do :; done\n"
+        "case \"$last\" in *@192.0.2.50) script_on_stdin=1 ;; esac\n"  # no remote command
+        "if [ -n \"$script_on_stdin\" ]; then\n"
+        "  input=$(cat)\n"
+        "  printf '%s\\n' \"$input\" >> \"$SSH_LOG\"\n"
+        "  case \"$input\" in *useradd*) printf 'CREATED\\n' ;; esac\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    ssh.chmod(ssh.stat().st_mode | stat.S_IEXEC)
+
+    env = _clean_env(
+        tmp_path,
+        PATH=f"{bin_dir}:{os.environ['PATH']}",
+        SITE_ENV_FILE=str(config),
+        SSH_LOG=str(ssh_log),
+        STUDENTS_FILE=str(students),
+        JUMPBOX_CREDENTIALS_FILE=str(creds),
+    )
+    result = subprocess.run(
+        ["bash", str(JUMPBOX), "192.0.2.50"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=tmp_path,
+        input="\n",  # answers the manual Headscale-registration pause
+    )
+
+    sent = ssh_log.read_text()
+    legacy_password = "change" + "me123"  # split so the literal never appears in the repo
+    assert legacy_password not in sent + result.stdout + result.stderr
+    assert "chage -d 0" in sent
+    assert stat.S_IMODE(creds.stat().st_mode) == 0o600
+    rows = [line.split(",") for line in creds.read_text().splitlines()]
+    assert [r[0] for r in rows] == ["alice", "bob"]
+    passwords = [r[1] for r in rows]
+    assert len(set(passwords)) == 2 and all(len(p) >= 12 for p in passwords)
+    for password in passwords:
+        assert password in sent  # delivered to the remote side via stdin
+        assert password not in result.stdout + result.stderr
+        assert not any(
+            password in line for line in sent.splitlines() if line.startswith("ARGS:")
+        )
+    assert str(creds) in result.stdout
+
+
+def test_setup_production_passes_proxmox_credentials_via_environment(tmp_path):
+    """Credentials with quotes/backslashes must reach proxmoxer intact and never be code."""
+    lines = (ROOT / "setup-production.sh").read_text().splitlines()
+    start = next(i for i, l in enumerate(lines) if "Testing Proxmox connection" in l)
+    end = next(i for i, l in enumerate(lines) if l.startswith("# Check templates.yaml"))
+    snippet = "\n".join(lines[start:end])
+
+    stub = tmp_path / "stub"
+    stub.mkdir()
+    out = tmp_path / "seen.txt"
+    (stub / "proxmoxer.py").write_text(
+        "import os\n"
+        "class _V:\n"
+        "    def get(self):\n"
+        "        return {'version': '8'}\n"
+        "class ProxmoxAPI:\n"
+        "    def __init__(self, host, user=None, password=None, verify_ssl=True):\n"
+        f"        open({str(out)!r}, 'w').write(repr((host, user, password)))\n"
+        "        self.version = _V()\n"
+    )
+    evil = "pa'ss\\w\"); import os #"
+    marker = tmp_path / "pwned"
+    evil_user = f"u'\"); open({str(marker)!r}, 'w') #@pam"
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=str(stub),
+        PROXMOX_HOST="h'ost",
+        PROXMOX_USER=evil_user,
+        PROXMOX_PASSWORD=evil,
+    )
+    result = subprocess.run(
+        ["bash", "-c", snippet], env=env, capture_output=True, text=True, cwd=tmp_path
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert out.read_text() == repr(("h'ost", evil_user, evil))
+    assert not marker.exists()

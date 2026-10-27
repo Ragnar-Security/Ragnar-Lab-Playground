@@ -1,0 +1,31 @@
+deployment_groups:
+  - display_name: "Windows Lab"
+    description: >
+      Generic Windows workstation used to exercise the multi-node deployment
+      and RDP connection flow.
+    enabled: true
+    group_mode: false
+    uptime_minutes: 240
+    extend_time_minutes: 120
+    load_balancing:
+      enabled: true
+      cpu_threshold: 80.0
+      memory_threshold: 85.0
+    templates:
+      - name: "windows-workstation"
+        type: "qemu"
+        memory: 6144
+        cores: 4
+        entry_point: true
+        full_clone: true
+        internal_nic: false
+        connect:
+          protocol: "rdp"
+          port: 3389
+          username: "student"
+        storage_locations:
+          node1: "local-zfs"
+          node2: "local-zfs"
+        template_locations:
+          node1: 7101
+          node2: 7201

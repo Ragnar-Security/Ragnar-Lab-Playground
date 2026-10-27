@@ -1,0 +1,164 @@
+services:
+  vm-automation:
+    build:
+      context: .
+      dockerfile: Dockerfile.prod
+    container_name: proxmox-vm-automation-prod
+    expose:
+      - "5000"
+    environment:
+      - FLASK_ENV=production
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER:?Set MYSQL_USER in .env}:${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}@db:3306/${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env}
+      - MYSQL_HOST=db
+      - MYSQL_DATABASE=${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env}
+      - MYSQL_USER=${MYSQL_USER:?Set MYSQL_USER in .env}
+      - MYSQL_PASSWORD=${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+      - PROXMOX_HOST=${PROXMOX_HOST}
+      - PROXMOX_USER=${PROXMOX_USER}
+      - PROXMOX_PASSWORD=${PROXMOX_PASSWORD}
+      - PROXMOX_TOKEN_ID=${PROXMOX_TOKEN_ID}
+      - PROXMOX_TOKEN_SECRET=${PROXMOX_TOKEN_SECRET}
+      - PROXMOX_VERIFY_SSL=${PROXMOX_VERIFY_SSL:-true}
+      # A CA bundle path must exist inside the container; mount the PEM file
+      # read-only under volumes when you set this.
+      - PROXMOX_CA_BUNDLE=${PROXMOX_CA_BUNDLE:-}
+      - SECRET_KEY=${SECRET_KEY:?Set SECRET_KEY in .env}
+      - ADMIN_LOGIN_ID=${ADMIN_LOGIN_ID}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - ADMIN_USERS=${ADMIN_USERS}
+      - ENABLE_LOAD_BALANCING=${ENABLE_LOAD_BALANCING}
+      - FIXED_NODE=${FIXED_NODE}
+      - CPU_THRESHOLD=${CPU_THRESHOLD}
+      - MEMORY_THRESHOLD=${MEMORY_THRESHOLD}
+      - TEMPLATES_FILE=${TEMPLATES_FILE:-/app/templates.yaml}
+      - SITE_NAME=${SITE_NAME:-}
+      - SITE_BRAND_TAG=${SITE_BRAND_TAG:-}
+      - SITE_ORG=${SITE_ORG:-}
+      - VPN_LOGIN_SERVER=${VPN_LOGIN_SERVER:-}
+      - SELF_SERVICE_PASSWORD_RESET=${SELF_SERVICE_PASSWORD_RESET:-false}
+      # Session cookies keep their production defaults (Secure, HttpOnly,
+      # SameSite=Lax): this stack is always served over HTTPS through Caddy,
+      # so the Secure/HttpOnly switches are deliberately not passed through.
+      - SESSION_COOKIE_SAMESITE=${SESSION_COOKIE_SAMESITE:-Lax}
+      - PERMANENT_SESSION_LIFETIME=${PERMANENT_SESSION_LIFETIME:-7200}
+      # Every request reaches the app through Caddy, which appends the client
+      # address to X-Forwarded-For. Without this the password-reset rate
+      # limit would see one client (Caddy) and lock out the whole class.
+      - TRUSTED_PROXY_HOPS=1
+      # Orphan reaper (app/orphan_reaper.py): destroys expired app-named guests
+      # that have no VMRecord. Set DRY_RUN=true to log decisions only.
+      - ORPHAN_REAPER_ENABLED=${ORPHAN_REAPER_ENABLED:-true}
+      - ORPHAN_REAPER_DRY_RUN=${ORPHAN_REAPER_DRY_RUN:-false}
+      - ORPHAN_REAPER_GRACE_MINUTES=${ORPHAN_REAPER_GRACE_MINUTES:-60}
+      # Alert notification settings
+      - SMTP_SERVER=${SMTP_SERVER}
+      - SMTP_PORT=${SMTP_PORT}
+      - SMTP_USERNAME=${SMTP_USERNAME}
+      - SMTP_PASSWORD=${SMTP_PASSWORD}
+      - SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL}
+      - ADMIN_ALERT_EMAILS=${ADMIN_ALERT_EMAILS}
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
+      - ALERT_WEBHOOK_TYPE=${ALERT_WEBHOOK_TYPE}
+    volumes:
+      - ./data:/app/data
+      - type: bind
+        source: ./templates.yaml
+        target: /app/templates.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    # Raise the file-descriptor ulimit well above Docker's 1024 default.
+    # Each open KOTH SSE client (one per student tab) holds a socket FD;
+    # 22 teams × 2-3 tabs plus DB pool + Proxmox API sockets had been
+    # blowing past 1024 and crashing the worker with EMFILE. 65536 is
+    # essentially free (kernel accounting only) and covers any class size.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    networks:
+      - vm-automation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    image: mysql:8.0
+    container_name: mysql-db-prod
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?Set MYSQL_ROOT_PASSWORD in .env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:?Set MYSQL_DATABASE in .env}
+      MYSQL_USER: ${MYSQL_USER:?Set MYSQL_USER in .env}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?Set MYSQL_PASSWORD in .env}
+    # Loopback only. Published Docker ports bypass host firewalls such as ufw,
+    # so a 0.0.0.0 binding would expose MySQL to the internet regardless of
+    # firewall rules. The app reaches the db over the compose network; host
+    # tools (backups, maintenance scripts) connect to 127.0.0.1 on DB_PORT.
+    ports:
+      - "127.0.0.1:${DB_PORT:-3306}:3306"
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./backups:/backups
+    networks:
+      - vm-automation
+    # max_connections raised from MySQL default (151) so the app's
+    # SQLALCHEMY_ENGINE_OPTIONS pool (50 + 50 overflow = 100) has room
+    # alongside migrations, mysqldump backups, and the occasional manual
+    # mysql shell session during a class without hitting "Too many connections".
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --max-connections=300
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      # HTTP/3 (UDP) intentionally NOT mapped. Caddy is configured for h1+h2
+      # only (see Caddyfile global options); leaving the UDP port closed
+      # avoids confusing clients that race-negotiate H3 and then fall back.
+      # Re-enable once we've validated H3 / QUIC stability under classroom load.
+    environment:
+      - SITE_DOMAIN=${SITE_DOMAIN:?Set SITE_DOMAIN in .env}
+      - ACME_EMAIL=${ACME_EMAIL:?Set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - vm-automation
+    depends_on:
+      - vm-automation
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  vm-automation:
+    driver: bridge
+
+volumes:
+  db_data:
+  caddy_data:
+  caddy_config:
+    driver: local

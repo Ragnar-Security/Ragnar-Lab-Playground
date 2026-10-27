@@ -1,0 +1,48 @@
+# Example groups.yaml — upload via the Admin → Groups tab "YAML upload" card.
+# The preview endpoint will diff this against current DB state and show what
+# would be added/updated. Click "Apply" to commit.
+#
+# Schema:
+#   name              slug, [a-z0-9-]+, <= 100 chars, IMMUTABLE after create
+#   display_name      shown in UI; editable later
+#   description       optional
+#   members           list of login_ids (User or StudentWhitelist). Unknown -> warning.
+#   entry_vlan_tag    optional; auto-allocated from group pool if omitted
+#   internal_vlan_tag optional; must be set together with entry_vlan_tag if used
+#
+# Notes:
+#   - A login_id can only appear in ONE group across this file (duplicate -> error).
+#   - Logins that don't match an existing User or whitelisted student come back
+#     as warnings, not errors, so you can dry-run with placeholder names.
+#   - Any student who is a member of any group can see and deploy any
+#     group_mode: true lab from templates.yaml. Group-less students see no
+#     group-mode labs.
+
+groups:
+
+  - name: team-alpha
+    display_name: "Team Alpha"
+    description: "Test group A — three members."
+    members:
+      - student-a
+      - student-b
+      - student-c
+
+  # - name: team-bravo
+  #   display_name: "Team Bravo"
+  #   description: "Test group B — two members."
+  #   members:
+  #     - dave
+  #     - eve
+
+  # Uncomment to also exercise the explicit-VLAN path. Both tags must be set
+  # together, must not collide with any existing user/group VLAN, and values
+  # outside the configured group pool produce a warning (not blocking).
+  #
+  # - name: team-charlie
+  #   display_name: "Team Charlie"
+  #   description: "Group with explicit VLAN override."
+  #   members:
+  #     - frank
+  #   entry_vlan_tag: 312
+  #   internal_vlan_tag: 412

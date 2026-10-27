@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}{{ (site_brand_tag ~ ' ') if site_brand_tag else '' }}{{ site_name }}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    {% block head_extra %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar sticky-top">
+        <div class="container-fluid">
+            <a class="navbar-brand-wrapper text-decoration-none" href="/">
+                {% if site_brand_tag %}<span class="navbar-course">{{ site_brand_tag }}</span>{% endif %}
+                <span class="navbar-brand mb-0">{{ site_name }}</span>
+            </a>
+            <div class="d-flex align-items-center gap-3">
+                <a href="/koth" class="text-light text-decoration-none small" title="King of the Hill scoreboard">
+                    <i class="bi bi-flag-fill"></i> KOTH
+                </a>
+                <span class="text-light" id="userInfo">
+                    <span id="userName" class="user-name">Loading...</span>
+                    <span id="userRole" class="badge ms-2"></span>
+                </span>
+                <button class="btn btn-sm btn-outline-light" id="logoutBtn">
+                    Logout
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    {% block content %}{% endblock %}
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+    <script>
+      // index.html calls loadUserInfo() from app.js; pages that extend base.html
+      // (KOTH player + admin) don't load app.js, so wire it up here so the
+      // navbar's "Loading..." gets replaced with the real username/role.
+      document.addEventListener('DOMContentLoaded', function () {
+        if (typeof loadUserInfo === 'function') loadUserInfo();
+      });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

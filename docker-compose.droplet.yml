@@ -1,0 +1,31 @@
+# Droplet override for docker-compose.prod.yml
+#
+# Use together with the prod compose file to deploy on a DigitalOcean droplet
+# (or any host) using the pre-built image from Docker Hub instead of building
+# locally:
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.droplet.yml pull
+#   docker compose -f docker-compose.prod.yml -f docker-compose.droplet.yml up -d
+#
+# Pin IMAGE_TAG in .env to a specific commit SHA published by CI for
+# reproducible deploys (recommended). Falls back to :latest.
+#
+# Database coordinates come from .env so this override does not encode a
+# deployment's schema or account names.
+
+services:
+  vm-automation:
+    # Override the build directive from prod with a pulled image.
+    build: !reset null
+    image: ${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}/${IMAGE_NAME:-lab-playground}:${IMAGE_TAG:-latest}
+    environment:
+      - MYSQL_HOST=db
+      - MYSQL_DATABASE=${MYSQL_DATABASE}
+      - MYSQL_USER=${MYSQL_USER}
+      - DATABASE_URL=mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE}
+
+  db:
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+    ports: !reset []  # Don't expose MySQL on the public droplet interface.

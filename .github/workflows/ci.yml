@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main, features/*]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.gitignore'
+      - 'LICENSE'
+  # No paths-ignore here: "Unit Tests" and "Integration Tests" are required
+  # status checks on main, and a skipped workflow never reports, which would
+  # leave docs-only pull requests blocked forever.
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        env:
+          FLASK_ENV: testing
+          PROXMOX_HOST: fake-host
+          PROXMOX_PASSWORD: fake-password
+        run: |
+          python -m pytest tests/ --ignore=tests/integration -q --tb=short
+
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Start test server
+        run: |
+          docker compose -f docker-compose.test.yml up -d --build
+          # Wait for server to be ready
+          for i in $(seq 1 30); do
+            curl -s http://localhost:5099/auth/health > /dev/null 2>&1 && break || sleep 2
+          done
+
+      - name: Run integration tests
+        run: |
+          python -m pytest tests/integration/test_flows.py --base-url http://localhost:5099 -v --tb=short
+
+      - name: Stop test server
+        if: always()
+        run: |
+          docker compose -f docker-compose.test.yml down
+
+  docker-push:
+    name: Push to Docker Hub
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests]
+    # Opt-in: set repository variables PUBLISH_DOCKERHUB=true,
+    # DOCKERHUB_USERNAME and IMAGE_NAME, plus the DOCKERHUB_TOKEN secret.
+    # Production builds its image on the droplet, so nothing depends on this job.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && vars.PUBLISH_DOCKERHUB == 'true'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.prod
+          push: true
+          tags: |
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.IMAGE_NAME || 'lab-playground' }}:latest
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.IMAGE_NAME || 'lab-playground' }}:main
+            ${{ vars.DOCKERHUB_USERNAME }}/${{ vars.IMAGE_NAME || 'lab-playground' }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

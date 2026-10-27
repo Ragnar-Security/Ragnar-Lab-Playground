@@ -1,0 +1,32 @@
+Flask==3.1.3
+Flask-SQLAlchemy==3.0.5
+# 2.0.1+ is required: 2.0.0 dropped verify_ssl for API-token auth, so token
+# requests skipped TLS verification whatever PROXMOX_VERIFY_SSL said.
+proxmoxer==2.0.1
+requests==2.33.0
+python-dotenv==1.2.2
+PyYAML>=6.0.1
+pymysql==1.1.1
+cryptography==50.0.0
+werkzeug==3.1.9
+
+# Production server
+gunicorn==22.0.0
+
+# Testing dependencies
+pytest==9.0.3
+pytest-cov==4.1.0
+# Integration testing
+playwright>=1.40.0
+pytest-playwright>=0.4.0
+
+# KOTH scoring scheduler
+apscheduler>=3.10.0
+
+# Async I/O for gunicorn worker. Replaces gthread so SSE clients (one per
+# student tab on the KOTH scoreboard) cost ~bytes per greenlet instead of
+# 8 MB per OS thread, and don't burn one FD per idle thread. monkey.patch_all
+# is invoked at the top of run_prod.py before any stdlib import.
+# Upper bound caps any future major-version surprise around the monkey-patch
+# surface (we rely on threading being patched so that queue.Queue.get yields).
+gevent>=23.9.0,<26

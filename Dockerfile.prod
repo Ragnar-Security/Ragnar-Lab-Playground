@@ -1,0 +1,47 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies.
+# build-essential / libffi-dev support source builds when a platform has no
+# gevent or cryptography wheel. Python.h ships with the python:3.12-slim base,
+# so no separate python3-dev package is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+
+# Copy application files
+COPY app/ app/
+COPY templates/ templates/
+COPY static/ static/
+COPY run_prod.py .
+COPY gunicorn.conf.py .
+COPY scripts/ scripts/
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser
+
+# Create directory for data and logs with proper permissions
+RUN mkdir -p /app/data && \
+    chown -R appuser:appuser /app && \
+    chmod -R 755 /app && \
+    chmod 755 /app/data && \
+    find /app -type f -exec chmod 644 {} \;
+
+USER appuser
+
+# Expose port
+EXPOSE 5000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:5000/auth/health', timeout=5)" || exit 1
+
+# Run database initialization and start with gunicorn
+CMD ["sh", "-c", "python scripts/init_db.py && gunicorn -c gunicorn.conf.py run_prod:app"]

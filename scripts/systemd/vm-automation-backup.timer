@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly lab playground MySQL backup
+
+[Timer]
+# 07:30 UTC = 03:30 US Eastern (EDT), outside class hours.
+OnCalendar=*-*-* 07:30:00 UTC
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target

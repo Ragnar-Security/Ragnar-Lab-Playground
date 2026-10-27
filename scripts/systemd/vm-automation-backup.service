@@ -1,0 +1,14 @@
+[Unit]
+Description=Lab playground MySQL backup (mysqldump -> BACKUP_DIR)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# COMPOSE_DIR (checkout holding the compose files and .env), BACKUP_DIR and
+# RETENTION_DAYS come from this file so the unit carries no site-specific
+# paths. See vm-automation-backup.env.example. The shell form is needed
+# because systemd does not expand variables in the executable path itself.
+EnvironmentFile=/etc/default/vm-automation-backup
+ExecStart=/bin/sh -c 'exec "$COMPOSE_DIR/scripts/backup-database.sh"'
+Nice=10

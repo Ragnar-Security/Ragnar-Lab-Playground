@@ -1,0 +1,88 @@
+# Caddyfile - Automatic HTTPS with Let's Encrypt
+# SITE_DOMAIN and ACME_EMAIL are supplied by the operator through Compose.
+
+{
+    # Global options
+    email {$ACME_EMAIL}
+    # Uncomment for staging certificates during testing:
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+
+    # Disable HTTP/3 (QUIC). Earlier classroom traffic surfaced
+    # H3_REQUEST_CANCELLED -> 502 errors when Chromium-family browsers
+    # raced negotiation between H3 and H2 on flaky networks. HTTP/2 over
+    # TCP is rock-solid; HTTP/3 is bonus. Re-enable once we can validate
+    # H3 / QUIC stability under classroom load.
+    servers {
+        protocols h1 h2
+    }
+}
+
+# Main site configuration
+{$SITE_DOMAIN} {
+    # Reverse proxy to Flask application.
+    # `dynamic a` re-resolves vm-automation:5000 via Docker's embedded DNS
+    # every 10s so a `docker compose up -d vm-automation` (which gives the
+    # container a new IP) doesn't strand Caddy on the dead old IP and
+    # serve "no upstreams available" 503s until restart.
+    reverse_proxy {
+        dynamic a {
+            name vm-automation
+            port 5000
+            refresh 10s
+        }
+
+        # `dynamic a` can return multiple A records; we only ever have one
+        # backend, so pick the first instead of round-robining (which would
+        # split traffic across what should be the same upstream and amplify
+        # any transient health-state divergence).
+        lb_policy first
+
+        # Active health check: probe /auth/health every 5s so a recovering
+        # backend is re-marked healthy quickly after a redeploy or crash.
+        health_uri /auth/health
+        health_interval 5s
+        health_timeout 5s
+
+        # Brief retry window for transient connection failures (container
+        # restart, DNS flap) before surfacing a 503 to the client.
+        lb_try_duration 5s
+        lb_try_interval 250ms
+
+        # SSE lives at /koth/api/stream and stays open for the player's
+        # entire session. Disable Caddy's per-request transport read
+        # timeout for these long-lived streams, otherwise they get
+        # silently dropped and clients reconnect-storm the worker.
+        flush_interval -1
+
+        # Headers
+        header_up X-Real-IP {remote_host}
+    }
+    
+    # Enable compression
+    encode gzip zstd
+    
+    # Security headers
+    header {
+        # Enable HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # Prevent clickjacking
+        X-Frame-Options "SAMEORIGIN"
+        # Prevent MIME type sniffing
+        X-Content-Type-Options "nosniff"
+        # XSS Protection
+        X-XSS-Protection "1; mode=block"
+        # Referrer Policy
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    
+    # Access logs
+    log {
+        output file /data/access.log {
+            roll_size 10mb
+            roll_keep 5
+        }
+    }
+}
+
+# Add a separate redirect site only when the operator also provisions its DNS
+# record; requesting certificates for an absent hostname triggers ACME limits.

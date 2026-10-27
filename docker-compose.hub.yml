@@ -1,0 +1,42 @@
+services:
+  app:
+    image: ${DOCKERHUB_USERNAME:?Set DOCKERHUB_USERNAME}/${IMAGE_NAME:-lab-playground}:latest
+    # Loopback only: this stack serves plain HTTP. Front it with a TLS reverse
+    # proxy (see Caddyfile and docker-compose.prod.yml) before exposing it.
+    ports:
+      - "127.0.0.1:5001:5000"
+    env_file:
+      - .env
+    volumes:
+      - type: bind
+        source: ./templates.yaml
+        target: /app/templates.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    command: >
+      sh -c "python scripts/init_db.py && gunicorn -c gunicorn.conf.py run_prod:app"
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-vmdatabase}
+      MYSQL_USER: ${MYSQL_USER:-vmuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  db_data:

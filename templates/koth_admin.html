@@ -1,0 +1,480 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/koth.css') }}">
+
+<div class="koth-root koth-admin-root">
+  <header class="koth-header">
+    <div class="koth-brand">
+      <span class="koth-brand-bracket">[</span>
+      <span class="koth-brand-text">KOTH ADMIN</span>
+      <span class="koth-brand-bracket">]</span>
+    </div>
+    <div class="koth-status">
+      <a href="/" class="koth-back-link">&larr; back to dashboard</a>
+      <span class="koth-sep">|</span>
+      <a href="/koth" class="koth-back-link">view player page &rarr;</a>
+    </div>
+  </header>
+
+  <section id="koth-current-game" class="koth-card"></section>
+
+  <!--
+    The flag editor and team-tokens panels are properties of the *current*
+    game, so they live directly under the CURRENT GAME card. The CREATE
+    NEW GAME form sits *after* them in the DOM and is hidden whenever a
+    current game (draft / deploying / active) exists — there can only be
+    one game at a time, and showing a form that the backend would reject
+    just confuses the layout. Default `hidden` here so the create-form
+    doesn't flash on first paint before JS has loaded the game state.
+  -->
+  <section id="koth-flags" class="koth-card" hidden>
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">FLAGS</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <table id="koth-flags-table" class="koth-table">
+      <thead><tr><th>NAME</th><th>VALUE</th><th class="koth-num">PTS</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="koth-flags-controls">
+      <form id="koth-add-flag" class="koth-form koth-form--inline">
+        <input name="name" placeholder="Flag name" required>
+        <input name="value" placeholder="Flag value" required>
+        <input name="points" type="number" step="0.5" placeholder="Points" required>
+        <button type="submit" class="koth-btn">ADD FLAG</button>
+      </form>
+      <div class="koth-upload-block">
+        <button type="button" class="koth-btn" id="koth-upload-btn">UPLOAD FLAGS YAML</button>
+        <input type="file" id="koth-upload-file" accept=".yaml,.yml,application/x-yaml,text/yaml" hidden>
+        <div class="koth-upload-error" id="koth-upload-error" hidden></div>
+        <details class="koth-upload-hint">
+          <summary>YAML FORMAT</summary>
+<pre>Bulk-upload format (flat list):
+
+- name: "Root flag &mdash; DC"
+  value: "&lt;UUID&gt;"
+  points: 10
+  box_name: "final-dc"        # optional; omit for global
+
+- name: "Web pivot flag"
+  value: "&lt;UUID&gt;"
+  points: 5</pre>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="koth-teams-panel" class="koth-card" hidden>
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">TEAM TOKENS</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <table id="koth-teams-table" class="koth-table">
+      <thead><tr><th>TEAM</th><th>COLOR</th><th>TOKEN</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section id="koth-create-form" class="koth-card" hidden>
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">CREATE NEW GAME</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <form id="koth-new-game" class="koth-form">
+      <div class="koth-form-row">
+        <label>NAME <input name="name" required></label>
+        <label>DEPLOYMENT GROUP
+          <select name="deployment_group_name" id="koth-dg-select" required></select>
+        </label>
+      </div>
+      <div class="koth-form-row">
+        <label>ENTRY VLAN <input name="entry_vlan_tag" type="number" min="2" max="4094" required></label>
+        <label>INTERNAL VLAN <input name="internal_vlan_tag" type="number" min="2" max="4094" required></label>
+      </div>
+      <div class="koth-form-row">
+        <label>DURATION (MIN, BLANK = UNLIMITED) <input name="duration_minutes" type="number" min="1" placeholder="unlimited"></label>
+      </div>
+      <fieldset class="koth-fieldset">
+        <legend>PARTICIPATING TEAMS</legend>
+        <div id="koth-team-picker" class="koth-team-picker"></div>
+      </fieldset>
+      <button type="submit" class="koth-btn koth-btn--primary">CREATE DRAFT</button>
+    </form>
+  </section>
+
+  <style>
+  .koth-admin-root { padding: 24px; }
+  .koth-back-link { color: var(--koth-muted); text-decoration: none; }
+  .koth-back-link:hover { color: var(--koth-accent); }
+
+  .koth-form { padding: 16px; display: flex; flex-direction: column; gap: 14px; }
+  .koth-form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .koth-form label {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    color: var(--koth-muted);
+    text-transform: uppercase;
+  }
+  .koth-form input, .koth-form select {
+    background: var(--koth-bg);
+    color: var(--koth-text);
+    border: 1px solid var(--koth-border);
+    padding: 8px 10px;
+    font-family: var(--koth-mono);
+    font-size: 13px;
+    letter-spacing: 0;
+    text-transform: none;
+  }
+  .koth-form input:focus, .koth-form select:focus {
+    outline: none;
+    border-color: var(--koth-accent);
+  }
+  .koth-fieldset {
+    border: 1px solid var(--koth-border);
+    padding: 12px 14px;
+    margin: 0;
+  }
+  .koth-fieldset legend {
+    padding: 0 8px;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    color: var(--koth-muted);
+  }
+  .koth-team-picker {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+  }
+  .koth-team-picker label {
+    display: flex !important;
+    flex-direction: row !important;
+    align-items: center;
+    gap: 8px;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--koth-text);
+    font-size: 12px;
+    background: var(--koth-bg);
+    border: 1px solid var(--koth-border);
+    padding: 8px 10px;
+    cursor: pointer;
+  }
+  .koth-team-picker label:hover { border-color: var(--koth-accent); }
+  .koth-btn {
+    background: transparent;
+    border: 1px solid var(--koth-border);
+    color: var(--koth-text);
+    padding: 8px 16px;
+    font-family: var(--koth-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    cursor: pointer;
+    align-self: flex-start;
+    text-transform: uppercase;
+  }
+  .koth-btn:hover { border-color: var(--koth-accent); color: var(--koth-accent); }
+  .koth-btn--primary {
+    background: var(--koth-accent);
+    border-color: var(--koth-accent);
+    color: var(--koth-bg);
+  }
+  .koth-btn--primary:hover { background: transparent; color: var(--koth-accent); }
+  .koth-btn--danger { color: var(--koth-bad); }
+  .koth-btn--danger:hover { border-color: var(--koth-bad); color: var(--koth-bad); }
+  .koth-form--inline {
+    display: grid;
+    grid-template-columns: 1fr 1fr 100px auto;
+    align-items: end;
+    padding: 16px;
+    gap: 10px;
+  }
+  .koth-form--inline input { background: var(--koth-bg); color: var(--koth-text); border: 1px solid var(--koth-border); padding: 8px 10px; font-family: var(--koth-mono); font-size: 12px; }
+  .koth-toggle-row {
+    display: flex;
+    gap: 18px;
+    padding: 14px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .koth-toggle-row label {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 11px; letter-spacing: 0.14em;
+    color: var(--koth-muted); text-transform: uppercase;
+    cursor: pointer;
+  }
+  .koth-game-summary {
+    padding: 14px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 14px;
+    border-bottom: 1px solid var(--koth-border);
+  }
+  .koth-game-summary dt {
+    font-size: 10px; letter-spacing: 0.18em;
+    color: var(--koth-muted); text-transform: uppercase;
+    margin-bottom: 4px;
+  }
+  .koth-game-summary dd { margin: 0; color: var(--koth-text); font-size: 14px; font-weight: 700; }
+  .koth-game-actions { display: flex; gap: 10px; padding: 14px; border-top: 1px solid var(--koth-border); }
+  .koth-empty {
+    padding: 32px;
+    text-align: center;
+    color: var(--koth-muted);
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+  }
+  .koth-tag-status {
+    display: inline-block;
+    padding: 2px 8px;
+    border: 1px solid var(--koth-border);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+  }
+  .koth-tag-status--active { border-color: var(--koth-ok); color: var(--koth-ok); }
+  .koth-tag-status--draft { border-color: var(--koth-accent); color: var(--koth-accent); }
+  .koth-tag-status--deploying {
+    border-color: #38bdf8; color: #38bdf8;
+    animation: koth-deploying-pulse 1.4s ease-in-out infinite;
+  }
+  .koth-tag-status--ended { border-color: var(--koth-muted); color: var(--koth-muted); }
+  @keyframes koth-deploying-pulse { 50% { opacity: 0.45; } }
+
+  /* Busy state: must beat .koth-btn--primary (solid amber bg) and
+     .koth-btn--danger (red text) on specificity, otherwise the busy text
+     ends up amber-on-amber and is invisible until hover. Two classes give
+     us 0,2,0 vs --primary's 0,1,0. */
+  .koth-btn[disabled], .koth-btn.koth-btn--busy {
+    opacity: 0.85;
+    cursor: wait;
+    background: transparent;
+    color: var(--koth-accent);
+    border-color: var(--koth-accent);
+  }
+  .koth-btn.koth-btn--busy:hover {
+    background: transparent;
+    color: var(--koth-accent);
+  }
+  .koth-btn.koth-btn--busy::after {
+    content: '';
+    display: inline-block;
+    width: 8px; height: 8px;
+    margin-left: 8px;
+    border: 2px solid var(--koth-accent);
+    border-top-color: transparent;
+    border-radius: 50%;
+    vertical-align: -1px;
+    animation: koth-spin 0.7s linear infinite;
+  }
+
+  .koth-deploying-block {
+    display: flex;
+    gap: 18px;
+    align-items: center;
+    padding: 24px;
+    border-top: 1px solid var(--koth-border);
+    background:
+      repeating-linear-gradient(45deg,
+        rgba(56, 189, 248, 0.04) 0,
+        rgba(56, 189, 248, 0.04) 12px,
+        transparent 12px, transparent 24px);
+  }
+  .koth-spinner {
+    width: 36px; height: 36px;
+    border: 3px solid var(--koth-border);
+    border-top-color: #38bdf8;
+    border-radius: 50%;
+    animation: koth-spin 1s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes koth-spin { to { transform: rotate(360deg); } }
+  .koth-deploying-title {
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: 0.16em;
+    color: #38bdf8;
+    margin-bottom: 6px;
+  }
+  .koth-deploying-sub { font-size: 12px; color: var(--koth-muted); line-height: 1.5; }
+
+  .koth-time-block {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 24px;
+    padding: 12px 14px;
+    border-top: 1px solid var(--koth-border);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--koth-muted);
+  }
+  .koth-time-block strong {
+    color: var(--koth-text);
+    font-weight: 700;
+    margin-left: 6px;
+  }
+  .koth-time-block .koth-time-left {
+    color: var(--koth-accent);
+  }
+
+  .koth-extend-group {
+    display: inline-flex;
+    align-items: stretch;
+    gap: 0;
+    margin-left: auto;
+  }
+  .koth-extend-group input {
+    background: var(--koth-bg);
+    color: var(--koth-text);
+    border: 1px solid var(--koth-border);
+    border-right: none;
+    padding: 0 10px;
+    font-family: var(--koth-mono);
+    font-size: 12px;
+    width: 70px;
+    text-align: right;
+  }
+  .koth-extend-group input:focus {
+    outline: none;
+    border-color: var(--koth-accent);
+  }
+  .koth-extend-group .koth-btn {
+    align-self: stretch;
+    margin: 0;
+  }
+
+  .koth-token-cell { font-size: 11px; color: var(--koth-ok); word-break: break-all; }
+
+  /* Flag-list row styling. Mirrors the existing koth-table look (mono,
+     amber-on-charcoal) but compresses points + actions into narrow cells
+     so wide flag values don't push the buttons off-screen. */
+  .koth-flag-name { font-weight: 700; color: var(--koth-text); }
+  .koth-flag-scope {
+    font-size: 10px;
+    color: var(--koth-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 2px;
+  }
+  .koth-flag-value {
+    font-size: 11px;
+    color: var(--koth-ok);
+    word-break: break-all;
+  }
+  .koth-flag-actions {
+    text-align: right;
+    white-space: nowrap;
+  }
+  .koth-flag-actions .koth-btn { margin-left: 4px; }
+  .koth-btn--small {
+    padding: 4px 8px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+  }
+  .koth-flag-edit-input {
+    background: var(--koth-bg);
+    color: var(--koth-text);
+    border: 1px solid var(--koth-accent);
+    padding: 4px 6px;
+    font-family: var(--koth-mono);
+    font-size: 12px;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .koth-flag-edit-input:focus { outline: none; border-color: var(--koth-text); }
+  .koth-flag-edit-input.koth-num { text-align: right; max-width: 80px; }
+
+  .koth-poll-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    border-top: 1px solid var(--koth-border);
+    border-bottom: 1px solid var(--koth-border);
+    font-family: var(--koth-mono);
+    font-size: 12px;
+    color: var(--koth-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  .koth-poll-row label { white-space: nowrap; }
+  .koth-poll-row input {
+    background: var(--koth-bg);
+    color: var(--koth-text);
+    border: 1px solid var(--koth-border);
+    padding: 0 10px;
+    font-family: var(--koth-mono);
+    font-size: 12px;
+    width: 80px;
+    text-align: right;
+  }
+  .koth-poll-row input:focus {
+    outline: none;
+    border-color: var(--koth-accent);
+  }
+  .koth-poll-status { margin-left: auto; font-size: 11px; }
+  .koth-poll-ok  { color: var(--koth-ok); }
+  .koth-poll-bad { color: var(--koth-bad); }
+
+  .koth-flags-controls {
+    border-top: 1px solid var(--koth-border);
+  }
+  .koth-upload-block {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 0 16px 16px;
+    border-top: 1px solid var(--koth-border);
+    padding-top: 14px;
+  }
+  .koth-upload-block .koth-btn { align-self: flex-start; }
+  .koth-upload-error {
+    border: 1px solid var(--koth-bad);
+    color: var(--koth-bad);
+    padding: 8px 10px;
+    font-size: 12px;
+    font-family: var(--koth-mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .koth-upload-hint {
+    border: 1px solid var(--koth-border);
+    background: var(--koth-bg);
+    font-size: 11px;
+  }
+  .koth-upload-hint summary {
+    cursor: pointer;
+    padding: 6px 10px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    color: var(--koth-muted);
+    text-transform: uppercase;
+  }
+  .koth-upload-hint summary:hover { color: var(--koth-accent); }
+  .koth-upload-hint pre {
+    margin: 0;
+    padding: 10px 12px;
+    border-top: 1px solid var(--koth-border);
+    font-family: var(--koth-mono);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--koth-text);
+    overflow-x: auto;
+    white-space: pre;
+  }
+  </style>
+</div>
+
+<script src="{{ url_for('static', filename='js/koth-admin.js') }}"></script>
+{% endblock %}

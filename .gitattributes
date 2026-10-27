@@ -1,0 +1,8 @@
+# Store all text with LF. Several shell scripts were committed with CRLF, which
+# makes bash fail before the first command ("$'\r': command not found").
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.gz binary

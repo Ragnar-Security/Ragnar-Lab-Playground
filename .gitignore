@@ -1,0 +1,48 @@
+# Every .env variant can hold secrets (including editor/script backups such
+# as .env.bak); only the template is tracked.
+.env*
+!.env.example
+*.pyc
+__pycache__/
+*.egg-info/
+dist/
+build/
+venv/
+env/
+.DS_Store
+.superpowers/
+# Site-specific template catalog; copy templates.example.yaml before startup.
+/templates.yaml
+/templates.yaml.bak
+
+
+# Per-workstation tool permissions and deployment configuration.
+.claude/*
+scripts/site.env
+config/headscale-acl.json
+
+# Isolated worktrees (local working state, never repository content).
+.worktrees/
+
+# Student data and credentials: never commit (FERPA records, live VPN keys).
+# Production receives the roster over SSH; see CLAUDE.md rule 8.
+*.csv
+# Generated jumpbox initial passwords (explicit, in case the rule above is loosened).
+jumpbox-credentials*.csv
+!tests/**/*.csv
+
+# Local SQLite files and Flask instance data.
+*.db
+*.sqlite
+instance/
+
+# Backups and dumps.
+backups/
+data/backups/
+*.sql.gz
+*.bak
+*.backup
+*.dump
+*.sql
+# Tracked, reviewed SQL (no data) is the only exception.
+!scripts/purge_roster.sql

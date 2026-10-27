@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ (site_brand_tag ~ ' ') if site_brand_tag else '' }}{{ site_name }}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <!-- Navigation -->
+    <nav class="navbar sticky-top">
+        <div class="container-fluid">
+            <div class="navbar-brand-wrapper">
+                {% if site_brand_tag %}<span class="navbar-course">{{ site_brand_tag }}</span>{% endif %}
+                <span class="navbar-brand mb-0">{{ site_name }}</span>
+            </div>
+            <div class="d-flex align-items-center gap-3">
+                <span class="text-light" id="userInfo">
+                    <span id="userName" class="user-name">Loading...</span>
+                    <span id="userRole" class="badge ms-2"></span>
+                </span>
+                <button class="btn btn-sm btn-outline-light" id="logoutBtn">
+                    Logout
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Container -->
+    <div class="container-fluid mt-4">
+        <div class="row">
+            <!-- Sidebar Navigation -->
+            <div class="col-lg-2 mb-4">
+                <div class="list-group sticky-top" style="top: 80px;">
+                    <button class="list-group-item list-group-item-action active" data-tab="create">
+                        <i class="bi bi-plus-circle"></i> Launch Lab
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="my-labs">
+                        <i class="bi bi-display"></i> My Labs
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="assignments" id="assignments-tab" style="display: none;">
+                        <i class="bi bi-person-check"></i> Assignments
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="admin-students" id="admin-students-tab" style="display: none;">
+                        <i class="bi bi-people"></i> Students
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="admin-vms" id="admin-vms-tab" style="display: none;">
+                        <i class="bi bi-hdd-stack"></i> All VMs
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="test-alerts" id="test-alerts-tab" style="display: none;">
+                        <i class="bi bi-bell"></i> Test Alerts
+                    </button>
+                    <button class="list-group-item list-group-item-action" data-tab="admin-groups" id="admin-groups-tab" style="display: none;">
+                        <i class="bi bi-people-fill"></i> Groups
+                    </button>
+                    <a href="/admin/koth" class="list-group-item list-group-item-action" id="admin-koth-tab" style="display: none;">
+                        <i class="bi bi-flag-fill"></i> King of the Hill
+                    </a>
+                </div>
+            </div>
+
+            <!-- Main Content -->
+            <div class="col-lg-10">
+                <!-- Create VM Tab -->
+                <div id="create-tab" class="tab-content">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="bi bi-plus-circle"></i> Create New VM(s)</h5>
+                        </div>
+                        <div class="card-body">
+                            <form id="create-form">
+                                <div class="mb-3">
+                                    <label for="deployment_group" class="form-label">Select Deployment Group (Homework/Assignment)</label>
+                                    <select class="form-control" id="deployment_group" name="deployment_group" required>
+                                        <option value="">-- Select a deployment group --</option>
+                                    </select>
+                                    <small class="form-text text-muted">Select which homework/assignment VMs to deploy</small>
+                                </div>
+                                <div id="deployment-details" class="mb-3" style="display: none;">
+                                    <div class="alert alert-info">
+                                        <strong>Deployment Details:</strong>
+                                        <div id="deployment-description" class="mt-2"></div>
+                                        <div id="deployment-templates" class="mt-2"></div>
+                                    </div>
+                                </div>
+                                <div id="admin-group-mode-fields" class="mb-3" style="display: none;">
+                                    <label for="admin_group_slug" class="form-label">Deploy on behalf of student group</label>
+                                    <select class="form-control" id="admin_group_slug" name="group_slug">
+                                        <option value="">-- Select a student group --</option>
+                                    </select>
+                                    <small class="form-text text-muted">Required for shared (group-mode) labs. Pick the team this deployment belongs to.</small>
+                                </div>
+                                <button type="submit" class="btn btn-primary">
+                                    <i class="bi bi-plus-circle"></i> Create VM(s)
+                                </button>
+                            </form>
+                            <div id="create-result" class="mt-3"></div>
+
+                            <!-- Tailscale Setup Instructions -->
+                            <div id="tailscale-setup" class="mt-4" style="display: none;">
+                                <div class="card border-secondary">
+                                    <div class="card-header bg-secondary text-white">
+                                        <h6 class="mb-0"><i class="bi bi-shield-lock"></i> Setting Up Tailscale</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <ol class="mb-0">
+                                            <li class="mb-2">
+                                                Install Tailscale via the following command - ideally you will do this on your Kali Linux machine.
+                                                <pre class="bg-dark text-light p-2 rounded mt-1 mb-0"><code>curl -fsSL https://tailscale.com/install.sh | sh</code></pre>
+                                            </li>
+                                            <li class="mb-2">
+                                                Bring up Tailscale:
+                                                <pre class="bg-dark text-light p-2 rounded mt-1 mb-0"><code>sudo tailscale up{% if vpn_login_server %} --login-server={{ vpn_login_server }}{% endif %} --auth-key=<span id="tailscale-auth-key">loading...</span> --accept-routes</code></pre>
+                                            </li>
+                                            <li>
+                                                Now you can try pinging your network connection.
+                                            </li>
+                                        </ol>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- My Labs Tab -->
+                <div id="my-labs-tab" class="tab-content d-none">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-primary text-white d-flex justify-content-between align-items-center">
+                            <h5 class="mb-0"><i class="bi bi-display"></i> My Labs</h5>
+                            <button class="btn btn-sm btn-outline-light" id="refresh-labs">
+                                <i class="bi bi-arrow-clockwise"></i> Refresh
+                            </button>
+                        </div>
+                        <div class="card-body" id="my-labs-content">
+                            <div class="text-center">
+                                <div class="spinner-border text-primary" role="status">
+                                    <span class="visually-hidden">Loading...</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Assignments Tab (Admin Only) -->
+                <div id="assignments-tab-content" class="tab-content d-none">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="bi bi-person-check"></i> Lab Assignments (Admin Only)</h5>
+                        </div>
+                        <div class="card-body">
+                            <p class="text-secondary mb-4" style="font-size: 0.85rem;">All labs are visible by default. Assigning students to a lab restricts it to only those students.</p>
+
+                            <!-- Assign Form -->
+                            <div class="assign-form-grid mb-2">
+                                <div>
+                                    <label for="assign_group" class="form-label">Deployment Group</label>
+                                    <select class="form-control" id="assign_group">
+                                        <option value="">-- Select group --</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label for="assign_students" class="form-label">Students</label>
+                                    <select class="form-control" id="assign_students" multiple size="4">
+                                    </select>
+                                    <small class="form-text text-muted">Ctrl/Cmd + click for multiple</small>
+                                </div>
+                            </div>
+                            <button class="btn btn-primary w-100 mb-4" id="assign-btn">
+                                <i class="bi bi-plus-circle"></i> Assign Selected Students
+                            </button>
+
+                            <!-- Current Assignments -->
+                            <div class="d-flex justify-content-between align-items-center mb-3" style="border-top: 1px solid var(--border-color); padding-top: 1.25rem;">
+                                <h6 class="mb-0" style="color: var(--text-primary);">Current Assignments</h6>
+                                <div class="d-flex align-items-center gap-2">
+                                    <select class="form-control form-control-sm" id="filter_group" style="width: 220px;">
+                                        <option value="">All groups</option>
+                                    </select>
+                                    <button class="btn btn-sm btn-outline-danger" id="clear-assignments-btn" style="display: none; white-space: nowrap;">
+                                        <i class="bi bi-trash"></i> Clear Group
+                                    </button>
+                                </div>
+                            </div>
+                            <div id="assignments-table-container">
+                                <div class="text-center py-3">
+                                    <div class="spinner-border text-primary" role="status">
+                                        <span class="visually-hidden">Loading...</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Students Tab (Admin Only) -->
+                <div id="admin-students-tab-content" class="tab-content d-none">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="bi bi-people"></i> Student Management</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="mb-3">
+                                <input type="text" class="form-control" id="student-search" placeholder="Search by name or login ID..." style="max-width: 300px;">
+                            </div>
+                            <div id="students-table-container">
+                                <div class="text-center"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- All VMs Tab (Admin Only) -->
+                <div id="admin-vms-tab-content" class="tab-content d-none">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="bi bi-hdd-stack"></i> All Virtual Machines</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="row mb-3">
+                                <div class="col-md-3"><select class="form-control" id="vm-filter-student"><option value="">All Students</option></select></div>
+                                <div class="col-md-3"><select class="form-control" id="vm-filter-node"><option value="">All Nodes</option></select></div>
+                                <div class="col-md-3"><select class="form-control" id="vm-filter-status"><option value="active">Active</option><option value="">All</option><option value="destroyed">Destroyed</option></select></div>
+                                <div class="col-md-3"><button class="btn btn-primary" id="vm-filter-apply"><i class="bi bi-search"></i> Filter</button></div>
+                            </div>
+                            <div id="admin-vms-table-container">
+                                <div class="text-center"><div class="spinner-border text-primary" role="status"><span class="visually-hidden">Loading...</span></div></div>
+                            </div>
+                            <div class="mt-3" id="bulk-actions" style="display: none;">
+                                <button class="btn btn-danger btn-sm" id="bulk-destroy-btn"><i class="bi bi-trash"></i> Destroy Selected</button>
+                                <button class="btn btn-warning btn-sm ms-2" id="bulk-extend-btn"><i class="bi bi-clock"></i> Extend Selected (24h)</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Groups Tab (Admin Only) -->
+                <div id="admin-groups-tab-content" class="tab-content d-none">
+                    <div class="card shadow-sm mb-3">
+                        <div class="card-header bg-primary text-white">
+                            <h5 class="mb-0"><i class="bi bi-people-fill"></i> Student Groups (Admin Only)</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="d-flex gap-2 flex-wrap mb-3">
+                                <button id="btn-new-group" class="btn btn-primary btn-sm">
+                                    <i class="bi bi-plus-lg"></i> New group
+                                </button>
+                                <button id="btn-upload-groups-yaml" class="btn btn-outline-light btn-sm">
+                                    <i class="bi bi-upload"></i> Upload groups.yaml
+                                </button>
+                            </div>
+                            <p class="text-muted small mb-3">
+                                Groups let multiple students share a single VM bundle (group-mode labs) instead of each student spinning up their own copy. Each group gets its own VLAN pair.
+                            </p>
+                            <table class="table table-sm mt-3" id="groups-table">
+                                <thead>
+                                    <tr>
+                                        <th>Slug</th><th>Display name</th><th>Members</th>
+                                        <th>Entry VLAN</th><th>Internal VLAN</th>
+                                        <th></th>
+                                    </tr>
+                                </thead>
+                                <tbody></tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div id="group-detail" class="card shadow-sm mb-3" style="display: none;">
+                        <div class="card-header bg-primary text-white"><h5 class="mb-0" id="group-detail-title">Group detail</h5></div>
+                        <div class="card-body" id="group-detail-body"></div>
+                    </div>
+                    <div id="groups-yaml-panel" class="card shadow-sm mb-3" style="display: none;">
+                        <div class="card-header d-flex align-items-center gap-2">
+                            <i class="bi bi-file-earmark-diff"></i>
+                            <h5 class="mb-0">YAML plan</h5>
+                            <span class="text-muted small ms-2">preview before apply</span>
+                        </div>
+                        <div class="card-body" id="groups-yaml-body"></div>
+                    </div>
+                </div>
+
+                <!-- Test Alerts Tab (Admin Only) -->
+                <div id="test-alerts-tab-content" class="tab-content d-none">
+                    <div class="card shadow-sm">
+                        <div class="card-header bg-warning text-dark">
+                            <h5 class="mb-0"><i class="bi bi-bell"></i> Test Alert Notifications (Admin Only)</h5>
+                        </div>
+                        <div class="card-body">
+                            <div class="alert alert-info">
+                                <strong>Test your alert notification configuration</strong>
+                                <p class="mb-0 mt-2">This will send test alerts to verify your email and webhook configurations are working correctly.</p>
+                            </div>
+                            
+                            <form id="test-alerts-form">
+                                <div class="mb-3">
+                                    <h6 class="mb-3">Select Alert Types to Test:</h6>
+                                    <div class="form-check">
+                                        <input class="form-check-input" type="checkbox" id="test_email" name="test_email" checked>
+                                        <label class="form-check-label" for="test_email">
+                                            <strong>Email Alerts</strong> (SMTP)
+                                            <br><small class="text-muted">Requires SMTP_SERVER, SMTP_USERNAME, etc. in .env</small>
+                                        </label>
+                                    </div>
+                                    <div class="form-check mt-2">
+                                        <input class="form-check-input" type="checkbox" id="test_webhook" name="test_webhook" checked>
+                                        <label class="form-check-label" for="test_webhook">
+                                            <strong>Webhook Alerts</strong> (Discord/Slack)
+                                            <br><small class="text-muted">Requires ALERT_WEBHOOK_URL in .env</small>
+                                        </label>
+                                    </div>
+                                    <div class="form-check mt-2">
+                                        <input class="form-check-input" type="checkbox" disabled checked>
+                                        <label class="form-check-label text-muted">
+                                            <strong>File Logging</strong> (Always Enabled)
+                                            <br><small>Logs to /app/data/failed_vms.log</small>
+                                        </label>
+                                    </div>
+                                    <div class="form-check mt-2">
+                                        <input class="form-check-input" type="checkbox" disabled checked>
+                                        <label class="form-check-label text-muted">
+                                            <strong>Database Alerts</strong> (Always Enabled)
+                                            <br><small>Creates AdminAlert record in database</small>
+                                        </label>
+                                    </div>
+                                </div>
+                                
+                                <button type="submit" class="btn btn-warning">
+                                    <i class="bi bi-bell"></i> Send Test Alerts
+                                </button>
+                            </form>
+                            
+                            <div id="test-alerts-result" class="mt-4"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer class="bg-light text-center py-4 mt-5">
+        <div class="container-fluid">
+            <p class="text-muted mb-0">&copy; 2026 {{ (site_brand_tag ~ ' ') if site_brand_tag else '' }}{{ site_name }}{% if site_org %} - {{ site_org }}{% endif %}. All rights reserved.</p>
+        </div>
+    </footer>
+
+    <!-- How to connect over RDP. One modal serves every row; the Connect
+         cell fills in that row's address and user. Written for a student who
+         has never used Remote Desktop. -->
+    <div class="modal fade" id="rdpHelpModal" tabindex="-1" aria-labelledby="rdpHelpLabel" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="rdpHelpLabel">
+              <i class="bi bi-display"></i> Connect to this lab with Remote Desktop
+            </h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+
+            <p>This lab is a Windows desktop. You reach it with RDP, the Remote
+               Desktop Protocol. Your computer shows the Windows desktop in a
+               window, and you work in it as if the machine were in front of you.</p>
+
+            <table class="table table-sm">
+              <tbody>
+                <tr><th style="width:9rem">Address</th>
+                    <td><code id="rdpHelpAddress">-</code></td></tr>
+                <tr><th>User name</th>
+                    <td><code id="rdpHelpUser">-</code></td></tr>
+                <tr><th>Password</th>
+                    <td>The password your instructor gave you for this lab.</td></tr>
+              </tbody>
+            </table>
+
+            <div class="alert alert-warning py-2">
+              <strong>You must be on the course VPN first.</strong> This address is
+              private. It does not work from the open internet. Start your VPN
+              client, then connect.
+            </div>
+
+            <p>The quickest way on any system: select <strong>open .rdp</strong> in
+               the Connect column. Your computer downloads a small file. Open that
+               file. The address and the user name are already in it, so you only
+               type the password.</p>
+
+            <hr>
+
+            <h6><i class="bi bi-windows"></i> Windows</h6>
+            <p class="mb-1">Windows includes the client. You do not install anything.</p>
+            <ol>
+              <li>Select <strong>copy address</strong> in the Connect column.</li>
+              <li>Press the Windows key, type <code>Remote Desktop Connection</code>,
+                  and open it.</li>
+              <li>Paste the address into the <strong>Computer</strong> box.
+                  Paste it. Do not type it. One wrong digit gives the error
+                  &ldquo;Remote Desktop can&rsquo;t connect to the remote
+                  computer&rdquo;, which does not tell you that the address is
+                  wrong.</li>
+              <li>Select <strong>Connect</strong>.</li>
+              <li>Give the user name above and your lab password.</li>
+              <li>A certificate warning appears. The lab uses a self-signed
+                  certificate, so this is expected. Select <strong>Yes</strong>.</li>
+            </ol>
+
+            <h6><i class="bi bi-apple"></i> macOS</h6>
+            <ol>
+              <li>Install <strong>Windows App</strong> from the Mac App Store. Apple
+                  renamed it; older guides call it Microsoft Remote Desktop.</li>
+              <li>Open it and select <strong>+</strong>, then <strong>Add PC</strong>.</li>
+              <li>Put the address above in <strong>PC name</strong>.</li>
+              <li>Leave <strong>User account</strong> set to <em>Ask when required</em>,
+                  or add the user name above.</li>
+              <li>Save, then double-click the entry.</li>
+              <li>Accept the certificate warning. It is expected.</li>
+            </ol>
+
+            <h6><i class="bi bi-ubuntu"></i> Linux</h6>
+            <p class="mb-1">Install one client, then connect.</p>
+<pre class="bg-dark text-light p-2 rounded"><code># Debian or Ubuntu
+sudo apt install freerdp2-x11
+
+# Fedora
+sudo dnf install freerdp
+
+# then connect, with your own user name and address
+xfreerdp /u:<span class="rdp-help-user">USER</span> /v:<span class="rdp-help-address">ADDRESS</span> /dynamic-resolution +clipboard</code></pre>
+            <p class="small mb-3">FreeRDP asks for the password. It also asks about the
+               certificate the first time; answer <code>Y</code>. If your distribution
+               ships FreeRDP 3, the command is <code>xfreerdp3</code>. Remmina is a
+               graphical alternative, and it is in every major repository.</p>
+
+            <hr>
+
+            <h6>Useful to know</h6>
+            <ul>
+              <li><strong>Save your work off the VM.</strong> The lab is deleted when
+                  the timer ends. The <strong>.rdp</strong> file shares your local
+                  drives, so you can copy files out through
+                  <code>\\tsclient\</code>.</li>
+              <li><strong>Extend</strong> adds time when less than an hour remains.</li>
+              <li>A black screen for a few seconds after you log in is normal. The
+                  desktop is still starting.</li>
+              <li>If the connection is refused, check the VPN first, then check that
+                  the address matches the Connect column exactly.</li>
+            </ul>
+
+          </div>
+          <div class="modal-footer">
+            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Close</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <!-- Custom JS -->
+    <script src="{{ url_for('static', filename='js/utils.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/auth.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/vm-operations.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/admin.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/student-groups.js') }}" defer></script>
+</body>
+</html>

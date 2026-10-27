@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/koth.css') }}">
+<script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+
+<div id="koth-root" class="koth-root" data-is-admin="{{ 1 if current_user_is_admin else 0 }}">
+  <div class="koth-scanline" aria-hidden="true"></div>
+
+  <header class="koth-header">
+    <div class="koth-brand">
+      <span class="koth-brand-bracket">[</span>
+      <span class="koth-brand-text">KING OF THE HILL</span>
+      <span class="koth-brand-bracket">]</span>
+    </div>
+    <div class="koth-status">
+      <span id="koth-status-dot" class="koth-status-dot"></span>
+      <span id="koth-status-text">CONNECTING</span>
+      <span class="koth-sep">|</span>
+      <span id="koth-iter">ITER 0</span>
+    </div>
+  </header>
+
+  <section id="koth-myteam" class="koth-card koth-card--accent" hidden>
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">MY TEAM</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <div id="koth-myteam-body"></div>
+  </section>
+
+  <section id="koth-timer" class="koth-card koth-card--timer" hidden>
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">TIME LEFT</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <div id="koth-timer-body" class="koth-timer-body">
+      <span id="koth-timer-digits" class="koth-timer-digits">--:--:--</span>
+    </div>
+  </section>
+
+  <div class="koth-grid">
+    <section id="koth-scoreboard" class="koth-card">
+      <div class="koth-card-header">
+        <span class="koth-bracket-l">[</span>
+        <span class="koth-card-title">SCOREBOARD</span>
+        <span class="koth-bracket-r">]</span>
+      </div>
+      <table id="koth-scores" class="koth-table">
+        <thead><tr><th>RANK</th><th>TEAM</th><th class="koth-num">SCORE</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section id="koth-map" class="koth-card">
+      <div class="koth-card-header">
+        <span class="koth-bracket-l">[</span>
+        <span class="koth-card-title">NETWORK MAP</span>
+        <span class="koth-bracket-r">]</span>
+      </div>
+      <div id="cy" class="koth-cy"></div>
+    </section>
+  </div>
+
+  <section id="koth-events" class="koth-card">
+    <div class="koth-card-header">
+      <span class="koth-bracket-l">[</span>
+      <span class="koth-card-title">EVENT LOG</span>
+      <span class="koth-bracket-r">]</span>
+    </div>
+    <ul id="koth-events-list" class="koth-events-list"></ul>
+  </section>
+</div>
+<script src="{{ url_for('static', filename='js/koth-player.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,30 @@
+{
+  "groups": {
+    "group:staff": ["infrastructure@", "instructor@", "assistant@"]
+  },
+  "tagOwners": {
+    "tag:jumpbox": ["group:staff"]
+  },
+  "hosts": {
+    "node1-v4": "192.0.2.10/32",
+    "node1-v6": "2001:db8::10/128"
+  },
+  "acls": [
+    {
+      "action": "accept",
+      "src": ["group:staff"],
+      "dst": ["*:*"]
+    },
+    {
+      "action": "accept",
+      "src": ["autogroup:member"],
+      "dst": [
+        "autogroup:self:*",
+        "node1-v4:*",
+        "node1-v6:*",
+        "tag:jumpbox:*",
+        "192.0.2.0/24:*"
+      ]
+    }
+  ]
+}
