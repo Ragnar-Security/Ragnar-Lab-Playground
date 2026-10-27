@@ -1,0 +1,19 @@
+# Run a published release image instead of building from source.
+#
+#   docker compose -f docker-compose.prod.yml -f docker-compose.release.yml up -d
+#
+# or set, in .env:
+#   COMPOSE_FILE=docker-compose.prod.yml:docker-compose.release.yml
+#   LAB_PLAYGROUND_VERSION=1.0.0
+#
+# The only change to the production stack is the app's image: everything
+# else (environment, mounts, ulimits, MySQL, Caddy) comes from
+# docker-compose.prod.yml. `!reset` removes the build section, so Compose
+# pulls the image rather than building it; it needs Docker Compose 2.24.0
+# or later. A plain `docker compose -f docker-compose.prod.yml` still builds
+# from the checkout. To pin the exact bytes, set LAB_PLAYGROUND_VERSION to
+# `1.0.0@sha256:<digest>` with the digest from the release notes.
+services:
+  vm-automation:
+    build: !reset null
+    image: ghcr.io/ragnar-security/lab-playground:${LAB_PLAYGROUND_VERSION:?Set LAB_PLAYGROUND_VERSION in .env, e.g. 1.0.0}

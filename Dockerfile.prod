@@ -40,6 +40,19 @@ RUN mkdir -p /app/data && \
 
 USER appuser
 
+# Build identity. The release workflow passes the tag's version and commit;
+# a source build on the server passes neither, so APP_REVISION is empty and
+# /auth/health reports revision null. Declared after every other layer so a
+# new commit does not invalidate the dependency install cache.
+ARG APP_VERSION
+ARG APP_REVISION
+ENV APP_REVISION=${APP_REVISION}
+LABEL org.opencontainers.image.title="Ragnar Lab Playground" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.revision="${APP_REVISION}" \
+      org.opencontainers.image.source="https://github.com/Ragnar-Security/Ragnar-Lab-Playground" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
 # Expose port
 EXPOSE 5000
 

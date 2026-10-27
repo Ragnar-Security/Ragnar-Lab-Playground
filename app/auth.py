@@ -43,6 +43,7 @@ from typing import Callable, Any, Union, Tuple
 import hashlib
 import hmac
 import logging
+import os
 import threading
 import time
 
@@ -51,7 +52,7 @@ from sqlalchemy import delete, func, insert, select
 logger = logging.getLogger(__name__)
 
 from .models import db, User, StudentWhitelist, PasswordResetFailure
-from . import coordination, password_reset_links
+from . import __version__, coordination, password_reset_links
 
 auth = Blueprint('auth', __name__)
 
@@ -837,18 +838,25 @@ def health_check():
     Health check endpoint for monitoring and load balancers
     
     Returns:
-        JSON response with status
-    
+        JSON response with status, the release version, and the git commit
+        the image was built from. Release images bake that commit into
+        APP_REVISION; source builds pass none, so the image sets it empty
+        and revision is null.
+
     Example:
         GET /auth/health
-        
+
         Response:
         {
             "status": "ok",
-            "timestamp": "2026-01-28T12:00:00.123456"
+            "timestamp": "2026-01-28T12:00:00.123456",
+            "version": "1.0.0",
+            "revision": "0123456789abcdef0123456789abcdef01234567"
         }
     """
     return jsonify({
         'status': 'ok',
-        'timestamp': datetime.now(timezone.utc).isoformat()
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'version': __version__,
+        'revision': os.environ.get('APP_REVISION') or None,
     })

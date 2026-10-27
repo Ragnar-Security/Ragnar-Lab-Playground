@@ -188,3 +188,31 @@ def test_unrecognised_seed_flag_is_reported(tmp_path):
 
     assert result.returncode == 1
     assert result.stderr.startswith('SEED_ADMIN_ACCOUNT:')
+
+
+# LAB_PLAYGROUND_VERSION names the release image (docker-compose.release.yml).
+# A floating value such as `latest` would let a restart silently change
+# what production runs, so only an exact version (optionally with digest)
+# passes. Source-build hosts do not set it, and then nothing is checked.
+DIGEST = 'sha256:' + 'a' * 64
+
+
+@pytest.mark.parametrize('value', ['latest', 'main', '1.0', 'v1.0.0', '1',
+                                   f'1.0.0@{DIGEST[:-1]}', f'1.0.0@{DIGEST.upper()}',
+                                   f'latest@{DIGEST}', '1.0.0@sha512:' + 'a' * 64])
+def test_release_version_must_be_exact(tmp_path, value):
+    result = _run(str(_write_env(tmp_path / '.env',
+                                 {**GOOD, 'LAB_PLAYGROUND_VERSION': value})))
+
+    assert result.returncode == 1
+    assert result.stderr.startswith('LAB_PLAYGROUND_VERSION:')
+    assert len(result.stderr.splitlines()) == 1
+
+
+@pytest.mark.parametrize('value', ['1.0.0', '12.3.45', '2.0.0-rc.1',
+                                   f'1.0.0@{DIGEST}', None, ''])
+def test_exact_or_absent_release_version_passes(tmp_path, value):
+    result = _run(str(_write_env(tmp_path / '.env',
+                                 {**GOOD, 'LAB_PLAYGROUND_VERSION': value})))
+
+    assert result.returncode == 0, result.stderr

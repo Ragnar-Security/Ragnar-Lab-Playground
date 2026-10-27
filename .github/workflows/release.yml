@@ -1,0 +1,360 @@
+name: Release
+
+# A pushed vX.Y.Z tag publishes ghcr.io/ragnar-security/lab-playground:X.Y.Z
+# with provenance and SBOM attestations, and a GitHub Release carrying the
+# CHANGELOG section and the attested deploy bundle. Nothing here deploys
+# anywhere. docs/RELEASING.md is the maintainer checklist.
+#
+# Only a tag push publishes. v* tags are restricted to the release
+# maintainers by a ruleset, and every job that can write (image push,
+# attestations, the release) also waits for approval of the `release`
+# environment, which only v* tags may use. A vX.Y.Z-rc.N tag publishes a
+# prerelease. workflow_dispatch is always a dry run: every job it starts
+# holds contents: read only.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  # Every publishing run shares one queue, so two releases never move the
+  # X.Y / latest aliases at once. queue: max keeps every waiting release:
+  # the default keeps one and cancels it when another arrives. Dry runs
+  # queue per ref and never block a release.
+  group: ${{ github.event_name == 'push' && 'release-publish' || format('release-dry-run-{0}', github.ref) }}
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/ragnar-security/lab-playground
+
+jobs:
+  verify:
+    name: Verify tag, version and notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      revision: ${{ steps.check.outputs.revision }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      aliases: ${{ steps.check.outputs.aliases }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The ancestry check needs origin/main; the aliases need every tag.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Check tag, version, release notes and ancestry
+        id: check
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # Fails unless app/__init__.py and pyproject.toml agree.
+          version="$(python3 scripts/release_version.py)"
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::Version '$version' is not X.Y.Z or X.Y.Z-prerelease"
+            exit 1
+          fi
+
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $REF_NAME does not match version $version in app/__init__.py and pyproject.toml"
+            exit 1
+          fi
+
+          # Fails unless CHANGELOG.md has a non-empty section with upgrade notes.
+          python3 scripts/release_notes.py "$version" > /dev/null
+
+          revision="$(git rev-parse HEAD)"
+          if ! git merge-base --is-ancestor "$revision" origin/main; then
+            if [ "$EVENT_NAME" = push ]; then
+              echo "::error::$revision is not on origin/main; tag a commit that has been merged"
+              exit 1
+            fi
+            echo "::warning::$revision is not on origin/main; a release from it would be refused"
+          fi
+
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+
+          # X.Y and latest only for the highest stable release among the
+          # protected v* tags, whichever release run finishes last.
+          aliases="$(python3 scripts/release_version.py aliases "$version" | tr '\n' ' ')"
+
+          {
+            echo "version=$version"
+            echo "revision=$revision"
+            echo "prerelease=$prerelease"
+            echo "aliases=$aliases"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $version from $revision (event $EVENT_NAME, prerelease=$prerelease, aliases: ${aliases:-none})" >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    name: Test
+    needs: verify
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    # Dry run: the same build as publish-image, pushed nowhere.
+    name: Image (dry run)
+    needs: [verify, test]
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: false
+          build-args: |
+            APP_VERSION=${{ needs.verify.outputs.version }}
+            APP_REVISION=${{ needs.verify.outputs.revision }}
+          provenance: mode=max
+          sbom: true
+          no-cache: true
+
+  publish-image:
+    name: Publish image
+    needs: [verify, test]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # arm64 builds under emulation. Every pinned dependency ships an arm64
+      # wheel, so nothing is compiled and the emulated build stays short.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: tags
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          ALIASES: ${{ needs.verify.outputs.aliases }}
+        run: |
+          {
+            echo 'list<<TAGS'
+            echo "$IMAGE:$VERSION"
+            for alias in $ALIASES; do
+              echo "$IMAGE:$alias"
+            done
+            echo 'TAGS'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          # Path context: the checkout, filtered by .dockerignore.
+          context: .
+          file: Dockerfile.prod
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            APP_VERSION=${{ needs.verify.outputs.version }}
+            APP_REVISION=${{ needs.verify.outputs.revision }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.verify.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/Ragnar-Security/Ragnar-Lab-Playground
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: true
+          # No build cache: a release image is built from the tagged sources
+          # alone, never from layers another workflow run wrote.
+          no-cache: true
+
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          # Storage records need the artifact-metadata permission; the
+          # attestation itself does not.
+          create-storage-record: false
+
+  bundle:
+    name: Deploy bundle
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Build bundle
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: python3 scripts/build_release_bundle.py "$VERSION" dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: deploy-bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  attest-bundle:
+    # Separate from the release job so that no job holds both an OIDC token
+    # and contents: write.
+    name: Attest bundle
+    needs: [verify, bundle]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy-bundle
+          path: dist
+
+      - name: Check the bundle against its checksum
+        working-directory: dist
+        run: sha256sum -c SHA256SUMS
+
+      - name: Attest bundle provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/lab-playground-${{ needs.verify.outputs.version }}-deploy.tar.gz
+
+  release:
+    name: GitHub Release
+    needs: [verify, publish-image, attest-bundle]
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: deploy-bundle
+          path: dist
+
+      - name: Write release notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          REVISION: ${{ needs.verify.outputs.revision }}
+          DIGEST: ${{ needs.publish-image.outputs.digest }}
+        run: |
+          notes="$RUNNER_TEMP/notes.md"
+          signer="$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          python3 scripts/release_notes.py "$VERSION" > "$notes"
+          # The backticks are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            printf '\n---\n\n'
+            printf '**Image:** `%s:%s` (`%s`), commit `%s`\n\n' "$IMAGE" "$VERSION" "$DIGEST" "$REVISION"
+            printf 'Run it with `docker-compose.release.yml` and `LAB_PLAYGROUND_VERSION=%s`; see `DEPLOY-FROM-RELEASE.md` in the bundle.\n\n' "$VERSION"
+            printf 'Verify that this workflow built both from this tag and commit:\n\n```bash\n'
+            printf 'gh attestation verify oci://%s:%s -R %s --signer-workflow %s --source-ref refs/tags/v%s --source-digest %s\n' "$IMAGE" "$VERSION" "$GITHUB_REPOSITORY" "$signer" "$VERSION" "$REVISION"
+            printf 'sha256sum -c SHA256SUMS\n'
+            printf 'gh attestation verify lab-playground-%s-deploy.tar.gz -R %s --signer-workflow %s --source-ref refs/tags/v%s --source-digest %s\n' "$VERSION" "$GITHUB_REPOSITORY" "$signer" "$VERSION" "$REVISION"
+            printf '```\n'
+          } >> "$notes"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          ALIASES: ${{ needs.verify.outputs.aliases }}
+        run: |
+          flags=()
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          # GitHub's "Latest release" follows the image's latest tag, so a
+          # patch to an older line does not take it.
+          if [[ " $ALIASES " == *" latest "* ]]; then
+            flags+=(--latest)
+          else
+            flags+=(--latest=false)
+          fi
+          gh release create "v$VERSION" \
+            --verify-tag \
+            --title "v$VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "${flags[@]}" \
+            "dist/lab-playground-$VERSION-deploy.tar.gz" dist/SHA256SUMS

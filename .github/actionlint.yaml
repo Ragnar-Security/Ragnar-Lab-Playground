@@ -1,0 +1,7 @@
+# actionlint 1.7.12 predates `concurrency.queue` (GitHub Actions, May 2026),
+# which release.yml needs so a waiting release is never cancelled. Remove
+# this once actionlint knows the key.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section'

@@ -562,6 +562,43 @@ destroys it. Choose one of these:
 The `.lock` and `.import.lock` files beside them are empty lock files. They
 are harmless, and can be deleted whenever the app is stopped.
 
+### Running a released image
+
+The redeploy above builds the image from the checkout, and it stays the
+default. A host can instead run a published release image,
+`ghcr.io/ragnar-security/lab-playground:X.Y.Z`, through the
+`docker-compose.release.yml` override. The override replaces only the app's
+build with that image; everything else comes from `docker-compose.prod.yml`.
+It needs Docker Compose 2.24.0 or later. The release's version is then the
+rollback target. A host without a checkout uses the release's deploy bundle
+instead; its `DEPLOY-FROM-RELEASE.md` has the steps.
+
+Check out the release tag, so that the compose files and migrations match
+the image, and name the version in `.env`:
+
+```bash
+git fetch --tags origin
+git checkout vX.Y.Z
+echo 'LAB_PLAYGROUND_VERSION=X.Y.Z' >> .env
+gh attestation verify oci://ghcr.io/ragnar-security/lab-playground:X.Y.Z \
+  -R Ragnar-Security/Ragnar-Lab-Playground \
+  --signer-workflow Ragnar-Security/Ragnar-Lab-Playground/.github/workflows/release.yml \
+  --source-ref refs/tags/vX.Y.Z
+```
+
+Then follow steps 1, 3 and 5 of the redeploy above, and replace step 4 with:
+
+```bash
+docker compose -f docker-compose.prod.yml -f docker-compose.release.yml pull vm-automation
+docker compose -f docker-compose.prod.yml -f docker-compose.release.yml up -d
+curl -s https://lab.example.edu/auth/health   # "version": "X.Y.Z", "revision": "<commit>"
+```
+
+A source build reports `"revision": null`. To roll back, set
+`LAB_PLAYGROUND_VERSION` to the previous release and run the same `up -d`.
+Any command given with only `-f docker-compose.prod.yml ... --build` goes
+back to building from the checkout.
+
 ### Watch a King of the Hill game
 
 `GET /koth/api/_diag` is admin-only and reports live numbers. Read it during
