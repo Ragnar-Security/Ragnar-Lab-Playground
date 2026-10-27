@@ -35,3 +35,14 @@ def test_oci_labels_are_set():
         'org.opencontainers.image.licenses': r'"?Apache-2\.0"?',
     }.items():
         assert re.search(re.escape(key) + '=' + value + r'(\s|$)', labels), key
+
+
+def test_release_helper_scripts_stay_out_of_the_runtime_image():
+    """Dockerfile.prod copies scripts/ for the migrations; the release
+    tooling runs only in the workflow and on maintainers' machines."""
+    ignored = {line.strip() for line in
+               (Path(__file__).resolve().parent.parent / '.dockerignore')
+               .read_text().splitlines()}
+    for script in ('build_release_bundle.py', 'release_notes.py',
+                   'release_version.py'):
+        assert f'scripts/{script}' in ignored, script

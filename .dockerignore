@@ -39,6 +39,12 @@ venv/
 .pytest_cache
 **/.pytest_cache
 
+# Release tooling runs in the release workflow and on maintainers' machines,
+# never in the app; the images copy scripts/ for init_db and the migrations.
+scripts/build_release_bundle.py
+scripts/release_notes.py
+scripts/release_version.py
+
 # Integration-run artifacts (Playwright traces, screenshots, reports).
 test-results/
 playwright-report/
