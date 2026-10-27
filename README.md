@@ -478,7 +478,7 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 | GET | `/time-remaining` | Check VM expiration time |
 | GET | `/api/vms` | List VMs (flat, filterable by active status) |
 | GET | `/api/vms/<vmid>` | Get detailed info for a single VM |
-| GET | `/nodes/resources` | Cluster node resource usage (admin only) |
+| GET | `/nodes/resources` | Cluster node resource usage (admin only). Memory fields: `memory_available_gb` (Linux MemAvailable; `total - used` if the node omits it), `memory_linux_free_gb` (Linux MemFree), and `memory_free_gb`, a **deprecated** alias that equals `memory_available_gb`, not MemFree. See [docs/LOAD_BALANCING.md](docs/LOAD_BALANCING.md#monitoring-node-resources) |
 
 ### Admin (all require admin role)
 

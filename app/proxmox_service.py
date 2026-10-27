@@ -679,7 +679,13 @@ def get_node_resources(proxmox: ProxmoxAPI, node_name: str) -> Dict[str, Any]:
         # MemAvailable, while retaining the old memory_free key as an alias
         # because the admin JSON endpoint already exposes that name.
         memory_linux_free = memory.get('free', 0)
-        memory_available = memory.get('available', memory_total - memory_used)
+        # A missing or null 'available' falls back to total - used; a real 0
+        # stays 0. Clamp bad data into [0, total] so a corrupt report can
+        # neither go negative nor claim more memory than the node has.
+        memory_available = memory.get('available')
+        if memory_available is None:
+            memory_available = memory_total - memory_used
+        memory_available = max(0, min(memory_available, memory_total))
         memory_usage = (memory_used / memory_total * 100) if memory_total > 0 else 0
         
         # Node is online if we can get its status and it has valid uptime
@@ -773,7 +779,7 @@ def _filter_suitable_nodes(all_nodes: List[Dict[str, Any]],
 
         # Preserve the existing 10% headroom, but apply it to effective
         # availability after app-owned ramp-up commitments and reservations.
-        required_memory_bytes = required_memory_mb * 1024 * 1024 * 1.1
+        required_memory_bytes = max(0, required_memory_mb) * 1024 * 1024 * 1.1
         effective = node.get(
             'memory_effective_available',
             node.get('memory_available', node.get('memory_free', 0)))
