@@ -223,6 +223,82 @@ def render_zeek_networks(routes):
     return "\n".join(lines) + "\n"
 
 
+SSH_TABLE = "jumpbox_ssh"
+SSH_NFT_FILE = "/etc/nftables.d/jumpbox-ssh.nft"
+SSH_UNIT_NAME = "jumpbox-ssh-filter.service"
+SSH_STAFF_IF = "tailscale0"
+
+
+def _staff_networks(addresses):
+    """Split staff addresses into sorted, de-duplicated IPv4 and IPv6 lists."""
+    v4, v6 = set(), set()
+    for raw in addresses:
+        try:
+            net = ipaddress.ip_network(raw, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"invalid staff address {raw!r}") from exc
+        (v4 if net.version == 4 else v6).add(net)
+    fmt = lambda nets: [str(n.network_address) if n.num_addresses == 1 else str(n)
+                        for n in sorted(nets, key=lambda n: (int(n.network_address), n.prefixlen))]
+    return fmt(v4), fmt(v6)
+
+
+def render_ssh_filter(mgmt_if, staff_ips):
+    """nftables table that limits inbound SSH to loopback, the management NIC
+    and listed staff tailnet addresses.
+
+    Students route THROUGH the jumpbox and never log in to it, but its own
+    10.x.x.1 gateway addresses sit inside the advertised 10.0.0.0/8 route, so a
+    Headscale ACL alone cannot close port 22 to them. A separate table at input
+    priority -10 with policy accept touches only tcp/22 and never forwarding.
+    """
+    mgmt_if = _ifname(mgmt_if)
+    v4, v6 = _staff_networks(staff_ips)
+    lines = [f"# {HEADER}",
+             f"table inet {SSH_TABLE}",
+             f"delete table inet {SSH_TABLE}",
+             f"table inet {SSH_TABLE} {{"]
+    for name, kind, items in (("staff_v4", "ipv4_addr", v4), ("staff_v6", "ipv6_addr", v6)):
+        lines += [f"    set {name} {{", f"        type {kind}", "        flags interval"]
+        # nft rejects an empty element list, so an empty set omits the line.
+        if items:
+            lines.append(f"        elements = {{ {', '.join(items)} }}")
+        lines.append("    }")
+    lines += [
+        "    chain input {",
+        "        type filter hook input priority -10; policy accept;",
+        '        iifname "lo" tcp dport 22 accept',
+        f'        iifname "{mgmt_if}" tcp dport 22 accept',
+        f'        iifname "{SSH_STAFF_IF}" ip saddr @staff_v4 tcp dport 22 accept',
+        f'        iifname "{SSH_STAFF_IF}" ip6 saddr @staff_v6 tcp dport 22 accept',
+        "        tcp dport 22 counter drop",
+        "    }",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def render_ssh_filter_unit(nft_file=SSH_NFT_FILE):
+    if not re.match(r"^/[A-Za-z0-9_./-]+$", nft_file):
+        raise ValueError(f"invalid nft file path {nft_file!r}")
+    return "\n".join([
+        f"# {HEADER}",
+        "[Unit]",
+        "Description=Restrict inbound SSH on the jumpbox to staff (nftables)",
+        "DefaultDependencies=no",
+        "Before=network-pre.target ssh.socket ssh.service",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        f"ExecStart=/usr/sbin/nft -f {nft_file}",
+        f"ExecStop=/usr/sbin/nft delete table inet {SSH_TABLE}",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]) + "\n"
+
+
 def unified_diff(path, current, generated):
     return "".join(difflib.unified_diff(
         current.splitlines(keepends=True), generated.splitlines(keepends=True),
@@ -236,7 +312,8 @@ def _split(value, separators=r"[\s,]+"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
-        "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "diff"])
+        "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "ssh-filter",
+        "ssh-filter-unit", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -246,6 +323,8 @@ def main(argv=None):
     parser.add_argument("--dhcp-end", type=int, default=DEFAULT_DHCP_END)
     parser.add_argument("--lease", default=DEFAULT_LEASE)
     parser.add_argument("--routes", default="10.0.0.0/8")
+    parser.add_argument("--staff-ips", default="", help="ssh-filter: comma/space separated")
+    parser.add_argument("--nft-file", default=SSH_NFT_FILE)
     parser.add_argument("--label", help="diff: path shown in the header")
     parser.add_argument("files", nargs="*", help="diff: CURRENT GENERATED")
     args = parser.parse_args(argv)
@@ -264,6 +343,10 @@ def main(argv=None):
             return 0
         if args.what == "sysctl":
             out = render_sysctl()
+        elif args.what == "ssh-filter":
+            out = render_ssh_filter(args.mgmt_if, _split(args.staff_ips))
+        elif args.what == "ssh-filter-unit":
+            out = render_ssh_filter_unit(args.nft_file)
         elif args.what == "zeek-node":
             out = render_zeek_node(args.trunk_if)
         elif args.what == "zeek-networks":

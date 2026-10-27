@@ -242,6 +242,54 @@ your current session open until a new key login works.
 Students with jumpbox accounts must have keys before you turn this on. Most
 courses use no jumpbox accounts at all (below).
 
+### Staff-only SSH
+
+Students route *through* the jumpbox and never log in to it, yet without this
+step SSH answers every tailnet device and every lab VLAN. A Headscale ACL
+cannot fix that on its own: the jumpbox's gateway addresses (`10.x.x.1`) sit
+inside the advertised `10.0.0.0/8` route, so a student's SSH to their own
+gateway is matched as routed traffic to `10.0.0.0/8`, which the member rule
+above has to allow. Close the port on the jumpbox itself:
+
+```bash
+# scripts/site.env: staff tailnet addresses, IPv4 and IPv6 mixed
+JUMPBOX_SSH_STAFF_IPS="100.64.0.10,fd7a:115c:a1e0::a"
+sudo jumpbox/jumpbox_configure.sh --ssh-staff-only            # dry run: shows the diff
+sudo jumpbox/jumpbox_configure.sh --apply --ssh-staff-only
+```
+
+This writes `/etc/nftables.d/jumpbox-ssh.nft` and
+`/etc/systemd/system/jumpbox-ssh-filter.service` (a oneshot that loads the file
+before the network and `ssh.socket`/`ssh.service`) and enables the unit. The
+file is its own table, `inet jumpbox_ssh`, with an input hook at priority -10
+and policy accept. It touches only `tcp dport 22`, in this order: accept on
+`lo`; accept on the management interface (`JUMPBOX_MGMT_IF`); accept on
+`tailscale0` from the two staff sets (`staff_v4`, `staff_v6`); count and drop
+everything else. Forwarding and ICMP are untouched, so students' routed
+traffic keeps working. The script validates the ruleset with `nft -c -f`
+before it changes anything, and refuses when `JUMPBOX_SSH_STAFF_IPS` is empty
+and the management interface cannot be determined, since nobody could then log
+in. An empty staff list otherwise leaves SSH on loopback and the management
+interface only.
+
+Dropped packets include your own session if it arrives from an address that is
+neither on the management interface nor listed. Keep a console open and test a
+login from a listed device before closing it.
+
+**Add a staff device:** append its tailnet addresses (`tailscale ip` on that
+device) to `JUMPBOX_SSH_STAFF_IPS` and re-run with `--apply --ssh-staff-only`.
+The table is replaced in one load.
+
+**Roll back:**
+
+```bash
+sudo systemctl disable --now jumpbox-ssh-filter.service   # ExecStop deletes the table
+```
+
+This does not enable key-only SSH; that stays a separate choice
+(`--ssh-keys-only`), which you cannot take while a staff account signs in with
+a password.
+
 ## Optional: Zeek and RITA
 
 ```bash

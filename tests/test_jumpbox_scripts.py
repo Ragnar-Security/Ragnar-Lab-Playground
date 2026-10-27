@@ -413,6 +413,159 @@ def test_ssh_keys_only_disables_password_logins_once_the_admin_has_a_key(tmp_pat
     assert "systemctl try-reload-or-restart ssh" in calls
 
 
+# --- staff-only SSH filter ----------------------------------------------------
+
+STAFF = "100.64.0.10, fd7a:115c:a1e0::a 100.64.0.11,fd7a:115c:a1e0::b"
+SSH_NFT = "etc/nftables.d/jumpbox-ssh.nft"
+SSH_UNIT = "etc/systemd/system/jumpbox-ssh-filter.service"
+
+
+def _rules(text: str) -> list:
+    return [l.strip() for l in text.splitlines() if "tcp dport 22" in l]
+
+
+def test_ssh_filter_orders_loopback_management_staff_then_drop_with_mixed_family_sets():
+    ng = _netgen()
+    text = ng.render_ssh_filter("ens18", ["100.64.0.10", "fd7a:115c:a1e0::a", "100.64.0.11"])
+    assert _rules(text) == [
+        'iifname "lo" tcp dport 22 accept',
+        'iifname "ens18" tcp dport 22 accept',
+        'iifname "tailscale0" ip saddr @staff_v4 tcp dport 22 accept',
+        'iifname "tailscale0" ip6 saddr @staff_v6 tcp dport 22 accept',
+        "tcp dport 22 counter drop",
+    ]
+    assert "hook input priority -10; policy accept;" in text
+    # Idempotent load: declare, delete, then recreate.
+    lines = [l for l in text.splitlines() if l.startswith(("table", "delete"))]
+    assert lines == ["table inet jumpbox_ssh", "delete table inet jumpbox_ssh",
+                     "table inet jumpbox_ssh {"]
+    v4 = re.search(r"set staff_v4 \{.*?\n\s*\}", text, re.S).group(0)
+    v6 = re.search(r"set staff_v6 \{.*?\n\s*\}", text, re.S).group(0)
+    assert "ipv4_addr" in v4 and "100.64.0.10" in v4 and "100.64.0.11" in v4 and ":" not in v4.split("{", 1)[1]
+    assert "ipv6_addr" in v6 and "fd7a:115c:a1e0::a" in v6 and "100.64" not in v6
+
+
+def test_ssh_filter_is_deterministic_and_ignores_order_and_duplicates():
+    ng = _netgen()
+    a = ng.render_ssh_filter("ens18", ["100.64.0.11", "fd7a:115c:a1e0::a", "100.64.0.10"])
+    b = ng.render_ssh_filter("ens18", ["100.64.0.10", "100.64.0.10", "100.64.0.11", "fd7a:115c:a1e0::a"])
+    assert a == b == ng.render_ssh_filter("ens18", ["100.64.0.10", "100.64.0.11", "fd7a:115c:a1e0::a"])
+
+
+def test_ssh_filter_with_no_staff_is_still_a_valid_table_for_management_and_loopback_only():
+    ng = _netgen()
+    text = ng.render_ssh_filter("ens18", [])
+    assert "elements" not in text  # nft rejects an empty element list
+    assert _rules(text)[:2] == ['iifname "lo" tcp dport 22 accept', 'iifname "ens18" tcp dport 22 accept']
+    assert _rules(text)[-1] == "tcp dport 22 counter drop"
+    assert text.count("{") == text.count("}")
+
+
+@pytest.mark.parametrize("bad", ["not-an-ip", "100.64.0.999", "100.64.0.10; drop"])
+def test_ssh_filter_rejects_malformed_staff_addresses_and_interface_names(bad):
+    ng = _netgen()
+    with pytest.raises(ValueError):
+        ng.render_ssh_filter("ens18", [bad])
+    with pytest.raises(ValueError):
+        ng.render_ssh_filter('ens18" accept #', [])
+
+
+def test_ssh_filter_unit_loads_before_the_network_and_sshd_and_removes_its_table():
+    ng = _netgen()
+    unit = ng.render_ssh_filter_unit("/etc/nftables.d/jumpbox-ssh.nft")
+    lines = unit.splitlines()
+    for required in ("DefaultDependencies=no",
+                     "Before=network-pre.target ssh.socket ssh.service",
+                     "Type=oneshot", "RemainAfterExit=yes",
+                     "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-ssh.nft",
+                     "ExecStop=/usr/sbin/nft delete table inet jumpbox_ssh",
+                     "WantedBy=multi-user.target"):
+        assert required in lines
+    assert unit == ng.render_ssh_filter_unit("/etc/nftables.d/jumpbox-ssh.nft")
+
+
+def test_netgen_cli_emits_the_filter_and_unit():
+    out = subprocess.run(
+        ["python3", str(NETGEN), "ssh-filter", "--mgmt-if", "ens18", "--staff-ips", STAFF],
+        capture_output=True, text=True, check=True).stdout
+    assert "100.64.0.11" in out and "fd7a:115c:a1e0::b" in out
+    unit = subprocess.run(["python3", str(NETGEN), "ssh-filter-unit"],
+                          capture_output=True, text=True, check=True).stdout
+    assert "jumpbox-ssh.nft" in unit
+
+
+def _ssh_filter_env(tmp_path: Path, staff: str = STAFF):
+    extra = f"JUMPBOX_SSH_STAFF_IPS=\"{staff}\"\n" if staff else ""
+    env, sysroot = _configure_env(tmp_path, extra)
+    _tool(tmp_path / "bin", "nft", LOG_CALL)
+    return env, sysroot
+
+
+def test_ssh_staff_only_dry_run_writes_and_runs_nothing(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    assert "+        iifname \"tailscale0\" ip saddr @staff_v4 tcp dport 22 accept" in result.stdout
+    assert "would run: systemctl enable jumpbox-ssh-filter.service" in result.stdout
+
+
+def test_ssh_staff_only_apply_installs_file_and_unit_enables_it_and_is_idempotent(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    first = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    nft = (sysroot / SSH_NFT).read_text()
+    assert "100.64.0.10" in nft and "fd7a:115c:a1e0::a" in nft
+    assert 'iifname "ens18" tcp dport 22 accept' in nft
+    assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-ssh.nft" in (sysroot / SSH_UNIT).read_text()
+    calls = _calls(tmp_path).splitlines()
+    assert any(c.startswith("nft -c -f") for c in calls)  # validated before loading
+    check = next(i for i, c in enumerate(calls) if c.startswith("nft -c -f"))
+    enable = calls.index("systemctl enable jumpbox-ssh-filter.service")
+    assert check < enable
+    assert "systemctl restart jumpbox-ssh-filter.service" in calls
+
+    converged = _tree(sysroot)
+    (tmp_path / "calls.log").unlink()
+    second = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _tree(sysroot) == converged
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_refuses_a_ruleset_nft_rejects(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path)
+    _tool(tmp_path / "bin", "nft", LOG_CALL + 'echo "syntax error" >&2\nexit 1\n')
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "nft" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_refuses_with_no_staff_and_no_management_interface(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path, staff="")
+    Path(env["SITE_ENV_FILE"]).write_text("HEADSCALE_URL=https://vpn.example.edu\nJUMPBOX_TRUNK_IF=ens19\n")
+    _tool(tmp_path / "bin", "ip", "exit 0\n")  # no default route to learn the management NIC from
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode != 0
+    assert "JUMPBOX_SSH_STAFF_IPS" in result.stderr and "lock" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_ssh_staff_only_with_no_staff_but_a_management_interface_is_allowed(tmp_path):
+    env, sysroot = _ssh_filter_env(tmp_path, staff="")
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--ssh-staff-only"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    nft = (sysroot / SSH_NFT).read_text()
+    assert 'iifname "ens18" tcp dport 22 accept' in nft and "@staff_v4" in nft
+
+
 def test_monitoring_refuses_a_root_disk_too_small_for_zeek_and_rita(tmp_path):
     # Zeek logs and RITA's ClickHouse filled the reference jumpbox's disk,
     # and a full disk stopped dnsmasq from recording leases.
