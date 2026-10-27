@@ -42,6 +42,13 @@ def app():
     os.unlink(db_path)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_untracked_survivors_file(tmp_path, monkeypatch):
+    """Keep the failed-deploy fallback file out of the checkout's data/."""
+    monkeypatch.setenv(
+        'UNTRACKED_SURVIVORS_FILE', str(tmp_path / 'untracked-survivors.jsonl'))
+
+
 @pytest.fixture
 def client(app):
     """Create test client"""

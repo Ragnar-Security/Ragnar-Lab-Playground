@@ -372,6 +372,40 @@ class AdminAlert(db.Model):
         return f'<AdminAlert {self.id} [{self.severity}] {self.alert_type}>'
 
 
+class AlertOutbox(db.Model):
+    """An operator alert waiting for delivery (app/alert_outbox.py).
+
+    The row is written in the same transaction as the state change that
+    raised it, so committing that state can no longer lose the alert. The
+    deletion-failure alert used to be sent after `deletion_alert_sent` was
+    committed; a crash in between suppressed the only alert for good.
+
+    `pending_channels` lists the channels (comma-separated) not yet
+    delivered. Each channel is removed in its own commit, so a retry never
+    repeats a channel that already succeeded.
+    """
+
+    __tablename__ = 'alert_outbox'
+
+    id = db.Column(db.Integer, primary_key=True)
+    alert_type = db.Column(db.String(100), nullable=False)
+    payload = db.Column(db.Text, nullable=False)  # JSON
+    pending_channels = db.Column(db.String(255), nullable=False)
+    status = db.Column(db.String(20), nullable=False, default='pending')  # pending, sent, abandoned
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    next_attempt_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    last_error = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.now)
+    sent_at = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (
+        Index('ix_alert_outbox_status_next_attempt', 'status', 'next_attempt_at'),
+    )
+
+    def __repr__(self):
+        return f'<AlertOutbox {self.id} {self.alert_type} {self.status}>'
+
+
 class StudentGroup(db.Model):
     """
     A cohort of students who share group-mode lab deployments.

@@ -9,7 +9,7 @@ import json
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch, MagicMock, mock_open
 from app.tasks import (
-    _stop_vm, _delete_vm, _send_deletion_failure_alert,
+    _stop_vm, _delete_vm,
     _log_alert_to_file, _create_database_alert,
     VM_DELETION_MAX_RETRIES
 )

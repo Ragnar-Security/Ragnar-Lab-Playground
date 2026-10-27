@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.alert_outbox import dispatch_pending_alerts
 from app.models import AdminAlert, KothBox, KothGame, VMRecord, db
 from app.proxmox_service import (
     _clear_vmid_reservations,
@@ -182,6 +183,7 @@ def test_expired_orphan_is_stopped_deleted_awaited_and_alerted(app, vm_type):
     boundary = ProxmoxBoundary([_resource(vm_type=vm_type)])
     with app.app_context():
         results = _run(boundary)
+        dispatch_pending_alerts()
         alerts = AdminAlert.query.filter_by(alert_type="vm_orphan_reaped").all()
 
     guest = boundary.guests[700]

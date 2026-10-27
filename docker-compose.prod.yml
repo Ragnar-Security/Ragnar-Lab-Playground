@@ -53,6 +53,9 @@ services:
       - ORPHAN_REAPER_ENABLED=${ORPHAN_REAPER_ENABLED:-true}
       - ORPHAN_REAPER_DRY_RUN=${ORPHAN_REAPER_DRY_RUN:-false}
       - ORPHAN_REAPER_GRACE_MINUTES=${ORPHAN_REAPER_GRACE_MINUTES:-60}
+      # Failed-deploy survivors recorded while the database was down
+      # (app/untracked_survivors.py). Must stay under /app/data.
+      - UNTRACKED_SURVIVORS_FILE=${UNTRACKED_SURVIVORS_FILE:-}
       # Alert notification settings
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}
