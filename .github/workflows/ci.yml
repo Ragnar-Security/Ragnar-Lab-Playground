@@ -13,6 +13,11 @@ on:
   # leave docs-only pull requests blocked forever.
   pull_request:
     branches: [main]
+  # The release workflow runs this suite on the tagged commit before it
+  # publishes anything. Called this way, github.event_name is the caller's
+  # (a tag push or workflow_dispatch) and github.ref is the tag, so the Docker
+  # Hub job's main-branch push condition stays false.
+  workflow_call:
 
 permissions:
   contents: read
@@ -77,8 +82,9 @@ jobs:
         run: |
           docker compose -f docker-compose.test.yml up -d --build
           # Wait for server to be ready
-          for i in $(seq 1 30); do
-            curl -s http://localhost:5099/auth/health > /dev/null 2>&1 && break || sleep 2
+          for _ in $(seq 1 30); do
+            if curl -s http://localhost:5099/auth/health > /dev/null 2>&1; then break; fi
+            sleep 2
           done
 
       - name: Run integration tests
