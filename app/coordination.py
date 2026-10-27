@@ -260,6 +260,10 @@ def reset_for_tests(tables: Iterable, state_rows: Iterable[str] = ()) -> None:
 
 # ---- MySQL named locks -----------------------------------------------------
 
+# GET_LOCK rejects longer names with an error.
+MYSQL_LOCK_NAME_MAX_LENGTH = 64
+
+
 @contextmanager
 def mysql_named_lock(engine: Engine, name: str, timeout_seconds: int):
     """Hold MySQL's GET_LOCK(name) for the duration of the block.
@@ -271,6 +275,12 @@ def mysql_named_lock(engine: Engine, name: str, timeout_seconds: int):
     failed VMRecord commit must be able to remove the guest during an
     outage, as it could before this lock existed.
     """
+    if len(name) > MYSQL_LOCK_NAME_MAX_LENGTH:
+        # MySQL's rejection would look like an outage and fall back to the
+        # process lock, losing cross-worker exclusion without a trace.
+        raise ValueError(
+            f'lock name {name!r} exceeds MySQL\'s '
+            f'{MYSQL_LOCK_NAME_MAX_LENGTH}-character limit')
     connection = None
     acquired = None
     try:
