@@ -130,9 +130,15 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     holds MySQL `GET_LOCK('vm-lifecycle-<vmid>')` on a dedicated connection;
     on SQLite it is a process lock only, and during a database outage it
     falls back to the process lock so cleanup can still remove guests.
-    These no longer limit the worker count. APScheduler and the SSE event
-    bus still do (rules 1 and 6), so `workers` stays 1. Leases use
-    `time.time()` epoch seconds, not local DateTimes.
+    That does not make a second worker safe. This state still lives in one
+    process, so `workers` stays 1 (rule 1): APScheduler (rule 6); the SSE
+    event bus fan-out; the orphan reaper's sweep schedule; the
+    `note_vm_state` sighting counters that reconcile and `/list` use to
+    confirm a guest missing; and alert outbox delivery, which reads pending
+    rows without claiming them, so every worker's expiry loop would send
+    each alert. The untracked-survivors file is safe across processes
+    (`fcntl.flock` on sidecar lock files). Leases use `time.time()` epoch
+    seconds, not local DateTimes.
     Node memory is `memory.available` (MemAvailable), never
     `memory.free`: ZFS ARC and page cache can leave MemFree low even when
     reclaimable memory is available. See `docs/LOAD_BALANCING.md`.
@@ -147,6 +153,9 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     `ORPHAN_REAPER_DRY_RUN=true` logs decisions only. A sweep runs after
     the expiry pass and stops starting guests past
     `ORPHAN_REAPER_MAX_PASS_SECONDS` / `_GUESTS`, so it cannot starve expiry.
+    Alert outbox delivery follows the same rule: it runs after expiry and
+    reconcile, and stops starting alerts past
+    `ALERT_DISPATCH_MAX_PASS_SECONDS` / `_ALERTS`.
 13. **Site-specific identities and infrastructure never belong in tracked
     files.** Real hosts, domains, usernames, node/storage names, VMIDs, and
     credentials live only in operator-owned `.env`, `templates.yaml`,

@@ -68,6 +68,9 @@ services:
       - ADMIN_ALERT_EMAILS=${ADMIN_ALERT_EMAILS}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL}
       - ALERT_WEBHOOK_TYPE=${ALERT_WEBHOOK_TYPE}
+      # Per-pass budget so alert delivery cannot hold up expiry.
+      - ALERT_DISPATCH_MAX_PASS_SECONDS=${ALERT_DISPATCH_MAX_PASS_SECONDS:-20}
+      - ALERT_DISPATCH_MAX_PASS_ALERTS=${ALERT_DISPATCH_MAX_PASS_ALERTS:-50}
     volumes:
       - ./data:/app/data
       - type: bind

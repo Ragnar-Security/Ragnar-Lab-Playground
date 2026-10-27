@@ -242,3 +242,88 @@ def test_expiry_loop_destroys_survivor_recorded_during_outage(
     endpoints[vmid].delete.assert_called_once_with()
     with app.app_context():
         assert VMRecord.query.filter_by(vmid=vmid).count() == 0
+
+
+_SECOND_WORKER = r'''
+import sys
+from app.untracked_survivors import record_untracked_survivors
+print('ready', flush=True)
+sys.stdin.readline()
+record_untracked_survivors(
+    [{'vmid': 702, 'node': 'pve', 'vm_name': 'student-bob-vm',
+      'vm_type': 'qemu'}], 'second worker')
+'''
+
+
+def test_append_from_another_process_during_import_is_not_lost(
+        app, survivors_file):
+    """A second worker process appends between recovery's read of the file
+    and its unlink. The line must be imported, now or on the next pass."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    import app.untracked_survivors as survivors
+
+    survivors.record_untracked_survivors(
+        [{'vmid': 701, 'node': 'pve', 'vm_name': 'student-alice-vm',
+          'vm_type': 'qemu'}], 'first worker')
+    worker = subprocess.Popen(
+        [sys.executable, '-c', _SECOND_WORKER],
+        cwd=Path(__file__).parents[1], env=dict(os.environ),
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    real_unlink = os.unlink
+
+    def unlink_after_racing_append(path, *args, **kwargs):
+        if path == survivors_file and worker.poll() is None:
+            worker.stdin.write('go\n')
+            worker.stdin.flush()
+            try:
+                # Done at once without a cross-process lock; blocked with one.
+                worker.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        return real_unlink(path, *args, **kwargs)
+
+    try:
+        assert worker.stdout.readline().strip() == 'ready'
+        with app.app_context(), \
+             patch.object(survivors.os, 'unlink',
+                          side_effect=unlink_after_racing_append):
+            recover_untracked_survivors()
+        assert worker.wait(timeout=10) == 0
+        with app.app_context():
+            recover_untracked_survivors()
+            imported = {vmid for (vmid,) in db.session.query(VMRecord.vmid)}
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+            worker.wait()
+
+    assert imported == {701, 702}
+
+
+def test_import_is_skipped_while_another_process_imports(app, survivors_file):
+    """Two importers would each read `.importing` and unlink it, dropping lines
+    the other handed over meanwhile; only one may import at a time."""
+    import fcntl
+    import app.untracked_survivors as survivors
+
+    survivors.record_untracked_survivors(
+        [{'vmid': 701, 'node': 'pve', 'vm_name': 'student-alice-vm',
+          'vm_type': 'qemu'}], 'first worker')
+    # flock() conflicts between open file descriptions, so a second
+    # descriptor stands in for another worker process mid-import.
+    other = os.open(survivors_file + '.import.lock', os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(other, fcntl.LOCK_EX)
+        with app.app_context():
+            report = recover_untracked_survivors()
+            assert VMRecord.query.count() == 0
+        assert report == {'imported': 0, 'already_tracked': 0, 'corrupt': []}
+        assert _lines(survivors_file), 'the line waits for the next pass'
+    finally:
+        os.close(other)
+
+    with app.app_context():
+        recover_untracked_survivors()
+        assert [r.vmid for r in VMRecord.query.all()] == [701]

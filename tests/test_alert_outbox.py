@@ -212,6 +212,119 @@ def test_orphan_reaped_alert_goes_through_outbox_without_new_channels(
     assert webhook.calls == 0
 
 
+def _queue_alerts(count, channels=('webhook',)):
+    """Queue `count` deletion-failure-shaped alerts on `channels` only."""
+    from app.alert_outbox import enqueue_alert
+    created = datetime(2026, 1, 1, 9, 0)
+    for n in range(count):
+        vmid = 900 + n
+        enqueue_alert(
+            alert_type='vm_deletion_failed', severity='critical',
+            message=f'VM {vmid} failed to delete', vmid=vmid,
+            vm_name=f'student-s-vm{n}', channels=channels,
+            vm={'vmid': vmid, 'vm_name': f'student-s-vm{n}', 'vm_type': 'qemu',
+                'node': 'pve', 'student_name': 's', 'template_name': 'lab/vm',
+                'deletion_retry_count': 5,
+                'created_at': created.isoformat(),
+                'expires_at': (created + timedelta(hours=1)).isoformat()})
+    db.session.commit()
+
+
+def test_dispatch_starts_no_alert_once_its_time_budget_is_spent(app, alert_env):
+    """Every send hangs for 15 s: a 20 s pass attempts two alerts, then stops.
+    The rest stay due for the next pass and lose none of their attempts."""
+    from app.alert_outbox import AlertOutbox, dispatch_pending_alerts
+    clock = [0.0]
+
+    def hung_post(url, json=None, timeout=None):
+        clock[0] += 15
+        raise requests.Timeout('no answer')
+
+    with app.app_context(), \
+         patch('app.tasks.requests.post', side_effect=hung_post) as post:
+        _queue_alerts(5)
+        start = datetime.now()
+
+        dispatch_pending_alerts(now=start, max_seconds=20,
+                                clock=lambda: clock[0])
+
+        assert post.call_count == 2
+        rows = AlertOutbox.query.order_by(AlertOutbox.id).all()
+        assert [row.attempts for row in rows] == [1, 1, 0, 0, 0]
+        assert {row.status for row in rows} == {'pending'}
+        assert all(row.next_attempt_at <= start for row in rows[2:])
+
+        # The untried alerts are first in line next pass; the tried ones
+        # are in backoff.
+        clock[0] = 0.0
+        dispatch_pending_alerts(now=start, max_seconds=20,
+                                clock=lambda: clock[0])
+        rows = AlertOutbox.query.order_by(AlertOutbox.id).all()
+        assert [row.attempts for row in rows] == [1, 1, 1, 1, 0]
+
+
+def test_dispatch_caps_the_alerts_attempted_per_pass(app, alert_env):
+    from app.alert_outbox import AlertOutbox, dispatch_pending_alerts
+    webhook = _Webhook()
+    with app.app_context(), \
+         patch('app.tasks.requests.post', side_effect=webhook.post):
+        _queue_alerts(5)
+        assert dispatch_pending_alerts(max_alerts=2) == 2
+        rows = AlertOutbox.query.order_by(AlertOutbox.id).all()
+        assert [row.status for row in rows] == ['sent'] * 2 + ['pending'] * 3
+        assert [row.attempts for row in rows[2:]] == [0, 0, 0]
+
+
+def test_dispatch_budget_defaults_to_twenty_seconds():
+    from app.config import (
+        ALERT_DISPATCH_MAX_PASS_ALERTS, ALERT_DISPATCH_MAX_PASS_SECONDS)
+    assert ALERT_DISPATCH_MAX_PASS_SECONDS == 20
+    assert ALERT_DISPATCH_MAX_PASS_ALERTS > 0
+
+
+_SMTP_ENV = {
+    'SMTP_SERVER': 'smtp.example.edu',
+    'SMTP_USERNAME': 'alerts@example.edu',
+    'SMTP_PASSWORD': 'secret',
+    'SMTP_FROM_EMAIL': 'alerts@example.edu',
+    'ADMIN_ALERT_EMAILS': 'admin@example.edu',
+}
+
+
+def test_alert_senders_bound_their_network_calls(app, alert_env, monkeypatch):
+    for name, value in {**_SMTP_ENV, 'SMTP_PORT': '587'}.items():
+        monkeypatch.setenv(name, value)
+    with app.app_context(), \
+         patch('app.tasks.smtplib.SMTP') as smtp, \
+         patch('app.tasks.requests.post', side_effect=_Webhook().post) as post:
+        _queue_alerts(1, channels=('email', 'webhook'))
+        _dispatch()
+    assert smtp.call_args.kwargs.get('timeout') == 10
+    assert post.call_args.kwargs.get('timeout') == 10
+
+
+@pytest.mark.parametrize('smtp_env', [
+    {'SMTP_PORT': ''},                    # compose's ${SMTP_PORT}, unset
+    {**_SMTP_ENV, 'SMTP_PORT': ''},
+    {**_SMTP_ENV},                        # SMTP_PORT absent altogether
+    {**_SMTP_ENV, 'SMTP_PORT': 'smtp'},   # not a number
+], ids=['empty-port-only', 'empty-port', 'unset-port', 'non-numeric-port'])
+def test_email_without_a_usable_port_is_not_configured(
+        app, alert_env, monkeypatch, smtp_env):
+    """An unusable SMTP_PORT means email is off. Retrying cannot fix it, so
+    it must not drive the alert through 30 attempts to 'abandoned'."""
+    from app.alert_outbox import AlertOutbox
+    monkeypatch.delenv('SMTP_PORT', raising=False)
+    for name, value in smtp_env.items():
+        monkeypatch.setenv(name, value)
+    with app.app_context(), patch('app.tasks.smtplib.SMTP') as smtp:
+        _queue_alerts(1, channels=('email',))
+        _dispatch()
+        row = AlertOutbox.query.one()
+        assert (row.status, row.attempts) == ('sent', 0)
+    smtp.assert_not_called()
+
+
 def _load_migration():
     path = Path(__file__).parents[1] / 'scripts' / 'migrate_add_alert_outbox.py'
     assert path.exists(), 'alert outbox migration must ship with the model'
