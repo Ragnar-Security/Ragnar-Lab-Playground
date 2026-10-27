@@ -148,3 +148,27 @@ def test_missing_file_is_reported(tmp_path):
 
     assert result.returncode == 2
     assert 'absent.env' in result.stderr
+
+
+@pytest.mark.parametrize('admin_password', [None, '', 'admin123'])
+def test_admin_password_not_required_when_admin_seeding_is_off(tmp_path, admin_password):
+    values = {**GOOD, 'ADMIN_PASSWORD': admin_password, 'SEED_ADMIN_ACCOUNT': 'false'}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_admin_password_still_checked_when_seeding_is_explicitly_on(tmp_path):
+    values = {**GOOD, 'ADMIN_PASSWORD': 'admin123', 'SEED_ADMIN_ACCOUNT': 'true'}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+
+    assert result.returncode == 1
+    assert result.stderr.startswith('ADMIN_PASSWORD:')
+
+
+def test_unrecognised_seed_flag_is_reported(tmp_path):
+    values = {**GOOD, 'SEED_ADMIN_ACCOUNT': 'flase'}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+
+    assert result.returncode == 1
+    assert result.stderr.startswith('SEED_ADMIN_ACCOUNT:')

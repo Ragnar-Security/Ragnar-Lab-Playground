@@ -191,3 +191,102 @@ def test_mixed_case_development_keeps_default_admin_password(app, monkeypatch):
     with app.app_context():
         init_db.create_admin_account()
         assert User.query.filter_by(login_id="admin").one().check_password("admin123")
+
+
+def _seed_admin(login_id="admin", password="existing-password"):
+    admin = User(login_id=login_id, is_admin=True)
+    admin.set_password(password)
+    db.session.add(admin)
+    db.session.commit()
+    return admin
+
+
+def test_seed_disabled_creates_no_admin_account(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+
+    with app.app_context():
+        init_db.create_admin_account()
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_disabled_leaves_existing_admin_untouched(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.setenv("ADMIN_PASSWORD", "a-different-password")
+
+    with app.app_context():
+        _seed_admin()
+        init_db.create_admin_account()
+        admin = User.query.filter_by(login_id="admin").one()
+        assert admin.is_admin
+        assert not admin.disabled
+        assert admin.check_password("existing-password")
+
+
+@pytest.mark.parametrize("raw", [None, "", "true", "TRUE", "1"])
+def test_seed_enabled_or_unset_keeps_current_behavior(app, monkeypatch, raw):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("ADMIN_PASSWORD", "operator-supplied-strong-password")
+    if raw is None:
+        monkeypatch.delenv("SEED_ADMIN_ACCOUNT", raising=False)
+    else:
+        monkeypatch.setenv("SEED_ADMIN_ACCOUNT", raw)
+
+    with app.app_context():
+        init_db.create_admin_account()
+        admin = User.query.filter_by(login_id="admin").one()
+        assert admin.is_admin
+        assert admin.check_password("operator-supplied-strong-password")
+
+
+def test_production_without_seeding_needs_no_admin_password(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr(init_db, "create_app", lambda: app)
+    monkeypatch.setattr(init_db, "verify_schema", lambda: None)
+    monkeypatch.setattr(init_db, "import_student_whitelist", lambda: None)
+
+    init_db.init_database()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_production_with_seeding_still_refuses_default_password(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "true")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin123")
+
+    with app.app_context(), pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        init_db.create_admin_account()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_flag_typo_is_refused_rather_than_seeding(app, monkeypatch):
+    # "flase" must not silently fall back to seeding a generic admin.
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "flase")
+
+    with app.app_context(), pytest.raises(RuntimeError, match="SEED_ADMIN_ACCOUNT"):
+        init_db.create_admin_account()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_disabled_still_promotes_listed_admin_users(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.setenv("ADMIN_USERS", "ta1")
+
+    with app.app_context():
+        ta = User(login_id="ta1", is_admin=False)
+        ta.set_password("x-not-real")
+        db.session.add(ta)
+        db.session.commit()
+        init_db.create_admin_account()
+        assert User.query.filter_by(login_id="ta1").one().is_admin

@@ -221,7 +221,8 @@ These values normally live in `.env`:
 | `VPN_LOGIN_SERVER` | Optional Tailscale/Headscale login-server URL, including its scheme (`https://vpn.example.edu`), shown in student instructions; when unset, the UI omits the `--login-server` flag |
 | `SITE_DOMAIN` | Public hostname consumed by Caddy |
 | `ACME_EMAIL` | ACME contact address consumed by Caddy |
-| `ADMIN_PASSWORD` | Bootstrap admin password; production refuses missing or known weak defaults |
+| `ADMIN_PASSWORD` | Bootstrap admin password; production refuses missing or known weak defaults when the account is about to be seeded (see `SEED_ADMIN_ACCOUNT`) |
+| `SEED_ADMIN_ACCOUNT` | Whether `init_db` creates the generic `ADMIN_LOGIN_ID` account when it does not exist; defaults to `true`. Set `false` when staff use personal accounts listed in `ADMIN_USERS`; `ADMIN_PASSWORD` is then not required, in production or by `scripts/preflight_env.py`. It never deletes or changes an account that already exists. To retire an existing generic account, sign in as another admin and `PUT /admin/students/<id>` with `{"disabled": true}` (the same toggle as the Admin Dashboard's student list). Anything other than a recognised boolean fails startup |
 | `PROXMOX_HOST` | Proxmox API hostname or IP |
 | `PROXMOX_USER` / `PROXMOX_PASSWORD` | Password authentication (development) |
 | `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET` | API token authentication (production) |
@@ -451,3 +452,9 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push to `main` or `fea
 ---
 
 **Last Updated:** October 2026
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

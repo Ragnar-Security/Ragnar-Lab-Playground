@@ -116,7 +116,7 @@ PERMANENT_SESSION_LIFETIME=7200
   32 characters;
 - the database password (`DATABASE_URL` or `MYSQL_PASSWORD`) is empty or a
   published example value;
-- `ADMIN_PASSWORD` is missing or a known weak default;
+- `ADMIN_PASSWORD` is missing or a known weak default and the admin account is about to be seeded (`SEED_ADMIN_ACCOUNT` is not `false` and the account does not exist yet);
 - `PROXMOX_CA_BUNDLE` is set but the file does not exist;
 - `SESSION_COOKIE_SAMESITE` is not a valid value.
 
@@ -237,7 +237,7 @@ docker compose up -d --build
 After starting the containers, the system will automatically:
 
 1. Initialize the database schema
-2. Create the admin account from `ADMIN_LOGIN_ID` and `ADMIN_PASSWORD`
+2. Create the admin account from `ADMIN_LOGIN_ID` and `ADMIN_PASSWORD` (skipped when `SEED_ADMIN_ACCOUNT=false`)
 3. Start background VM monitoring
 
 The test student is created only when `SEED_TEST_STUDENT=1`. Production must
@@ -245,7 +245,11 @@ leave this variable unset because that account has a known password.
 
 Production startup refuses to seed the admin when `ADMIN_PASSWORD` is
 missing or is a known weak default. Set a unique password before starting
-the stack.
+the stack. If staff sign in with personal accounts listed in `ADMIN_USERS`,
+set `SEED_ADMIN_ACCOUNT=false` instead: no generic account is created and
+`ADMIN_PASSWORD` is not required. An account that already exists is left as
+it is; disable it from another admin session with `PUT /admin/students/<id>`
+and `{"disabled": true}`.
 
 ### Migrating an existing checkout to this repository
 

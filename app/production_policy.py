@@ -96,6 +96,16 @@ def admin_password_problem(value):
     return None
 
 
+def seed_admin_account(raw):
+    """Whether init_db seeds the generic admin account: True when unset or
+    empty (the historical behavior), False/True when recognised, None for an
+    unrecognised value. None must be refused by the caller: a typo such as
+    "flase" would otherwise quietly create the account the operator turned off."""
+    if not (raw or '').strip():
+        return True
+    return parse_bool(raw)
+
+
 def samesite_value(raw):
     """The canonical SameSite attribute, or None when `raw` is not valid.
     Unset or empty means Lax."""

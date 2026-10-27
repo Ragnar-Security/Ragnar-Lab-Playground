@@ -75,8 +75,13 @@ def problems(env):
     for key in ('MYSQL_ROOT_PASSWORD', 'MYSQL_PASSWORD'):
         check(key, policy.db_password_problem(env.get(key)))
     # init_db only needs it to seed the first admin, but a deployment that
-    # loses its database volume seeds again with whatever is here.
-    check('ADMIN_PASSWORD', policy.admin_password_problem(env.get('ADMIN_PASSWORD')))
+    # loses its database volume seeds again with whatever is here. With
+    # seeding off nothing reads it, so it is not required.
+    seed = policy.seed_admin_account(env.get('SEED_ADMIN_ACCOUNT'))
+    if seed is None:
+        check('SEED_ADMIN_ACCOUNT', 'must be true or false')
+    elif seed:
+        check('ADMIN_PASSWORD', policy.admin_password_problem(env.get('ADMIN_PASSWORD')))
     if policy.samesite_value(env.get('SESSION_COOKIE_SAMESITE')) is None:
         check('SESSION_COOKIE_SAMESITE', 'must be Lax, Strict or None')
 
