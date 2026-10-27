@@ -3,8 +3,12 @@ Component tests for authentication routes
 Tests login, logout, registration functionality
 """
 
+import os
 import unittest
 import json
+from unittest import mock
+
+import app as app_package
 from app import create_app
 from app.models import db, User, StudentWhitelist
 
@@ -308,6 +312,27 @@ class TestAuthRoutes(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(data['status'], 'ok')
         self.assertIn('timestamp', data)
+
+    def test_health_check_reports_version_and_revision(self):
+        """Operators and monitoring read the running release from health."""
+        with mock.patch.dict(os.environ, {'APP_REVISION': 'abc1234'}):
+            data = self.client.get('/auth/health').get_json()
+
+        self.assertEqual(data['version'], app_package.__version__)
+        self.assertEqual(data['revision'], 'abc1234')
+
+    def test_health_check_revision_is_null_without_build_revision(self):
+        """Source builds on the droplet pass no APP_REVISION; the image then
+        sets it empty, which must read as unknown, not as a revision."""
+        for value in (None, ''):
+            with self.subTest(value=value), mock.patch.dict(os.environ):
+                os.environ.pop('APP_REVISION', None)
+                if value is not None:
+                    os.environ['APP_REVISION'] = value
+                data = self.client.get('/auth/health').get_json()
+
+                self.assertEqual(data['version'], app_package.__version__)
+                self.assertIsNone(data['revision'])
 
 
     def test_disabled_user_cannot_login(self):
