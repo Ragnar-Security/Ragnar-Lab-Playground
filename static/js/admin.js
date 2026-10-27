@@ -215,6 +215,7 @@ function renderStudentTable(students, filter) {
         html += `<tr><td>${escapeHtml(s.login_id)}</td><td>${escapeHtml(s.full_name || '')}</td><td>${role}</td><td>${escapeHtml(s.entry_vlan_tag || '-')}/${escapeHtml(s.internal_vlan_tag || '-')}</td><td>${escapeHtml(lastLogin)}</td><td>${escapeHtml(s.active_vm_count)}</td><td>${status}</td><td>
             <button class="btn btn-sm btn-outline-warning js-toggle-admin" data-id="${escapeHtml(s.id)}" data-value="${s.is_admin ? 'false' : 'true'}" style="border:1px solid rgba(255,210,0,0.5)" title="${s.is_admin ? 'Remove admin' : 'Make admin'}"><i class="bi bi-shield"></i></button>
             <button class="btn btn-sm btn-outline-${s.disabled ? 'success' : 'danger'} js-toggle-disabled" data-id="${escapeHtml(s.id)}" data-value="${s.disabled ? 'false' : 'true'}" title="${s.disabled ? 'Enable' : 'Disable'}"><i class="bi bi-${s.disabled ? 'check-circle' : 'x-circle'}"></i></button>
+            <button class="btn btn-sm btn-outline-info js-reset-link" data-id="${escapeHtml(s.id)}" data-login="${escapeHtml(s.login_id)}" title="Create reset link"><i class="bi bi-key"></i></button>
         </td></tr>`;
     });
     html += '</tbody></table>';
@@ -224,6 +225,8 @@ function renderStudentTable(students, filter) {
         btn.addEventListener('click', () => toggleAdmin(Number(btn.dataset.id), btn.dataset.value === 'true')));
     container.querySelectorAll('.js-toggle-disabled').forEach(btn =>
         btn.addEventListener('click', () => toggleDisabled(Number(btn.dataset.id), btn.dataset.value === 'true')));
+    container.querySelectorAll('.js-reset-link').forEach(btn =>
+        btn.addEventListener('click', () => createResetLink(Number(btn.dataset.id), btn.dataset.login)));
 }
 
 function toggleAdmin(userId, value) {
@@ -236,6 +239,63 @@ function toggleDisabled(userId, value) {
     if (!confirm(value ? 'Disable this account?' : 'Enable this account?')) return;
     fetch('/admin/students/' + userId, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({disabled: value}) })
         .then(r => r.json()).then(data => { if (data.success) loadStudentManagement(); });
+}
+
+function createResetLink(userId, loginId) {
+    if (!confirm(`Create a password reset link for ${loginId}? Any earlier unused link for this account stops working.`)) return;
+    fetch(`/admin/students/${userId}/reset-link`, { method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}' })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) showResetLink(data);
+            else showMessage('reset-link-result', `<strong>Error:</strong> ${escapeHtml(data.error || 'Unknown error')}`, 'error');
+        })
+        .catch(err => showMessage('reset-link-result', `<strong>Error:</strong> ${escapeHtml(err.message)}`, 'error'));
+}
+
+// The server returns the link exactly once and keeps only its hash, so this
+// panel is the admin's only chance to copy it. Built with DOM APIs: the link
+// is a URL and a credential, never markup.
+function showResetLink(data) {
+    const url = new URL(data.reset_url, window.location.origin).href;
+    const container = document.getElementById('reset-link-result');
+
+    const box = document.createElement('div');
+    box.className = 'alert alert-warning';
+    const heading = document.createElement('div');
+    heading.innerHTML = `<strong>Reset link for ${escapeHtml(data.login_id)}</strong>: shown only now. `
+        + `It works once and expires ${escapeHtml(new Date(data.expires_at).toLocaleString())}. `
+        + 'Give it to the student directly.';
+
+    const group = document.createElement('div');
+    group.className = 'input-group mt-2';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.readOnly = true;
+    input.id = 'reset-link-url';
+    input.className = 'form-control font-monospace';
+    input.value = url;
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'btn btn-outline-dark';
+    copy.textContent = 'Copy';
+    copy.addEventListener('click', () => {
+        input.select();
+        // The Clipboard API exists only in secure contexts (HTTPS, localhost).
+        const copied = navigator.clipboard
+            ? navigator.clipboard.writeText(url)
+            : Promise.resolve(document.execCommand('copy'));
+        copied.then(() => { copy.textContent = 'Copied'; });
+    });
+    const done = document.createElement('button');
+    done.type = 'button';
+    done.className = 'btn btn-outline-secondary';
+    done.textContent = 'Done';
+    done.addEventListener('click', () => container.replaceChildren());
+
+    group.append(input, copy, done);
+    box.append(heading, group);
+    container.replaceChildren(box);
+    input.select();
 }
 
 // ---- VM Overview (Admin) ----

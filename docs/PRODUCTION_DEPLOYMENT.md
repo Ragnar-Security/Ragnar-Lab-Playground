@@ -97,9 +97,12 @@ Further settings (all documented in `.env.example`):
 PROXMOX_VERIFY_SSL=true
 PROXMOX_CA_BUNDLE=
 
-# Student self-service password reset (default false = ask an admin).
-# true allows reset with only login + SIS ID: low-entropy, see below
+# Student self-service password reset (default false = ask an admin for a
+# reset link). true allows reset with only login + SIS ID: low-entropy, see below
 SELF_SERVICE_PASSWORD_RESET=false
+
+# Lifetime of an admin-issued, single-use password reset link (default 60)
+PASSWORD_RESET_TOKEN_TTL_MINUTES=60
 
 # 1 behind the bundled Caddy (set by docker-compose.prod.yml); 0 if exposed directly
 TRUSTED_PROXY_HOPS=1
@@ -116,7 +119,7 @@ PERMANENT_SESSION_LIFETIME=7200
   32 characters;
 - the database password (`DATABASE_URL` or `MYSQL_PASSWORD`) is empty or a
   published example value;
-- `ADMIN_PASSWORD` is missing or a known weak default;
+- `ADMIN_PASSWORD` is missing, a known default, or shorter than 16 characters and the admin account is about to be seeded (`SEED_ADMIN_ACCOUNT` is not `false` and the account does not exist yet);
 - `PROXMOX_CA_BUNDLE` is set but the file does not exist;
 - `SESSION_COOKIE_SAMESITE` is not a valid value.
 
@@ -138,6 +141,18 @@ through Caddy, and both flags are forced on in production. Only
 anyone who knows a student's login and SIS ID reset that student's password
 without an administrator, so leave it off unless that risk is acceptable.
 
+Admin-issued reset links are the recommended recovery path and work whatever
+`SELF_SERVICE_PASSWORD_RESET` says. An admin creates one from the key button
+in the Students tab, sees it once, and hands it to the student. Each link is
+single-use, expires after `PASSWORD_RESET_TOKEN_TTL_MINUTES`, and dies when a
+newer one is issued for the same student; the database holds at most one link
+per student, so two admins issuing at once leave only the later link working.
+The token travels in the URL fragment, so neither Caddy's `access.log` nor
+gunicorn's access log records it, and only its SHA-256 is stored. The feature
+needs the `password_reset_tokens` table (`migrate_add_password_reset_tokens.py`).
+Sites that rely on self-service today can keep `SELF_SERVICE_PASSWORD_RESET=true`
+while staff move to links, then turn it off.
+
 Before starting or updating, validate the file:
 
 ```bash
@@ -148,9 +163,10 @@ The script is stdlib-only and runs on the host (default file `./.env`). It
 prints one `KEY: problem` line per issue, never the values, and exits 1 on
 problems or 2 if the file is unreadable. It checks `SECRET_KEY`,
 `MYSQL_ROOT_PASSWORD`, `MYSQL_PASSWORD` and `ADMIN_PASSWORD` (present and not
-a known default), `SESSION_COOKIE_SAMESITE`, and that `PROXMOX_CA_BUNDLE` is
-readable on the host when verification is on. Mount the PEM into the container
-at the same path it has on the host.
+a known default; `ADMIN_PASSWORD` also at least 16 characters),
+`SESSION_COOKIE_SAMESITE`, and that `PROXMOX_CA_BUNDLE` is readable on the
+host when verification is on. Mount the PEM into the container at the same
+path it has on the host.
 
 Registration and self-service reset both refuse roster rows with an empty SIS
 ID. `init_db` fails immediately on configuration errors instead of retrying as
@@ -237,15 +253,19 @@ docker compose up -d --build
 After starting the containers, the system will automatically:
 
 1. Initialize the database schema
-2. Create the admin account from `ADMIN_LOGIN_ID` and `ADMIN_PASSWORD`
+2. Create the admin account from `ADMIN_LOGIN_ID` and `ADMIN_PASSWORD` (skipped when `SEED_ADMIN_ACCOUNT=false`)
 3. Start background VM monitoring
 
 The test student is created only when `SEED_TEST_STUDENT=1`. Production must
 leave this variable unset because that account has a known password.
 
 Production startup refuses to seed the admin when `ADMIN_PASSWORD` is
-missing or is a known weak default. Set a unique password before starting
-the stack.
+missing, a known default, or shorter than 16 characters. Set a unique password
+before starting the stack. If staff sign in with personal accounts listed in
+`ADMIN_USERS`, set `SEED_ADMIN_ACCOUNT=false` instead: no generic account is
+created and `ADMIN_PASSWORD` is not required. An account that already exists is left as
+it is; disable it from another admin session with `PUT /admin/students/<id>`
+and `{"disabled": true}`.
 
 ### Migrating an existing checkout to this repository
 
@@ -286,6 +306,8 @@ requires them:
   self-signed certificate;
 - `SELF_SERVICE_PASSWORD_RESET=true` only if the site wants the old
   behavior (see the warning in the environment section);
+- `PASSWORD_RESET_TOKEN_TTL_MINUTES` only to change the 60-minute lifetime of
+  admin-issued reset links;
 - `TRUSTED_PROXY_HOPS` is preset to `1` by `docker-compose.prod.yml`; do not
   set it unless the app is exposed without Caddy.
 
@@ -403,10 +425,16 @@ Adding a column does not break the old code, so this order is correct.
 Skipping one is not safe: `db.create_all()` never adds columns to an existing
 table, and the new code reads `users.session_version` and the
 `vm_records.deletion_*` columns on every request and expiry pass.
+`migrate_add_password_reset_tokens.py` adds a new table the old code never
+reads; `db.create_all()` at startup would also create it, but run it here so
+the schema is complete before the new code serves its first reset link. On a
+table an earlier release created it also makes `user_id` unique, first
+deleting all but each student's newest link (the ones a newer link had
+already retired, or that the old issuance race left live).
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -417,7 +445,7 @@ the migration itself, the file is not there yet. Inject it for this one run:
 
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
-                 migrate_vm_deletion_retry.py; do
+                 migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration

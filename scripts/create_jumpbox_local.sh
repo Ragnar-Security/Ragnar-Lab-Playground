@@ -39,6 +39,13 @@ JUMPBOX_CORES="${JUMPBOX_CORES:-2}"
 JUMPBOX_DISK_SIZE="${JUMPBOX_DISK_SIZE:-32G}"
 JUMPBOX_BRIDGE="${JUMPBOX_BRIDGE:-vmbr0}"
 JUMPBOX_VLAN="${JUMPBOX_VLAN:-20}"
+# Optional: path to an SSH public-key file, installed for the default cloud
+# image user (ubuntu) through cloud-init. Without it the VM has no login.
+JUMPBOX_SSH_PUBKEY="${JUMPBOX_SSH_PUBKEY:-}"
+if [[ -n "$JUMPBOX_SSH_PUBKEY" && ! -f "$JUMPBOX_SSH_PUBKEY" ]]; then
+    echo "ERROR: JUMPBOX_SSH_PUBKEY file not found: $JUMPBOX_SSH_PUBKEY" >&2
+    exit 1
+fi
 
 echo "========================================"
 echo "Lab Jumpbox Setup (Local)"
@@ -128,6 +135,9 @@ qm set $JUMPBOX_VMID --ide2 $JUMPBOX_STORAGE:cloudinit
 # Set cloud-init settings
 qm set $JUMPBOX_VMID --serial0 socket --vga serial0
 qm set $JUMPBOX_VMID --ipconfig0 ip=dhcp
+if [[ -n "$JUMPBOX_SSH_PUBKEY" ]]; then
+    qm set $JUMPBOX_VMID --ciuser ubuntu --sshkeys "$JUMPBOX_SSH_PUBKEY"
+fi
 
 echo "✓ Cloud-init configured"
 
@@ -163,9 +173,15 @@ echo "========================================"
 echo ""
 echo "Next steps:"
 echo ""
-echo "1. SSH into the jumpbox (default user: ubuntu, use console first time):"
-echo "   qm terminal $JUMPBOX_VMID"
-echo "   # Login with ubuntu/ubuntu, set password"
+if [[ -n "$JUMPBOX_SSH_PUBKEY" ]]; then
+    echo "1. SSH into the jumpbox as ubuntu with the key configured through cloud-init"
+    echo "   ($JUMPBOX_SSH_PUBKEY); there is no password login:"
+    echo "   ssh ubuntu@$JUMPBOX_IP"
+else
+    echo "1. No SSH key was configured, so the VM has no way to log in. Re-run with"
+    echo "   JUMPBOX_SSH_PUBKEY=<path-to-public-key-file> to install one through"
+    echo "   cloud-init, or set one on the VM: qm set $JUMPBOX_VMID --sshkeys <file>"
+fi
 echo ""
 echo "2. Install Tailscale:"
 echo "   curl -fsSL https://tailscale.com/install.sh | sh"

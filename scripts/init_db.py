@@ -136,20 +136,32 @@ def create_admin_account():
     admin_login = os.getenv('ADMIN_LOGIN_ID', 'admin')
     configured_password = os.getenv('ADMIN_PASSWORD')
 
-    # Existing accounts are not modified here. This guard only prevents a
-    # production bootstrap from creating a privileged account with a password
-    # that is absent or copied from one of the historical examples.
+    seed = production_policy.seed_admin_account(os.getenv('SEED_ADMIN_ACCOUNT'))
+    if seed is None:
+        raise AdminConfigurationError(
+            'SEED_ADMIN_ACCOUNT must be true or false.'
+        )
+
+    # Existing accounts are not modified here, including when seeding is off:
+    # retiring an unused generic account is an operator action (PUT
+    # /admin/students/<id> with {"disabled": true}), not something a restart
+    # may do. The password guard below only prevents a production bootstrap
+    # from creating a privileged account with a password that is absent or
+    # copied from one of the historical examples; with seeding off nothing is
+    # created, so there is no password to vet.
     existing_admin = User.query.filter_by(login_id=admin_login).first()
-    if not existing_admin and is_production():
-        if production_policy.admin_password_problem(configured_password):
+    if seed and not existing_admin and is_production():
+        problem = production_policy.admin_password_problem(configured_password)
+        if problem:
             raise AdminConfigurationError(
-                'Refusing to seed a production admin: set ADMIN_PASSWORD '
-                'to an operator-supplied password that is not a known default.'
+                f'Refusing to seed a production admin: ADMIN_PASSWORD {problem}.'
             )
 
     admin_password = configured_password or 'admin123'
 
-    if not existing_admin:
+    if not seed:
+        print("✓ Default admin seeding disabled (SEED_ADMIN_ACCOUNT=false)")
+    elif not existing_admin:
         admin = User(
             login_id=admin_login,
             is_admin=True

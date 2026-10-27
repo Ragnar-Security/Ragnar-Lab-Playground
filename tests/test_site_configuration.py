@@ -4,7 +4,7 @@ import pytest
 
 from app import create_app
 from app.models import User, db
-from scripts import init_db
+from scripts import init_db, preflight_env
 
 
 @pytest.fixture
@@ -146,6 +146,50 @@ def test_production_seeds_admin_with_operator_password(app, monkeypatch):
         assert admin.check_password("operator-supplied-strong-password")
 
 
+# Generated, not literal: only the length is under test.
+@pytest.mark.parametrize("length, seeds", [(15, False), (16, True), (32, True)])
+def test_production_admin_password_needs_sixteen_characters(app, monkeypatch, length, seeds):
+    password = "k" * length
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("ADMIN_PASSWORD", password)
+
+    with app.app_context():
+        if seeds:
+            init_db.create_admin_account()
+            assert User.query.filter_by(login_id="admin").one().check_password(password)
+        else:
+            with pytest.raises(RuntimeError, match="ADMIN_PASSWORD") as refused:
+                init_db.create_admin_account()
+            assert "16" in str(refused.value)
+            assert password not in str(refused.value)
+            assert User.query.filter_by(login_id="admin").first() is None
+
+
+@pytest.mark.parametrize("password", [
+    None, "", "admin123", "change-this-password-immediately", "k" * 15, "k" * 16,
+    " " * 4 + "k" * 15 + " " * 4,
+])
+def test_preflight_and_startup_agree_on_admin_password(app, monkeypatch, password):
+    """An .env that passes the host preflight must not then stop the
+    container at startup, and the reverse."""
+    monkeypatch.setenv("FLASK_ENV", "production")
+    if password is None:
+        monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    else:
+        monkeypatch.setenv("ADMIN_PASSWORD", password)
+    preflight_refuses = any(line.startswith("ADMIN_PASSWORD:")
+                            for line in preflight_env.problems({"ADMIN_PASSWORD": password}))
+
+    with app.app_context():
+        try:
+            init_db.create_admin_account()
+            startup_refuses = False
+        except init_db.AdminConfigurationError:
+            startup_refuses = True
+
+    assert preflight_refuses == startup_refuses
+
+
 def _raise_validate_config_error():
     raise ValueError("Configuration errors:\n  - PROXMOX_HOST is not set")
 
@@ -191,3 +235,102 @@ def test_mixed_case_development_keeps_default_admin_password(app, monkeypatch):
     with app.app_context():
         init_db.create_admin_account()
         assert User.query.filter_by(login_id="admin").one().check_password("admin123")
+
+
+def _seed_admin(login_id="admin", password="existing-password"):
+    admin = User(login_id=login_id, is_admin=True)
+    admin.set_password(password)
+    db.session.add(admin)
+    db.session.commit()
+    return admin
+
+
+def test_seed_disabled_creates_no_admin_account(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+
+    with app.app_context():
+        init_db.create_admin_account()
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_disabled_leaves_existing_admin_untouched(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.setenv("ADMIN_PASSWORD", "a-different-password")
+
+    with app.app_context():
+        _seed_admin()
+        init_db.create_admin_account()
+        admin = User.query.filter_by(login_id="admin").one()
+        assert admin.is_admin
+        assert not admin.disabled
+        assert admin.check_password("existing-password")
+
+
+@pytest.mark.parametrize("raw", [None, "", "true", "TRUE", "1"])
+def test_seed_enabled_or_unset_keeps_current_behavior(app, monkeypatch, raw):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("ADMIN_PASSWORD", "operator-supplied-strong-password")
+    if raw is None:
+        monkeypatch.delenv("SEED_ADMIN_ACCOUNT", raising=False)
+    else:
+        monkeypatch.setenv("SEED_ADMIN_ACCOUNT", raw)
+
+    with app.app_context():
+        init_db.create_admin_account()
+        admin = User.query.filter_by(login_id="admin").one()
+        assert admin.is_admin
+        assert admin.check_password("operator-supplied-strong-password")
+
+
+def test_production_without_seeding_needs_no_admin_password(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.setattr(init_db, "create_app", lambda: app)
+    monkeypatch.setattr(init_db, "verify_schema", lambda: None)
+    monkeypatch.setattr(init_db, "import_student_whitelist", lambda: None)
+
+    init_db.init_database()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_production_with_seeding_still_refuses_default_password(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "production")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "true")
+    monkeypatch.setenv("ADMIN_PASSWORD", "admin123")
+
+    with app.app_context(), pytest.raises(RuntimeError, match="ADMIN_PASSWORD"):
+        init_db.create_admin_account()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_flag_typo_is_refused_rather_than_seeding(app, monkeypatch):
+    # "flase" must not silently fall back to seeding a generic admin.
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "flase")
+
+    with app.app_context(), pytest.raises(RuntimeError, match="SEED_ADMIN_ACCOUNT"):
+        init_db.create_admin_account()
+
+    with app.app_context():
+        assert User.query.filter_by(login_id="admin").first() is None
+
+
+def test_seed_disabled_still_promotes_listed_admin_users(app, monkeypatch):
+    monkeypatch.setenv("FLASK_ENV", "development")
+    monkeypatch.setenv("SEED_ADMIN_ACCOUNT", "false")
+    monkeypatch.setenv("ADMIN_USERS", "ta1")
+
+    with app.app_context():
+        ta = User(login_id="ta1", is_admin=False)
+        ta.set_password("x-not-real")
+        db.session.add(ta)
+        db.session.commit()
+        init_db.create_admin_account()
+        assert User.query.filter_by(login_id="ta1").one().is_admin

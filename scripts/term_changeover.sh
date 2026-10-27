@@ -30,6 +30,9 @@ for name in PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER HEADSCALE_DIR \
         || { printf "ERROR: %s must not contain an apostrophe\n" "$name" >&2; exit 1; }
 done
 SSH_OPTIONS=(-o BatchMode=yes -o ConnectTimeout=10)
+# The app container runs as uid/gid 1000 (Dockerfile.prod pins both); the
+# mounted roster is delivered as mode 0640 with this group so it can read it.
+APP_GID=1000
 # The interpreter must live in the same path universe as this shell. Under WSL
 # every path here is /mnt/c/..., and the Windows python.exe cannot open such a
 # path. Under Git Bash the repository venv is the right answer. Both helpers
@@ -379,8 +382,11 @@ replace_roster_files() {
             fi"
         printf '  portal roster backup: %s:%s\n' "$PORTAL_HOST" "$remote_backup"
         scp "${SSH_OPTIONS[@]}" "$new_file" "$PORTAL_HOST:$remote_tmp" >/dev/null
+        # The roster carries reusable VPN keys: readable by its owner and by the
+        # app container's group (APP_GID), not by other accounts on the host.
         ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" "set -e
-            chmod 644 '$remote_tmp'
+            chgrp $APP_GID '$remote_tmp'
+            chmod 640 '$remote_tmp'
             mv '$remote_tmp' '$PORTAL_DIR/data/students_merged.csv'
             test \"\$(sha256sum '$PORTAL_DIR/data/students_merged.csv' | cut -d' ' -f1)\" = '$DESIRED_HASH'"
     fi

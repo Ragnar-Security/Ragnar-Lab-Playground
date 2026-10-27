@@ -166,7 +166,7 @@ PROXMOX_HOST=<proxmox-host>
 PROXMOX_PASSWORD=<choose-a-password>
 MYSQL_ROOT_PASSWORD=<choose-a-password>
 MYSQL_PASSWORD=<choose-a-password>
-ADMIN_PASSWORD=<choose-a-password>  # Production rejects missing/known defaults
+ADMIN_PASSWORD=<choose-a-password>  # Production rejects missing/known defaults and anything under 16 characters
 SITE_DOMAIN=lab.example.edu
 ACME_EMAIL=admin@example.edu
 ```

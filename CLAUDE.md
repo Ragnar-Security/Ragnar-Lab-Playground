@@ -158,6 +158,10 @@ file, and the production database. A second run of a finished changeover
 reports "nothing to do" at every stage. `docs/TERM_CHANGEOVER.md` carries the
 procedure, the rollback and the four failure modes behind these rules.
 
+Rotating keys without a roster change is `scripts/rotate_headscale_keys.sh`
+(dry run by default). It must update the database as well as the CSV, and
+expires old keys only after the database update succeeds.
+
 
 ### Capacity planning
 

@@ -234,6 +234,42 @@ class StudentWhitelist(db.Model):
         return f"<StudentWhitelist {self.login_id}: {self.full_name}>"
 
 
+class PasswordResetToken(db.Model):
+    """A single-use password reset link an administrator issued for a user.
+
+    Only the SHA-256 of the token is stored: the link is the credential, so
+    a database dump or backup must not hand out working links. A fast hash
+    is enough because the token carries 32 random bytes; there is nothing to
+    brute-force the way there is with a password.
+
+    One row per user, enforced by the database: issuing a link replaces the
+    user's row, so an earlier link stops working however two issuers
+    interleave. A used row stays until the next link replaces it.
+    """
+
+    __tablename__ = 'password_reset_tokens'
+    __table_args__ = (
+        # Also the index the user_id foreign key needs on MySQL.
+        db.UniqueConstraint('user_id', name='uq_password_reset_tokens_user_id'),
+    )
+
+    id = db.Column(db.Integer, primary_key=True)
+    # scripts/purge_roster.sql deletes student users at term changeover; a
+    # plain foreign key would stop that DELETE at the first student who ever
+    # got a link. Links die with their user; the issuing admin may go too.
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'),
+                        nullable=False)
+    created_by_user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'),
+                                   nullable=True)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime, nullable=True)
+
+    def __repr__(self):
+        return f'<PasswordResetToken {self.id} user={self.user_id}>'
+
+
 class StudentLabAssignment(db.Model):
     """
     Controls per-student visibility of deployment groups (lab restriction system).

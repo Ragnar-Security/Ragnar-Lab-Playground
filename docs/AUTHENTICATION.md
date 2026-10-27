@@ -71,8 +71,8 @@ Importing students from ./gradebook.csv...
 
 The first run creates an admin from `ADMIN_LOGIN_ID` and `ADMIN_PASSWORD`.
 Development and test environments retain convenient defaults. Production
-refuses to seed an admin when the password is missing or is a known weak
-default, so set a unique value before startup.
+refuses to seed an admin when the password is missing, a known default, or
+shorter than 16 characters, so set a unique value before startup.
 
 #### Additional Admin Accounts (TAs)
 

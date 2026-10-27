@@ -15,7 +15,8 @@ import requests
 logger = logging.getLogger(__name__)
 
 from ..auth import login_required, admin_required, get_authenticated_user
-from ..models import db, VMRecord, User, StudentLabAssignment
+from ..models import db, VMRecord, User, StudentLabAssignment, _iso_local
+from .. import password_reset_links
 from .. import proxmox_service, tasks
 from .utils import _config_issue_alerts_sent
 
@@ -195,6 +196,48 @@ def update_student(user_id):
         user.disabled = disabled
     db.session.commit()
     return jsonify({'success': True, 'user': user.to_dict()})
+
+
+@admin_bp.route('/admin/students/<int:user_id>/reset-link', methods=['POST'])
+@login_required
+@admin_required
+def create_reset_link(user_id):
+    """Issue a single-use password reset link for a user and return it once.
+
+    The admin hands the link to the student out of band. Issuing a link
+    retires any earlier one for the same user.
+
+    CSRF: like every admin POST here, this relies on the session cookie's
+    SameSite=Lax, which a cross-site POST does not carry. It also refuses
+    anything but a JSON body. A cross-site HTML form cannot send one, and a
+    cross-site fetch() that tries needs a CORS preflight this app never
+    grants, so the endpoint stays closed even where an operator has set
+    SESSION_COOKIE_SAMESITE=None. A forged request could only mint a link it
+    cannot read anyway.
+    """
+    if not request.is_json:
+        return jsonify({'success': False, 'error': 'Expected a JSON request body'}), 415
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'success': False, 'error': 'User not found'}), 404
+
+    admin = get_authenticated_user()
+    raw_token, expires_at = password_reset_links.issue(user, created_by=admin)
+    # Never log the link itself: it works until it is used or expires.
+    logger.info("Admin %s issued a password reset link for %s (expires %s)",
+                admin.login_id, user.login_id, expires_at)
+
+    # A fragment, never a query string: browsers do not send fragments, so
+    # the token stays out of gunicorn's and Caddy's access logs, and out of
+    # any Referer header.
+    response = jsonify({
+        'success': True,
+        'login_id': user.login_id,
+        'reset_url': f'/reset-password#token={raw_token}',
+        'expires_at': _iso_local(expires_at),
+    })
+    response.headers['Cache-Control'] = 'no-store'
+    return response
 
 
 @admin_bp.route('/admin/assignments', methods=['GET'])
