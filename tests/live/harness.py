@@ -1,10 +1,13 @@
 """Safety harness for the opt-in live Proxmox contract run.
 
 The contract run clones, boots, stops and deletes real guests. Everything
-destructive goes through ``ContractRun``, which enforces four rules:
+destructive goes through ``ContractRun``, which enforces five rules:
 
 * it only ever allocates VMIDs inside ``LIVE_VMID_RANGE``, and refuses to
   start while any guest in that range lacks the ``lab-contract-test-`` prefix;
+* on a cluster the portal deploys to, the range must not reach above the
+  portal's VMID high-water mark, which lives in the portal database and
+  never goes down;
 * each guest gets a unique ``lab-contract-test-<random>`` name and the app's
   ``Expires:`` description, 30 minutes out;
 * cleanup runs on exit even when the body raised;
@@ -23,6 +26,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Mapping, Optional
 
+from sqlalchemy import create_engine, func, inspect, select
+
+from app.coordination import VMID_ALLOCATOR
+from app.models import CoordinationState, VMRecord
 from app.proxmox_service import (
     confirm_proxmox_absence,
     reset_cluster_vm_index,
@@ -77,6 +84,32 @@ def live_skip_reason(environ: Mapping[str, str]) -> Optional[str]:
     return None
 
 
+def read_portal_vmid_mark(database_url: str) -> int:
+    """The highest VMID the portal has allocated: its stored high-water mark
+    or its highest VMRecord, whichever is larger. Only reads."""
+    state, records = CoordinationState.__table__, VMRecord.__table__
+    engine = create_engine(database_url)
+    try:
+        existing = set(inspect(engine).get_table_names())
+        if not {state.name, records.name} & existing:
+            raise ValueError(
+                'LIVE_PORTAL_DATABASE_URL has no portal tables '
+                f'({state.name}, {records.name})')
+        mark = 0
+        with engine.connect() as conn:
+            if state.name in existing:
+                stored = conn.execute(
+                    select(state.c.value)
+                    .where(state.c.name == VMID_ALLOCATOR)).scalar()
+                mark = max(mark, int(stored or 0))
+            if records.name in existing:
+                highest = conn.execute(select(func.max(records.c.vmid))).scalar()
+                mark = max(mark, int(highest or 0))
+        return mark
+    finally:
+        engine.dispose()
+
+
 def _per_node(text: str, nodes: List[str], *, name: str,
               required: bool) -> Dict[str, str]:
     """Read ``value`` (every node) or ``node:value,node:value``."""
@@ -109,6 +142,8 @@ class LiveConfig:
     templates: Dict[str, int]
     storage: Dict[str, str]
     vmid_range: range
+    portal_database_url: Optional[str] = None
+    separate_cluster: bool = False
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> 'LiveConfig':
@@ -121,8 +156,16 @@ class LiveConfig:
                 name='LIVE_TEMPLATE_VMID', required=True).items()}
         storage = _per_node(environ.get('LIVE_CLONE_STORAGE', ''), nodes,
                             name='LIVE_CLONE_STORAGE', required=False)
+        portal_database_url = environ.get('LIVE_PORTAL_DATABASE_URL', '').strip() or None
+        separate_cluster = environ.get('LIVE_SEPARATE_CLUSTER', '').strip() == '1'
+        if portal_database_url and separate_cluster:
+            raise ValueError(
+                'set LIVE_PORTAL_DATABASE_URL (cluster shared with the portal) '
+                'or LIVE_SEPARATE_CLUSTER=1 (cluster it never deploys to), '
+                'not both')
         return cls(nodes, templates, storage,
-                   parse_vmid_range(environ.get('LIVE_VMID_RANGE', '')))
+                   parse_vmid_range(environ.get('LIVE_VMID_RANGE', '')),
+                   portal_database_url, separate_cluster)
 
     def template_for(self, node: str) -> int:
         return self.templates[node]
@@ -155,9 +198,13 @@ class ContractRun:
     """Owns every guest the contract run creates; use as a context manager."""
 
     def __init__(self, proxmox, vmid_range: range, *,
+                 portal_vmid_mark: Optional[int] = None,
+                 separate_cluster: bool = False,
                  now: Callable[[], datetime] = datetime.now):
         self.proxmox = proxmox
         self.vmid_range = vmid_range
+        self.portal_vmid_mark = portal_vmid_mark
+        self.separate_cluster = separate_cluster
         self.now = now
         self._owned: Dict[int, Guest] = {}
 
@@ -198,8 +245,40 @@ class ContractRun:
                 f'{self.vmid_range[0]}-{self.vmid_range[-1]} holds guests not '
                 f'named {NAME_PREFIX}*: ' + ', '.join(foreign))
 
+    def _require_range_below_portal_mark(self, inventory: Dict[int, dict]) -> None:
+        """The portal allocates above max(cluster VMIDs, its database mark)
+        and stores the result as the new mark, which never goes down. A
+        contract guest above that mark, alive while a student deploys, would
+        raise every later allocation for good."""
+        if self.separate_cluster:
+            return
+        top = self.vmid_range[-1]
+        span = f'{self.vmid_range[0]}-{top}'
+        if self.portal_vmid_mark is not None:
+            if top > self.portal_vmid_mark:
+                raise UnsafeLiveRun(
+                    f'refusing to run: LIVE_VMID_RANGE {span} reaches above '
+                    f"the portal's VMID high-water mark {self.portal_vmid_mark}; "
+                    "pick a range below the portal's VMIDs, or use a cluster "
+                    'it never deploys to (LIVE_SEPARATE_CLUSTER=1)')
+            return
+        # Without the database, the highest guest outside the range is the
+        # best available lower bound on the mark.
+        ceiling = max((vmid for vmid in inventory if vmid not in self.vmid_range),
+                      default=0)
+        if top > ceiling:
+            raise UnsafeLiveRun(
+                f'refusing to run: LIVE_VMID_RANGE {span} reaches above every '
+                f'other guest on the cluster (highest {ceiling}), so it may '
+                "be above the portal's VMID high-water mark; pick a range "
+                "below the portal's VMIDs, set LIVE_PORTAL_DATABASE_URL so "
+                'the mark can be checked, or LIVE_SEPARATE_CLUSTER=1 on a '
+                'cluster the portal never deploys to')
+
     def preflight(self) -> None:
-        self._require_clean_range(self._inventory())
+        inventory = self._inventory()
+        self._require_clean_range(inventory)
+        self._require_range_below_portal_mark(inventory)
 
     def _allocate_vmid(self) -> int:
         inventory = self._inventory()

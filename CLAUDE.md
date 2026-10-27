@@ -71,7 +71,7 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
   subscriber set. Concurrency comes from greenlets, not threads.
   Configured in `gunicorn.conf.py`.
 - **db** (`mysql:8.0`) — `--max-connections=300` so the SQLAlchemy pool
-  (50 + 50 overflow) plus migrations + backups don't hit the cap.
+  (50 + 100 overflow) plus migrations + backups don't hit the cap.
 - **ulimits**: `nofile: 65536` on `vm-automation` (Docker default of 1024
   was the EMFILE crash root cause).
 
@@ -127,9 +127,11 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     reservations plus the VMID high-water mark, and reset-failure stamps in
     tables. Each check-and-reserve runs in one transaction that locks a
     `coordination_state` row (`SELECT ... FOR UPDATE`). `vm_lifecycle_lock`
-    holds MySQL `GET_LOCK('vm-lifecycle-<vmid>')` on a dedicated connection;
-    on SQLite it is a process lock only, and during a database outage it
-    falls back to the process lock so cleanup can still remove guests.
+    is a process lock; with `DISTRIBUTED_VM_LOCKS=true` (required before a
+    second worker; default false) it also holds MySQL
+    `GET_LOCK('vm-lifecycle-<database>-<vmid>')` on a dedicated connection,
+    falling back to the process lock during a database outage so cleanup
+    can still remove guests. Re-entering a held VMID raises RuntimeError.
     That does not make a second worker safe. This state still lives in one
     process, so `workers` stays 1 (rule 1): APScheduler (rule 6); the SSE
     event bus fan-out; the orphan reaper's sweep schedule; the

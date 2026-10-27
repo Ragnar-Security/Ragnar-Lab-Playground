@@ -4,6 +4,7 @@ Handles all interactions with the Proxmox API
 """
 
 from contextlib import contextmanager
+import hashlib
 import threading
 import time
 import logging
@@ -13,8 +14,8 @@ from sqlalchemy import delete, func, insert, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from . import coordination
 from .config import (
-    PROXMOX_HOST, PROXMOX_USER, PROXMOX_PASSWORD, PROXMOX_TOKEN_ID,
-    PROXMOX_TOKEN_SECRET, proxmox_tls_verify,
+    DISTRIBUTED_VM_LOCKS, PROXMOX_HOST, PROXMOX_USER, PROXMOX_PASSWORD,
+    PROXMOX_TOKEN_ID, PROXMOX_TOKEN_SECRET, proxmox_tls_verify,
 )
 from .models import NodeMemoryReservation, VMIDReservation, VMRecord, db
 
@@ -39,24 +40,37 @@ VM_LIFECYCLE_LOCK_TIMEOUT_SECONDS = 30 * 60
 
 # Every mutation of a guest is serialized by VMID. Greenlets of one worker
 # queue on a process lock (monkey-patched threading locks coordinate
-# greenlets as well as helper threads); on MySQL a named server lock then
-# excludes other workers. Entries are reference-counted so the table does
-# not grow forever as the allocation high-water mark advances.
+# greenlets as well as helper threads); with DISTRIBUTED_VM_LOCKS on MySQL a
+# named server lock then excludes other workers. Entries are
+# reference-counted so the table does not grow forever as the allocation
+# high-water mark advances.
 _vm_lifecycle_locks: Dict[int, Dict[str, Any]] = {}
 _vm_lifecycle_locks_guard = threading.Lock()
 
 
 @contextmanager
 def _process_vm_lifecycle_lock(key: int):
+    # Under gevent's monkey patching get_ident() names the greenlet.
+    me = threading.get_ident()
     with _vm_lifecycle_locks_guard:
         entry = _vm_lifecycle_locks.get(key)
+        if entry is not None and entry['owner'] == me:
+            # The lock is not reentrant: waiting here would wait for itself
+            # forever, with the VMID locked for every other path too.
+            raise RuntimeError(
+                f'vm_lifecycle_lock({key}) is already held by this greenlet; '
+                'nested acquisition of the same VMID would never return')
         if entry is None:
-            entry = {'lock': threading.Lock(), 'users': 0}
+            entry = {'lock': threading.Lock(), 'users': 0, 'owner': None}
             _vm_lifecycle_locks[key] = entry
         entry['users'] += 1
     try:
         with entry['lock']:
-            yield
+            entry['owner'] = me
+            try:
+                yield
+            finally:
+                entry['owner'] = None
     finally:
         with _vm_lifecycle_locks_guard:
             entry['users'] -= 1
@@ -72,22 +86,36 @@ def _mysql_engine_or_none():
     return engine if engine.dialect.name == 'mysql' else None
 
 
+def _vm_lifecycle_lock_name(engine, key: int) -> str:
+    """GET_LOCK names are global to the MySQL server, so a staging database
+    on the same server must not share them. A database name too long for
+    MySQL's limit is replaced by a digest of it."""
+    database = engine.url.database or ''
+    name = f'vm-lifecycle-{database}-{key}'
+    if len(name) > coordination.MYSQL_LOCK_NAME_MAX_LENGTH:
+        digest = hashlib.sha256(database.encode()).hexdigest()[:16]
+        name = f'vm-lifecycle-{digest}-{key}'
+    return name
+
+
 @contextmanager
 def vm_lifecycle_lock(vmid: int):
     """Serialize allocation/destruction decisions for one VMID.
 
-    On MySQL this holds GET_LOCK('vm-lifecycle-<vmid>') across workers.
-    SQLite (tests, scripts) and callers without an app context get the
-    process lock only.
+    With DISTRIBUTED_VM_LOCKS on MySQL this also holds
+    GET_LOCK('vm-lifecycle-<database>-<vmid>') across workers, on a second
+    pool connection. Otherwise (the one-worker default, SQLite, callers
+    without an app context) it is the process lock only. Re-entering a VMID
+    this greenlet already holds raises RuntimeError.
     """
     key = int(vmid)
     with _process_vm_lifecycle_lock(key):
-        engine = _mysql_engine_or_none()
+        engine = _mysql_engine_or_none() if DISTRIBUTED_VM_LOCKS else None
         if engine is None:
             yield
             return
         with coordination.mysql_named_lock(
-                engine, f'vm-lifecycle-{key}',
+                engine, _vm_lifecycle_lock_name(engine, key),
                 VM_LIFECYCLE_LOCK_TIMEOUT_SECONDS):
             yield
 

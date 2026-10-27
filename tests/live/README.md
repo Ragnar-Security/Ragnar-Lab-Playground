@@ -30,12 +30,15 @@ connection. The safety guards are unit-tested without a cluster in
 1. **Only VMIDs inside `LIVE_VMID_RANGE`.** The run refuses to start, and
    refuses each new clone, while any guest in the range has a name that does
    not start with `lab-contract-test-`.
-2. **Recognisable guests.** Each guest is named
+2. **Never above the portal's VMID high-water mark.** On a cluster the
+   portal deploys to, the run refuses to start when the range reaches above
+   that mark (see "Choosing the VMID range").
+3. **Recognisable guests.** Each guest is named
    `lab-contract-test-<random>` and gets the app's description line
    `Expires: <now + 30 minutes>`.
-3. **Cleanup always runs.** The fixture's teardown destroys every guest the
+4. **Cleanup always runs.** The fixture's teardown destroys every guest the
    run created, whether the test passed or failed.
-4. **It touches only its own guests.** The run starts, stops or destroys a
+5. **It touches only its own guests.** The run starts, stops or destroys a
    VMID only if this run created it and fresh inventory still shows the exact
    name and node it gave that guest. Otherwise it leaves the VMID alone and
    reports it.
@@ -54,7 +57,9 @@ fails the test's teardown.
 | `PROXMOX_VERIFY_SSL` / `PROXMOX_CA_BUNDLE` | no | | TLS settings, same as the app. |
 | `LIVE_NODE` | yes | `node1` or `node1,node2` | Node(s) to test. Each node gets its own cases. |
 | `LIVE_TEMPLATE_VMID` | yes | `9000` or `node1:9000,node2:9001` | QEMU template on each node. The app clones on the template's node. |
-| `LIVE_VMID_RANGE` | yes | `99000-99099` | Inclusive VMID range the run may use. |
+| `LIVE_VMID_RANGE` | yes | `900-999` | Inclusive VMID range the run may use. Must lie below the portal's VMIDs; see below. |
+| `LIVE_PORTAL_DATABASE_URL` | no | `mysql+pymysql://readonly:...@db-host/portal` | Portal database, read once per test to check the range against the VMID high-water mark. Use a read-only account. |
+| `LIVE_SEPARATE_CLUSTER` | no | `1` | The cluster is one the portal never deploys to; skips the high-water check. Not allowed together with `LIVE_PORTAL_DATABASE_URL`. |
 | `LIVE_CLONE_STORAGE` | no | `fast-zfs` or `node2:fast-zfs` | Enables the full-clone-onto-storage test for those nodes. |
 | `LIVE_AGENT_TIMEOUT` | no | `90` | Seconds to wait for the guest agent when the template enables it. |
 
@@ -69,12 +74,36 @@ the target storage, and (optionally) query the guest agent.
 
 ## Choosing the VMID range
 
-The portal allocates the next VMID as one above the highest VMID in the
-cluster. A contract guest above every student VMID raises that mark while it
-exists, and the portal keeps its in-process high-water mark until it
-restarts. On a cluster the portal also uses, pick a range below the portal's
-current VMIDs. The best option is a disposable cluster that the portal never
-deploys to.
+The portal allocates the next VMID above the larger of the highest VMID in
+the cluster and a high-water mark stored in its database, then stores the
+new top as the mark. The mark never goes down: not when guests are deleted,
+and not when the portal restarts. If a contract guest sits above every
+student VMID while a student deploys, the portal allocates above the
+contract guest and records that, so every later allocation stays raised
+for good.
+
+Therefore use one of these:
+
+- **A range below the portal's allocation base**, on a cluster the portal
+  also uses: below every VMID the portal has ever allocated (if student
+  VMIDs start at 1000, for example, use `900-999`). Set
+  `LIVE_PORTAL_DATABASE_URL` and the run reads the mark (the larger of
+  `coordination_state.vmid_allocator` and `MAX(vm_records.vmid)`) and
+  refuses a range that reaches above it. Without that variable the run can
+  only see the cluster: it refuses a range that reaches above every other
+  guest, which is a lower bound on the mark. That check cannot see a mark
+  raised by guests that were since deleted, so read the mark yourself
+  before choosing:
+
+  ```sql
+  SELECT GREATEST(
+    COALESCE((SELECT value FROM coordination_state
+              WHERE name = 'vmid_allocator'), 0),
+    COALESCE((SELECT MAX(vmid) FROM vm_records), 0)) AS vmid_mark;
+  ```
+
+- **A separate cluster** that the portal never deploys to, with
+  `LIVE_SEPARATE_CLUSTER=1`. Any range works there.
 
 Leftover `lab-contract-test-*` guests are allowed in the range. The run skips
 their VMIDs and never touches them.
@@ -85,7 +114,8 @@ their VMIDs and never touches them.
 export LIVE_PROXMOX=1 PROXMOX_HOST=lab.example.edu PROXMOX_USER=contract@pve \
        PROXMOX_TOKEN_ID=contract PROXMOX_TOKEN_SECRET=... \
        LIVE_NODE=node1,node2 LIVE_TEMPLATE_VMID=node1:9000,node2:9001 \
-       LIVE_VMID_RANGE=99000-99099
+       LIVE_VMID_RANGE=900-999 \
+       LIVE_PORTAL_DATABASE_URL='mysql+pymysql://readonly:...@db-host/portal'
 uv run python -m pytest tests/live -v -rs
 ```
 

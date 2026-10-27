@@ -246,6 +246,7 @@ These values normally live in `.env`:
 | `ENABLE_LOAD_BALANCING` | Global load-balancing toggle |
 | `FIXED_NODE` | Default node when load balancing is off |
 | `CPU_THRESHOLD` / `MEMORY_THRESHOLD` | Global resource thresholds |
+| `DISTRIBUTED_VM_LOCKS` | Serialize each VMID's stop/delete/retire across gunicorn workers with MySQL `GET_LOCK`; defaults to `false`, which uses an in-process lock only, enough for the single production worker. Set `true` before running more than one worker; each lock holder then uses a second database connection |
 | `SMTP_*` / `ALERT_WEBHOOK_*` | Alert notification settings |
 | `DOCKERHUB_USERNAME` | Docker Hub namespace |
 | `IMAGE_NAME` | Image repository name; defaults to `lab-playground` |

@@ -8,13 +8,14 @@ one SQLite file, the way two workers share one MySQL database.
 import importlib.util
 import multiprocessing
 import queue
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import pytest
 from flask import Flask
-from sqlalchemy import create_engine, inspect, select
+from sqlalchemy import create_engine, inspect, make_url, select
 from sqlalchemy.exc import OperationalError
 
 from app import proxmox_service
@@ -342,9 +343,11 @@ class _FakeMySQLConnection:
 
 
 class _FakeMySQLEngine:
-    def __init__(self, connection=None, connect_error=None):
+    def __init__(self, connection=None, connect_error=None,
+                 database='portal'):
         self.dialect = MagicMock()
         self.dialect.name = 'mysql'
+        self.url = make_url(f'mysql+pymysql://user:secret@db/{database}')
         self.connection = connection
         self.connect_error = connect_error
 
@@ -355,13 +358,15 @@ class _FakeMySQLEngine:
 
 
 @contextmanager
-def _mysql_engine(engine):
+def _mysql_engine(engine, *, distributed=True):
     application = Flask(__name__)
     application.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
     db.init_app(application)
     with application.app_context(), patch.object(
-            type(db), 'engine', new_callable=PropertyMock, return_value=engine):
-        yield
+            type(db), 'engine', new_callable=PropertyMock,
+            return_value=engine), patch.object(
+                proxmox_service, 'DISTRIBUTED_VM_LOCKS', distributed):
+        yield application
 
 
 def _named_lock_calls(connection, function):
@@ -376,11 +381,11 @@ def test_mysql_lifecycle_lock_holds_a_server_lock_named_for_the_vmid():
             seen_inside = list(connection.statements)
 
     [acquire] = _named_lock_calls(connection, 'GET_LOCK')
-    assert acquire['name'] == 'vm-lifecycle-700'
+    assert acquire['name'] == 'vm-lifecycle-portal-700'
     assert acquire['timeout'] > 0
     assert len(seen_inside) == 1, 'body must run while the lock is held'
     [release] = _named_lock_calls(connection, 'RELEASE_LOCK')
-    assert release['name'] == 'vm-lifecycle-700'
+    assert release['name'] == 'vm-lifecycle-portal-700'
     assert connection.closed
 
 
@@ -431,6 +436,195 @@ def test_unreachable_database_still_lets_cleanup_run_under_process_lock():
             ran.append(True)
 
     assert ran == [True]
+
+
+def test_single_worker_default_takes_no_server_lock():
+    """With DISTRIBUTED_VM_LOCKS off (one worker) the process lock already
+    excludes every other holder; GET_LOCK would only pin a second pool
+    connection per holder."""
+    connection = _FakeMySQLConnection()
+    ran = []
+    with _mysql_engine(_FakeMySQLEngine(connection), distributed=False):
+        with proxmox_service.vm_lifecycle_lock(705):
+            ran.append(True)
+
+    assert ran == [True]
+    assert connection.statements == []
+
+
+class _CountingConnection:
+    def __init__(self, engine):
+        self.engine = engine
+
+    def execute(self, statement, parameters=None):
+        return _FakeResult(1)
+
+    def invalidate(self):
+        pass
+
+    def close(self):
+        with self.engine.guard:
+            self.engine.checked_out -= 1
+
+
+class _CountingEngine(_FakeMySQLEngine):
+    """Counts connections checked out at once, as the pool would."""
+
+    def __init__(self):
+        super().__init__()
+        self.guard = threading.Lock()
+        self.checked_out = 0
+        self.peak = 0
+
+    def connect(self):
+        with self.guard:
+            self.checked_out += 1
+            self.peak = max(self.peak, self.checked_out)
+        return _CountingConnection(self)
+
+
+# A class-wide destroy wave: every student destroys at once while the expiry
+# thread holds one more VMID, and each student's /list render holds its own
+# session connection across Proxmox calls.
+WAVE_DESTROYS = 45
+WAVE_EXPIRY_HOLDERS = 1
+WAVE_LIST_RENDERS = 45
+
+
+@pytest.mark.parametrize('distributed, per_holder', [(False, 1), (True, 2)])
+def test_pool_covers_a_class_wide_destroy_wave(distributed, per_holder):
+    """Each holder reads its VMRecord under the lock, so its session
+    connection stays checked out through the Proxmox stop and delete."""
+    from app.config import ProductionConfig
+
+    engine = _CountingEngine()
+    holders = WAVE_DESTROYS + WAVE_EXPIRY_HOLDERS
+    all_holding = threading.Barrier(holders, timeout=30)
+    errors = []
+
+    def holder(application, vmid):
+        try:
+            with application.app_context():
+                with proxmox_service.vm_lifecycle_lock(vmid):
+                    session_connection = db.engine.connect()
+                    try:
+                        all_holding.wait()
+                    finally:
+                        session_connection.close()
+        except Exception as exc:  # surfaced below
+            errors.append(exc)
+
+    with _mysql_engine(engine, distributed=distributed) as application:
+        threads = [threading.Thread(target=holder, args=(application, 81000 + i))
+                   for i in range(holders)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+
+    assert errors == []
+    assert engine.peak == holders * per_holder
+    options = ProductionConfig.SQLALCHEMY_ENGINE_OPTIONS
+    budget = options['pool_size'] + options['max_overflow']
+    assert engine.peak + WAVE_LIST_RENDERS <= budget
+    # Two workers at a full pool must still fit MySQL's max_connections
+    # (300 in docker-compose.prod.yml) with room for backups and a shell.
+    assert 2 * budget <= 300
+
+
+def test_reentering_a_held_vmid_lock_raises_instead_of_hanging():
+    """The process lock is not reentrant: a nested acquisition by the same
+    greenlet would wait for itself forever."""
+    outcome = {}
+
+    def nested():
+        with proxmox_service.vm_lifecycle_lock(90706):
+            try:
+                with proxmox_service.vm_lifecycle_lock(90706):
+                    outcome['entered'] = True
+            except RuntimeError as exc:
+                outcome['error'] = exc
+
+    thread = threading.Thread(target=nested, daemon=True)
+    thread.start()
+    thread.join(5)
+
+    assert not thread.is_alive(), 'nested vm_lifecycle_lock hung'
+    assert 'entered' not in outcome
+    assert '90706' in str(outcome['error'])
+    assert 90706 not in proxmox_service._vm_lifecycle_locks
+
+
+def test_another_holder_of_the_same_vmid_waits_rather_than_raising():
+    release = threading.Event()
+    holding = threading.Event()
+    order = []
+
+    def first():
+        with proxmox_service.vm_lifecycle_lock(90707):
+            holding.set()
+            release.wait(5)
+            order.append('first')
+
+    def second():
+        holding.wait(5)
+        with proxmox_service.vm_lifecycle_lock(90707):
+            order.append('second')
+
+    threads = [threading.Thread(target=first), threading.Thread(target=second)]
+    for thread in threads:
+        thread.start()
+    holding.wait(5)
+    release.set()
+    for thread in threads:
+        thread.join(5)
+
+    assert order == ['first', 'second']
+
+
+def test_lock_names_from_two_databases_on_one_server_do_not_collide():
+    """GET_LOCK names are global to the MySQL server, which may also host a
+    staging database."""
+    names = []
+    for database in ('portal', 'portal_staging'):
+        connection = _FakeMySQLConnection()
+        with _mysql_engine(_FakeMySQLEngine(connection, database=database)):
+            with proxmox_service.vm_lifecycle_lock(708):
+                pass
+        [acquire] = _named_lock_calls(connection, 'GET_LOCK')
+        names.append(acquire['name'])
+
+    assert names == ['vm-lifecycle-portal-708', 'vm-lifecycle-portal_staging-708']
+
+
+def test_lock_name_for_a_long_database_name_fits_mysql_limit():
+    names = []
+    for database in ('d' * 64, 'd' * 63 + 'e'):
+        connection = _FakeMySQLConnection()
+        with _mysql_engine(_FakeMySQLEngine(connection, database=database)):
+            with proxmox_service.vm_lifecycle_lock(999_999_999):
+                pass
+        [acquire] = _named_lock_calls(connection, 'GET_LOCK')
+        names.append(acquire['name'])
+
+    assert all(len(name) <= 64 for name in names)
+    assert all(name.startswith('vm-lifecycle-') for name in names)
+    assert all(name.endswith('-999999999') for name in names)
+    assert names[0] != names[1]
+
+
+def test_named_lock_refuses_a_name_mysql_would_reject():
+    """An over-long name makes GET_LOCK fail, and that failure would be
+    mistaken for an outage and silently drop to the process lock."""
+    from app import coordination
+
+    connection = _FakeMySQLConnection()
+    with pytest.raises(ValueError, match='64'):
+        with coordination.mysql_named_lock(
+                _FakeMySQLEngine(connection), 'x' * 65, 10):
+            pass
+
+    assert connection.statements == []
 
 
 # ---- the migration ----

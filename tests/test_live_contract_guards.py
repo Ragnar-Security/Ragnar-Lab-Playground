@@ -20,6 +20,7 @@ from tests.live.harness import (
     UnsafeLiveRun,
     live_skip_reason,
     parse_vmid_range,
+    read_portal_vmid_mark,
 )
 
 
@@ -150,8 +151,11 @@ class FakeProxmox(_Path):
 TEMPLATE = {'vmid': 9000, 'name': 'contract-template', 'template': 1}
 
 
-def _run(api, vmids='99000-99009'):
-    return ContractRun(api, parse_vmid_range(vmids), now=lambda: FIXED_NOW)
+def _run(api, vmids='99000-99009', **guards):
+    # Most tests exercise other guards, on a cluster the portal never uses.
+    guards = guards or {'separate_cluster': True}
+    return ContractRun(api, parse_vmid_range(vmids), now=lambda: FIXED_NOW,
+                       **guards)
 
 
 # --- VMID range -------------------------------------------------------------
@@ -198,6 +202,70 @@ def test_preflight_accepts_leftover_contract_guests_and_guests_outside_range():
     ])
 
     _run(api).preflight()
+
+
+# --- the portal's VMID high-water mark ----------------------------------------
+# The portal allocates above max(cluster VMIDs, its database mark), and the
+# mark never goes down. A contract guest above it would raise every later
+# student allocation for good.
+
+def test_preflight_refuses_a_range_above_the_portal_vmid_mark():
+    api = FakeProxmox([TEMPLATE, {'vmid': 5000, 'name': 'student-alice-web'}])
+
+    with pytest.raises(UnsafeLiveRun, match='high-water mark 5000'):
+        _run(api, portal_vmid_mark=5000).preflight()
+
+
+def test_preflight_accepts_a_range_below_the_portal_vmid_mark():
+    api = FakeProxmox([TEMPLATE])
+
+    _run(api, portal_vmid_mark=120_000).preflight()
+
+
+def test_without_the_mark_preflight_refuses_a_range_above_every_cluster_guest():
+    """The highest guest outside the range is a lower bound on the mark."""
+    api = FakeProxmox([TEMPLATE, {'vmid': 5000, 'name': 'student-alice-web'}])
+
+    with pytest.raises(UnsafeLiveRun, match='LIVE_PORTAL_DATABASE_URL'):
+        _run(api, portal_vmid_mark=None).preflight()
+
+
+def test_without_the_mark_a_range_below_the_highest_cluster_guest_is_accepted():
+    api = FakeProxmox([TEMPLATE, {'vmid': 120_000, 'name': 'student-alice-web'}])
+
+    _run(api, portal_vmid_mark=None).preflight()
+
+
+def test_a_separate_cluster_needs_no_mark():
+    api = FakeProxmox([TEMPLATE])
+
+    _run(api, separate_cluster=True).preflight()
+
+
+def test_portal_vmid_mark_is_the_larger_of_the_stored_mark_and_vm_records(tmp_path):
+    from sqlalchemy import create_engine, insert
+    from app.models import CoordinationState, VMRecord, db
+
+    url = f'sqlite:///{tmp_path / "portal.db"}'
+    engine = create_engine(url)
+    db.metadata.create_all(
+        engine, tables=[CoordinationState.__table__, VMRecord.__table__])
+    with engine.begin() as conn:
+        conn.execute(insert(CoordinationState.__table__).values(
+            name='vmid_allocator', value=1234))
+        conn.execute(insert(VMRecord.__table__), [
+            {'vmid': vmid, 'vm_name': f'student-{vmid}', 'vm_type': 'qemu',
+             'node': 'node1', 'template_name': 't', 'student_name': 's',
+             'expires_at': FIXED_NOW}
+            for vmid in (1200, 1300)])
+    engine.dispose()
+
+    assert read_portal_vmid_mark(url) == 1300
+
+
+def test_portal_vmid_mark_refuses_a_database_without_portal_tables(tmp_path):
+    with pytest.raises(ValueError, match='portal'):
+        read_portal_vmid_mark(f'sqlite:///{tmp_path / "empty.db"}')
 
 
 # --- allocation ----------------------------------------------------------------
@@ -499,3 +567,20 @@ def test_config_rejects_a_node_without_a_template():
     with pytest.raises(ValueError, match='node2'):
         LiveConfig.from_env(dict(LIVE_ENV, LIVE_NODE='node1,node2',
                                  LIVE_TEMPLATE_VMID='node1:9000'))
+
+
+def test_config_reads_the_portal_mark_source():
+    config = LiveConfig.from_env(dict(
+        LIVE_ENV, LIVE_PORTAL_DATABASE_URL='mysql+pymysql://ro@db/portal'))
+    assert config.portal_database_url == 'mysql+pymysql://ro@db/portal'
+    assert not config.separate_cluster
+
+    assert LiveConfig.from_env(
+        dict(LIVE_ENV, LIVE_SEPARATE_CLUSTER='1')).separate_cluster
+
+
+def test_config_rejects_a_portal_mark_on_a_separate_cluster():
+    with pytest.raises(ValueError, match='LIVE_SEPARATE_CLUSTER'):
+        LiveConfig.from_env(dict(
+            LIVE_ENV, LIVE_SEPARATE_CLUSTER='1',
+            LIVE_PORTAL_DATABASE_URL='mysql+pymysql://ro@db/portal'))
