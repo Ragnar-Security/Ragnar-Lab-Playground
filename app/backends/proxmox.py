@@ -10,7 +10,10 @@ Every call goes through the module attribute so the existing patch points
 Callers hold vm_lifecycle_lock(vmid) around every mutation, as they do today.
 """
 
+import functools
 import logging
+import threading
+from contextlib import contextmanager
 from datetime import datetime
 from typing import Callable, List, Mapping, Optional
 
@@ -51,23 +54,71 @@ def _is_template(entry) -> bool:
     return entry.get('template') in (1, '1')
 
 
+def _operation(method):
+    """Run one lifecycle operation on a connection of its own.
+
+    Nested operations (destroy's inspect, delete_resource's destroy) and
+    operations inside session() reuse the connection already open.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.session():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+
 class ProxmoxBackend:
     """VMBackend for Proxmox VE."""
 
     def __init__(self, name: str = BACKEND_PROXMOX, client=None):
         self.name = name
-        self._client = client
+        # Tests and contract cases inject a fake that serves every call.
+        self._injected = client
+        # Greenlet-local under gevent's monkey patching: concurrent create
+        # tasks share this instance but never each other's connection.
+        self._local = threading.local()
+
+    def connect(self):
+        """A connection of the caller's own: the injected client, or a new one.
+
+        Never cached across operations. proxmoxer renews a password ticket
+        only while it is still valid and does not keep the password, so a
+        client left idle past the ticket lifetime can never authenticate
+        again; a fresh connection per operation is what the routes always
+        made.
+        """
+        if self._injected is not None:
+            return self._injected
+        return proxmox_service.get_proxmox_connection()
+
+    @contextmanager
+    def session(self):
+        """Pin one connection for every operation run inside this block.
+
+        Operations already open one each; a caller groups several (a create
+        task's admit and create) to make one connection, as the route did.
+        """
+        if self._injected is not None or getattr(self._local, 'api', None) is not None:
+            yield
+            return
+        self._local.api = self.connect()
+        try:
+            yield
+        finally:
+            self._local.api = None
 
     @property
-    def client(self):
-        # Lazy: a process that never touches Proxmox never connects, and
-        # tests inject FakeProxmox. proxmoxer renews its ticket itself.
-        if self._client is None:
-            self._client = proxmox_service.get_proxmox_connection()
-        return self._client
+    def _api(self):
+        if self._injected is not None:
+            return self._injected
+        api = getattr(self._local, 'api', None)
+        if api is None:
+            raise RuntimeError('ProxmoxBackend client used outside an operation')
+        return api
 
     def _endpoint(self, ref: VMRef):
-        node = self.client.nodes(ref.location)
+        node = self._api.nodes(ref.location)
         return node.lxc(ref.vmid) if ref.vm_type == 'lxc' else node.qemu(ref.vmid)
 
     def _forget_guest(self, ref: VMRef) -> None:
@@ -78,11 +129,12 @@ class ProxmoxBackend:
 
     # Admission and create
 
+    @_operation
     def admit(self, spec: VMSpec, *, reservation_id: str,
               load_balancing_config: Optional[Mapping]) -> str:
         locations = spec.template.get('template_locations') or {}
         node = proxmox_service.select_best_node(
-            self.client,
+            self._api,
             required_memory_mb=spec.memory_mb,
             required_cores=spec.cores,
             load_balancing_config=load_balancing_config,
@@ -116,6 +168,7 @@ class ProxmoxBackend:
                 and not proxmox_service.renew_vmid_reservation(spec.deployment_id)):
             raise RuntimeError(f'VMID reservation expired {when}')
 
+    @_operation
     def create(self, spec: VMSpec, location: str, *,
                heartbeat: Callable[[], None],
                clone_semaphores: Optional[Mapping] = None,
@@ -156,7 +209,7 @@ class ProxmoxBackend:
 
         def clone(target_vmid):
             return vm_creation.create_qemu_vm(
-                self.client, node, node, target_vmid, spec.vm_name, source_vmid,
+                self._api, node, node, target_vmid, spec.vm_name, source_vmid,
                 config, spec.expires_at, internal_vlan, entry_vlan)
 
         def clone_with_collision_retry():
@@ -167,7 +220,7 @@ class ProxmoxBackend:
                 if 'already exists' not in str(error).lower() or not spec.deployment_id:
                     raise
                 vmid = proxmox_service.get_next_available_vmid(
-                    self.client, reservation_id=spec.deployment_id)
+                    self._api, reservation_id=spec.deployment_id)
                 logger.warning(
                     "Clone VMID collision; retrying once with freshly "
                     "reserved VMID %s", vmid)
@@ -177,7 +230,7 @@ class ProxmoxBackend:
             self._renew_leases(heartbeat, spec, 'before create')
             create_guest(
                 lambda target_vmid: vm_creation.create_lxc_container(
-                    self.client, node, target_vmid, spec.vm_name, config,
+                    self._api, node, target_vmid, spec.vm_name, config,
                     spec.expires_at, internal_vlan, entry_vlan),
                 vmid)
         elif config['type'] == 'qemu':
@@ -222,22 +275,23 @@ class ProxmoxBackend:
         # failure would destroy a successfully-created guest.
         if spec.deployment_id:
             proxmox_service.renew_vmid_reservation(spec.deployment_id)
-        vm_creation.start_vm(self.client, node, vmid, config['type'])
+        vm_creation.start_vm(self._api, node, vmid, config['type'])
         logger.info(f"VM {vmid} ({spec.vm_name}) created and started on {node}")
         return LaunchedVM(vmid=vmid, vm_type=config['type'], location=node,
                           network_slot=spec.network_slot)
 
     # Identity and destroy
 
+    @_operation
     def inspect(self, ref: VMRef) -> str:
         return proxmox_service.inspect_vm_guest(
-            self.client, ref.vmid, node=ref.location, vm_name=ref.vm_name,
+            self._api, ref.vmid, node=ref.location, vm_name=ref.vm_name,
             vm_type=ref.vm_type)
 
     def _wait(self, ref: VMRef, upid, timeout: int):
         # The 60 s stop / 120 s delete, 1 s poll every source path passes.
         return proxmox_service.wait_for_proxmox_task(
-            self.client, ref.location, upid, timeout=timeout, poll_interval=1)
+            self._api, ref.location, upid, timeout=timeout, poll_interval=1)
 
     def _stop(self, ref: VMRef, policy: DestroyPolicy) -> str:
         """_STOPPED, _STOP_FAILED (may still be running) or _GONE."""
@@ -261,7 +315,7 @@ class ProxmoxBackend:
                     return _STOPPED
             elif policy is DestroyPolicy.BEST_EFFORT and (
                     proxmox_service.confirm_proxmox_absence(
-                        self.client, ref.vmid, error)):
+                        self._api, ref.vmid, error)):
                 # Failed-deploy cleanup has always confirmed a stop error
                 # against fresh inventory and skipped the delete. Admin bulk
                 # shares the policy and gains this on purpose: it used to
@@ -287,7 +341,7 @@ class ProxmoxBackend:
             # A 'does not exist' answer is a hint, not proof: a corrupt
             # config says the same while the guest runs on.
             if proxmox_service.confirm_proxmox_absence(
-                    self.client, ref.vmid, error):
+                    self._api, ref.vmid, error):
                 logger.info("VM %s confirmed absent after destroy request",
                             ref.vmid)
                 return
@@ -302,7 +356,7 @@ class ProxmoxBackend:
             # The waiter raises only TimeoutError, which no source path ever
             # treated as absence (confirm_proxmox_absence refuses it).
             if proxmox_service.confirm_proxmox_absence(
-                    self.client, ref.vmid, error):
+                    self._api, ref.vmid, error):
                 return
             raise BackendError(
                 f'destroy task for VM {ref.vmid} did not finish: {error}') from error
@@ -311,6 +365,7 @@ class ProxmoxBackend:
                 f"destroy task for VM {ref.vmid} failed: "
                 f"{result.get('error', result.get('status'))}")
 
+    @_operation
     def destroy(self, ref: VMRef, policy: DestroyPolicy) -> None:
         # Always a fresh identity read, even if the caller just inspected:
         # a replacement at the same VMID must never inherit this request.
@@ -327,7 +382,7 @@ class ProxmoxBackend:
         if policy is DestroyPolicy.FORCE_CORRUPT:
             utils = _route_utils()
             state, error = utils._verify_vm_exists(
-                self.client, ref.location, ref.vmid, ref.vm_type)
+                self._api, ref.location, ref.vmid, ref.vm_type)
             force_corrupt = state == utils.VM_CONFIG_ERROR
             if force_corrupt:
                 # A listed guest whose config cannot be read cannot be
@@ -353,9 +408,10 @@ class ProxmoxBackend:
         self._delete(ref, policy, force_corrupt)
         self._forget_guest(ref)
 
+    @_operation
     def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
         absent = proxmox_service.confirm_proxmox_absence(
-            self.client, ref.vmid, error)
+            self._api, ref.vmid, error)
         if absent:
             self._forget_guest(ref)
         return absent
@@ -366,21 +422,22 @@ class ProxmoxBackend:
     def _display_state(self, ref: VMRef) -> str:
         utils = _route_utils()
         try:
-            index = proxmox_service.get_cluster_vm_index(self.client)
+            index = proxmox_service.get_cluster_vm_index(self._api)
         except Exception as error:
             logger.warning("cluster inventory unavailable (%s); reading VM %s "
                            "config directly", error, ref.vmid)
             index = None
         state, _error = utils._verify_vm_exists(
-            self.client, ref.location, ref.vmid, ref.vm_type, index=index)
+            self._api, ref.location, ref.vmid, ref.vm_type, index=index)
         return state
 
+    @_operation
     def ip_addresses(self, ref: VMRef) -> List[str]:
         utils = _route_utils()
         state = self._display_state(ref)
         if state == utils.VM_PRESENT:
             ips = utils._get_vm_ip_addresses(
-                self.client, ref.location, ref.vmid, ref.vm_type)
+                self._api, ref.location, ref.vmid, ref.vm_type)
         elif state == utils.VM_UNKNOWN:
             # Proxmox did not answer, so the agent would not either; a
             # seconds-old cached address beats none for a student mid-SSH.
@@ -390,6 +447,7 @@ class ProxmoxBackend:
         # Lab addresses only; this also drops the ['N/A'] display sentinel.
         return [ip for ip in ips if ip.startswith('10.')]
 
+    @_operation
     def status(self, ref: VMRef) -> str:
         utils = _route_utils()
         state = self._display_state(ref)
@@ -402,6 +460,7 @@ class ProxmoxBackend:
             return utils.VM_MISSING
         return 'unknown'
 
+    @_operation
     def set_expiry(self, ref: VMRef, expires_at: datetime) -> None:
         # The orphan reaper parses exactly this line; naive local time.
         try:
@@ -413,6 +472,7 @@ class ProxmoxBackend:
 
     # Inventory
 
+    @_operation
     def list_managed(self) -> List[ManagedResource]:
         """Every cluster guest, templates included, from one fresh read.
 
@@ -420,7 +480,7 @@ class ProxmoxBackend:
         A failed read propagates; an empty list would mean "all gone".
         """
         index = proxmox_service.get_cluster_vm_index(
-            self.client, max_age=0, allow_stale=False)
+            self._api, max_age=0, allow_stale=False)
         return [
             ManagedResource(
                 backend=self.name, kind='instance', provider_id=str(vmid),
@@ -429,6 +489,7 @@ class ProxmoxBackend:
                 is_template=_is_template(entry))
             for vmid, entry in sorted(index.items())]
 
+    @_operation
     def delete_resource(self, resource: ManagedResource) -> None:
         if resource.backend != self.name or resource.kind != 'instance':
             raise BackendError(
@@ -440,7 +501,7 @@ class ProxmoxBackend:
         # and let destroy() re-verify name and node against another.
         try:
             index = proxmox_service.get_cluster_vm_index(
-                self.client, max_age=0, allow_stale=False)
+                self._api, max_age=0, allow_stale=False)
         except Exception as error:
             raise BackendError(
                 f'inventory unavailable for VM {resource.vmid}: {error}') from error

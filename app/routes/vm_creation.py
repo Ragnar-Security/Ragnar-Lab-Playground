@@ -3,7 +3,7 @@ VM Creation routes module - REFACTORED FOR CLARITY
 Handles VM creation from deployment groups with parallel processing
 """
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from flask import Blueprint, request, jsonify, current_app, has_app_context
 from datetime import datetime, timedelta
 import time
@@ -619,6 +619,7 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
                 raise RuntimeError('Admission reservation expired')
 
         create_options = None
+        connection = nullcontext()
         if backend_name == BACKEND_PROXMOX:
             def on_claim(vmid, node):
                 nonlocal claimed
@@ -626,13 +627,16 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
 
             create_options = {'clone_semaphores': node_semaphores,
                               'on_claim': on_claim}
+            # One connection for this task's admission and clone, as the
+            # task always opened.
+            connection = backend.session()
 
         # ThreadPoolExecutor workers do not inherit Flask's app context.
         # Supplying it here gives each admission a fresh scoped DB session,
         # so a just-committed VMRecord is visible before its reservation is
         # released; the collision retry's allocation and distributed router
         # and slot locks need it too.
-        with flask_app.app_context():
+        with flask_app.app_context(), connection:
             _location, launched = vm_provisioning.create_vm(
                 spec, reservation_id=reservation_id,
                 load_balancing_config=load_balancing_config,
@@ -921,7 +925,7 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
     # for a cloud bundle: VMIDs are one namespace, and a manually created
     # Proxmox guest must not share one with a cloud VM. A cloud-only portal
     # has no cluster to read.
-    proxmox = (get_backend(BACKEND_PROXMOX).client
+    proxmox = (get_backend(BACKEND_PROXMOX).connect()
                if BACKEND_PROXMOX in enabled_backends() else None)
     flask_app = current_app._get_current_object()
     vmid_reservation_id = uuid4().hex

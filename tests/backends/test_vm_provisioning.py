@@ -510,3 +510,83 @@ def test_proxmox_bundle_resolves_the_backend_block(app, proxmox_portal):
     [record] = _deploy(app, [template])
     assert record.memory == 2048
     assert api.guests[record.vmid]['config']['memory'] == 2048
+
+
+# --- Proxmox: one connection per operation (fix round 1) ----------------------
+# proxmoxer cannot re-authenticate a password session whose ticket expired, so
+# a cached client would go permanently dead after an idle spell. The patch
+# boundary app.proxmox_service.ProxmoxAPI is the contract: every operation
+# constructs its own client there.
+
+class _Constructions:
+    """Stands in for the ProxmoxAPI class; each call is a new connection."""
+
+    def __init__(self, *apis):
+        self.apis = list(apis)
+        self.count = 0
+
+    def __call__(self, *args, **kwargs):
+        api = self.apis[min(self.count, len(self.apis) - 1)]
+        self.count += 1
+        return api
+
+
+def _cluster_with_guest():
+    forget_proxmox_caches()
+    api = FakeProxmox()
+    api.add_guest(100, 'student-a-vm', node=NODE, status='running')
+    api.add_guest(TEMPLATE_VMID, 'template-base', node=NODE, template=1)
+    return api
+
+
+# Catches a backend that reuses one HTTP client across operations.
+def test_each_proxmox_operation_constructs_its_own_client(app):
+    api = _cluster_with_guest()
+    ref = VMRef(vmid=100, vm_name='student-a-vm', vm_type='qemu',
+                location=NODE, backend=BACKEND_PROXMOX)
+    backend = ProxmoxBackend()
+    constructions = _Constructions(api)
+    with patch('app.proxmox_service.ProxmoxAPI', constructions):
+        assert backend.inspect(ref) == 'match'
+        assert constructions.count == 1
+        backend.list_managed()
+        assert constructions.count == 2
+        # One operation, however many reads and mutations it makes inside.
+        backend.destroy(ref, DestroyPolicy.BEST_EFFORT)
+        assert constructions.count == 3
+    assert 100 not in api.guests
+    forget_proxmox_caches()
+
+
+# Catches an operation that dies for good once a previous client's session
+# can no longer authenticate.
+def test_operation_after_a_dead_client_uses_a_new_one(app):
+    from proxmoxer.core import AuthenticationError
+    dead = FakeProxmox()
+    dead.cluster_error = AuthenticationError("Couldn't authenticate user")
+    live = _cluster_with_guest()
+    backend = ProxmoxBackend()
+    with patch('app.proxmox_service.ProxmoxAPI', _Constructions(dead, live)):
+        with pytest.raises(AuthenticationError):
+            backend.list_managed()
+        assert [r.vmid for r in backend.list_managed()] == [100, TEMPLATE_VMID]
+    forget_proxmox_caches()
+
+
+# Catches the bundle path sharing one client between deploys or create tasks,
+# or opening more than the deploy's inventory connection plus one per task.
+def test_proxmox_bundle_opens_one_client_per_deploy_and_per_create_task(
+        app, monkeypatch):
+    _clear_node_reservations()
+    _clear_vmid_reservations()
+    api = _cluster_with_guest()
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', (BACKEND_PROXMOX,))
+    constructions = _Constructions(api)
+    with patch('app.proxmox_service.ProxmoxAPI', constructions):
+        _deploy(app, [_qemu('web'), _qemu('db')])
+        assert constructions.count == 3
+        _deploy(app, [_lxc('ct')])
+        assert constructions.count == 5
+    forget_proxmox_caches()
+    _clear_node_reservations()
+    _clear_vmid_reservations()
