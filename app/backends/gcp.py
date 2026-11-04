@@ -721,26 +721,51 @@ class GCPBackend:
             expected[TAG_SLOT] = str(ref.network_slot)
         return expected
 
+    def _placement_problems(self, instance: dict, slot_label: Optional[str]) -> List[str]:
+        """Why the instance's NIC is not on the lab network and, when the
+        caller knows its slot, that slot's subnetwork. Labels alone never
+        place an instance: anything may carry a copy of them."""
+        config = _config()
+        interfaces = instance.get('networkInterfaces')
+        nic = interfaces[0] if isinstance(interfaces, list) and interfaces else None
+        if not isinstance(nic, dict):
+            return ['networkInterfaces=[]']
+        problems = []
+        if not self._in_lab_network(nic.get('network')):
+            problems.append(f'network={nic.get("network")!r}')
+        if slot_label is not None:
+            link = nic.get('subnetwork')
+            match = _SUBNETWORK_LINK.fullmatch(link) if isinstance(link, str) else None
+            # The region is the instance's own, which Compute enforces.
+            if (match is None or match.group(1) != config.GCP_PROJECT
+                    or match.group(3) != slot_network_name(config.LAB_SITE_ID,
+                                                           int(slot_label))):
+                problems.append(f'subnetwork={link!r}')
+        return problems
+
     def _judge(self, zone: str, name: str, instance: dict,
-               expected: Mapping[str, str]) -> _Resolution:
+               expected: Mapping[str, str], *, placement: bool) -> _Resolution:
         labels = _labels(instance)
         problems = [f'{key}={labels.get(key)!r}' for key, value in expected.items()
                     if labels.get(key) != value]
         if instance.get('name') != name:
             problems.insert(0, f'name={instance.get("name")!r}')
+        if placement and not problems:
+            problems = self._placement_problems(instance, expected.get(TAG_SLOT))
         if problems:
             return _Resolution(GUEST_MISMATCH, zone, name, instance, ', '.join(problems))
         return _Resolution(GUEST_MATCH, zone, name, instance)
 
     def _fetch(self, zone: str, name: str, expected: Mapping[str, str]) -> _Resolution:
         """A fresh GET of one instance in the zone discovery found it in,
-        judged against its name and `expected`. Never absence: a 404 here is
-        a delete racing discovery or a moved instance, so it is unknown."""
+        judged against its name, `expected` and its lab placement: every
+        caller may act on the verdict. Never absence: a 404 here is a delete
+        racing discovery or a moved instance, so it is unknown."""
         try:
             instance = self._send('GET', ('zones', zone, 'instances', name))
         except requests.RequestException as error:
             return _Resolution(GUEST_UNKNOWN, zone, name, reason=str(error))
-        return self._judge(zone, name, instance, expected)
+        return self._judge(zone, name, instance, expected, placement=True)
 
     def _identify(self, name, expected: Mapping[str, str], *,
                   reread: bool = True) -> _Resolution:
@@ -758,7 +783,8 @@ class GCPBackend:
             return _Resolution(GUEST_ABSENT, None, name)
         zone, listed = found
         if not reread:
-            return self._judge(zone, name, listed, expected)
+            # Display only: nothing acts on it, so labels suffice.
+            return self._judge(zone, name, listed, expected, placement=False)
         return self._fetch(zone, name, expected)
 
     def _resolve(self, ref: VMRef, *, reread: bool = True) -> _Resolution:

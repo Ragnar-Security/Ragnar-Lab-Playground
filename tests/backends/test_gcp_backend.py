@@ -1378,3 +1378,54 @@ def test_router_transitional_states_are_waited_out(
     _settles_on_second_read(gce, monkeypatch, settled)
     _start(backend) if action == 'start' else _stop(backend)
     assert _router_status(gce) == final
+
+
+# Instance placement on mutation paths
+
+@pytest.mark.parametrize('field, value', [
+    ('network', 'projects/example-project/global/networks/other-vpc'),
+    ('network', 'https://www.googleapis.com/compute/v1/projects/other-project/global/'
+                'networks/lab-vpc'),
+    ('network', None),
+    ('subnetwork', 'projects/example-project/regions/us-central1/subnetworks/lp-test-site-s-7'),
+    ('subnetwork', 'projects/other-project/regions/us-central1/subnetworks/lp-test-site-s-100'),
+])
+def test_mutations_refuse_a_same_labelled_instance_outside_the_lab_placement(
+        backend, gce, spec, field, value):
+    # Catches destroy or a sweep deleting a same-name, same-label instance
+    # that sits in another network or another slot's subnetwork.
+    ref = _launch(backend, spec)
+    [listed] = _instances(backend)
+    gce.instances[(ZONE, NAME)]['networkInterfaces'][0][field] = value
+    before = dict(gce.instances[(ZONE, NAME)])
+    assert backend.inspect(ref) == GUEST_MISMATCH
+    with pytest.raises(DestroyRefused):
+        backend.destroy(ref, DestroyPolicy.FORCE_CORRUPT)
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(listed)
+    with pytest.raises(BackendError):
+        backend.set_expiry(ref, spec.expires_at + timedelta(hours=2))
+    assert gce.instances[(ZONE, NAME)] == before
+
+
+def test_mutations_refuse_an_instance_without_a_network_interface(backend, gce, spec):
+    # Catches an instance with no lab NIC passing identity on labels alone.
+    ref = _launch(backend, spec)
+    gce.instances[(ZONE, NAME)]['networkInterfaces'] = []
+    with pytest.raises(DestroyRefused):
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    assert (ZONE, NAME) in gce.instances
+
+
+def test_mutations_accept_full_url_links_to_the_lab_placement(backend, gce, spec):
+    # Catches the placement check refusing Compute's full-URL form of the
+    # lab network and slot subnetwork.
+    ref = _launch(backend, spec)
+    link = 'https://www.googleapis.com/compute/v1/projects/example-project'
+    gce.instances[(ZONE, NAME)]['networkInterfaces'][0].update(
+        network=f'{link}/global/networks/lab-vpc',
+        subnetwork=f'{link}/regions/{REGION}/subnetworks/{SUBNET}')
+    survivor = replace(ref, provider_id=None, network_slot=None, location='gcp')
+    assert backend.inspect(ref) == backend.inspect(survivor) == GUEST_MATCH
+    backend.destroy(ref, DestroyPolicy.STRICT)
+    assert gce.instances == {}
