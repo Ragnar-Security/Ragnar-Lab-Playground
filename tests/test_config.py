@@ -284,9 +284,14 @@ def _restore_reloaded_config():
     """Reload app.config after each test, so a module reloaded under
     patched env does not carry that state into later test files.
 
-    Autouse and independent of monkeypatch, so it is set up before and torn
-    down after monkeypatch: the reload sees the restored environment."""
+    The conftest autouse fixtures request monkeypatch before this one is
+    set up, so monkeypatch is torn down after it and cannot be relied on
+    to have restored the environment. Restore a snapshot of os.environ
+    here, then reload against it."""
+    snapshot = dict(os.environ)
     yield
+    os.environ.clear()
+    os.environ.update(snapshot)
     importlib.reload(sys.modules['app.config'])
 
 
