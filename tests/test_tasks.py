@@ -93,13 +93,17 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.return_value = (
                 'UPID:stop')
+            mock_proxmox.nodes().qemu().delete.return_value = 'UPID:delete'
 
             assert _strict_destroy(mock_proxmox, vm_record) is True
 
-            # The stop wait; the delete's own wait follows it.
-            assert mock_wait.call_args_list[0] == call(
-                mock_proxmox, 'pve', 'UPID:stop',
-                timeout=60, poll_interval=1)
+            # Exactly one stop wait, then exactly one delete wait.
+            assert mock_wait.call_args_list == [
+                call(mock_proxmox, 'pve', 'UPID:stop',
+                     timeout=60, poll_interval=1),
+                call(mock_proxmox, 'pve', 'UPID:delete',
+                     timeout=120, poll_interval=1),
+            ]
     
     @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
     def test_stop_vm_already_stopped(self, _mock_wait, app):
@@ -760,14 +764,11 @@ class TestExpiryNotStarvedByAlerts:
             assert db.session.get(VMRecord, vm_id) is None
 
     @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
-    @patch("app.tasks.backend_for",
-           side_effect=RuntimeError("Proxmox unreachable"))
-    # The reaper's connection, now opened by ProxmoxBackend at the
-    # definition site rather than once at the top of the pass.
+    # ProxmoxBackend opens the pass's connection at the definition site.
     @patch("app.proxmox_service.get_proxmox_connection",
            side_effect=RuntimeError("Proxmox unreachable"))
     def test_proxmox_outage_still_delivers_queued_alerts(
-            self, _proxmox_connect, _connect, _reaper, app):
+            self, _connect, _reaper, app):
         """The alerts that matter most during an outage still go out."""
         from app.models import AlertOutbox
         _queue_webhook_alerts(app, 1)

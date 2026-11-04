@@ -73,21 +73,30 @@ def _display_state(status):
     return VM_PRESENT
 
 
+def _status_and_diagnostic(backend, ref):
+    # Proxmox also explains a status (the config-error webhook carries its
+    # error text); a backend without that answers with status() alone.
+    describe = getattr(backend, 'status_diagnostic', None)
+    if describe is not None:
+        return describe(ref)
+    return backend.status(ref), None
+
+
 def _observe(backend, record):
-    """(backend, state, status, ips) of one record for this render.
+    """(backend, state, status, ips, diagnostic) of one record for this render.
 
     A disabled or unreachable backend, or a failed read, is UNKNOWN: the
     VM is listed unverified and its record is never put up for retirement.
     """
     if backend is None:
-        return None, VM_UNKNOWN, 'unknown', []
+        return None, VM_UNKNOWN, 'unknown', [], None
     ref = VMRef.from_record(record)
     try:
-        status = backend.status(ref)
+        status, diagnostic = _status_and_diagnostic(backend, ref)
     except Exception as error:
         current_app.logger.warning("status of VM %s unavailable: %s",
                                    record.vmid, error)
-        status = 'unknown'
+        status, diagnostic = 'unknown', str(error)
     state = _display_state(status)
     ips = []
     if state in (VM_PRESENT, VM_UNKNOWN):
@@ -96,7 +105,13 @@ def _observe(backend, record):
         except Exception as error:
             current_app.logger.warning("addresses of VM %s unavailable: %s",
                                        record.vmid, error)
-    return backend, state, status, ips
+    return backend, state, status, ips, diagnostic
+
+
+def _uptime(backend, record):
+    # Only Proxmox reports one; the page shows N/A for None.
+    read = getattr(backend, 'uptime', None)
+    return read(VMRef.from_record(record)) if read is not None else None
 
 
 @vm_listing_bp.route('/list', methods=['GET'])
@@ -155,7 +170,7 @@ def list_vms():
                         for record in vm_records}
 
         for record in vm_records:
-            backend, vm_state, status, ips = observed[record.id]
+            backend, vm_state, status, ips, error_msg = observed[record.id]
 
             confirmed_gone = note_vm_state(record.node, record.vmid, vm_state)
 
@@ -186,15 +201,15 @@ def list_vms():
                 # VM and it runs forever.
                 current_app.logger.warning(
                     f"VM {record.vmid} ({record.vm_name}): state unknown "
-                    f"on {record.backend}; listing it unverified and keeping "
-                    f"the record")
+                    f"on {record.backend} ({error_msg}); listing it "
+                    f"unverified and keeping the record")
 
             has_config_issues = vm_state == VM_CONFIG_ERROR
             if has_config_issues:
                 # The cluster still lists this VM but its config file is
                 # unreadable. It is real, it is consuming resources, and it
                 # needs a manual purge.
-                error_msg = 'configuration file unreadable'
+                error_msg = error_msg or 'configuration file unreadable'
                 current_app.logger.error(
                     f"VM {record.vmid} ({record.vm_name}) has configuration issues: {error_msg}")
                 current_app.logger.error(
@@ -426,11 +441,15 @@ def api_vm_detail(vmid):
             current_app.logger.warning(
                 "backend %s unavailable for VM %s: %s", db_vm.backend, vmid, error)
             backend = None
+        uptime = None
         if backend is None:
             status, ip_addresses = 'unknown', []
         else:
             with vm_provisioning.provider_session(backend):
-                _backend, _state, status, ip_addresses = _observe(backend, db_vm)
+                _backend, state, status, ip_addresses, _diagnostic = _observe(
+                    backend, db_vm)
+                if state == VM_PRESENT:
+                    uptime = _uptime(backend, db_vm)
         if status == VM_MISSING:
             return jsonify({'success': False,
                             'error': f'VM {vmid} not found on {db_vm.backend}'}), 404
@@ -444,8 +463,7 @@ def api_vm_detail(vmid):
             'status': status,
             'memory': db_vm.memory,
             'cores': db_vm.cores,
-            # No backend reports uptime; the page shows N/A for None.
-            'uptime': None,
+            'uptime': uptime,
             'ip_addresses': ip_addresses,
             'database_info': db_vm.to_dict(),
             'expires_at': db_vm.expires_at.isoformat() if db_vm.expires_at else None,

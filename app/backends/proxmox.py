@@ -15,7 +15,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Callable, List, Mapping, Optional
+from typing import Callable, List, Mapping, Optional, Tuple
 
 from app import proxmox_service
 from app.backends.base import (
@@ -80,7 +80,8 @@ class ProxmoxBackend:
         self._local = threading.local()
 
     def connect(self):
-        """A connection of the caller's own: the injected client, or a new one.
+        """A connection of the caller's own: the injected client, the one
+        pinned by an open session(), or a new one.
 
         Never cached across operations. proxmoxer renews a password ticket
         only while it is still valid and does not keep the password, so a
@@ -90,6 +91,9 @@ class ProxmoxBackend:
         """
         if self._injected is not None:
             return self._injected
+        pinned = getattr(self._local, 'api', None)
+        if pinned is not None:
+            return pinned
         return proxmox_service.get_proxmox_connection()
 
     @contextmanager
@@ -419,7 +423,8 @@ class ProxmoxBackend:
     # Display reads: the cached index (ruling C5), so one /list render costs
     # one cluster call however many VMs it shows.
 
-    def _display_state(self, ref: VMRef) -> str:
+    def _display_state(self, ref: VMRef):
+        """(state, diagnostic): `_verify_vm_exists`'s verdict and error text."""
         utils = _route_utils()
         try:
             index = proxmox_service.get_cluster_vm_index(self._api)
@@ -427,14 +432,13 @@ class ProxmoxBackend:
             logger.warning("cluster inventory unavailable (%s); reading VM %s "
                            "config directly", error, ref.vmid)
             index = None
-        state, _error = utils._verify_vm_exists(
+        return utils._verify_vm_exists(
             self._api, ref.location, ref.vmid, ref.vm_type, index=index)
-        return state
 
     @_operation
     def ip_addresses(self, ref: VMRef) -> List[str]:
         utils = _route_utils()
-        state = self._display_state(ref)
+        state, _error = self._display_state(ref)
         if state == utils.VM_PRESENT:
             ips = utils._get_vm_ip_addresses(
                 self._api, ref.location, ref.vmid, ref.vm_type)
@@ -448,17 +452,31 @@ class ProxmoxBackend:
         return [ip for ip in ips if ip.startswith('10.')]
 
     @_operation
-    def status(self, ref: VMRef) -> str:
+    def status_diagnostic(self, ref: VMRef) -> Tuple[str, Optional[str]]:
+        """status() plus Proxmox's own error text, which the config-error
+        webhook has always carried so an operator sees why the read failed."""
         utils = _route_utils()
-        state = self._display_state(ref)
+        state, error = self._display_state(ref)
         if state == utils.VM_PRESENT:
             # What /list has always shown for a guest Proxmox can read.
-            return 'running'
+            return 'running', None
         if state == utils.VM_CONFIG_ERROR:
-            return 'config_error'
+            return 'config_error', error
         if state == utils.VM_MISSING:
-            return utils.VM_MISSING
-        return 'unknown'
+            return utils.VM_MISSING, error
+        return 'unknown', error
+
+    def status(self, ref: VMRef) -> str:
+        return self.status_diagnostic(ref)[0]
+
+    @_operation
+    def uptime(self, ref: VMRef) -> Optional[int]:
+        """Seconds the guest has run, for the detail page; None when unread."""
+        try:
+            return self._endpoint(ref).status.current.get().get('uptime')
+        except Exception as error:
+            logger.warning("uptime of VM %s unavailable: %s", ref.vmid, error)
+            return None
 
     @_operation
     def set_expiry(self, ref: VMRef, expires_at: datetime) -> None:

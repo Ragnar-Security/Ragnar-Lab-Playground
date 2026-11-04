@@ -190,7 +190,8 @@ class FakeProxmox(_Path):
             guest['status'] = 'stopped'
             return self._task()
         if rest == ('status', 'current'):
-            return {'status': guest['status'], 'vmid': vmid}
+            return {'status': guest['status'], 'vmid': vmid,
+                    'uptime': guest.get('uptime', 0)}
         if rest == ('agent', 'network-get-interfaces') and method == 'GET':
             if not guest['ips']:
                 raise ResourceException(500, 'Internal Server Error',

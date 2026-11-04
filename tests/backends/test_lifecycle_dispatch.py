@@ -6,6 +6,8 @@ and the assertions read what the fake provider and the database now hold.
 """
 
 import importlib
+import json
+import os
 import threading
 import time
 from contextlib import contextmanager
@@ -15,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 from flask import current_app
+from sqlalchemy.exc import OperationalError
 
 import app.routes.utils as route_utils
 import app.tasks as tasks
@@ -26,14 +29,17 @@ from app.backends.base import (
 from app.backends.proxmox import ProxmoxBackend
 from app.models import AlertOutbox, KothGame, StudentGroup, User, VMRecord, db
 from app.routes.koth_admin import _destroy_game_vms
-from app.routes.vm_creation import DeployFailed, deploy_bundle
+from app.routes.vm_creation import (
+    DeployFailed, _cleanup_with_sweep, cleanup_vms, deploy_bundle,
+)
+from app.untracked_survivors import recover_untracked_survivors
 from app.tasks import reconcile_missing_vm_records
 from app.vm_provisioning import after_record_retired, create_vm
 from tests.backends.fake_backend import (
     StaticInventoryBackend, registered_fake_backend,
 )
 from tests.backends.proxmox_case import forget_proxmox_caches
-from tests.test_live_contract_guards import FakeProxmox
+from tests.test_live_contract_guards import FakeProxmox, _missing
 
 config = importlib.import_module('app.config')
 
@@ -447,17 +453,26 @@ def test_extend_writes_the_committed_expiry_to_the_provider(
     assert case.backend.expiry[record.vmid] == int(committed.timestamp())
 
 
-# Catches a backend removed from ENABLED_BACKENDS leaving live VMs undestroyable and silent (I18).
+# Catches a backend removed from ENABLED_BACKENDS leaving live VMs undestroyable
+# and silent (I18), or stopping the pass before another backend's record.
 def test_record_of_disabled_backend_is_retained_retried_and_alerted(
         app, memory_backend_case, monkeypatch):
     case = memory_backend_case
-    record = persist_case_record(case, expired=True, backend='gcp')
+    record = persist_case_record(
+        case, expired=True, backend='gcp',
+        spec=replace(case.spec, vmid=case.spec.vmid + 1,
+                     vm_name=case.spec.vm_name + '-gcp'))
+    neighbour = persist_case_record(case, expired=True)
     monkeypatch.setattr(tasks, 'VM_DELETION_MAX_RETRIES', 1)
     run_one_expiry_pass(app)
     row = db.session.get(VMRecord, record.id)
     assert row is not None
     assert (row.deletion_retry_count, row.deletion_alert_sent) == (1, True)
+    assert row.deletion_last_attempt_at is not None
     assert AlertOutbox.query.count() == 1
+    # The same pass still destroyed the enabled backend's expired record.
+    assert case.backend.destroyed == {neighbour.vmid: DestroyPolicy.STRICT}
+    assert db.session.get(VMRecord, neighbour.id) is None
 
 
 # Catches an empty cloud-only expiry pass trying to open Proxmox before alerts.
@@ -545,3 +560,315 @@ def test_koth_destroy_sweeps_stranded_proxmox_guests_of_its_game_only(
     assert 9501 not in proxmox.guests
     assert 9502 in proxmox.guests
     forget_proxmox_caches()
+
+
+# --- fix round 1: Proxmox display and outage semantics ------------------------
+
+def _proxmox_portal(api):
+    """Serve Proxmox from `api` on the mixed portal, with fresh caches."""
+    register_backend_factory('proxmox', lambda: ProxmoxBackend(client=api))
+    forget_proxmox_caches()
+
+
+def _proxmox_record(*, vmid=500, expired=False, api=None, status='running'):
+    owner = _owner('student-a')
+    name = f'student-student-a-pve-{vmid}'
+    if api is not None:
+        api.add_guest(vmid, name, node='node-a', status=status,
+                      ips=['10.1.0.5'])
+    record = VMRecord(
+        vmid=vmid, vm_name=name, vm_type='qemu', node='node-a',
+        template_name='Proxmox Lab/pve', student_name='student-a',
+        memory=1024, cores=1, created_at=datetime.now(),
+        created_by_user_id=owner.id,
+        expires_at=(datetime.now() - timedelta(minutes=5) if expired
+                    else datetime.now() + timedelta(hours=1)))
+    db.session.add(record)
+    db.session.commit()
+    db.session.refresh(record)
+    db.session.expunge(record)
+    return record
+
+
+# Catches the Proxmox VM detail page losing the uptime it always reported.
+def test_proxmox_detail_reports_guest_uptime(app, client, memory_backend_case):
+    api = FakeProxmox()
+    _proxmox_portal(api)
+    record = _proxmox_record(api=api)
+    api.guests[record.vmid]['uptime'] = 4242
+    login_owner(client, record.created_by_user_id)
+    body = client.get(f'/api/vms/{record.vmid}').get_json()
+    assert body['success'] is True, body
+    assert body['vm']['uptime'] == 4242
+    forget_proxmox_caches()
+
+
+# Catches the /list config-error webhook losing Proxmox's own diagnostic.
+def test_list_config_error_webhook_carries_the_provider_diagnostic(
+        app, client, memory_backend_case):
+    api = FakeProxmox()
+    _proxmox_portal(api)
+    # The cluster lists it in no healthy state and its config read fails.
+    record = _proxmox_record(api=api, status='unknown')
+    api.corrupt_config.add(record.vmid)
+    login_owner(client, record.created_by_user_id)
+    with patch('app.routes.vm_listing._send_config_issue_webhook') as hook:
+        body = client.get('/list').get_json()
+    vm = body['students'][0]['deployment_groups'][0]['vms'][0]
+    assert vm['ip_address'] == 'CONFIG ERROR'
+    [(alerted, diagnostic)] = [c.args for c in hook.call_args_list]
+    assert alerted.vmid == record.vmid
+    assert diagnostic == str(_missing('node-a', record.vmid))
+    forget_proxmox_caches()
+
+
+# Catches a Proxmox outage at the start of a pass being counted as failed
+# deletes (and alerted) for every Proxmox VM, or stopping cloud expiry and
+# alert delivery.
+def test_proxmox_connect_failure_skips_proxmox_records_without_counting(
+        app, memory_backend_case, queued_alert, monkeypatch):
+    case = memory_backend_case
+    register_backend_factory('proxmox', lambda: ProxmoxBackend())
+    proxmox_record = _proxmox_record(expired=True)
+    cloud_record = persist_case_record(case, expired=True)
+    monkeypatch.setattr(tasks, 'VM_DELETION_MAX_RETRIES', 1)
+    with patch('app.proxmox_service.get_proxmox_connection',
+               side_effect=RuntimeError('Proxmox unreachable')):
+        run_one_expiry_pass(app)
+    row = db.session.get(VMRecord, proxmox_record.id)
+    assert (row.deletion_retry_count, row.deletion_last_attempt_at,
+            row.deletion_alert_sent) == (0, None, False)
+    assert AlertOutbox.query.filter_by(
+        alert_type='vm_deletion_failed').count() == 0
+    assert case.backend.destroyed == {cloud_record.vmid: DestroyPolicy.STRICT}
+    assert db.session.get(VMRecord, cloud_record.id) is None
+    assert queued_alert.delivered is True
+
+
+# --- fix round 1: adversarial safety pinning -----------------------------------
+
+def _group_owning(record):
+    group = StudentGroup(name='team-fail', display_name='Team Fail',
+                         entry_vlan_tag=332, internal_vlan_tag=432)
+    db.session.add(group)
+    db.session.commit()
+    db.session.get(VMRecord, record.id).owner_group_id = group.id
+    db.session.commit()
+    return group.id
+
+
+def _run_path(path, app, client, admin_client, record):
+    if path == 'expiry':
+        run_one_expiry_pass(app)
+    elif path == 'student':
+        login_owner(client, record.created_by_user_id)
+        client.post('/destroy', data={'deployment_group': 'Cloud Lab'})
+    elif path == 'admin':
+        admin_client.post('/admin/bulk-destroy', json={'vm_ids': [record.id]})
+    elif path == 'group':
+        group_id = _group_owning(record)
+        with patch('app.routes.student_groups.get_backend',
+                   return_value=StaticInventoryBackend([])):
+            admin_client.delete(f'/admin/groups/{group_id}?confirm_destroy=1')
+    else:
+        raise ValueError(path)
+
+
+# Catches any lifecycle path retiring a record after its provider raised.
+@pytest.mark.parametrize('failing', ['inspect', 'destroy'])
+@pytest.mark.parametrize('path', ['expiry', 'student', 'admin', 'group'])
+def test_provider_exception_never_retires_a_record(
+        app, client, admin_client, memory_backend_case, path, failing):
+    case = memory_backend_case
+    record = persist_case_record(case, expired=(path == 'expiry'))
+    with patch.object(case.backend, failing,
+                      side_effect=BackendError('provider down')):
+        _run_path(path, app, client, admin_client, record)
+    db.session.expire_all()
+    row = db.session.get(VMRecord, record.id)
+    assert row is not None and row.destroyed is False
+    assert record.vmid in case.backend.instances
+
+
+# Catches reconcile retiring a record, or aborting, when its inventory or
+# its confirmation raised; a failed confirmation is no sighting at all.
+@pytest.mark.parametrize('failing', ['list_managed', 'confirm_absent'])
+def test_reconcile_provider_exception_keeps_the_record(
+        app, memory_backend_case, monkeypatch, failing):
+    case = memory_backend_case
+    record = persist_case_record(case)
+    case.backend.instances.pop(record.vmid)
+    key = (record.node, record.vmid)
+    # A confirming sighting now would complete the window.
+    monkeypatch.setitem(route_utils._missing_since, key, time.monotonic() - 301)
+    with patch.object(case.backend, failing,
+                      side_effect=BackendError('provider down')):
+        assert reconcile_missing_vm_records() == []
+    assert db.session.get(VMRecord, record.id) is not None
+    if failing == 'confirm_absent':
+        assert key not in route_utils._missing_since
+
+
+# Catches reconcile reading inventory per record instead of once per backend
+# per pass (ruling C5).
+def test_reconcile_reads_inventory_once_per_backend(
+        app, memory_backend_case):
+    case = memory_backend_case
+    api = FakeProxmox()
+    _proxmox_portal(api)
+    for vmid in (500, 501):
+        _proxmox_record(vmid=vmid, api=api)
+    records = [persist_case_record(case, spec=replace(
+        case.spec, vmid=case.spec.vmid + n, vm_name=f'{case.spec.vm_name}-{n}'))
+        for n in range(3)]
+    case.backend.instances.pop(records[2].vmid)   # one is missing
+    with patch.object(case.backend, 'list_managed',
+                      wraps=case.backend.list_managed) as listed:
+        assert reconcile_missing_vm_records() == []
+    assert listed.call_count == 1
+    assert [c for c in api.calls if c[1] == ('cluster', 'resources')] \
+        == [('GET', ('cluster', 'resources'), {'type': 'vm'})]
+    forget_proxmox_caches()
+
+
+# Catches an intervening present sighting failing to restart the count.
+def test_reconcile_present_sighting_restarts_the_count(
+        app, memory_backend_case, monkeypatch):
+    case = memory_backend_case
+    record = persist_case_record(case)
+    launched = case.backend.instances.pop(record.vmid)
+    key = (record.node, record.vmid)
+    assert reconcile_missing_vm_records() == []
+    monkeypatch.setitem(route_utils._missing_since, key, time.monotonic() - 301)
+    case.backend.instances[record.vmid] = launched
+    assert reconcile_missing_vm_records() == []
+    case.backend.instances.pop(record.vmid)
+    assert reconcile_missing_vm_records() == []
+    assert db.session.get(VMRecord, record.id) is not None
+
+
+# Catches an intervening unknown confirmation failing to restart the count.
+def test_reconcile_unknown_confirmation_restarts_the_count(
+        app, memory_backend_case, monkeypatch):
+    case = memory_backend_case
+    record = persist_case_record(case)
+    case.backend.instances.pop(record.vmid)
+    key = (record.node, record.vmid)
+    assert reconcile_missing_vm_records() == []
+    monkeypatch.setitem(route_utils._missing_since, key, time.monotonic() - 301)
+    case.backend.inspect_result = GUEST_UNKNOWN
+    assert reconcile_missing_vm_records() == []
+    case.backend.inspect_result = None
+    assert reconcile_missing_vm_records() == []
+    assert db.session.get(VMRecord, record.id) is not None
+
+
+# Catches the failed-deploy cloud sweep matching by name or by deployment
+# alone: it must take the bundle's instance whatever the provider named it,
+# and nothing that only shares a name or a deployment (C7).
+def test_failed_deploy_cloud_sweep_matches_deployment_and_vmid_only(
+        app, memory_backend_case):
+    case = memory_backend_case
+    backend, spec = case.backend, case.spec
+    portal_name = spec.vm_name
+    backend.ensure_slot(spec.network_slot)
+    # The bundle's own instance, under a provider-side name.
+    backend.create(replace(spec, vm_name=f'lp-site-{spec.vmid}'),
+                   'memory-zone', heartbeat=lambda: None)
+    # The bundle's deployment, but a VMID no result names.
+    backend.create(replace(spec, vmid=spec.vmid + 1), 'memory-zone',
+                   heartbeat=lambda: None)
+    # The result's name, in another deployment.
+    backend.create(replace(spec, vmid=spec.vmid + 2, deployment_id='e' * 32),
+                   'memory-zone', heartbeat=lambda: None)
+    result = {'vmid': spec.vmid, 'vm_name': portal_name, 'vm_type': 'aws',
+              'node': 'aws', '_backend': 'aws', 'provider_id': None,
+              'deployment_id': spec.deployment_id,
+              'network_slot': spec.network_slot}
+
+    destroyed = _cleanup_with_sweep(
+        [result], templates=[_machine(case)], owning_identifier=spec.owner,
+        backend_name='aws')
+
+    assert destroyed == {spec.vmid}
+    assert backend.destroyed == {spec.vmid: DestroyPolicy.BEST_EFFORT}
+    assert set(backend.instances) == {spec.vmid + 1, spec.vmid + 2}
+    assert (result['provider_id'], result['node']) == (
+        f'provider-{spec.vmid}', 'memory-zone')
+
+
+# Catches a cloud survivor recorded while the provider inventory was down
+# (no provider id, no zone) being unrecoverable after a restart.
+def test_survivor_recorded_during_cloud_outage_is_destroyed_after_restart(
+        app, memory_backend_case):
+    case = memory_backend_case
+    outage = OperationalError('COMMIT', {}, Exception('server has gone away'))
+    down = BackendError('inventory down')
+    with patch.object(case.backend, 'list_managed', side_effect=down), \
+            patch.object(case.backend, 'inspect', side_effect=down), \
+            patch('app.routes.vm_creation.track_survivor', side_effect=outage), \
+            pytest.raises(OperationalError):
+        deploy_case_bundle(case, failure='after_launch')
+    [vmid] = case.backend.instances
+    with open(os.environ['UNTRACKED_SURVIVORS_FILE']) as handle:
+        [line] = [json.loads(text) for text in handle if text.strip()]
+    assert (line['vmid'], line['backend'], line['node'], line['provider_id']) \
+        == (vmid, 'aws', 'aws', None)
+
+    recover_untracked_survivors()   # what startup does after a restart
+    survivor = VMRecord.query.filter_by(vmid=vmid).one()
+    assert (survivor.backend, survivor.provider_id) == ('aws', None)
+
+    run_one_expiry_pass(app)
+    assert case.backend.destroyed == {vmid: DestroyPolicy.STRICT}
+    assert vmid not in case.backend.instances
+    assert VMRecord.query.filter_by(vmid=vmid).count() == 0
+
+
+# Catches one entry whose provider raised aborting the cleanup of the rest.
+@pytest.mark.parametrize('failure', ['session', 'inspect', 'confirm_absent'])
+def test_cleanup_contains_a_failing_entry_and_cleans_the_next(
+        app, memory_backend_case, monkeypatch, failure):
+    case = memory_backend_case
+    backend, spec = case.backend, case.spec
+    backend.ensure_slot(spec.network_slot)
+    first = backend.create(spec, 'memory-zone', heartbeat=lambda: None)
+    second = backend.create(replace(spec, vmid=spec.vmid + 1), 'memory-zone',
+                            heartbeat=lambda: None)
+    entries = [{'vmid': launched.vmid, 'vm_name': spec.vm_name,
+                'vm_type': 'aws', 'node': launched.location, 'backend': 'aws',
+                'provider_id': launched.provider_id,
+                'deployment_id': spec.deployment_id,
+                'network_slot': launched.network_slot}
+               for launched in (first, second)]
+    down = BackendError('provider down')
+    inspect, destroy = backend.inspect, backend.destroy
+
+    if failure == 'session':
+        opened = []
+
+        @contextmanager
+        def session():
+            opened.append(True)
+            if len(opened) == 1:
+                raise down
+            yield
+        monkeypatch.setattr(backend, 'session', session, raising=False)
+    elif failure == 'inspect':
+        monkeypatch.setattr(backend, 'inspect', lambda ref: (
+            (_ for _ in ()).throw(down) if ref.vmid == first.vmid
+            else inspect(ref)))
+    else:
+        def failing_destroy(ref, policy):
+            if ref.vmid == first.vmid:
+                raise down
+            destroy(ref, policy)
+
+        def failing_confirm(ref, error=None):
+            raise down
+        monkeypatch.setattr(backend, 'destroy', failing_destroy)
+        monkeypatch.setattr(backend, 'confirm_absent', failing_confirm)
+
+    assert cleanup_vms(entries) == {second.vmid}
+    assert first.vmid in backend.instances
+    assert second.vmid not in backend.instances

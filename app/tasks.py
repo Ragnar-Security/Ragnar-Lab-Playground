@@ -76,7 +76,7 @@ def _deletion_retry_due(vm_record, now):
     )
 
 
-def reconcile_missing_vm_records():
+def reconcile_missing_vm_records(skip_backends=frozenset()):
     """Retire live records whose guest was deleted outside the portal.
 
     A guest deleted by hand in its provider otherwise keeps its record, and
@@ -102,6 +102,8 @@ def reconcile_missing_vm_records():
 
     retired = []
     for backend_name, records in sorted(live.items()):
+        if backend_name in skip_backends:
+            continue
         try:
             backend = get_backend(backend_name)
         except BackendNotEnabled as error:
@@ -153,7 +155,14 @@ def reconcile_missing_vm_record(backend, record_id, vmid, node):
                 or (vm_record.backend or BACKEND_PROXMOX) != backend.name):
             return False
         ref = VMRef.from_record(vm_record)
-        absent = backend.confirm_absent(ref)
+        try:
+            absent = backend.confirm_absent(ref)
+        except Exception as error:
+            # A confirmation that raised is no sighting either way; it
+            # restarts the count like any other unknown answer.
+            logger.warning("Could not confirm absence of VM %s on %s: %s",
+                           vmid, ref.backend, error)
+            absent = False
         if not note_vm_state(node, vmid,
                              VM_MISSING if absent else VM_UNKNOWN):
             if absent:
@@ -260,11 +269,14 @@ def check_and_destroy_expired_vms(app):
         try:
             time.sleep(60)  # Check every 60 seconds
             
-            with app.app_context():
+            # The pass's one Proxmox connection, as the loop always opened;
+            # every Proxmox operation below reuses it.
+            with app.app_context(), ExitStack() as pass_sessions:
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Worker {worker_id}] Checking for expired VMs...")
                 # A survivor recorded while the database was down becomes a
                 # tracked, already-expired VM that this pass destroys.
                 _run_durable_step(recover_untracked_survivors)
+                skipped = _open_pass_sessions(pass_sessions)
 
                 # Check all active VMs in database for expiration
                 current_time = datetime.now()
@@ -279,6 +291,11 @@ def check_and_destroy_expired_vms(app):
                         time_remaining = (vm_record.expires_at - current_time).total_seconds()
                         
                         if current_time > vm_record.expires_at:
+                            if (vm_record.backend or BACKEND_PROXMOX) in skipped:
+                                # An outage, not a failed delete: no retry
+                                # is counted and no alert raised for it.
+                                logger.info(f"[Worker {worker_id}] VM {vm_record.vmid} waits for {vm_record.backend} to answer")
+                                continue
                             retry_info = f" (retry {vm_record.deletion_retry_count}/{VM_DELETION_MAX_RETRIES})" if vm_record.deletion_retry_count > 0 else ""
                             if _deletion_retry_due(vm_record, current_time):
                                 logger.info(f"[Worker {worker_id}] VM {vm_record.vmid} ({vm_record.vm_name}) has EXPIRED{retry_info}")
@@ -345,7 +362,7 @@ def check_and_destroy_expired_vms(app):
                         vm_provisioning.after_record_retired(ref)
                     time.sleep(1)
 
-                reconcile_missing_vm_records()
+                reconcile_missing_vm_records(skip_backends=skipped)
 
                 # Alert delivery runs after expiry and reconcile and is
                 # time-boxed (ALERT_DISPATCH_MAX_PASS_*): hung SMTP or webhook
@@ -358,9 +375,10 @@ def check_and_destroy_expired_vms(app):
                 # Orphan cleanup runs after expiry and is time-boxed
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
                 # never stand between an expired VM and its destroy. It is
-                # still the Proxmox sweep only, so a cloud-only portal never
-                # opens a Proxmox connection here.
-                if BACKEND_PROXMOX in enabled_backends():
+                # still the Proxmox sweep only, on the pass's connection, so
+                # a cloud-only portal never opens one.
+                if (BACKEND_PROXMOX in enabled_backends()
+                        and BACKEND_PROXMOX not in skipped):
                     maybe_reap_orphaned_vms(
                         get_backend(BACKEND_PROXMOX).connect())
         
@@ -373,6 +391,26 @@ def check_and_destroy_expired_vms(app):
                 # the alerts that matter most during one from going out.
                 with app.app_context():
                     _run_durable_step(dispatch_pending_alerts)
+
+
+def _open_pass_sessions(stack):
+    """Open the expiry pass's Proxmox connection; return backends to skip.
+
+    A Proxmox that cannot be reached at the start of a pass is an outage,
+    not a failed delete: its records wait for the next pass without a retry
+    counted or an alert raised, as when the loop opened its connection
+    first. Cloud records and alert delivery go ahead.
+    """
+    if BACKEND_PROXMOX not in enabled_backends():
+        return frozenset()
+    try:
+        stack.enter_context(vm_provisioning.provider_session(
+            get_backend(BACKEND_PROXMOX)))
+    except Exception as error:
+        logger.error("Proxmox unreachable (%s); its VMs wait for the next "
+                     "pass", error)
+        return frozenset({BACKEND_PROXMOX})
+    return frozenset()
 
 
 def _destroy_expired(ref):

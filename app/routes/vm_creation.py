@@ -331,37 +331,42 @@ def cleanup_vms(vm_list):
             ref = VMRef(vmid=vmid, vm_name=vm_name, vm_type=vm_type,
                         location=node, **identity_fields)
             try:
-                backend = get_backend(ref.backend)
-            except Exception as error:
-                logger.error("cleanup_vms: cannot reach the backend of VM "
-                             "%s: %s", vmid, error)
-                continue
-            with vm_provisioning.provider_session(backend):
-                identity = backend.inspect(ref)
-                if identity == GUEST_ABSENT:
-                    logger.info(f"VM {vmid} is absent from fresh inventory")
+                if _cleanup_one(get_backend(ref.backend), ref):
                     destroyed.add(vmid)
-                    continue
-                if identity != GUEST_MATCH:
-                    logger.error(
-                        "cleanup_vms: refusing to mutate unverified VM %s", vmid)
-                    continue
-                try:
-                    vm_provisioning.destroy_vm(ref, DestroyPolicy.BEST_EFFORT)
-                except Exception as error:
-                    # A destroy that raised may still have removed the guest
-                    # (a timed-out terminate); only fresh inventory says so.
-                    if backend.confirm_absent(ref, error):
-                        logger.info(f"VM {vmid} confirmed absent after a "
-                                    f"failed destroy: {error}")
-                        destroyed.add(vmid)
-                    else:
-                        logger.error(f"Destroy of VM {vmid} failed: {error}")
-                    continue
-            destroyed.add(vmid)
-            logger.info(f"Cleaned up VM {vmid}")
+            except Exception as error:
+                # The provider could not answer for this guest. It stays
+                # unconfirmed (a survivor record tracks it) and the next
+                # entry is still cleaned.
+                logger.error("cleanup_vms: could not clean up VM %s on %s: %s",
+                             vmid, ref.backend, error)
 
     return destroyed
+
+
+def _cleanup_one(backend, ref):
+    """Destroy one verified guest; return whether it is confirmed absent."""
+    with vm_provisioning.provider_session(backend):
+        identity = backend.inspect(ref)
+        if identity == GUEST_ABSENT:
+            logger.info(f"VM {ref.vmid} is absent from fresh inventory")
+            return True
+        if identity != GUEST_MATCH:
+            logger.error(
+                "cleanup_vms: refusing to mutate unverified VM %s", ref.vmid)
+            return False
+        try:
+            vm_provisioning.destroy_vm(ref, DestroyPolicy.BEST_EFFORT)
+        except Exception as error:
+            # A destroy that raised may still have removed the guest (a
+            # timed-out terminate); only fresh inventory says so.
+            if backend.confirm_absent(ref, error):
+                logger.info(f"VM {ref.vmid} confirmed absent after a "
+                            f"failed destroy: {error}")
+                return True
+            logger.error(f"Destroy of VM {ref.vmid} failed: {error}")
+            return False
+    logger.info(f"Cleaned up VM {ref.vmid}")
+    return True
 
 
 def _vm_name_prefix(*, owning_identifier, owner_group_id=None, koth_game_id=None):
