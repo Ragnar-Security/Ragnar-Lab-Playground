@@ -20,12 +20,13 @@ from ..config import KOTH_CLAIM_MODES, KOTH_TEAM_COLORS, get_koth_defaults
 from ..vlan_allocator import validate_vlan_free, VlanInUse
 from ..template_manager import (
     load_template_config, get_koth_groups, get_koth_services,
-    get_koth_claim_file,
+    get_koth_claim_file, TemplateConfigError,
 )
 from ..koth_layout import compute_layout
 from .koth import koth_bp
 from ..backends import get_backend
 from ..backends.base import BACKEND_PROXMOX
+from ..backends.template_spec import resolve_group_backend
 from .vm_creation import deploy_bundle, DeployFailed, cleanup_vms, named_instances
 
 logger = logging.getLogger(__name__)
@@ -864,6 +865,10 @@ def _resolve_koth_group(game):
     """Look up the koth_mode deployment_group dict for a game, or return
     (None, error_response). Centralises the templates.yaml lookup so both
     deploy and redeploy share the same error wording.
+
+    KOTH runs on Proxmox only: scoring reads claim files through the guest
+    agent. Any other resolution is refused before the game's status or VMs
+    are touched.
     """
     cfg = load_template_config()
     matches = [g for g in get_koth_groups(cfg)
@@ -875,6 +880,14 @@ def _resolve_koth_group(game):
     group = matches[0]
     if not group.get('templates'):
         return None, (jsonify({'error': 'deployment group has no templates'}), 400)
+    try:
+        backend_name = resolve_group_backend(group)
+    except TemplateConfigError as error:
+        return None, (jsonify({'error': str(error)}), 400)
+    if backend_name != BACKEND_PROXMOX:
+        return None, (jsonify({
+            'error': f'koth_mode requires the proxmox backend, not {backend_name}'
+        }), 400)
     return group, None
 
 
@@ -1007,6 +1020,7 @@ def deploy(game_id):
                 user_id=actor_id,
                 load_balancing_config=group.get('load_balancing'),
                 koth_game_id=game.id,
+                backend_name=BACKEND_PROXMOX,
             )
             boxes = _materialize_koth_boxes(game, group, vm_records, reuse_existing=False)
             game.status = 'active'
@@ -1087,6 +1101,7 @@ def redeploy(game_id):
                 user_id=actor_id,
                 load_balancing_config=group.get('load_balancing'),
                 koth_game_id=game.id,
+                backend_name=BACKEND_PROXMOX,
             )
             _materialize_koth_boxes(game, group, vm_records, reuse_existing=True)
             game.status = 'active'

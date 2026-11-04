@@ -31,7 +31,9 @@ from ..backends import enabled_backends, get_backend
 from ..backends.base import (
     BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, DestroyPolicy, VMRef, VMSpec,
 )
-from ..backends.template_spec import backend_block
+from ..backends.template_spec import (
+    backend_block, resolve_group_backend, validate_group_backends,
+)
 from ..utils import sanitize_name
 from ..template_manager import load_template_config, get_deployment_group_by_name, get_group_mode
 from ..models import StudentGroup, StudentGroupMember
@@ -575,8 +577,9 @@ def _acquire_deploy_lock(prefix):
 
 
 def _preflight_deployment_group(templates, *, owning_identifier,
-                                owner_group_id=None, koth_game_id=None):
-    """Inspect Proxmox for VMs the new deploy would shadow. Returns one of:
+                                owner_group_id=None, koth_game_id=None,
+                                backend_name=BACKEND_PROXMOX):
+    """Inspect `backend_name` for VMs the new deploy would shadow. Returns one of:
 
     - ('already_deployed', list[vm]) — every expected VM name is already
       present. Caller should no-op and report success; the student already
@@ -601,7 +604,7 @@ def _preflight_deployment_group(templates, *, owning_identifier,
                              owner_group_id=owner_group_id,
                              koth_game_id=koth_game_id)
     try:
-        inventory = named_instances(get_backend(BACKEND_PROXMOX), prefix)
+        inventory = named_instances(get_backend(backend_name), prefix)
     except Exception:
         # As the per-node listing always did: an unreadable inventory
         # reports nothing to shadow, and the deploy itself then meets the
@@ -1237,13 +1240,6 @@ def create_vm():
     if not deployment_group_name:
         return jsonify({'success': False, 'error': 'Deployment group required'})
 
-    # Validate user VLANs
-    valid, error = validate_user_vlans(user)
-    if not valid:
-        return jsonify({'success': False, 'error': error})
-
-    logger.info(f"User {user.login_id}: entry_vlan={user.entry_vlan_tag}, internal_vlan={user.internal_vlan_tag}")
-
     try:
         # Load deployment group configuration
         config = load_template_config()
@@ -1251,6 +1247,20 @@ def create_vm():
 
         if not deployment_group:
             return jsonify({'success': False, 'error': f'Deployment group {deployment_group_name} not found'})
+
+        # The backend decides which checks apply, so it is resolved before
+        # any of them; a group no backend can run is refused with the
+        # errors the admin's template listing shows.
+        backend_errors = validate_group_backends(deployment_group, enabled_backends())
+        if backend_errors:
+            return jsonify({'success': False, 'error': '; '.join(backend_errors)})
+        backend_name = resolve_group_backend(deployment_group)
+
+        if backend_name == BACKEND_PROXMOX:
+            valid, error = validate_user_vlans(user)
+            if not valid:
+                return jsonify({'success': False, 'error': error})
+            logger.info(f"User {user.login_id}: entry_vlan={user.entry_vlan_tag}, internal_vlan={user.internal_vlan_tag}")
 
         templates = deployment_group.get('templates', [])
         if not templates:
@@ -1312,6 +1322,18 @@ def create_vm():
             owning_identifier = student_name
             owner_group_id = None
 
+        if backend_name != BACKEND_PROXMOX:
+            # A cloud configures no VLANs, but the owner's tags are its
+            # network-slot identities, so it cannot deploy without both.
+            missing = [name for name, tag in (('entry_vlan_tag', entry_vlan),
+                                              ('internal_vlan_tag', internal_vlan))
+                       if tag is None]
+            if missing:
+                return jsonify({
+                    'success': False,
+                    'error': (f"Cloud deployment needs {' and '.join(missing)} "
+                              f"assigned. Please contact an administrator.")})
+
         # Per-target deploy lock — prevents two concurrent deploys for the
         # same student/group from racing through the pre-flight check (both
         # would see "fresh" and both would kick off clones with the same
@@ -1327,8 +1349,10 @@ def create_vm():
             }), 409
 
         try:
-            # Get Proxmox connection
-            proxmox = get_proxmox_connection()
+            if backend_name == BACKEND_PROXMOX:
+                # An unreachable cluster fails the deploy here, as it always
+                # has; a cloud deploy never needs this connection.
+                get_proxmox_connection()
 
             # Pre-flight: detect an already-fully-deployed state (idempotent
             # retry — no-op and report success) or a partially-deployed
@@ -1337,10 +1361,11 @@ def create_vm():
             status, existing = _preflight_deployment_group(
                 templates,
                 owning_identifier=owning_identifier,
-                owner_group_id=owner_group_id)
+                owner_group_id=owner_group_id,
+                backend_name=backend_name)
 
             if status == 'already_deployed':
-                # Proxmox says all expected VMs exist — but the user can
+                # The backend says all expected VMs exist — but the user can
                 # only manage VMs the app knows about. Verify the DB has a
                 # live VMRecord for each before declaring success; otherwise
                 # a prior deploy that crashed between clone and DB-insert
@@ -1363,7 +1388,7 @@ def create_vm():
                     logger.info(
                         f"Deploy no-op: {deployment_group_name} for "
                         f"{owning_identifier!r} is already fully deployed "
-                        f"({len(existing)} VMs present in Proxmox and "
+                        f"({len(existing)} VMs present on {backend_name} and "
                         f"tracked in DB).")
                     return jsonify({
                         'success': True,
@@ -1377,14 +1402,14 @@ def create_vm():
                                 for vm in existing],
                     })
 
-                # DB is out of sync — Proxmox has VMs the app doesn't know
+                # DB is out of sync — the backend has VMs the app doesn't know
                 # about (prior crash between clone-success and VMRecord
                 # insert, manual Proxmox-side creation, etc). Demote to
                 # 'partial' so the next block destroys them all and the
                 # caller does a fresh deploy with proper DB records.
                 logger.warning(
                     f"Pre-flight: {deployment_group_name} for "
-                    f"{owning_identifier!r} has {len(existing)} Proxmox "
+                    f"{owning_identifier!r} has {len(existing)} {backend_name} "
                     f"VM(s) but only {len(tracked_vmids)} live VMRecord(s); "
                     f"untracked vmids: {sorted(untracked)}. Demoting to "
                     f"'partial' so we redeploy with proper DB records.")
@@ -1399,7 +1424,8 @@ def create_vm():
                 cleaned = cleanup_vms([
                     {'vmid': vm['vmid'], 'node': vm['node'],
                      'vm_type': vm['vm_type'],
-                     'vm_name': vm.get('name')} for vm in existing])
+                     'vm_name': vm.get('name'),
+                     'backend': backend_name} for vm in existing])
                 failed = [vm for vm in existing if vm['vmid'] not in cleaned]
                 _mark_cleaned_records_destroyed(cleaned)
                 if failed:
@@ -1424,6 +1450,7 @@ def create_vm():
                 user_id=user_id,
                 load_balancing_config=load_balancing_config,
                 owner_group_id=owner_group_id,
+                backend_name=backend_name,
             )
             result_vms = [{
                 'vm_id': record.vmid,

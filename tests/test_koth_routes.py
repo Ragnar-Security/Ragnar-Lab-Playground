@@ -1,4 +1,8 @@
 import unittest
+from unittest.mock import patch
+
+import pytest
+
 from app import create_app
 from app.models import db, User, StudentGroup, KothGame
 from tests.backends.fake_backend import StaticInventoryBackend
@@ -796,3 +800,98 @@ class KothDeployTestCase(unittest.TestCase):
             self.assertIsNotNone(b.position)
             self.assertIn('x', b.position)
             self.assertIn('y', b.position)
+
+
+# --- KOTH is Proxmox-only ----------------------------------------------------
+
+def cloud_koth_catalog():
+    return {'deployment_groups': [{
+        'display_name': 'Cloud KOTH', 'enabled': True, 'koth_mode': True,
+        'backend': 'aws', 'uptime_minutes': 240,
+        'templates': [{'name': 'box1', 'entry_point': True,
+                       'aws': {'image_id': 'ami-placeholder',
+                               'instance_type': 't3.micro', 'disk_gb': 20}}],
+    }]}
+
+
+def proxmox_koth_catalog():
+    return {'deployment_groups': [{
+        'display_name': 'Proxmox KOTH', 'enabled': True, 'koth_mode': True,
+        'uptime_minutes': 240,
+        'templates': [{'name': 'box1', 'type': 'qemu', 'memory': 2048, 'cores': 2,
+                       'template_locations': {'pve': 9501}}],
+    }]}
+
+
+@pytest.fixture
+def admin_client(app):
+    with app.app_context():
+        admin = User(login_id='koth-admin', is_admin=True, session_version=1)
+        admin.set_password('Correct-Horse-9')
+        db.session.add(admin)
+        db.session.commit()
+        user_id = admin.id
+    client = app.test_client()
+    with client.session_transaction() as session:
+        session['user_id'] = user_id
+        session['session_version'] = 1
+    return client
+
+
+def _commit_game(app, name, status='draft'):
+    with app.app_context():
+        game = KothGame(name=name, deployment_group_name=name,
+                        entry_vlan_tag=350, internal_vlan_tag=450, status=status)
+        db.session.add(game)
+        db.session.commit()
+        return game.id
+
+
+@pytest.fixture
+def cloud_koth_game(app):
+    return _commit_game(app, 'Cloud KOTH')
+
+
+# Catches cloud KOTH reaching deploy and guest-agent claim reads.
+def test_koth_cloud_group_is_refused_before_deploy_bundle(app, admin_client, cloud_koth_game):
+    attempted = []
+    with patch('app.routes.koth_admin.load_template_config',
+               return_value=cloud_koth_catalog()), patch(
+            'app.routes.koth_admin.deploy_bundle',
+            side_effect=lambda **kwargs: attempted.append(kwargs) or []):
+        response = admin_client.post(f'/koth/api/games/{cloud_koth_game}/deploy')
+    assert response.status_code == 400
+    assert attempted == []
+    with app.app_context():
+        assert db.session.get(KothGame, cloud_koth_game).status == 'draft'
+
+
+# Catches a cloud KOTH redeploy tearing down the game before it is refused.
+def test_koth_cloud_group_redeploy_is_refused_before_teardown(app, admin_client):
+    game_id = _commit_game(app, 'Cloud KOTH', status='active')
+    attempted = []
+    with patch('app.routes.koth_admin.load_template_config',
+               return_value=cloud_koth_catalog()), patch(
+            'app.routes.koth_admin.deploy_bundle',
+            side_effect=lambda **kwargs: attempted.append(kwargs) or []), patch(
+            'app.routes.koth_admin._destroy_game_vms',
+            side_effect=lambda game: attempted.append(game) or 0):
+        response = admin_client.post(f'/koth/api/games/{game_id}/redeploy')
+    assert response.status_code == 400
+    assert attempted == []
+    with app.app_context():
+        assert db.session.get(KothGame, game_id).status == 'active'
+
+
+# Catches KOTH deploy/redeploy leaving the backend to deploy_bundle's default.
+@pytest.mark.parametrize('action,status', [('deploy', 'draft'), ('redeploy', 'active')])
+def test_koth_deploys_name_proxmox_explicitly(app, admin_client, action, status):
+    game_id = _commit_game(app, 'Proxmox KOTH', status=status)
+    with patch('app.routes.koth_admin.load_template_config',
+               return_value=proxmox_koth_catalog()), patch(
+            'app.routes.koth_admin.deploy_bundle', return_value=[]) as deploy, patch(
+            'app.routes.koth_admin._destroy_game_vms', return_value=0), patch(
+            'app.routes.koth_admin._start_scheduler'):
+        response = admin_client.post(f'/koth/api/games/{game_id}/{action}')
+    assert response.status_code == 200, response.data
+    assert deploy.call_args.kwargs['backend_name'] == 'proxmox'
