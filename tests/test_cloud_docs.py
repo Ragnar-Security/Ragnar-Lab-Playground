@@ -249,6 +249,39 @@ def test_iam_example_scopes_every_write_to_the_site():
             "lab-playground-created"}
 
 
+def _override_examples():
+    """Each copyable credentials override, keyed by its first-line label."""
+    examples = {}
+    for block in _fenced_blocks(RUNBOOK.read_text(), "yaml"):
+        first = block.strip().splitlines()[0]
+        if first.startswith("# docker-compose.cloud.yml"):
+            examples[first] = yaml.safe_load(block)["services"]["vm-automation"]
+    return examples
+
+
+def _override_env_names(service):
+    return {entry.split("=", 1)[0] for entry in service.get("environment", [])}
+
+
+# Catches an override that demands the other cloud's credentials, so an
+# AWS-only or GCP-only operator copying it fails before the app starts.
+def test_credentials_overrides_are_per_cloud():
+    examples = _override_examples()
+    aws = [s for label, s in examples.items() if "AWS only" in label]
+    gcp = [s for label, s in examples.items() if "GCP only" in label]
+    assert len(aws) == 1 and len(gcp) == 1, sorted(examples)
+    [aws], [gcp] = aws, gcp
+    assert _override_env_names(aws) == {"AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"}
+    assert "volumes" not in aws
+    assert _override_env_names(gcp) == {"GOOGLE_APPLICATION_CREDENTIALS"}
+    [mount] = gcp["volumes"]
+    assert mount["read_only"] is True
+    assert mount["target"] == gcp["environment"][0].split("=", 1)[1]
+    assert len(examples) == 3, "AWS only, GCP only, and one labelled combined example"
+    [both] = [s for label, s in examples.items() if "both" in label]
+    assert _override_env_names(both) == _override_env_names(aws) | _override_env_names(gcp)
+
+
 def test_jumpbox_doc_documents_vlan_isolation():
     headings = markdown_headings(ROOT / "docs" / "JUMPBOX.md")
     assert "### VLAN isolation" in headings

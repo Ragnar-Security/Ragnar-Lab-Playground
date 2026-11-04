@@ -537,15 +537,46 @@ only the router disks bill.
    Set `JUMPBOX_VLAN_BANDS` to the jumpbox's value if you changed it there.
 
 3. **Credentials, never in a tracked file.** AWS uses boto3's standard chain
-   and GCP uses Application Default Credentials. On a portal host that runs
-   in the same cloud, an instance role (AWS; set the instance metadata hop
-   limit to 2 so a container can reach it) or the attached service account
-   (GCP metadata server) needs nothing else. Otherwise create an
-   operator-owned override next to `docker-compose.prod.yml`, keep it out of
-   git, and keep the key values in `.env`:
+   and GCP uses Application Default Credentials. **A portal host that runs
+   in the same cloud needs no override and no key entries:** an instance
+   role (AWS; set the instance metadata hop limit to 2 so a container can
+   reach it) or the attached service account (GCP metadata server) is found
+   by the SDK on its own. Otherwise create an operator-owned override next to
+   `docker-compose.prod.yml`, keep it out of git, and keep key values in
+   `.env`. Use the snippet for the clouds you enabled: each `:?` entry stops
+   Compose until that key is set, so never copy another cloud's entries.
+
+   AWS only (keys in `.env`):
 
    ```yaml
-   # docker-compose.cloud.yml (operator-owned, untracked)
+   # docker-compose.cloud.yml (operator-owned, untracked) - AWS only
+   services:
+     vm-automation:
+       environment:
+         - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+         - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
+   ```
+
+   GCP only (a service account key file on the host, owner uid 1000, mode
+   0400; nothing in `.env`):
+
+   ```yaml
+   # docker-compose.cloud.yml (operator-owned, untracked) - GCP only
+   services:
+     vm-automation:
+       environment:
+         - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp-portal.json
+       volumes:
+         - type: bind
+           source: /etc/lab-playground/gcp-portal.json
+           target: /run/secrets/gcp-portal.json
+           read_only: true
+   ```
+
+   AWS and GCP both enabled, neither through a role or metadata server:
+
+   ```yaml
+   # docker-compose.cloud.yml (operator-owned, untracked) - both AWS and GCP
    services:
      vm-automation:
        environment:
@@ -554,10 +585,13 @@ only the router disks bill.
          - GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp-portal.json
        volumes:
          - type: bind
-           source: /etc/lab-playground/gcp-portal.json   # owner uid 1000, mode 0400
+           source: /etc/lab-playground/gcp-portal.json
            target: /run/secrets/gcp-portal.json
            read_only: true
    ```
+
+   If one cloud uses its role or metadata server and the other needs keys,
+   use only the other cloud's snippet.
 
    Name the override in `.env`, the way "Running a released image"
    (`docs/PRODUCTION_DEPLOYMENT.md`) names its own, so a plain
