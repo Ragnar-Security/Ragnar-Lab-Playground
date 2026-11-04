@@ -66,6 +66,8 @@ _PROVIDER_ERRORS = (BotoCoreError, ClientError)
 
 KIND_DEPLOYMENT_NETWORK = 'deployment-network'
 KIND_SLOT_NETWORK = 'slot-network'
+# The operator-provisioned shared router's kind tag.
+KIND_ROUTER = 'router'
 # The tailnet's CGNAT range: besides its own group, the only peers a
 # deployment's VMs may reach or be reached from. No internet rule exists.
 _TAILNET_CIDR = '100.64.0.0/10'
@@ -278,7 +280,8 @@ class AWSBackend:
 
     def _delete_network(self, kind: _NetworkKind, provider_id: str) -> None:
         """Delete one network resource; absent is done. Anything else, a
-        DependencyViolation included, raises so cleanup and the sweeper retry."""
+        DependencyViolation included, raises so cleanup and the sweeper retry.
+        Only ever called right after _owned_network proved ownership."""
         try:
             getattr(self._ec2, kind.delete)(**{kind.id_field: provider_id})
         except ClientError as error:
@@ -289,6 +292,70 @@ class AWSBackend:
         except BotoCoreError as error:
             raise BackendError(
                 f'could not delete {kind.label} {provider_id}: {error}') from error
+
+    def _owned_network(self, kind: _NetworkKind, provider_id: str, pairs: dict,
+                       key: Optional[str] = None) -> Tuple[Optional[dict], List[str]]:
+        """A fresh by-id describe of one network resource, judged against
+        the identity a caller is about to act on: the exact tag `pairs`, the
+        deployment `key` when given, the lab VPC, and (for a group) the
+        deterministic name of the deployment it is tagged with.
+
+        Returns (None, []) on provider-confirmed absence, (item, []) when
+        it is still owned, (item, problems) when it is not. A malformed id
+        or an unverifiable describe raises BackendError: neither is absence.
+        """
+        config = _config()
+        # Checked locally, like instance ids: a malformed id must never
+        # read as absent because of how a provider phrases the rejection.
+        if not kind.id_pattern.fullmatch(provider_id or ''):
+            raise BackendError(f'malformed {kind.label} id {provider_id!r}')
+        try:
+            items = getattr(self._ec2, kind.describe)(
+                **{kind.ids_param: [provider_id]})[kind.key]
+        except ClientError as error:
+            if _error_code(error) == kind.not_found:
+                return None, []
+            raise BackendError(
+                f'identity of {kind.label} {provider_id} could not be verified: '
+                f'{error}') from error
+        except BotoCoreError as error:
+            raise BackendError(
+                f'identity of {kind.label} {provider_id} could not be verified: '
+                f'{error}') from error
+        items = [item for item in items if item.get(kind.id_field) == provider_id]
+        if not items:
+            return None, []
+        item = items[0]
+        tags = _tag_map(item)
+        problems = [f'{tag}={tags.get(tag)!r}' for tag, value in pairs.items()
+                    if tags.get(tag) != value]
+        deployment = tags.get(TAG_DEPLOYMENT)
+        if key is not None and (deployment is None or deployment_key(deployment) != key):
+            problems.append(f'{TAG_DEPLOYMENT}={deployment!r}')
+        if item.get('VpcId') != config.AWS_LAB_VPC_ID:
+            problems.append(f'VpcId={item.get("VpcId")!r}')
+        if kind is _GROUPS:
+            try:
+                name = deployment_network_name(config.LAB_SITE_ID, deployment or '')
+            except ValueError:
+                name = None
+            if name is None or item.get('GroupName') != name:
+                problems.append(f'GroupName={item.get("GroupName")!r}')
+        return item, problems
+
+    def _delete_owned_network(self, kind: _NetworkKind, provider_id: str,
+                              pairs: dict, key: Optional[str] = None) -> None:
+        """Delete one network resource only if a fresh read proves it still
+        carries `pairs` (and `key`); absent is done; otherwise DestroyRefused
+        and nothing is mutated."""
+        item, problems = self._owned_network(kind, provider_id, pairs, key)
+        if item is None:
+            return
+        if problems:
+            raise DestroyRefused(
+                f'{kind.label} {provider_id} no longer carries the identity to be '
+                f'deleted: {", ".join(problems)}')
+        self._delete_network(kind, provider_id)
 
     def _slot_identity(self, slot: int) -> dict:
         return {TAG_SITE: _config().LAB_SITE_ID, TAG_SLOT: str(slot),
@@ -357,8 +424,10 @@ class AWSBackend:
     def release_slot(self, slot: int) -> None:
         """Delete the slot's subnet; absent is done. The caller holds
         vm_lifecycle_lock(slot_lock_key('aws', slot))."""
-        for subnet in self._tagged(_SUBNETS, self._slot_identity(slot)):
-            self._delete_network(_SUBNETS, subnet['SubnetId'])
+        identity = self._slot_identity(slot)
+        for subnet in self._tagged(_SUBNETS, identity):
+            # The enumeration may be stale by now: re-prove before deleting.
+            self._delete_owned_network(_SUBNETS, subnet['SubnetId'], identity)
 
     def _group_identity(self, deployment_id: str) -> dict:
         return {TAG_SITE: _config().LAB_SITE_ID, TAG_DEPLOYMENT: deployment_id,
@@ -410,15 +479,20 @@ class AWSBackend:
                 f'{deployment_id}: {duplicate}')
         return group['GroupId']
 
-    def _converge_group_rules(self, group_id: str) -> None:
+    def _converge_group_rules(self, group_id: str, deployment_id: str) -> None:
         """Make the group's rules exactly the isolation set, both ways.
         Egress first, and in each direction revoke before authorize, so
-        the default allow-all egress is gone before anything is granted."""
-        try:
-            [group] = self._ec2.describe_security_groups(
-                GroupIds=[group_id])['SecurityGroups']
-        except (*_PROVIDER_ERRORS, ValueError) as error:
-            raise BackendError(f'could not read the rules of {group_id}: {error}') from error
+        the default allow-all egress is gone before anything is granted.
+        Nothing is mutated unless the fresh read still proves the group is
+        this deployment's."""
+        group, problems = self._owned_network(
+            _GROUPS, group_id, self._group_identity(deployment_id))
+        if group is None:
+            raise BackendError(f'security group {group_id} vanished before its rules were set')
+        if problems:
+            raise BackendError(
+                f'security group {group_id} is no longer deployment {deployment_id}\'s: '
+                f'{", ".join(problems)}')
         wanted = _isolation_rules(group_id)
         for field, revoke, authorize in (
                 ('IpPermissionsEgress', 'revoke_security_group_egress',
@@ -445,7 +519,7 @@ class AWSBackend:
     def _deployment_group(self, deployment_id: str) -> str:
         group = self._own_group(deployment_id)
         group_id = group['GroupId'] if group else self._create_group(deployment_id)
-        self._converge_group_rules(group_id)
+        self._converge_group_rules(group_id, deployment_id)
         return group_id
 
     def _resolve_network(self, spec: VMSpec) -> Tuple[str, str]:
@@ -462,13 +536,18 @@ class AWSBackend:
         """Delete the deployment's security groups; absent is done. Run
         after its instances are terminated: EC2 refuses to delete a group
         an interface still uses, and that refusal propagates."""
-        for group in self._tagged(_GROUPS, self._group_identity(deployment_id)):
-            self._delete_network(_GROUPS, group['GroupId'])
+        identity = self._group_identity(deployment_id)
+        for group in self._tagged(_GROUPS, identity):
+            # The enumeration may be stale by now: re-prove before deleting.
+            self._delete_owned_network(_GROUPS, group['GroupId'], identity)
 
     # Router. The caller holds vm_lifecycle_lock(router_lock_key('aws')).
+    # The operator provisions it tagged TAG_SITE=<site> and TAG_KIND=router;
+    # the configured id alone never proves which machine it is.
 
     def _router(self) -> Tuple[str, str]:
-        router_id = _config().AWS_ROUTER_INSTANCE_ID
+        config = _config()
+        router_id = config.AWS_ROUTER_INSTANCE_ID
         if not router_id:
             raise BackendError('AWS_ROUTER_INSTANCE_ID is not configured')
         try:
@@ -476,11 +555,17 @@ class AWSBackend:
                 InstanceIds=[router_id])['Reservations']
         except _PROVIDER_ERRORS as error:
             raise BackendError(f'could not read router {router_id}: {error}') from error
-        states = [_state(i) for r in reservations for i in r['Instances']
-                  if i.get('InstanceId') == router_id]
-        if not states:
+        instances = [i for r in reservations for i in r['Instances']
+                     if i.get('InstanceId') == router_id]
+        if not instances:
             raise BackendError(f'router {router_id} does not exist')
-        return router_id, states[0]
+        identity = {TAG_SITE: config.LAB_SITE_ID, TAG_KIND: KIND_ROUTER}
+        if not _carries(instances[0], identity):
+            tags = _tag_map(instances[0])
+            raise BackendError(
+                f'instance {router_id} is not this site\'s router: '
+                f'{TAG_SITE}={tags.get(TAG_SITE)!r}, {TAG_KIND}={tags.get(TAG_KIND)!r}')
+        return router_id, _state(instances[0])
 
     def _router_call(self, router_id: str, operation: str) -> None:
         try:
@@ -807,39 +892,9 @@ class AWSBackend:
         self._terminate(resource.provider_id)
 
     def _delete_listed_network(self, kind: _NetworkKind, resource: ManagedResource) -> None:
-        provider_id = resource.provider_id
-        # Checked locally, like instance ids: a malformed id must never
-        # read as absent because of how a provider phrases the rejection.
-        if not kind.id_pattern.fullmatch(provider_id or ''):
-            raise BackendError(f'malformed {kind.label} id {provider_id!r}')
-        try:
-            items = getattr(self._ec2, kind.describe)(
-                **{kind.ids_param: [provider_id]})[kind.key]
-        except ClientError as error:
-            if _error_code(error) == kind.not_found:
-                return
-            raise BackendError(
-                f'identity of {kind.label} {provider_id} could not be verified: '
-                f'{error}') from error
-        except BotoCoreError as error:
-            raise BackendError(
-                f'identity of {kind.label} {provider_id} could not be verified: '
-                f'{error}') from error
-        items = [item for item in items if item.get(kind.id_field) == provider_id]
-        if not items:
-            return
-        tags = _tag_map(items[0])
-        deployment = tags.get(TAG_DEPLOYMENT)
-        holds = (
-            tags.get(TAG_SITE) == _config().LAB_SITE_ID
-            and tags.get(TAG_KIND) == resource.kind
-            and (resource.deployment_id is None
-                 or (deployment is not None
-                     and deployment_key(deployment) == resource.deployment_id))
-            and (resource.network_slot is None
-                 or tags.get(TAG_SLOT) == str(resource.network_slot)))
-        if not holds:
-            raise DestroyRefused(
-                f'{kind.label} {provider_id} no longer carries the identity it '
-                'was listed with')
-        self._delete_network(kind, provider_id)
+        pairs = {TAG_SITE: _config().LAB_SITE_ID, TAG_KIND: resource.kind}
+        if resource.network_slot is not None:
+            pairs[TAG_SLOT] = str(resource.network_slot)
+        # A listed group carries the 16-character key (ruling C1).
+        self._delete_owned_network(kind, resource.provider_id, pairs,
+                                   key=resource.deployment_id)

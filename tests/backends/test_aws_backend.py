@@ -118,9 +118,12 @@ def aws_network_backend(app, monkeypatch):
         ec2 = boto3.client('ec2', region_name='us-east-1')
         vpc_id = ec2.create_vpc(CidrBlock='172.20.0.0/16')['Vpc']['VpcId']
         image_id = register_aws_test_image(ec2)
+        # Tagged as the operator provisions it (TAG_SITE + TAG_KIND=router).
         router_instance_id = ec2.run_instances(
-            ImageId=image_id, InstanceType='t3.micro',
-            MinCount=1, MaxCount=1)['Instances'][0]['InstanceId']
+            ImageId=image_id, InstanceType='t3.micro', MinCount=1, MaxCount=1,
+            TagSpecifications=[{'ResourceType': 'instance', 'Tags': _tags(
+                {TAG_SITE: 'test-site', TAG_KIND: 'router'})}],
+        )['Instances'][0]['InstanceId']
         monkeypatch.setattr(config, 'AWS_LAB_VPC_ID', vpc_id)
         monkeypatch.setattr(config, 'AWS_LAB_CIDR', '172.20.0.0/16')
         monkeypatch.setattr(config, 'AWS_ROUTER_INSTANCE_ID', router_instance_id)
@@ -196,6 +199,40 @@ def _group(ec2, vpc_id, deployment_id, site='test-site', name=None):
 def _ensure_slot(backend, slot):
     with vm_lifecycle_lock(slot_lock_key(BACKEND_AWS, slot)):
         backend.ensure_slot(slot)
+
+
+def _after_enumeration(monkeypatch, ec2, operation, change):
+    """Run `change(pages)` once, right after the backend's next paginated
+    `operation` read returns: a concurrent writer acting between an
+    enumeration and whatever the backend does with its result."""
+    real = ec2.get_paginator
+    fired = []
+
+    class _Changing:
+        def __init__(self, paginator):
+            self._paginator = paginator
+
+        def paginate(self, **kwargs):
+            pages = list(self._paginator.paginate(**kwargs))
+            fired.append(True)
+            change(pages)
+            return pages
+
+    def get_paginator(name):
+        paginator = real(name)
+        return paginator if name != operation or fired else _Changing(paginator)
+
+    monkeypatch.setattr(ec2, 'get_paginator', get_paginator)
+    return fired
+
+
+def _retag(ec2, list_key, id_field, tags):
+    """A change that retags every item an enumeration of `list_key` returned."""
+    def change(pages):
+        ids = [item[id_field] for page in pages for item in page[list_key]]
+        assert ids, 'the enumeration found nothing to retag'
+        ec2.create_tags(Resources=ids, Tags=_tags(tags))
+    return change
 
 
 def test_admit_counts_live_records_and_unexpired_reservations_atomically(app, aws_instance_backend):
@@ -912,6 +949,156 @@ def test_router_missing_terminated_or_unconfigured_raises(aws_network_backend, m
                 backend.ensure_router_running()
             with pytest.raises(BackendError):
                 backend.stop_router()
+
+
+def test_cleanup_and_release_reverify_each_network_before_deleting(
+        aws_network_backend, monkeypatch):
+    # Catches a stale enumeration deleting a group or subnet that another
+    # portal or deployment took over between the listing and the delete.
+    backend, spec, ec2, resources = aws_network_backend
+    group_id = _group(ec2, resources['vpc_id'], spec.deployment_id)
+    _ensure_slot(backend, 1)
+    [subnet] = _site_subnets(ec2, 1)
+    fired = _after_enumeration(
+        monkeypatch, ec2, 'describe_security_groups',
+        _retag(ec2, 'SecurityGroups', 'GroupId', {TAG_DEPLOYMENT: 'f' * 32}))
+    with pytest.raises(BackendError):
+        backend.cleanup_deployment(spec.deployment_id)
+    assert fired
+    assert ec2.describe_security_groups(GroupIds=[group_id])['SecurityGroups']
+    fired = _after_enumeration(
+        monkeypatch, ec2, 'describe_subnets',
+        _retag(ec2, 'Subnets', 'SubnetId', {TAG_SITE: 'other-site'}))
+    with pytest.raises(BackendError):
+        with vm_lifecycle_lock(slot_lock_key(BACKEND_AWS, 1)):
+            backend.release_slot(1)
+    assert fired
+    assert ec2.describe_subnets(SubnetIds=[subnet['SubnetId']])['Subnets']
+
+
+def test_cleanup_refuses_a_correctly_tagged_group_outside_the_lab_vpc(aws_network_backend):
+    # Catches cleanup deleting a group in a VPC this portal does not manage.
+    backend, spec, ec2, resources = aws_network_backend
+    other_vpc = ec2.create_vpc(CidrBlock='10.9.0.0/16')['Vpc']['VpcId']
+    group_id = _group(ec2, other_vpc, spec.deployment_id)
+    with pytest.raises(DestroyRefused):
+        backend.cleanup_deployment(spec.deployment_id)
+    assert ec2.describe_security_groups(GroupIds=[group_id])['SecurityGroups']
+
+
+@pytest.mark.parametrize('tag, value', [(TAG_SITE, 'other-site'),
+                                        (TAG_DEPLOYMENT, 'f' * 32)])
+def test_create_sets_no_rules_on_a_group_whose_ownership_changed_after_lookup(
+        aws_network_backend, monkeypatch, tag, value):
+    # Catches convergence rewriting the rules of a group that is no longer
+    # this deployment's by the time its fresh describe runs.
+    backend, spec, ec2, resources = aws_network_backend
+    group_id = _group(ec2, resources['vpc_id'], spec.deployment_id)
+    _ensure_slot(backend, 1)
+    fired = _after_enumeration(
+        monkeypatch, ec2, 'describe_security_groups',
+        _retag(ec2, 'SecurityGroups', 'GroupId', {tag: value}))
+    with pytest.raises(BackendError):
+        backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    assert fired
+    [group] = ec2.describe_security_groups(GroupIds=[group_id])['SecurityGroups']
+    assert _flatten_group_rules(group['IpPermissions']) == set()
+    assert _flatten_group_rules(group['IpPermissionsEgress']) == {('-1', 'cidr', '0.0.0.0/0')}
+    assert not [r for r in backend.list_managed() if r.kind == 'instance']
+
+
+@pytest.mark.parametrize('winner_deployment, adopted', [('d' * 32, True),
+                                                        ('d' * 16 + 'f' * 16, False)])
+def test_group_duplicate_adopts_only_a_winner_with_the_exact_identity(
+        aws_network_backend, monkeypatch, winner_deployment, adopted):
+    # Catches a lost create race joining a group of another deployment that
+    # shares the 16-character key, or failing when the winner is its own.
+    backend, spec, ec2, resources = aws_network_backend
+    _ensure_slot(backend, 1)
+    real_create = ec2.create_security_group
+    winners = []
+
+    def raced(**kwargs):
+        # A concurrent creator wins the name first; ours then hits Duplicate.
+        monkeypatch.setattr(ec2, 'create_security_group', real_create)
+        winners.append(_group(ec2, resources['vpc_id'], winner_deployment))
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(ec2, 'create_security_group', raced)
+    if adopted:
+        launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+        [instance] = ec2.describe_instances(
+            InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
+        assert [g['GroupId'] for g in instance['NetworkInterfaces'][0]['Groups']] == winners
+        [group] = ec2.describe_security_groups(GroupIds=winners)['SecurityGroups']
+        assert _flatten_group_rules(group['IpPermissionsEgress']) == {
+            ('-1', 'group', winners[0]), ('-1', 'cidr', '100.64.0.0/10')}
+    else:
+        with pytest.raises(BackendError):
+            backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+        assert not [r for r in backend.list_managed() if r.kind == 'instance']
+        [group] = ec2.describe_security_groups(GroupIds=winners)['SecurityGroups']
+        assert _flatten_group_rules(group['IpPermissionsEgress']) == {
+            ('-1', 'cidr', '0.0.0.0/0')}
+    assert len(winners) == 1
+
+
+@pytest.mark.parametrize('winner_site, winner_zone, adopted', [
+    ('test-site', 'us-east-1a', True),
+    ('other-site', 'us-east-1a', False),
+    ('test-site', 'us-east-1b', False),
+])
+def test_subnet_conflict_adopts_only_a_winner_with_exact_identity_and_placement(
+        aws_network_backend, monkeypatch, winner_site, winner_zone, adopted):
+    # Catches a lost create race adopting another portal's subnet, or one
+    # at the slot's CIDR but in the wrong zone.
+    backend, spec, ec2, resources = aws_network_backend
+    real_create = ec2.create_subnet
+    winners = []
+
+    def raced(**kwargs):
+        # A concurrent creator takes the CIDR first; ours then conflicts.
+        monkeypatch.setattr(ec2, 'create_subnet', real_create)
+        winners.append(real_create(
+            VpcId=resources['vpc_id'], CidrBlock=kwargs['CidrBlock'],
+            AvailabilityZone=winner_zone,
+            TagSpecifications=[{'ResourceType': 'subnet',
+                                'Tags': _tags(_slot_tags(7, site=winner_site))}],
+        )['Subnet']['SubnetId'])
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(ec2, 'create_subnet', raced)
+    if adopted:
+        _ensure_slot(backend, 7)
+        assert [s['SubnetId'] for s in _site_subnets(ec2, 7)] == winners
+    else:
+        with pytest.raises(BackendError):
+            _ensure_slot(backend, 7)
+    assert len(winners) == 1
+    vpc_subnets = ec2.describe_subnets(Filters=[
+        {'Name': 'vpc-id', 'Values': [resources['vpc_id']]}])['Subnets']
+    assert [s['SubnetId'] for s in vpc_subnets] == winners
+
+
+@pytest.mark.parametrize('tag, value', [(TAG_SITE, 'other-site'), (TAG_KIND, 'instance')])
+def test_router_of_another_site_or_kind_is_never_started_or_stopped(
+        aws_network_backend, tag, value):
+    # Catches a misconfigured AWS_ROUTER_INSTANCE_ID starting or stopping
+    # a machine that is not this site's router.
+    backend, spec, ec2, resources = aws_network_backend
+    router_id = resources['router_instance_id']
+    ec2.create_tags(Resources=[router_id], Tags=_tags({tag: value}))
+    with vm_lifecycle_lock(router_lock_key(BACKEND_AWS)):
+        with pytest.raises(BackendError):
+            backend.stop_router()
+    assert _instance_state(ec2, router_id) == 'running'
+    ec2.stop_instances(InstanceIds=[router_id])
+    ec2.get_waiter('instance_stopped').wait(
+        InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
+    with vm_lifecycle_lock(router_lock_key(BACKEND_AWS)):
+        with pytest.raises(BackendError):
+            backend.ensure_router_running()
+    assert _instance_state(ec2, router_id) == 'stopped'
 
 
 def test_moto_attached_security_group_dependency_capability(aws_network_backend):

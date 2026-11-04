@@ -21,6 +21,7 @@ from app.backends.base import (
     DestroyPolicy, DestroyRefused, LaunchedVM, ManagedResource,
     SlotNetworkMissing, VMBackend, VMRef, VMSpec,
 )
+from app.backends.cloud_common import TAG_KIND, TAG_SITE
 
 MEMORY_LOCATION = 'memory-zone'
 MEMORY_IP = '192.0.2.10'
@@ -334,9 +335,13 @@ def make_aws_backend_case(app) -> BackendContractCase:
         ec2 = boto3.client('ec2', region_name='us-east-1')
         vpc_id = ec2.create_vpc(CidrBlock=AWS_TEST_VPC_CIDR)['Vpc']['VpcId']
         image_id = register_aws_test_image(ec2)
+        # The operator tags the shared router with its site and kind.
         router_id = ec2.run_instances(
-            ImageId=image_id, InstanceType='t3.micro',
-            MinCount=1, MaxCount=1)['Instances'][0]['InstanceId']
+            ImageId=image_id, InstanceType='t3.micro', MinCount=1, MaxCount=1,
+            TagSpecifications=[{'ResourceType': 'instance', 'Tags': [
+                {'Key': TAG_SITE, 'Value': AWS_TEST_CONFIG['LAB_SITE_ID']},
+                {'Key': TAG_KIND, 'Value': 'router'}]}],
+        )['Instances'][0]['InstanceId']
         ec2.stop_instances(InstanceIds=[router_id])
         ec2.get_waiter('instance_stopped').wait(
             InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
