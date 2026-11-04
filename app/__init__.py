@@ -38,7 +38,7 @@ __version__ = "1.0.0"
 __all__ = ["create_app", "db"]
 
 
-def create_app(testing=False, test_config=None):
+def create_app(testing=False, test_config=None, start_background_tasks=True):
     """
     Application factory function
 
@@ -50,6 +50,10 @@ def create_app(testing=False, test_config=None):
             before the database is initialized, e.g. a per-test
             SQLALCHEMY_DATABASE_URI. Flask-SQLAlchemy builds the engine in
             init_app, so setting the URI afterwards has no effect.
+        start_background_tasks: If False, skip the server's KOTH boot
+            recovery and scorer resume. One-shot tools (the network-slot
+            export) run beside a live server and must not revert its
+            in-flight deploy to draft or start a second scorer.
 
     Returns:
         Flask: Configured Flask application
@@ -123,7 +127,7 @@ def create_app(testing=False, test_config=None):
     # Database tables are managed externally (e.g., with migrations)
 
     # KOTH boot recovery + scheduler resume.
-    if not app.config.get('TESTING'):
+    if start_background_tasks and not app.config.get('TESTING'):
         with app.app_context():
             try:
                 from .models import db as _db, KothGame

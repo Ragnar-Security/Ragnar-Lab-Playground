@@ -143,7 +143,7 @@ def test_group_member_absent_from_the_whitelist_is_refused(app, portal_config):
 # Catches a failed export reaching stdout, where the policy renderer would read it.
 def test_main_prints_compact_json_and_reports_errors_on_stderr(app, portal_config,
                                                                monkeypatch, capsys):
-    monkeypatch.setattr(export_network_slots, "create_app", lambda: app)
+    monkeypatch.setattr(export_network_slots, "create_app", lambda **_: app)
     with app.app_context():
         db.session.add(StudentWhitelist(login_id="alice", entry_vlan_tag=100, internal_vlan_tag=200))
         db.session.commit()
@@ -159,3 +159,57 @@ def test_main_prints_compact_json_and_reports_errors_on_stderr(app, portal_confi
     out, err = capsys.readouterr()
     assert out == ""
     assert "bob" in err
+
+
+# ---- the export must not run the server's KOTH start-up work ---------------
+
+@pytest.fixture
+def production_db(app, monkeypatch):
+    """The non-test create_app() path against the fixture's SQLite file, with
+    one game mid-deploy and one active (which would resume the scorer)."""
+    import app as app_package
+    from app import koth_scorer
+
+    monkeypatch.setattr(app_package.config, "SQLALCHEMY_DATABASE_URI",
+                        app.config["SQLALCHEMY_DATABASE_URI"])
+    monkeypatch.setattr(app_package.config, "SQLALCHEMY_ENGINE_OPTIONS", {}, raising=False)
+    # Deployment validation is not under test, and other suites reload
+    # app.config and leave arbitrary settings behind.
+    monkeypatch.setattr(app_package, "validate_config", lambda: None)
+    started = []
+    # Record instead of starting a real APScheduler thread.
+    monkeypatch.setattr(koth_scorer, "start_scheduler", lambda flask_app, **_: started.append(flask_app))
+    with app.app_context():
+        deploying = _game("deploying", 350, 450, "deploying")
+        db.session.add_all([deploying, _game("live", 351, 451, "active")])
+        db.session.commit()
+        deploying_id = deploying.id
+    return deploying_id, started
+
+
+def _status(app, game_id):
+    with app.app_context():
+        db.session.expire_all()
+        return db.session.get(KothGame, game_id).status
+
+
+# Catches the safety check failing for the wrong reason: the server path must
+# still revert a stuck deploy and resume scoring.
+def test_server_start_up_still_recovers_koth(app, production_db):
+    from app import create_app
+
+    game_id, started = production_db
+    create_app()
+    assert _status(app, game_id) == "draft"
+    assert len(started) == 1
+
+
+# Catches an export (even a dry run) during a KOTH deploy reverting the live
+# game to draft or starting a second scorer.
+def test_export_leaves_a_deploying_game_and_the_scorer_alone(app, production_db, capsys):
+    game_id, started = production_db
+    assert export_network_slots.main() == 0
+    assert _status(app, game_id) == "deploying"
+    assert started == []
+    koth = json.loads(capsys.readouterr().out)["koth"]
+    assert [game["game_id"] for game in koth][0] == game_id

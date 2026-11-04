@@ -79,7 +79,8 @@ def main() -> int:
     try:
         # Keep stdout for the JSON alone, whatever app start-up prints.
         with contextlib.redirect_stdout(sys.stderr):
-            app = create_app()
+            # Runs beside the live server: no KOTH recovery, no scorer.
+            app = create_app(start_background_tasks=False)
             with app.app_context():
                 slots = collect_network_slots()
     except Exception as exc:  # any failure must leave stdout empty
