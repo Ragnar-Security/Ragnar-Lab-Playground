@@ -102,6 +102,12 @@ class VMRecord(db.Model):
 
     owner_group = db.relationship('StudentGroup', foreign_keys=[owner_group_id])
 
+    def __init__(self, **kwargs):
+        # Column defaults only apply at flush; callers that branch on
+        # backend before saving must still see 'proxmox'.
+        kwargs.setdefault('backend', 'proxmox')
+        super().__init__(**kwargs)
+
     def to_dict(self):
         """Convert model to dictionary for JSON serialization"""
         return {

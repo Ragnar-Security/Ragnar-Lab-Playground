@@ -129,6 +129,19 @@ class TestModels(unittest.TestCase):
         self.assertEqual(saved.to_dict()['deployment_id'], 'a' * 32)
         self.assertEqual(saved.to_dict()['network_slot'], 101)
 
+    # Catches code that branches on vm.backend before flush and sees None.
+    def test_vm_record_backend_defaults_at_construction(self):
+        expires_at = datetime.now() + timedelta(hours=1)
+        vm = VMRecord(vmid=101, vm_name='student-test-vm', vm_type='qemu',
+                      node='node-placeholder', template_name='lab/vm',
+                      student_name='test', expires_at=expires_at)
+        self.assertEqual(vm.backend, 'proxmox')
+        cloud = VMRecord(vmid=102, vm_name='student-test-vm', vm_type='aws',
+                         node='zone-placeholder', template_name='lab/vm',
+                         student_name='test', expires_at=expires_at,
+                         backend='aws')
+        self.assertEqual(cloud.backend, 'aws')
+
     def test_vm_record_relationships(self):
         """Test VM record relationship with User"""
         user = User(login_id='testuser', full_name='Test User')
