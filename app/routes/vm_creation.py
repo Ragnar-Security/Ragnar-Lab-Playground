@@ -1134,15 +1134,21 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
         expiration_time = (
             datetime.now() + timedelta(minutes=uptime_minutes))
         vm_records = []
+        # A cloud admission must stay live until its VMRecord commits, or the
+        # router idle step could stop the router under it (ruling C4).
+        renewing = (nullcontext() if backend_name == BACKEND_PROXMOX else
+                    _heartbeat_deployment_reservations(
+                        created_vms, vmid_reservation_id))
         try:
-            by_index = {vm['vm_index']: vm for vm in created_vms}
-            for idx, _template, _vmid in vm_assignments:
-                vm_info = by_index[idx]
-                rec = log_vm_to_database(
-                    vm_info, deployment_group_name, owning_identifier,
-                    expiration_time, user_id, owner_group_id, koth_game_id)
-                vm_records.append(rec)
-            db.session.commit()
+            with renewing:
+                by_index = {vm['vm_index']: vm for vm in created_vms}
+                for idx, _template, _vmid in vm_assignments:
+                    vm_info = by_index[idx]
+                    rec = log_vm_to_database(
+                        vm_info, deployment_group_name, owning_identifier,
+                        expiration_time, user_id, owner_group_id, koth_game_id)
+                    vm_records.append(rec)
+                db.session.commit()
         except Exception as db_error:
             logger.error(
                 "deploy_bundle: DB logging failed; rolling back: %s",

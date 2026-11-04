@@ -1002,6 +1002,16 @@ config = importlib.import_module("app.config")
 _IDLE_VM_NAME = "router-idle-vm"
 
 
+@pytest.fixture(autouse=True)
+def _fresh_router_idle_state():
+    # Every expiry pass in this module runs the router step, so a pass with a
+    # cloud enabled leaves an idle timestamp; no test may inherit one. Enables
+    # no backend: the Proxmox suites above keep their configuration.
+    _reset_router_idle_state_for_tests()
+    yield
+    _reset_router_idle_state_for_tests()
+
+
 @pytest.fixture
 def router_backend(app, monkeypatch):
     # Router-idle tests only: one enabled fake AWS backend with a running router.
