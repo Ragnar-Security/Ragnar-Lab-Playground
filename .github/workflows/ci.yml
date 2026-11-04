@@ -52,7 +52,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install --require-hashes -r requirements.txt
+          pip install --require-hashes --dry-run -r requirements.txt
+
+      - name: Install dev dependencies
+        run: uv sync --frozen --dev
 
       - name: Run unit tests
         env:
@@ -60,7 +63,7 @@ jobs:
           PROXMOX_HOST: fake-host
           PROXMOX_PASSWORD: fake-password
         run: |
-          python -m pytest tests/ --ignore=tests/integration -q --tb=short
+          uv run --frozen python -m pytest tests/ --ignore=tests/integration -q --tb=short
 
   integration-tests:
     name: Integration Tests
