@@ -3,7 +3,6 @@ Configuration module for Lab Playground
 Handles environment variables and Flask configuration
 """
 
-import ipaddress
 import os
 import logging
 import re
@@ -177,14 +176,6 @@ _CLOUD_REQUIRED = {
 JUMPBOX_VLAN_BANDS = _env_text(
     'JUMPBOX_VLAN_BANDS',
     'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
-
-# A cloud lab network is slot N's /26 at base + N * 64, for N up to 500, so
-# a base must hold 501 * 64 addresses (a /17 or larger). It must not touch
-# the Proxmox lab VLANs (10.0.0.0/8), the tailnet (100.64.0.0/10) or the
-# Docker default bridge (172.17.0.0/16).
-_LAB_CIDR_RESERVED = ('10.0.0.0/8', '100.64.0.0/10', '172.17.0.0/16')
-_SLOT_PREFIXLEN = 26
-_SLOT_MAX = 500
 
 # ============ ORPHAN REAPER CONFIGURATION ============
 # A fallback for clones whose VMRecord was never committed because the app
@@ -438,41 +429,18 @@ def _production_secret_errors():
     return errors
 
 
-def _validate_lab_cidr(name, cidr, *, others):
-    """Refuse a cloud lab base that is malformed, overlaps a reserved range
-    or another enabled backend's base (`others`: backend name -> CIDR), or
-    cannot hold slot 500's /26. T5 moves this to
-    app.backends.network_slots.validate_lab_cidr with these messages."""
-    try:
-        network = ipaddress.IPv4Network(cidr)
-    except ValueError:
-        raise ValueError(f"{name} {cidr!r} is not an IPv4 network address/prefix") from None
-    for reserved in _LAB_CIDR_RESERVED:
-        if network.overlaps(ipaddress.IPv4Network(reserved)):
-            raise ValueError(f"{name} {cidr} overlaps reserved range {reserved}")
-    needed = (_SLOT_MAX + 1) * 2 ** (32 - _SLOT_PREFIXLEN)
-    if network.num_addresses < needed:
-        raise ValueError(
-            f"{name} {cidr} is too small for slot {_SLOT_MAX}: slots 0-{_SLOT_MAX} as "
-            f"/{_SLOT_PREFIXLEN}s need {needed} addresses, a /17 or larger")
-    for other, other_cidr in others.items():
-        try:
-            other_network = ipaddress.IPv4Network(other_cidr)
-        except ValueError:
-            continue  # reported when that backend's own base is validated
-        if network.overlaps(other_network):
-            raise ValueError(f"{name} {cidr} overlaps {other} lab CIDR {other_cidr}")
-
-
 def _validate_configured_lab_cidrs(enabled):
     """Validate each enabled cloud's lab base against the reserved ranges
     and the other enabled clouds' bases; a disabled cloud's base is never
     allocated, so it is not checked."""
+    # Imported here, not at module top: the backends package must be
+    # importable while this module is still initialising.
+    from app.backends.network_slots import validate_lab_cidr
     bases = {'aws': AWS_LAB_CIDR, 'gcp': GCP_LAB_CIDR}
     clouds = [name for name in enabled if name in CLOUD_BACKENDS]
     for name in clouds:
         others = {other: bases[other] for other in clouds if other != name}
-        _validate_lab_cidr(f'{name.upper()}_LAB_CIDR', bases[name], others=others)
+        validate_lab_cidr(f'{name.upper()}_LAB_CIDR', bases[name], others=others)
 
 
 def _backend_errors(enabled):

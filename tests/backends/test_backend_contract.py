@@ -13,6 +13,7 @@ from app.backends.base import (
     GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, BackendError, DestroyPolicy,
     DestroyRefused, SlotNetworkMissing,
 )
+from app.backends.cloud_common import deployment_key
 from app.proxmox_service import vm_lifecycle_lock
 from tests.backends.fake_backend import FakeBackend, make_memory_backend_case
 
@@ -92,8 +93,9 @@ def test_backend_cleanup_invariant(backend_case):
     # Not vacuous for Proxmox, whose resources carry no deployment id (M7).
     assert not [r for r in case.backend.list_managed()
                 if r.kind == 'instance' and r.vmid == ref.vmid]
+    key = deployment_key(case.spec.deployment_id)
     assert not [r for r in case.backend.list_managed()
-                if r.deployment_id == case.spec.deployment_id]
+                if r.deployment_id is not None and deployment_key(r.deployment_id) == key]
 
 
 # The fake stands in for clouds in route tests (T7, T8, T16, T19), so the

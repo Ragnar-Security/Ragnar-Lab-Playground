@@ -389,6 +389,15 @@ def test_lab_cidrs_fail_closed(monkeypatch, aws_cidr, gcp_cidr, message):
         cfg.validate_config()
 
 
+# Catches validate_config() drifting from the shared validator's exact peer message.
+def test_lab_cidr_peer_overlap_message_is_the_shared_validators(monkeypatch):
+    cfg = reload_valid_cloud_config(
+        monkeypatch, AWS_LAB_CIDR='172.20.0.0/16', GCP_LAB_CIDR='172.20.128.0/17')
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert 'AWS_LAB_CIDR 172.20.0.0/16 overlaps gcp lab CIDR 172.20.128.0/17' in str(exc.value)
+
+
 # Catches the boundary drifting: a /17 holds slot 500 (32,064 addresses).
 def test_smallest_base_that_holds_slot_500_is_accepted(monkeypatch):
     cfg = reload_valid_cloud_config(
