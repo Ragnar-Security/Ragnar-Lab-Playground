@@ -717,6 +717,50 @@ def test_create_makes_every_inherited_ebs_volume_disposable(aws_instance_backend
     assert not remaining & {ebs['VolumeId'] for ebs in mappings.values()}
 
 
+class _RequestBuilt(Exception):
+    """Raised once RunInstances is built: not a provider error, so create()
+    lets it out with nothing launched."""
+
+
+def _stop_at_run_instances(ec2):
+    """Record the parameters of the next RunInstances request, as botocore
+    hands them to the serializer, and stop it there. moto 5.2.5 drops Iops
+    when it creates a launch's volumes, so it refuses every io1/io2 launch;
+    the request itself is what is under test."""
+    sent = []
+
+    def record(params, **kwargs):
+        sent.append(params)
+        raise _RequestBuilt()
+
+    ec2.meta.events.register('provide-client-params.ec2.RunInstances', record)
+    return sent
+
+
+@pytest.mark.parametrize('inherited', [
+    {'VolumeSize': 50, 'VolumeType': 'io2', 'Iops': 4000,
+     'Encrypted': True, 'KmsKeyId': 'alias/example-lab-key'},
+    {'VolumeSize': 40, 'VolumeType': 'gp3', 'Iops': 3000, 'Throughput': 250,
+     'Encrypted': False},
+], ids=['io2-encrypted', 'gp3-throughput'])
+def test_disposable_ami_disks_keep_every_inherited_ebs_setting(
+        aws_instance_backend, monkeypatch, inherited):
+    # Catches restating an inherited data disk from its snapshot and size
+    # alone: the launch would silently drop its volume type, IOPS,
+    # throughput or encryption key, changing the disk the AMI defines.
+    backend, spec, ec2, resources = aws_instance_backend
+    _with_image_mappings(monkeypatch, ec2, extra=[
+        {'DeviceName': '/dev/sdf', 'Ebs': dict(inherited, DeleteOnTermination=False)}])
+    sent = _stop_at_run_instances(ec2)
+    with pytest.raises(_RequestBuilt):
+        backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    [request] = sent
+    mappings = {m['DeviceName']: m['Ebs'] for m in request['BlockDeviceMappings']}
+    assert mappings['/dev/sdf'] == dict(inherited, DeleteOnTermination=True)
+    # The root keeps its resize-only rule: everything else is the AMI's.
+    assert mappings['/dev/sda1'] == {'VolumeSize': 24, 'DeleteOnTermination': True}
+
+
 @pytest.mark.parametrize('extra, root', [
     ([{'Ebs': {'VolumeSize': 5, 'DeleteOnTermination': False}}], None),
     ([{'DeviceName': '/dev/sdf', 'Ebs': {'DeleteOnTermination': False}}], None),

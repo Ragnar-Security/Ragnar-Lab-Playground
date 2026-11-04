@@ -632,7 +632,12 @@ class AWSBackend:
         instance and bill with no cleanup path (no inventory lists volumes).
         Instance-store and suppressed (NoDevice) mappings never outlive it.
         An AMI mapping that cannot be restated as a disposable disk is refused.
+        A data disk is restated field-for-field (type, IOPS, throughput,
+        encryption, key), so only its deletion flag differs from the AMI's.
         """
+        ebs_fields = self._ec2.meta.service_model.operation_model(
+            'RunInstances').input_shape.members['BlockDeviceMappings'] \
+            .member.members['Ebs'].members
         try:
             images = self._ec2.describe_images(ImageIds=[image_id])['Images']
         except _PROVIDER_ERRORS as error:
@@ -654,11 +659,13 @@ class AWSBackend:
             if device == root:
                 pinned = {'VolumeSize': disk_gb}
             else:
-                # Restated from the AMI: EC2 merges either way, but moto
-                # refuses an EBS override with neither.
-                pinned = {key: ebs[key] for key in ('SnapshotId', 'VolumeSize')
-                          if ebs.get(key) is not None}
-                if not pinned:
+                # Only fields RunInstances accepts, as this client's own
+                # model defines them: DescribeImages and RunInstances share
+                # the EbsBlockDevice shape, so none of the AMI's is lost.
+                pinned = {key: value for key, value in ebs.items()
+                          if key in ebs_fields and value is not None}
+                # EC2 merges an override with neither, but moto refuses it.
+                if 'SnapshotId' not in pinned and 'VolumeSize' not in pinned:
                     raise BackendError(
                         f'image {image_id} maps {device} to EBS with no snapshot or size')
             mappings.append({'DeviceName': device,
