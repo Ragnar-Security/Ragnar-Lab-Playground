@@ -429,18 +429,15 @@ def _production_secret_errors():
     return errors
 
 
-def _validate_configured_lab_cidrs(enabled):
+def _validate_configured_lab_cidrs(enabled, validate_lab_cidr):
     """Validate each enabled cloud's lab base against the reserved ranges
     and the other enabled clouds' bases; a disabled cloud's base is never
     allocated, so it is not checked."""
-    # Imported here, not at module top: the backends package must be
-    # importable while this module is still initialising.
-    from app.backends.network_slots import validate_lab_cidr
     bases = {'aws': AWS_LAB_CIDR, 'gcp': GCP_LAB_CIDR}
     clouds = [name for name in enabled if name in CLOUD_BACKENDS]
     for name in clouds:
         others = {other: bases[other] for other in clouds if other != name}
-        validate_lab_cidr(f'{name.upper()}_LAB_CIDR', bases[name], others=others)
+        validate_lab_cidr(name, bases[name], others=others)
 
 
 def _backend_errors(enabled):
@@ -513,7 +510,10 @@ def validate_config():
     if group_ranges_errors:
         raise ValueError("Group VLAN config errors:\n  - " + "\n  - ".join(group_ranges_errors))
 
-    _validate_configured_lab_cidrs(ENABLED_BACKENDS)
+    # Imported here, not at module top: the backends package must be
+    # importable while this module is still initialising.
+    from app.backends.network_slots import validate_lab_cidr
+    _validate_configured_lab_cidrs(ENABLED_BACKENDS, validate_lab_cidr)
 
     if 'proxmox' in ENABLED_BACKENDS:
         if PROXMOX_VERIFY_SSL and PROXMOX_CA_BUNDLE:

@@ -17,14 +17,16 @@ def cloud_slot_cidr(base_cidr: str, slot: int) -> str:
     base = ipaddress.IPv4Network(base_cidr, strict=True)
     if not isinstance(slot, int) or not 0 <= slot <= SLOT_MAX:
         raise ValueError(f'slot {slot!r} is outside 0..{SLOT_MAX}')
+    # Judged against the highest slot, not the requested one, so a base that
+    # cannot hold slot 500 is refused for every slot.
+    if base.num_addresses < (SLOT_MAX + 1) * _SLOT_SIZE:
+        raise ValueError(f'{base_cidr} is too small to hold slot {SLOT_MAX}')
     start = int(base.network_address) + slot * _SLOT_SIZE
-    last = start + _SLOT_SIZE - 1
-    if last > int(base.broadcast_address):
-        raise ValueError(f'{base_cidr} is too small to hold slot {slot}')
     return f'{ipaddress.IPv4Address(start)}/{SLOT_PREFIXLEN}'
 
 
-def validate_lab_cidr(name: str, cidr: str, *, others: Mapping[str, str]) -> None:
+def validate_lab_cidr(backend: str, cidr: str, *, others: Mapping[str, str]) -> None:
+    name = f'{backend.upper()}_LAB_CIDR'
     try:
         network = ipaddress.IPv4Network(cidr)
     except ValueError:
