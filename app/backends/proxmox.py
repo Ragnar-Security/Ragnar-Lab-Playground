@@ -41,6 +41,10 @@ DELETE_TIMEOUT_SECONDS = 120
 _STOPPED = 'stopped'
 _STOP_FAILED = 'stop_failed'
 _GONE = 'gone'
+# The display index memo outside session() (never memoised: nothing would
+# clear it) and inside one before the first display read.
+_NO_SESSION = object()
+_UNREAD = object()
 
 
 def _route_utils():
@@ -101,16 +105,19 @@ class ProxmoxBackend:
         """Pin one connection for every operation run inside this block.
 
         Operations already open one each; a caller groups several (a create
-        task's admit and create) to make one connection, as the route did.
+        task's admit and create, a /list render) to make one connection, as
+        the route did. Display reads inside it share one cluster index.
         """
         if self._injected is not None or getattr(self._local, 'api', None) is not None:
             yield
             return
         self._local.api = self.connect()
+        self._local.display_index = _UNREAD
         try:
             yield
         finally:
             self._local.api = None
+            self._local.display_index = _NO_SESSION
 
     @property
     def _api(self):
@@ -129,6 +136,8 @@ class ProxmoxBackend:
         # Proxmox reuses VMIDs: a cached snapshot or address of this guest
         # must not describe the next one.
         proxmox_service.reset_cluster_vm_index()
+        if getattr(self._local, 'display_index', _NO_SESSION) is not _NO_SESSION:
+            self._local.display_index = _UNREAD
         _route_utils().invalidate_vm_ip_cache(ref.location, ref.vmid)
 
     # Admission and create
@@ -421,24 +430,31 @@ class ProxmoxBackend:
         return absent
 
     # Display reads: the cached index (ruling C5), so one /list render costs
-    # one cluster call however many VMs it shows.
+    # one cluster call however many VMs it shows, outage or not.
 
-    def _display_state(self, ref: VMRef):
-        """(state, diagnostic): `_verify_vm_exists`'s verdict and error text."""
-        utils = _route_utils()
+    def _display_index(self):
+        """The cluster index for display reads, read once per session(): in
+        an outage the first guest's read fails, not every guest's."""
+        memo = getattr(self._local, 'display_index', _NO_SESSION)
+        if memo is not _NO_SESSION and memo is not _UNREAD:
+            return memo
         try:
             index = proxmox_service.get_cluster_vm_index(self._api)
         except Exception as error:
-            logger.warning("cluster inventory unavailable (%s); reading VM %s "
-                           "config directly", error, ref.vmid)
+            logger.warning("cluster inventory unavailable (%s); reading VM "
+                           "configs directly", error)
             index = None
-        return utils._verify_vm_exists(
-            self._api, ref.location, ref.vmid, ref.vm_type, index=index)
+        if memo is _UNREAD:
+            self._local.display_index = index
+        return index
 
-    @_operation
-    def ip_addresses(self, ref: VMRef) -> List[str]:
+    def _display_state(self, ref: VMRef):
+        """(state, diagnostic): `_verify_vm_exists`'s verdict and error text."""
+        return _route_utils()._verify_vm_exists(
+            self._api, ref.location, ref.vmid, ref.vm_type, index=self._display_index())
+
+    def _addresses(self, ref: VMRef, state) -> List[str]:
         utils = _route_utils()
-        state, _error = self._display_state(ref)
         if state == utils.VM_PRESENT:
             ips = utils._get_vm_ip_addresses(
                 self._api, ref.location, ref.vmid, ref.vm_type)
@@ -451,12 +467,11 @@ class ProxmoxBackend:
         # Lab addresses only; this also drops the ['N/A'] display sentinel.
         return [ip for ip in ips if ip.startswith('10.')]
 
-    @_operation
-    def status_diagnostic(self, ref: VMRef) -> Tuple[str, Optional[str]]:
+    @staticmethod
+    def _status_of(state, error) -> Tuple[str, Optional[str]]:
         """status() plus Proxmox's own error text, which the config-error
         webhook has always carried so an operator sees why the read failed."""
         utils = _route_utils()
-        state, error = self._display_state(ref)
         if state == utils.VM_PRESENT:
             # What /list has always shown for a guest Proxmox can read.
             return 'running', None
@@ -466,8 +481,22 @@ class ProxmoxBackend:
             return utils.VM_MISSING, error
         return 'unknown', error
 
+    @_operation
+    def ip_addresses(self, ref: VMRef) -> List[str]:
+        state, _error = self._display_state(ref)
+        return self._addresses(ref, state)
+
+    @_operation
     def status(self, ref: VMRef) -> str:
-        return self.status_diagnostic(ref)[0]
+        return self._status_of(*self._display_state(ref))[0]
+
+    @_operation
+    def display_read(self, ref: VMRef) -> Tuple[str, Optional[str], List[str]]:
+        """(status, diagnostic, addresses) from one probe, as /list has
+        always read a guest: an unknown one's addresses come from the cache,
+        never from a second probe that would only time out again."""
+        state, error = self._display_state(ref)
+        return (*self._status_of(state, error), self._addresses(ref, state))
 
     @_operation
     def uptime(self, ref: VMRef) -> Optional[int]:

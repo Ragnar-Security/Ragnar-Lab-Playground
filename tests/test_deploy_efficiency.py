@@ -242,6 +242,37 @@ class ListCallCountTests(unittest.TestCase):
         self.assertTrue(all(vm['ip_address'] == '10.0.0.5' for vm in vms))
         self.assertEqual(VMRecord.query.count(), 7)
 
+    def test_an_outage_costs_one_probe_per_vm_and_keeps_the_cached_ips(self):
+        # Catches /list repeating the failing inventory and config reads for
+        # a VM it already classified unknown (each one a provider timeout in
+        # an outage) before falling back to the cached address.
+        proxmox, counts = self._proxmox()
+        proxmox.cluster.resources.get.side_effect = RuntimeError('cluster unreachable')
+
+        def qemu(vmid):
+            handle = MagicMock()
+
+            def config():
+                counts['config'] += 1
+                raise RuntimeError('read timed out')
+
+            handle.config.get.side_effect = config
+            handle.agent.side_effect = lambda _cmd: counts.__setitem__(
+                'agent', counts['agent'] + 1)
+            return handle
+
+        proxmox.nodes.return_value.qemu.side_effect = qemu
+        for i in range(7):
+            route_utils._ip_cache_put(('pve', 800 + i), ['10.0.0.5'])
+        body = self._list(proxmox).get_json()
+        vms = [vm for s in body['students']
+               for g in s['deployment_groups'] for vm in g['vms']]
+        self.assertEqual([vm['ip_address'] for vm in vms], ['10.0.0.5'] * 7)
+        self.assertEqual(counts, {'config': 7, 'agent': 0})
+        # One inventory attempt per render, as before the backend refactor.
+        self.assertEqual(proxmox.cluster.resources.get.call_count, 1)
+        self.assertEqual(VMRecord.query.count(), 7)
+
 
 class IpCacheTests(unittest.TestCase):
     def setUp(self):

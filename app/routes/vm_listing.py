@@ -73,15 +73,6 @@ def _display_state(status):
     return VM_PRESENT
 
 
-def _status_and_diagnostic(backend, ref):
-    # Proxmox also explains a status (the config-error webhook carries its
-    # error text); a backend without that answers with status() alone.
-    describe = getattr(backend, 'status_diagnostic', None)
-    if describe is not None:
-        return describe(ref)
-    return backend.status(ref), None
-
-
 def _observe(backend, record):
     """(backend, state, status, ips, diagnostic) of one record for this render.
 
@@ -91,8 +82,20 @@ def _observe(backend, record):
     if backend is None:
         return None, VM_UNKNOWN, 'unknown', [], None
     ref = VMRef.from_record(record)
+    # Proxmox answers status, its error text (the config-error webhook
+    # carries it) and addresses from one probe: an unknown guest's addresses
+    # come from its cache, never from a second probe that would time out too.
+    display_read = getattr(backend, 'display_read', None)
+    if display_read is not None:
+        try:
+            status, diagnostic, ips = display_read(ref)
+        except Exception as error:
+            current_app.logger.warning("status of VM %s unavailable: %s",
+                                       record.vmid, error)
+            return backend, VM_UNKNOWN, 'unknown', [], str(error)
+        return backend, _display_state(status), status, ips, diagnostic
     try:
-        status, diagnostic = _status_and_diagnostic(backend, ref)
+        status, diagnostic = backend.status(ref), None
     except Exception as error:
         current_app.logger.warning("status of VM %s unavailable: %s",
                                    record.vmid, error)
