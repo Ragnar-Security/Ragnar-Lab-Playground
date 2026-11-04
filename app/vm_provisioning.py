@@ -50,7 +50,10 @@ def _renewing_admission(heartbeat: Callable[[], None]
     A provider call can outlast the admission TTL without calling heartbeat
     (AWS's running waiter), as can the wait for a router or slot lock; the
     lease must still hold until the caller's VMRecord commits (ruling C4).
-    A thread like the deploy's other renewers: a greenlet under gevent.
+    A thread like the deploy's other renewers: a greenlet under gevent. On a
+    normal exit the guard runs once more after the renewer has stopped, so
+    a renewal that failed during teardown is raised too; an exception
+    already leaving the body takes precedence.
     """
     # Lazy: app.routes imports this module.
     from app.routes import vm_creation
@@ -77,6 +80,13 @@ def _renewing_admission(heartbeat: Callable[[], None]
     finally:
         stopped.set()
         renewer.join()
+    guard()
+
+
+def ensure_router_running(backend_name: str) -> None:
+    """Start `backend_name`'s router under its lifecycle lock (ruling C4)."""
+    with vm_lifecycle_lock(router_lock_key(backend_name)):
+        get_backend(backend_name).ensure_router_running()
 
 
 def create_vm(spec: VMSpec, *, reservation_id: str,
@@ -126,9 +136,9 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
             _ensure_slot(backend, spec)
             launched = backend.create(spec, location,
                                       heartbeat=guarded_heartbeat, **options)
-        # A launch the lease stopped covering is a failed create; the
-        # caller's cleanup resolves the instance by VMID (ruling C7).
-        guard()
+    # The renewer has stopped and its last renewal was checked on the way
+    # out: a launch the lease stopped covering is a failed create, and the
+    # caller's cleanup resolves the instance by VMID (ruling C7).
     return location, launched
 
 
