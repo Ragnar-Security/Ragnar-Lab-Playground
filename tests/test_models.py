@@ -113,6 +113,22 @@ class TestModels(unittest.TestCase):
         self.assertEqual(saved_vm.memory, 2048)
         self.assertFalse(saved_vm.destroyed)
     
+    # Catches a rollback that makes old records backend-less or omits cloud identity from APIs.
+    def test_vm_record_backend_defaults_and_serializes(self):
+        vm = VMRecord(vmid=100, vm_name='student-test-vm', vm_type='qemu',
+                      node='node-placeholder', template_name='lab/vm',
+                      student_name='test', expires_at=datetime.now() + timedelta(hours=1),
+                      provider_id='provider-placeholder', deployment_id='a' * 32,
+                      network_slot=101)
+        db.session.add(vm)
+        db.session.commit()
+        saved = VMRecord.query.one()
+        self.assertEqual(saved.backend, 'proxmox')
+        self.assertEqual(saved.to_dict()['backend'], 'proxmox')
+        self.assertEqual(saved.to_dict()['provider_id'], 'provider-placeholder')
+        self.assertEqual(saved.to_dict()['deployment_id'], 'a' * 32)
+        self.assertEqual(saved.to_dict()['network_slot'], 101)
+
     def test_vm_record_relationships(self):
         """Test VM record relationship with User"""
         user = User(login_id='testuser', full_name='Test User')

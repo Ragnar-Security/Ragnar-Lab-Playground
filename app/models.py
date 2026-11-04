@@ -44,6 +44,10 @@ class VMRecord(db.Model):
         expires_at (datetime): When the VM should be auto-destroyed
         destroyed (bool): Whether the VM has been destroyed
         destroyed_at (datetime): When the VM was destroyed
+        backend (str): 'proxmox', 'aws' or 'gcp'; existing rows default to 'proxmox'
+        provider_id (str): Cloud instance identifier; NULL for Proxmox
+        deployment_id (str): Groups the machines of one launch
+        network_slot (int): Per-deployment network slot
     """
     
     __tablename__ = 'vm_records'
@@ -56,6 +60,14 @@ class VMRecord(db.Model):
     vm_name = db.Column(db.String(255), nullable=False, index=True)
     vm_type = db.Column(db.String(50), nullable=False)  # 'lxc' or 'qemu'
     node = db.Column(db.String(255), nullable=False, index=True)
+
+    # Backend identity. node/vm_type keep their meaning per backend:
+    # Proxmox stores node + 'qemu'/'lxc'; clouds store AZ/zone + 'aws'/'gcp'.
+    backend = db.Column(db.String(32), nullable=False, default='proxmox',
+                        server_default='proxmox')
+    provider_id = db.Column(db.String(255), nullable=True)
+    deployment_id = db.Column(db.String(64), nullable=True, index=True)
+    network_slot = db.Column(db.Integer, nullable=True)
     
     # Template and ownership
     template_name = db.Column(db.String(255), nullable=False)
@@ -98,6 +110,10 @@ class VMRecord(db.Model):
             'vm_name': self.vm_name,
             'vm_type': self.vm_type,
             'node': self.node,
+            'backend': self.backend,
+            'provider_id': self.provider_id,
+            'deployment_id': self.deployment_id,
+            'network_slot': self.network_slot,
             'template_name': self.template_name,
             'student_name': self.student_name,
             'memory': self.memory,
