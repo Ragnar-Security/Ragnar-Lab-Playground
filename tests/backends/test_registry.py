@@ -56,6 +56,9 @@ def test_get_backend_refuses_unknown_name_even_when_listed(monkeypatch):
 # deep in a route instead of a refusal callers already handle.
 def test_get_backend_refuses_enabled_backend_without_factory(monkeypatch):
     monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox', 'gcp'))
+    # GCP has a production default factory; remove it so the backend is
+    # enabled with no implementation.
+    monkeypatch.delitem(importlib.import_module('app.backends')._backend_factories, 'gcp')
     with pytest.raises(BackendNotEnabled):
         get_backend('gcp')
 
