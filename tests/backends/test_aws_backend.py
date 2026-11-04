@@ -185,6 +185,13 @@ def test_create_launches_one_private_tagged_instance_with_disposable_root_disk(a
     [root_volume] = ec2.describe_volumes(
         VolumeIds=[instance['BlockDeviceMappings'][0]['Ebs']['VolumeId']])['Volumes']
     assert root_volume['Size'] == 24
+    # The root volume carries the ownership tags from launch, so a volume
+    # left behind by a failed DeleteOnTermination is attributable.
+    assert {tag['Key']: tag['Value'] for tag in root_volume.get('Tags', [])} == {
+        'Name': spec.vm_name,
+        TAG_SITE: 'test-site', TAG_VMID: '700', TAG_DEPLOYMENT: 'd' * 32,
+        TAG_SLOT: '1', TAG_KIND: 'instance-volume',
+    }
     assert tags == {
         'Name': spec.vm_name,
         TAG_SITE: 'test-site', TAG_VMID: '700',
@@ -400,6 +407,46 @@ def test_delete_resource_terminates_listed_instance_and_rejects_other_kinds(aws_
     backend.delete_resource(managed)
     [instance] = ec2.describe_instances(InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
     assert instance['State']['Name'] == 'terminated'
+    backend.delete_resource(managed)  # already terminated: done
+    backend.delete_resource(replace(managed, provider_id='i-00000000000000000'))  # NotFound: done
+
+
+@pytest.mark.parametrize('tag, value', [
+    (TAG_SITE, 'other-site'), (TAG_KIND, 'router'),
+    (TAG_VMID, '701'), (TAG_DEPLOYMENT, 'e' * 32),
+])
+def test_delete_resource_refuses_an_instance_retagged_since_listing(
+        aws_instance_backend, tag, value):
+    # Catches a sweep terminating an instance another portal or record owns now.
+    backend, spec, ec2, resources = aws_instance_backend
+    launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    [managed] = [r for r in backend.list_managed() if r.provider_id == launched.provider_id]
+    ec2.create_tags(Resources=[launched.provider_id], Tags=[{'Key': tag, 'Value': value}])
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(managed)
+    [instance] = ec2.describe_instances(InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
+    assert instance['State']['Name'] == 'running'
+
+
+def test_delete_resource_propagates_unknown_identity(aws_instance_backend):
+    # Catches a describe failure during a sweep being read as permission to terminate.
+    backend, spec, ec2, resources = aws_instance_backend
+    launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    [managed] = [r for r in backend.list_managed() if r.provider_id == launched.provider_id]
+    with pytest.raises(BackendError):
+        backend.delete_resource(replace(managed, provider_id='malformed'))
+
+    def fail(**kwargs):
+        raise ClientError({'Error': {'Code': 'RequestLimitExceeded',
+                                     'Message': 'slow down'}}, 'DescribeInstances')
+
+    backend._ec2.describe_instances = fail
+    with pytest.raises(BackendError) as raised:
+        backend.delete_resource(managed)
+    assert not isinstance(raised.value, DestroyRefused)
+    del backend._ec2.describe_instances  # the fixture's client is the backend's
+    [instance] = ec2.describe_instances(InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
+    assert instance['State']['Name'] == 'running'
 
 
 def test_default_network_resolver_finds_exactly_one_tagged_subnet_and_group(app, monkeypatch):

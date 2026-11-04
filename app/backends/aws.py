@@ -38,6 +38,14 @@ from app.backends.cloud_common import (
 logger = logging.getLogger(__name__)
 
 KIND_INSTANCE = 'instance'
+# An instance's root EBS volume. Its own kind, never 'instance': inventory
+# and identity match kind='instance', so a volume can never be mistaken for
+# a machine, while a volume a failed DeleteOnTermination leaves behind still
+# carries its owner's site/VMID/deployment/slot.
+KIND_INSTANCE_VOLUME = 'instance-volume'
+# Instance tags the root volume does not carry: its expiry lives on the
+# instance (set_expiry retags only that).
+_INSTANCE_ONLY_TAGS = (TAG_EXPIRES,)
 _NOT_FOUND = 'InvalidInstanceID.NotFound'
 # The states a live (billing or restartable) instance can be in.
 _LIVE_STATES = ('pending', 'running', 'shutting-down', 'stopping', 'stopped')
@@ -111,6 +119,19 @@ def _carries(resource, pairs: dict) -> bool:
     # on the provider (or a mock) filtering exactly.
     tags = _tag_map(resource)
     return all(tags.get(key) == value for key, value in pairs.items())
+
+
+def _verdict(instance, expected: dict) -> str:
+    if _state(instance) == 'terminated':
+        return GUEST_ABSENT
+    return GUEST_MATCH if _carries(instance, expected) else GUEST_MISMATCH
+
+
+def _volume_tags(instance_tags: dict) -> dict:
+    tags = {key: value for key, value in instance_tags.items()
+            if key not in _INSTANCE_ONLY_TAGS}
+    tags[TAG_KIND] = KIND_INSTANCE_VOLUME
+    return tags
 
 
 class _Resolution:
@@ -225,7 +246,10 @@ class AWSBackend:
                     'Ebs': {'VolumeSize': template['disk_gb'],
                             'DeleteOnTermination': True},
                 }],
-                TagSpecifications=[{'ResourceType': 'instance', 'Tags': _tags(tags)}],
+                TagSpecifications=[
+                    {'ResourceType': 'instance', 'Tags': _tags(tags)},
+                    {'ResourceType': 'volume', 'Tags': _tags(_volume_tags(tags))},
+                ],
             )
             instance_id = response['Instances'][0]['InstanceId']
             self._ec2.get_waiter('instance_running').wait(
@@ -244,35 +268,37 @@ class AWSBackend:
             pairs[TAG_DEPLOYMENT] = ref.deployment_id
         return pairs
 
-    def _verdict(self, ref: VMRef, instance) -> str:
-        if _state(instance) == 'terminated':
-            return GUEST_ABSENT
+    def _expected_tags(self, ref: VMRef) -> dict:
         expected = dict(self._identity_tags(ref), **{TAG_KIND: KIND_INSTANCE})
         if ref.network_slot is not None:
             expected[TAG_SLOT] = str(ref.network_slot)
-        return GUEST_MATCH if _carries(instance, expected) else GUEST_MISMATCH
+        return expected
+
+    def _describe_id(self, provider_id: str, expected: dict) -> _Resolution:
+        """A fresh describe of one instance id, judged against `expected`."""
+        if not _INSTANCE_ID.fullmatch(provider_id):
+            return _Resolution(GUEST_UNKNOWN,
+                               reason=f'malformed instance id {provider_id!r}')
+        try:
+            reservations = self._ec2.describe_instances(
+                InstanceIds=[provider_id])['Reservations']
+        except ClientError as error:
+            if _error_code(error) == _NOT_FOUND:
+                return _Resolution(GUEST_ABSENT)
+            return _Resolution(GUEST_UNKNOWN, reason=str(error))
+        except BotoCoreError as error:
+            return _Resolution(GUEST_UNKNOWN, reason=str(error))
+        instances = [i for r in reservations for i in r['Instances']
+                     if i.get('InstanceId') == provider_id]
+        if not instances:
+            return _Resolution(GUEST_ABSENT)
+        return _Resolution(_verdict(instances[0], expected), instances[0])
 
     def _resolve(self, ref: VMRef) -> _Resolution:
         """A fresh describe of the instance `ref` names. Location is never
         consulted: a survivor may carry location='aws' (T8)."""
         if ref.provider_id is not None:
-            if not _INSTANCE_ID.fullmatch(ref.provider_id):
-                return _Resolution(GUEST_UNKNOWN,
-                                   reason=f'malformed instance id {ref.provider_id!r}')
-            try:
-                reservations = self._ec2.describe_instances(
-                    InstanceIds=[ref.provider_id])['Reservations']
-            except ClientError as error:
-                if _error_code(error) == _NOT_FOUND:
-                    return _Resolution(GUEST_ABSENT)
-                return _Resolution(GUEST_UNKNOWN, reason=str(error))
-            except BotoCoreError as error:
-                return _Resolution(GUEST_UNKNOWN, reason=str(error))
-            instances = [i for r in reservations for i in r['Instances']
-                         if i.get('InstanceId') == ref.provider_id]
-            if not instances:
-                return _Resolution(GUEST_ABSENT)
-            return _Resolution(self._verdict(ref, instances[0]), instances[0])
+            return self._describe_id(ref.provider_id, self._expected_tags(ref))
 
         identity = self._identity_tags(ref)
         filters = _filters(identity) + [
@@ -290,7 +316,7 @@ class AWSBackend:
             return _Resolution(
                 GUEST_UNKNOWN,
                 reason=f'{len(candidates)} instances carry the identity of VM {ref.vmid}')
-        return _Resolution(self._verdict(ref, candidates[0]), candidates[0])
+        return _Resolution(_verdict(candidates[0], self._expected_tags(ref)), candidates[0])
 
     def inspect(self, ref: VMRef) -> str:
         return self._resolve(ref).verdict
@@ -395,4 +421,23 @@ class AWSBackend:
             raise BackendError(
                 f'{resource.backend} {resource.kind} {resource.provider_id} '
                 'is not an AWS instance')
+        # The listing may be minutes old: the id must still name this site's
+        # instance with the identity it was listed with.
+        expected = {TAG_SITE: _config().LAB_SITE_ID, TAG_KIND: KIND_INSTANCE}
+        for key, value in ((TAG_VMID, resource.vmid),
+                           (TAG_DEPLOYMENT, resource.deployment_id),
+                           (TAG_SLOT, resource.network_slot)):
+            if value is not None:
+                expected[key] = str(value)
+        resolution = self._describe_id(resource.provider_id, expected)
+        if resolution.verdict == GUEST_ABSENT:
+            return
+        if resolution.verdict == GUEST_MISMATCH:
+            raise DestroyRefused(
+                f'instance {resource.provider_id} no longer carries the identity '
+                'it was listed with')
+        if resolution.verdict != GUEST_MATCH:
+            raise BackendError(
+                f'identity of instance {resource.provider_id} could not be '
+                f'verified: {resolution.reason}')
         self._terminate(resource.provider_id)
