@@ -400,6 +400,7 @@ def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
         "[Unit]",
         "Description=Isolate routed lab VLANs from each other on the jumpbox (nftables)",
         "DefaultDependencies=no",
+        "Wants=network-pre.target",
         "Before=network-pre.target",
         "",
         "[Service]",

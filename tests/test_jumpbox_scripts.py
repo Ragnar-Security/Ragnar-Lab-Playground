@@ -909,6 +909,8 @@ def test_vlan_isolation_unit_is_persistent_and_reloadable():
     assert service["ExecReload"] == "/usr/sbin/nft -f /etc/nftables.d/jumpbox-vlan-isolation.nft"
     assert service["ExecStop"] == "-/usr/sbin/nft delete table inet jumpbox_vlan_isolation"
     assert parser["Install"]["WantedBy"] == "multi-user.target"
+    assert parser["Unit"]["Before"] == "network-pre.target"
+    assert parser["Unit"]["Wants"] == "network-pre.target"
 
 
 def test_netgen_cli_emits_the_isolation_table_and_unit():
@@ -981,6 +983,7 @@ def test_isolate_vlans_with_allow_vlans_installs_the_exemption_rules(tmp_path):
 
 @pytest.mark.parametrize("args", [
     ["--allow-vlans", "300"],
+    ["--allow-vlans", ""],
     ["--isolate-vlans", "--allow-vlans", "1"],
     ["--isolate-vlans", "--allow-vlans", "300-"],
     ["--isolate-vlans", "--allow-vlans"],
@@ -991,6 +994,13 @@ def test_allow_vlans_misuse_exits_nonzero_before_any_mutation(tmp_path, args):
     result = _run(CONFIGURE, ["--apply", "--no-try", *args], env)
     assert result.returncode != 0
     assert _tree(sysroot) == before and _calls(tmp_path) == ""
+
+
+def test_isolate_vlans_accepts_an_empty_allow_list(tmp_path):
+    env, sysroot = _isolate_env(tmp_path)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans", "--allow-vlans", ""], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == ['iifname "vlan*" oifname "vlan*" counter drop']
 
 
 def test_isolate_vlans_refuses_a_ruleset_nft_rejects(tmp_path):

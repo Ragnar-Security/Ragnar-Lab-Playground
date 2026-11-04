@@ -85,7 +85,7 @@ RITA_VERSION="${JUMPBOX_RITA_VERSION:-v5.1.1}"
 RITA_DATABASE="${JUMPBOX_RITA_DATABASE:-jumpbox}"
 ZEEK_ETC=/opt/zeek/etc
 
-APPLY=0 NO_TRY=0 DO_TS=0 KEY_STDIN=0 DO_SSH=0 DO_SSHF=0 DO_ISO=0 ALLOW_VLANS= DO_MON=0 I_HAVE_CONSOLE=0
+APPLY=0 NO_TRY=0 DO_TS=0 KEY_STDIN=0 DO_SSH=0 DO_SSHF=0 DO_ISO=0 ALLOW_VLANS= HAVE_ALLOW=0 DO_MON=0 I_HAVE_CONSOLE=0
 usage() { sed -n '3,49p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -99,7 +99,7 @@ while [ $# -gt 0 ]; do
         --isolate-vlans) DO_ISO=1 ;;
         --allow-vlans)
             [ $# -ge 2 ] || { printf 'ERROR: --allow-vlans needs a list\n' >&2; exit 2; }
-            ALLOW_VLANS="$2"; shift ;;
+            ALLOW_VLANS="$2"; HAVE_ALLOW=1; shift ;;
         --i-have-console) I_HAVE_CONSOLE=1 ;;
         --monitoring) DO_MON=1 ;;
         -h|--help) usage; exit 0 ;;
@@ -119,7 +119,7 @@ run() {
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo); the netplan files are readable only by root"
 command -v python3 >/dev/null || die "python3 is required"
-if [ -n "$ALLOW_VLANS" ] && [ "$DO_ISO" -eq 0 ]; then
+if [ "$HAVE_ALLOW" -eq 1 ] && [ "$DO_ISO" -eq 0 ]; then
     die "--allow-vlans only applies with --isolate-vlans"
 fi
 if [ "$DO_ISO" -eq 1 ]; then
