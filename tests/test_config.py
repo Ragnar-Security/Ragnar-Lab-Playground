@@ -394,6 +394,25 @@ def test_lab_cidrs_fail_closed(monkeypatch, aws_cidr, gcp_cidr, message):
         cfg.validate_config()
 
 
+# Catches the tailnet range, a malformed value, an IPv6 network or a base
+# with host bits set reaching the slot arithmetic of either cloud.
+@pytest.mark.parametrize('cidr,message', [
+    ('100.64.0.0/16', 'overlaps reserved range 100.64.0.0/10'),
+    ('100.0.0.0/8', 'overlaps reserved range 100.64.0.0/10'),
+    ('not-a-cidr', 'is not an IPv4 network address/prefix'),
+    ('172.20.0.0/33', 'is not an IPv4 network address/prefix'),
+    ('fd00:20::/48', 'is not an IPv4 network address/prefix'),
+    # Outside both clouds' bases, so only the host bits can refuse it.
+    ('172.22.1.0/16', 'is not an IPv4 network address/prefix'),
+], ids=['inside-cgnat', 'contains-cgnat', 'malformed', 'bad-prefix', 'ipv6', 'host-bits'])
+@pytest.mark.parametrize('key', ['AWS_LAB_CIDR', 'GCP_LAB_CIDR'])
+def test_lab_cidr_rejects_cgnat_malformed_ipv6_and_host_bits(monkeypatch, key, cidr, message):
+    cfg = reload_valid_cloud_config(monkeypatch, **{key: cidr})
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert f'{key} ' in str(exc.value) and message in str(exc.value)
+
+
 # Catches validate_config() drifting from the shared validator's exact peer message.
 def test_lab_cidr_peer_overlap_message_is_the_shared_validators(monkeypatch):
     cfg = reload_valid_cloud_config(

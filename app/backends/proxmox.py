@@ -367,7 +367,8 @@ class ProxmoxBackend:
             result = self._wait(ref, upid, DELETE_TIMEOUT_SECONDS)
         except Exception as error:
             # The waiter raises only TimeoutError, which no source path ever
-            # treated as absence (confirm_proxmox_absence refuses it).
+            # treated as absence: confirm_proxmox_absence refuses every error
+            # that is not a 404 or "does not exist" before reading inventory.
             if proxmox_service.confirm_proxmox_absence(
                     self._api, ref.vmid, error):
                 return

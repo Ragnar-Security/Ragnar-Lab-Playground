@@ -2,6 +2,7 @@
 
 import importlib
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,11 +15,12 @@ from app import coordination
 from app.alert_outbox import dispatch_pending_alerts
 from app.backends import register_backend_factory, reset_backends_for_tests
 from app.backends.aws import AWSBackend
-from app.backends.base import BackendError, ManagedResource
+from app.backends.base import BackendError, DestroyRefused, ManagedResource
 from app.backends.cloud_common import (
     TAG_CREATED, TAG_DEPLOYMENT, TAG_EXPIRES, TAG_KIND, TAG_SITE, TAG_SLOT,
     TAG_VMID, deployment_network_name, slot_network_name,
 )
+from app.backends.gcp import GCPBackend
 from app.backends.network_slots import cloud_slot_cidr
 from app.models import (
     AdminAlert, KothBox, KothGame, NodeMemoryReservation, VMIDReservation,
@@ -33,6 +35,7 @@ from app.proxmox_service import (
 from tests.backends.fake_backend import (
     AWS_TEST_CONFIG, AWS_TEST_ENV, register_aws_test_image,
 )
+from tests.backends.fake_gce import GCP_TEST_CONFIG, FakeGCESession
 
 config = importlib.import_module('app.config')
 
@@ -571,6 +574,7 @@ class _CloudSweepBackend:
         self.resources = []
         self.deleted = []
         self.refuse = set()
+        self.errors = {}  # provider_id -> the exception its delete raises
         self.on_list = None
         self.clock = _FakeMonotonic()
         self.advance_clock_per_delete = 0
@@ -586,6 +590,8 @@ class _CloudSweepBackend:
 
     def delete_resource(self, resource):
         self.clock.now += self.advance_clock_per_delete
+        if resource.provider_id in self.errors:
+            raise self.errors[resource.provider_id]
         if resource.provider_id in self.refuse:
             raise BackendError(f"{resource.provider_id} no longer carries this site's tag")
         assert resource.backend == self.name
@@ -891,6 +897,46 @@ def test_cloud_inventory_failure_aborts_that_backend_without_deletes(app, backen
     assert backend.deleted == []
 
 
+@pytest.mark.parametrize("error", [
+    DestroyRefused("slot-refused no longer carries this site's tag"),
+    BackendError("DescribeSubnets throttled"),
+], ids=["refused", "provider-error"])
+def test_cloud_delete_failure_does_not_stop_the_rest_of_the_sweep(app, backend, error):
+    # Catches one refused or failing delete ending the pass, leaving every
+    # later eligible leftover billing until it, too, sorts first.
+    refused = managed_slot("slot-refused", 17, NOW_EPOCH - 7200)
+    eligible = managed_slot("slot-next", 18, NOW_EPOCH - 7200)
+    backend.resources = [refused, eligible]
+    backend.errors = {"slot-refused": error}
+    reports = reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH)
+    assert reports == [report("aws", "slot-network", "slot-refused", "delete_failed"),
+                       report("aws", "slot-network", "slot-next", "reaped")]
+    assert backend.deleted == ["slot-next"]
+    assert backend.resources == [refused]
+
+
+@pytest.mark.parametrize("failure", ["inventory", "construction"])
+def test_a_failing_first_backend_does_not_stop_the_second(app, backend, monkeypatch, failure):
+    # Catches an AWS outage (or an unbuildable client) ending the cloud pass
+    # before GCP's leftovers are swept.
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws', 'gcp'))
+    healthy = _CloudSweepBackend('gcp')
+    healthy.resources = [replace(managed_slot("gcp-slot-old", 21, NOW_EPOCH - 7200),
+                                 backend='gcp')]
+    register_backend_factory('gcp', lambda: healthy)
+    backend.reset_with_old_orphans(1)
+    if failure == "inventory":
+        backend.fail_list = BackendError("EC2 inventory unavailable")
+    else:
+        def unbuildable():
+            raise BackendError("no AWS credentials")
+        register_backend_factory('aws', unbuildable)
+    reports = reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH)
+    assert reports == [report("gcp", "slot-network", "gcp-slot-old", "reaped")]
+    assert healthy.deleted == ["gcp-slot-old"]
+    assert backend.deleted == []
+
+
 def test_combined_sweep_without_proxmox_runs_only_the_cloud_pass(app, backend):
     # Catches a cloud-only portal (no Proxmox client) never reaping cloud leaks (C6).
     backend.reset_with_old_orphans(1)
@@ -1020,3 +1066,79 @@ def test_aws_sweep_reaps_only_this_sites_unowned_leftovers(aws_sweep):
     assert orphan_slot not in remaining_subnets
     remaining_groups = {g['GroupId'] for g in ec2.describe_security_groups()['SecurityGroups']}
     assert foreign_group in remaining_groups and orphan_group not in remaining_groups
+
+
+# -- the same sweep against the real GCP backend (stateful fake) ------------
+
+@pytest.fixture
+def gcp_sweep(app, monkeypatch):
+    for name, value in GCP_TEST_CONFIG.items():
+        monkeypatch.setattr(config, name, value)
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('gcp',))
+    gce = FakeGCESession(GCP_TEST_CONFIG['GCP_PROJECT'])
+    gcp = GCPBackend(session=gce)
+    register_backend_factory('gcp', lambda: gcp)
+    with app.app_context():
+        yield gce
+    reset_backends_for_tests()
+
+
+def _gcp_slot(gce, slot, site='test-site'):
+    name = slot_network_name(site, slot)
+    gce.add_subnetwork(GCP_TEST_CONFIG['GCP_REGION'], name,
+                       cloud_slot_cidr(GCP_TEST_CONFIG['GCP_LAB_CIDR'], slot))
+    return name
+
+
+def _gcp_firewall(gce, deployment_id, site='test-site'):
+    name = deployment_network_name(site, deployment_id)
+    gce.add_firewall({
+        'name': name, 'network': 'projects/example-project/global/networks/lab-vpc',
+        'direction': 'INGRESS', 'priority': 1000, 'sourceTags': [name],
+        'targetTags': [name], 'allowed': [{'IPProtocol': 'all'}]})
+    return name
+
+
+def _gcp_instance(gce, vmid, slot_name, site='test-site', expires=None):
+    name = f'lp-{site}-{vmid}'
+    gce.add_instance(
+        GCP_TEST_CONFIG['GCP_ZONE'], name, description=f'student-alice-{vmid}',
+        subnetwork=(GCP_TEST_CONFIG['GCP_REGION'], slot_name),
+        labels={TAG_SITE: site, TAG_KIND: 'instance', TAG_VMID: str(vmid),
+                TAG_DEPLOYMENT: '9' * 32, TAG_SLOT: '7',
+                TAG_EXPIRES: str(int(expires))})
+    return name
+
+
+def test_gcp_sweep_reaps_only_this_sites_unowned_leftovers(gcp_sweep):
+    # Catches the GCP inventory fields and the sweep disagreeing (a network
+    # never reaped, or a recorded/foreign one deleted), end to end through
+    # GCPBackend's listing and its delete-time identity re-check.
+    gce = gcp_sweep
+    old = time.time() - 7200  # the fake stamps every creation in early 2026
+    orphan_slot = _gcp_slot(gce, 3)
+    foreign_slot = _gcp_slot(gce, 4, site='other-site')
+    recorded_slot = _gcp_slot(gce, 5)
+    # Slot 7 is in use by the orphan instance, so this sweep keeps it.
+    instance_slot = _gcp_slot(gce, 7)
+    orphan_firewall = _gcp_firewall(gce, 'a' * 32)
+    foreign_firewall = _gcp_firewall(gce, 'a' * 32, site='other-site')
+    orphan_instance = _gcp_instance(gce, 901, instance_slot, expires=old)
+    foreign_instance = _gcp_instance(gce, 902, instance_slot, site='other-site',
+                                     expires=old)
+    add_live_record(backend='gcp', vmid=903, network_slot=5)
+
+    reports = reap_orphaned_cloud_resources(grace_minutes=60)
+
+    assert sorted((r['kind'], r['name'], r['status']) for r in reports) == sorted([
+        ('instance', 'student-alice-901', 'reaped'),
+        ('deployment-network', orphan_firewall, 'reaped'),
+        ('slot-network', orphan_slot, 'reaped'),
+    ])
+    zone = GCP_TEST_CONFIG['GCP_ZONE']
+    assert (zone, orphan_instance) not in gce.instances
+    assert (zone, foreign_instance) in gce.instances
+    remaining_slots = {name for _region, name in gce.subnetworks}
+    assert {foreign_slot, recorded_slot, instance_slot} <= remaining_slots
+    assert orphan_slot not in remaining_slots
+    assert foreign_firewall in gce.firewalls and orphan_firewall not in gce.firewalls

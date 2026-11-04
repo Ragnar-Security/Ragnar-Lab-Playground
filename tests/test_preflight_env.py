@@ -300,6 +300,20 @@ def test_preflight_rejects_reserved_overlapping_and_undersized_cidrs(tmp_path):
         assert result.stderr.startswith('AWS_LAB_CIDR:')
 
 
+# Catches the host accepting a tailnet-overlapping, malformed, IPv6 or
+# host-bits base that the app refuses at startup, for either cloud.
+@pytest.mark.parametrize('cidr', [
+    '100.64.0.0/16', '100.0.0.0/8', 'not-a-cidr', '172.20.0.0/33', 'fd00:20::/48',
+    # Host bits outside both clouds' bases, so nothing else can refuse it.
+    '172.22.1.0/16',
+], ids=['inside-cgnat', 'contains-cgnat', 'malformed', 'bad-prefix', 'ipv6', 'host-bits'])
+@pytest.mark.parametrize('key', ['AWS_LAB_CIDR', 'GCP_LAB_CIDR'])
+def test_preflight_rejects_cgnat_malformed_ipv6_and_host_bit_cidrs(tmp_path, key, cidr):
+    result = _run(str(_write_env(tmp_path / '.env', {**valid_cloud_env(), key: cidr})))
+    assert result.returncode == 1
+    assert result.stderr.startswith(f'{key}:')
+
+
 # Catches the two clouds being handed overlapping lab networks.
 def test_preflight_rejects_overlapping_cloud_cidrs(tmp_path):
     result = _run(str(_write_env(tmp_path / '.env', {
