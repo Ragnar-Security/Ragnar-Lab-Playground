@@ -782,20 +782,32 @@ def _release_vm_reservations(vm_results) -> None:
 
 @contextmanager
 def _heartbeat_deployment_reservations(vm_results, vmid_reservation_id):
-    """Renew create leases until cleanup and survivor tracking finish."""
+    """Renew create leases until cleanup and survivor tracking finish.
+
+    Yields the set of admission reservation ids whose renewal failed (False
+    or raised) at least once; renewal goes on for the rest either way.
+    """
     reservations = [
         (_admission_backend(result), result['_reservation_id'])
         for result in vm_results
         if result.get('_reservation_id')
     ]
     stopped = threading.Event()
+    lapsed = set()
 
     def heartbeat():
         while not stopped.is_set():
             if vmid_reservation_id:
                 renew_vmid_reservation(vmid_reservation_id)
             for backend, reservation_id in reservations:
-                backend.renew_admission(reservation_id)
+                try:
+                    renewed = backend.renew_admission(reservation_id)
+                except Exception:
+                    logger.exception("Could not renew admission reservation %s",
+                                     reservation_id)
+                    renewed = False
+                if not renewed:
+                    lapsed.add(reservation_id)
             stopped.wait(RESERVATION_HEARTBEAT_SECONDS)
 
     worker = threading.Thread(
@@ -805,7 +817,7 @@ def _heartbeat_deployment_reservations(vm_results, vmid_reservation_id):
     )
     worker.start()
     try:
-        yield
+        yield lapsed
     finally:
         stopped.set()
         worker.join()
@@ -1134,15 +1146,21 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
         expiration_time = (
             datetime.now() + timedelta(minutes=uptime_minutes))
         vm_records = []
+        # A cloud admission must stay live until its VMRecord commits, or the
+        # router idle step could stop the router under it (ruling C4).
+        renewing = (nullcontext(set()) if backend_name == BACKEND_PROXMOX else
+                    _heartbeat_deployment_reservations(
+                        created_vms, vmid_reservation_id))
         try:
-            by_index = {vm['vm_index']: vm for vm in created_vms}
-            for idx, _template, _vmid in vm_assignments:
-                vm_info = by_index[idx]
-                rec = log_vm_to_database(
-                    vm_info, deployment_group_name, owning_identifier,
-                    expiration_time, user_id, owner_group_id, koth_game_id)
-                vm_records.append(rec)
-            db.session.commit()
+            with renewing as lapsed:
+                by_index = {vm['vm_index']: vm for vm in created_vms}
+                for idx, _template, _vmid in vm_assignments:
+                    vm_info = by_index[idx]
+                    rec = log_vm_to_database(
+                        vm_info, deployment_group_name, owning_identifier,
+                        expiration_time, user_id, owner_group_id, koth_game_id)
+                    vm_records.append(rec)
+                db.session.commit()
         except Exception as db_error:
             logger.error(
                 "deploy_bundle: DB logging failed; rolling back: %s",
@@ -1169,6 +1187,19 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                 f"VMs created in Proxmox but DB logging failed: {db_error}; "
                 f"{cleanup_msg}")
 
+        if lapsed:
+            # Live, launched VMs are committed regardless; a lapsed lease
+            # only means the idle step may have stopped their router before
+            # the commit protected it, so start it again.
+            logger.warning(
+                "Admission reservation(s) %s lapsed before the %s records "
+                "committed; re-ensuring the router", sorted(lapsed),
+                backend_name)
+            try:
+                vm_provisioning.ensure_router_running(backend_name)
+            except Exception:
+                logger.exception("Could not re-ensure the %s router after "
+                                 "its admission lapsed", backend_name)
         vmid_safe_to_release = True
         _release_vm_reservations(created_vms)
         return vm_records

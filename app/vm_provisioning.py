@@ -17,8 +17,11 @@ neither lock.
 """
 
 import logging
-from contextlib import nullcontext
-from typing import Any, Callable, ContextManager, Mapping, Optional, Tuple
+import threading
+from contextlib import contextmanager, nullcontext
+from typing import (
+    Any, Callable, ContextManager, Iterator, Mapping, Optional, Tuple,
+)
 
 from app import coordination
 from app.backends import backend_for, get_backend
@@ -38,6 +41,54 @@ def _ensure_slot(backend: VMBackend, spec: VMSpec) -> None:
         backend.ensure_slot(spec.network_slot)
 
 
+@contextmanager
+def _renewing_admission(heartbeat: Callable[[], None]
+                        ) -> Iterator[Callable[[], None]]:
+    """Run `heartbeat` every RESERVATION_HEARTBEAT_SECONDS in the background
+    and yield a guard that raises the renewal's error once one failed.
+
+    A provider call can outlast the admission TTL without calling heartbeat
+    (AWS's running waiter), as can the wait for a router or slot lock; the
+    lease must still hold until the caller's VMRecord commits (ruling C4).
+    A thread like the deploy's other renewers: a greenlet under gevent. On a
+    normal exit the guard runs once more after the renewer has stopped, so
+    a renewal that failed during teardown is raised too; an exception
+    already leaving the body takes precedence.
+    """
+    # Lazy: app.routes imports this module.
+    from app.routes import vm_creation
+    stopped = threading.Event()
+    lost = []
+
+    def renew():
+        while not stopped.wait(vm_creation.RESERVATION_HEARTBEAT_SECONDS):
+            try:
+                heartbeat()
+            except Exception as error:
+                lost.append(error)
+                return
+
+    def guard() -> None:
+        if lost:
+            raise lost[0]
+
+    renewer = threading.Thread(target=renew, name='admission-heartbeat',
+                               daemon=True)
+    renewer.start()
+    try:
+        yield guard
+    finally:
+        stopped.set()
+        renewer.join()
+    guard()
+
+
+def ensure_router_running(backend_name: str) -> None:
+    """Start `backend_name`'s router under its lifecycle lock (ruling C4)."""
+    with vm_lifecycle_lock(router_lock_key(backend_name)):
+        get_backend(backend_name).ensure_router_running()
+
+
 def create_vm(spec: VMSpec, *, reservation_id: str,
               load_balancing_config: Optional[Mapping],
               heartbeat: Callable[[], None],
@@ -49,7 +100,10 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
     create that raised may still have left a provider resource that
     failed-deploy cleanup must resolve first. `create_options` are extra
     keyword arguments for this backend's create() (Proxmox: its clone
-    semaphores and claim callback).
+    semaphores and claim callback). For a cloud backend `heartbeat` also
+    runs in the background from admission until this returns; once it has
+    raised, the create raises that error rather than report a launch its
+    lease no longer covers.
     """
     backend = get_backend(spec.backend)
     location = backend.admit(spec, reservation_id=reservation_id,
@@ -58,21 +112,33 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
     if spec.backend == BACKEND_PROXMOX:
         return location, backend.create(spec, location, heartbeat=heartbeat, **options)
 
-    with vm_lifecycle_lock(router_lock_key(spec.backend)):
-        backend.ensure_router_running()
-    _ensure_slot(backend, spec)
-    try:
-        launched = backend.create(spec, location, heartbeat=heartbeat, **options)
-    except SlotNetworkMissing:
-        # A retirement released the slot between ensure_slot and create
-        # (release_slot_if_unused cannot see an admission that has not
-        # launched yet). Re-ensuring once is enough: the next release must
-        # again wait for this reservation to go.
-        logger.warning("Slot %s of %s vanished before launch of VM %s; "
-                       "re-ensuring it once", spec.network_slot, spec.backend,
-                       spec.vmid)
+    with _renewing_admission(heartbeat) as guard:
+        def guarded_heartbeat() -> None:
+            guard()
+            heartbeat()
+
+        with vm_lifecycle_lock(router_lock_key(spec.backend)):
+            guard()
+            backend.ensure_router_running()
         _ensure_slot(backend, spec)
-        launched = backend.create(spec, location, heartbeat=heartbeat, **options)
+        guard()
+        try:
+            launched = backend.create(spec, location,
+                                      heartbeat=guarded_heartbeat, **options)
+        except SlotNetworkMissing:
+            # A retirement released the slot between ensure_slot and create
+            # (release_slot_if_unused cannot see an admission that has not
+            # launched yet). Re-ensuring once is enough: the next release
+            # must again wait for this reservation to go.
+            logger.warning("Slot %s of %s vanished before launch of VM %s; "
+                           "re-ensuring it once", spec.network_slot,
+                           spec.backend, spec.vmid)
+            _ensure_slot(backend, spec)
+            launched = backend.create(spec, location,
+                                      heartbeat=guarded_heartbeat, **options)
+    # The renewer has stopped and its last renewal was checked on the way
+    # out: a launch the lease stopped covering is a failed create, and the
+    # caller's cleanup resolves the instance by VMID (ruling C7).
     return location, launched
 
 

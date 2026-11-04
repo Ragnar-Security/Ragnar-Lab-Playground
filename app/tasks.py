@@ -3,27 +3,31 @@ Background tasks module
 Handles periodic tasks like checking for expired VMs
 """
 
+import importlib
 import time
 import logging
 import os
 import json
 import smtplib
+import threading
 import requests
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from typing import Dict, List, Optional
 from .proxmox_service import reset_cluster_vm_index, vm_lifecycle_lock
 from .backends import backend_for, enabled_backends, get_backend
 from .backends.base import (
     BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, BackendNotEnabled,
     DestroyPolicy, VMRef,
 )
+from .backends.cloud_common import router_lock_key
 from .orphan_reaper import maybe_reap_orphaned_vms
 from .alert_outbox import dispatch_pending_alerts, enqueue_alert
 from .untracked_survivors import recover_untracked_survivors
-from .models import db, VMRecord, AdminAlert
-from . import vm_provisioning
+from .models import db, NodeMemoryReservation, VMRecord, AdminAlert
+from . import coordination, vm_provisioning
 
 logger = logging.getLogger(__name__)
 
@@ -374,13 +378,19 @@ def check_and_destroy_expired_vms(app):
 
                 # Orphan cleanup runs after expiry and is time-boxed
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
-                # never stand between an expired VM and its destroy. It is
-                # still the Proxmox sweep only, on the pass's connection, so
-                # a cloud-only portal never opens one.
-                if (BACKEND_PROXMOX in enabled_backends()
-                        and BACKEND_PROXMOX not in skipped):
-                    maybe_reap_orphaned_vms(
-                        get_backend(BACKEND_PROXMOX).connect())
+                # never stand between an expired VM and its destroy. It runs
+                # every pass, so a cloud-only portal still sweeps its cloud
+                # leftovers (ruling C6). The Proxmox sweep uses the pass's
+                # connection and is left out when Proxmox is not enabled or
+                # was unreachable at the start of this pass.
+                proxmox = (get_backend(BACKEND_PROXMOX).connect()
+                           if BACKEND_PROXMOX in enabled_backends()
+                           and BACKEND_PROXMOX not in skipped else None)
+                maybe_reap_orphaned_vms(proxmox)
+
+                # Last: a shared cloud router is a cost, not a safety concern,
+                # so stopping one never delays any phase above.
+                _stop_idle_cloud_routers()
         
         except Exception as e:
             logger.error(f"Error in expiration checker: {str(e)}")
@@ -411,6 +421,75 @@ def _open_pass_sessions(stack):
                      "pass", error)
         return frozenset({BACKEND_PROXMOX})
     return frozenset()
+
+
+# Process-local, deliberately: there is no durable last-activity column (VM
+# rows are hard-deleted, admission reservations released), so a restarted
+# worker starts a fresh idle interval — a little extra router cost, never a
+# premature stop.
+_router_idle_since: Dict[str, float] = {}
+_router_idle_guard = threading.Lock()
+
+
+def _reset_router_idle_state_for_tests() -> None:
+    with _router_idle_guard:
+        _router_idle_since.clear()
+
+
+def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
+    """Stop each enabled cloud's router once its backend has sat idle for
+    <BACKEND>_ROUTER_IDLE_MINUTES; return the backends stopped.
+
+    Idle means no live VMRecord and no unexpired admission reservation on
+    that backend. The deciding read happens under the router lifecycle
+    lock, which a launch holds around ensure_router_running() after
+    inserting its reservation (ruling C4), so a launch can never find its
+    router stopped under it. Reservation expiry is compared with now_epoch,
+    which is also the idle clock (ruling M13); it defaults to
+    coordination.lease_clock(). A backend's failure is logged and keeps its
+    idle timestamp, so the next pass retries; the other backends go ahead.
+    """
+    if now_epoch is None:
+        now_epoch = coordination.lease_clock()
+    config = importlib.import_module('app.config')
+    stopped = []
+    for name in enabled_backends():
+        if name == BACKEND_PROXMOX:
+            continue
+        try:
+            idle_seconds = getattr(
+                config, f'{name.upper()}_ROUTER_IDLE_MINUTES') * 60
+            with vm_lifecycle_lock(router_lock_key(name)):
+                # End the REPEATABLE READ snapshot taken before the lock.
+                db.session.rollback()
+                live = VMRecord.query.filter_by(
+                    backend=name, destroyed=False).first()
+                admitting = NodeMemoryReservation.query.filter(
+                    NodeMemoryReservation.node == name,
+                    NodeMemoryReservation.expires_at > now_epoch,
+                ).first()
+                # No transaction stays open across the provider's waiter.
+                db.session.rollback()
+                with _router_idle_guard:
+                    if live is not None or admitting is not None:
+                        _router_idle_since.pop(name, None)
+                        continue
+                    since = _router_idle_since.setdefault(name, now_epoch)
+                if now_epoch - since < idle_seconds:
+                    continue
+                get_backend(name).stop_router()
+            with _router_idle_guard:
+                # Forgotten once stopped, so a stopped router is not asked
+                # to stop again every pass.
+                _router_idle_since.pop(name, None)
+            stopped.append(name)
+            logger.info("Stopped the %s router after %d idle minutes",
+                        name, idle_seconds // 60)
+        except Exception:
+            db.session.rollback()
+            logger.exception("Could not stop the idle %s router; retrying "
+                             "next pass", name)
+    return stopped
 
 
 def _destroy_expired(ref):

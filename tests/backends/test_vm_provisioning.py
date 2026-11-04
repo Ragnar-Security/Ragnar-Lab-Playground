@@ -7,27 +7,35 @@ order, leases and NIC layout are read back from provider state.
 
 import importlib
 import threading
+import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from app import coordination
+from app import coordination, proxmox_service, vm_provisioning
 from app.backends import register_backend_factory
 from app.backends.base import BACKEND_PROXMOX, DestroyPolicy, VMRef, VMSpec
+from app.backends.cloud_admission import reserve_cloud_capacity
 from app.backends.cloud_common import router_lock_key, slot_lock_key
 from app.backends.proxmox import ProxmoxBackend
 from app.models import NodeMemoryReservation, VMIDReservation, VMRecord, db
 from app.proxmox_service import (
-    _clear_node_reservations, _clear_vmid_reservations, get_next_available_vmid,
+    RESERVATION_TTL_SECONDS, _clear_node_reservations, _clear_vmid_reservations,
+    get_next_available_vmid,
 )
 from app.routes import vm_creation
 from app.routes.vm_creation import (
     MAX_CONCURRENT_CLONES, DeployFailed, create_single_vm_task, deploy_bundle,
     extract_template_config,
 )
+from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
 from app.vm_provisioning import (
     after_record_retired, create_vm, destroy_vm, release_slot_if_unused,
+)
+from tests.backends.fake_backend import (
+    MEMORY_LOCATION, FakeBackend, make_memory_backend_case,
 )
 from tests.backends.proxmox_case import forget_proxmox_caches
 from tests.test_live_contract_guards import FakeProxmox
@@ -150,6 +158,262 @@ def test_cloud_bundle_releases_admission_and_vmids_after_commit(
             uptime_minutes=60, user_id=None, backend_name='aws')
         assert VMIDReservation.query.count() == 0
     assert case.backend.reservations == set()
+
+
+# --- cloud: the admission lease keeps the router up (C4) ----------------------
+
+class _LedgerBackend(FakeBackend):
+    """FakeBackend admitting through the real cloud ledger, so the router idle
+    step sees its reservation, and whose create blocks after the launch the
+    way AWS's running waiter does: no heartbeat until it returns."""
+
+    def __init__(self):
+        super().__init__('aws')
+        self.launching = threading.Event()
+        self.release_launch = threading.Event()
+        self.renewal_failed = threading.Event()
+
+    def admit(self, spec, *, reservation_id, load_balancing_config):
+        return reserve_cloud_capacity('aws', MEMORY_LOCATION, 5, reservation_id)
+
+    def renew_admission(self, reservation_id):
+        renewed = proxmox_service.renew_node_reservation(reservation_id)
+        if not renewed:
+            self.renewal_failed.set()
+        return renewed
+
+    def release_admission(self, reservation_id):
+        return proxmox_service.release_node_reservation(reservation_id)
+
+    def create(self, spec, location, *, heartbeat):
+        launched = super().create(spec, location, heartbeat=heartbeat)
+        self.launching.set()
+        assert self.release_launch.wait(timeout=10), 'launch never released'
+        return launched
+
+
+@pytest.fixture
+def ledger_cloud(app, monkeypatch):
+    """A cloud-only portal on a hand-driven lease clock whose router stops at
+    the first idle observation, so only a live lease or record keeps it up."""
+    clock = {'now': 1_000_000.0}
+    monkeypatch.setattr(coordination, 'lease_clock', lambda: clock['now'])
+    monkeypatch.setattr(vm_creation, 'RESERVATION_HEARTBEAT_SECONDS', 0.01)
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 0)
+    backend = _LedgerBackend()
+    register_backend_factory('aws', lambda: backend)
+    _reset_router_idle_state_for_tests()
+    yield backend, clock
+    backend.release_launch.set()
+    _reset_router_idle_state_for_tests()
+
+
+def _renewed_at(clock, timeout=2.0):
+    """Wait until every aws admission lease was renewed at the clock's now."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        db.session.rollback()
+        leases = NodeMemoryReservation.query.filter_by(node='aws').all()
+        if leases and all(lease.expires_at == clock['now'] + RESERVATION_TTL_SECONDS
+                          for lease in leases):
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _router_survives_past_ttl(backend, clock):
+    """Let a full TTL and more pass in heartbeat-sized steps; run the real
+    router idle step at each one."""
+    for _ in range(4):  # 4 x 300 s > the 900 s admission TTL
+        clock['now'] += 300
+        _renewed_at(clock)
+        assert _stop_idle_cloud_routers() == []
+        assert backend.router_running, 'router stopped under a live admission'
+
+
+def _slow_staging(monkeypatch):
+    """Make the bundle's record staging wait, before the commit, until released."""
+    staging = threading.Event()
+    release_staging = threading.Event()
+    stage = vm_creation.log_vm_to_database
+
+    def slow_stage(*args, **kwargs):
+        staging.set()
+        assert release_staging.wait(timeout=10), 'staging never released'
+        return stage(*args, **kwargs)
+
+    monkeypatch.setattr(vm_creation, 'log_vm_to_database', slow_stage)
+    return staging, release_staging
+
+
+def _deploy_in_thread(app, outcome):
+    def deploy():
+        with app.app_context():
+            try:
+                outcome['vmids'] = [record.vmid for record in deploy_bundle(
+                    deployment_group_name='Cloud Lab',
+                    templates=[{'name': 'vm', 'backend': 'aws', 'entry_point': True,
+                                'aws': {'image_id': 'ami-placeholder',
+                                        'instance_type': 'small', 'disk_gb': 20}}],
+                    owning_identifier='test-owner', entry_vlan=101,
+                    internal_vlan=201, uptime_minutes=60, user_id=None,
+                    backend_name='aws')]
+            except Exception as error:  # surfaced by the callers' assertions
+                outcome['error'] = error
+
+    deployer = threading.Thread(target=deploy)
+    deployer.start()
+    return deployer
+
+
+# Catches the admission lease lapsing during a long create or before the
+# VMRecord commits, which lets the idle step stop the router under a launch (C4).
+def test_cloud_admission_keeps_router_up_from_admit_through_record_commit(
+        app, ledger_cloud, monkeypatch):
+    backend, clock = ledger_cloud
+    staging, release_staging = _slow_staging(monkeypatch)
+    outcome = {}
+    deployer = _deploy_in_thread(app, outcome)
+    try:
+        with app.app_context():
+            assert backend.launching.wait(timeout=5), 'create never launched'
+            _router_survives_past_ttl(backend, clock)  # inside a long create
+            backend.release_launch.set()
+            assert staging.wait(timeout=5), 'bundle never staged its record'
+            _router_survives_past_ttl(backend, clock)  # before the commit
+            release_staging.set()
+            deployer.join(timeout=10)
+            assert 'error' not in outcome, outcome.get('error')
+            assert len(outcome['vmids']) == 1
+            assert NodeMemoryReservation.query.count() == 0
+            # The committed record protects the router from here on.
+            assert _stop_idle_cloud_routers() == []
+            assert backend.router_running
+    finally:
+        backend.release_launch.set()
+        release_staging.set()
+        deployer.join(timeout=10)
+
+
+# Catches a lease lost while the bundle stages its records letting an idle stop
+# leave live, just-committed VMs behind a stopped router.
+def test_lease_lost_before_commit_restarts_a_router_stopped_in_that_window(
+        app, ledger_cloud, monkeypatch):
+    backend, _clock = ledger_cloud
+    staging, release_staging = _slow_staging(monkeypatch)
+    outcome = {}
+    backend.release_launch.set()
+    deployer = _deploy_in_thread(app, outcome)
+    try:
+        with app.app_context():
+            assert staging.wait(timeout=5), 'bundle never staged its record'
+            NodeMemoryReservation.query.filter_by(node='aws').delete()
+            db.session.commit()
+            assert backend.renewal_failed.wait(timeout=5), (
+                'nothing renewed the lease while staging')
+            assert _stop_idle_cloud_routers() == ['aws']  # the lapse let it stop
+            assert not backend.router_running
+            release_staging.set()
+            deployer.join(timeout=10)
+            assert 'error' not in outcome, outcome.get('error')
+            db.session.rollback()
+            assert [record.vmid for record in VMRecord.query.all()] == outcome['vmids']
+            assert backend.router_running, 'committed VMs left behind a stopped router'
+    finally:
+        release_staging.set()
+        deployer.join(timeout=10)
+
+
+# Catches a create whose admission lease was lost mid-launch carrying on as if
+# admitted (I16): nothing then holds its router up or its capacity.
+def test_cloud_create_fails_when_its_admission_lease_is_lost_mid_create(
+        app, ledger_cloud):
+    backend, _clock = ledger_cloud
+    spec = make_memory_backend_case(app).spec
+    lost = threading.Event()
+
+    def heartbeat():
+        if not backend.renew_admission('r-lost'):
+            lost.set()
+            raise RuntimeError('Admission reservation expired')
+
+    errors = []
+
+    def create():
+        with app.app_context():
+            try:
+                create_vm(spec, reservation_id='r-lost',
+                          load_balancing_config=None, heartbeat=heartbeat)
+            except Exception as error:
+                errors.append(error)
+
+    creator = threading.Thread(target=create)
+    creator.start()
+    try:
+        assert backend.launching.wait(timeout=5), 'create never launched'
+        with app.app_context():
+            NodeMemoryReservation.query.filter_by(reservation_id='r-lost').delete()
+            db.session.commit()
+        assert lost.wait(timeout=5), 'nothing renewed the lease during create'
+    finally:
+        backend.release_launch.set()
+        creator.join(timeout=10)
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError), errors
+    assert 'Admission reservation expired' in str(errors[0])
+    # The launched instance is left for the caller's failed-create cleanup.
+    assert spec.vmid in backend.instances
+
+
+class _TeardownSignal(threading.Event):
+    """The renewer's stop event, announcing when create_vm starts tearing down."""
+    began = None  # set per test
+
+    def set(self):
+        super().set()
+        _TeardownSignal.began.set()
+
+
+# Catches a renewal that fails while create_vm stops its renewer being dropped,
+# so a launch its lease no longer covers is reported as a success.
+def test_cloud_create_fails_when_renewal_fails_during_renewer_teardown(
+        app, ledger_cloud, monkeypatch):
+    backend, _clock = ledger_cloud
+    spec = make_memory_backend_case(app).spec
+    _TeardownSignal.began = threading.Event()
+    monkeypatch.setattr(vm_provisioning, 'threading', SimpleNamespace(
+        Thread=threading.Thread, Event=_TeardownSignal))
+    renewer_entered = threading.Event()
+
+    def heartbeat():
+        if threading.current_thread().name != 'admission-heartbeat':
+            return  # the backend's own before-launch heartbeat
+        renewer_entered.set()
+        assert _TeardownSignal.began.wait(timeout=5), 'teardown never began'
+        raise RuntimeError('Admission reservation expired')
+
+    errors = []
+
+    def create():
+        with app.app_context():
+            try:
+                create_vm(spec, reservation_id='r-teardown',
+                          load_balancing_config=None, heartbeat=heartbeat)
+            except Exception as error:
+                errors.append(error)
+
+    creator = threading.Thread(target=create)
+    creator.start()
+    try:
+        assert backend.launching.wait(timeout=5), 'create never launched'
+        assert renewer_entered.wait(timeout=5), 'the renewer never ran'
+    finally:
+        backend.release_launch.set()
+        creator.join(timeout=10)
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError), errors
+    assert 'Admission reservation expired' in str(errors[0])
+    # The launched instance is left for the caller's failed-create cleanup.
+    assert spec.vmid in backend.instances
 
 
 # --- cloud: retirement --------------------------------------------------------
