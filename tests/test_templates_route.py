@@ -121,7 +121,9 @@ class TemplatesGroupFilterTestCase(unittest.TestCase):
     # Catches a clean catalog showing the admin phantom errors.
     def test_admin_sees_empty_config_errors_for_clean_catalog(self):
         self._login('admin')
-        with patch('app.routes.templates.load_template_config', return_value=FAKE_CONFIG):
+        # Pinned: FAKE_CONFIG is a Proxmox catalog, whatever the shell exports.
+        with patch('app.routes.templates.load_template_config', return_value=FAKE_CONFIG), \
+                patch('app.config.ENABLED_BACKENDS', ('proxmox',)):
             body = self.client.get('/templates').get_json()
         assert body['success'] is True
         assert body['config_errors'] == []

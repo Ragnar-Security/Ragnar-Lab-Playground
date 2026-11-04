@@ -71,6 +71,47 @@ def test_unknown_backend_is_refused():
                for e in errors)
 
 
+# Catches a malformed group selector (YAML false/""/[]) silently resolving to proxmox.
+@pytest.mark.parametrize('selector', [False, '', []])
+def test_falsey_group_selector_is_unknown_backend(selector):
+    group = {'display_name': 'Bad Lab', 'backend': selector,
+             'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001}}]}
+    with pytest.raises(TemplateConfigError, match='unknown backend'):
+        resolve_group_backend(group)
+    errors = validate_group_backends(group, ('proxmox',))
+    assert any('Bad Lab' in e and 'unknown backend' in e for e in errors)
+
+
+# Catches a malformed group selector hidden behind machines that all override it.
+def test_falsey_group_selector_is_reported_even_when_machines_override():
+    group = {'display_name': 'Bad Lab', 'backend': '',
+             'templates': [{'name': 'vm', 'backend': 'gcp', 'gcp': dict(GCP_BLOCK)}]}
+    with pytest.raises(TemplateConfigError, match='unknown backend'):
+        resolve_group_backend(group)
+    errors = validate_group_backends(group, ('proxmox', 'gcp'))
+    assert any('unknown backend' in e for e in errors)
+
+
+# Catches a malformed machine override silently inheriting the group backend.
+@pytest.mark.parametrize('selector', [False, '', []])
+def test_falsey_machine_override_is_unknown_backend(selector):
+    group = valid_aws_group()
+    group['templates'][0]['backend'] = selector
+    with pytest.raises(TemplateConfigError, match='unknown backend'):
+        resolve_group_backend(group)
+    errors = validate_group_backends(group, ('proxmox', 'aws'))
+    assert any('Cloud Lab' in e and 'unknown backend' in e for e in errors)
+
+
+# Catches YAML null (`backend:` with no value) being refused instead of meaning "unset".
+def test_null_selectors_mean_absent():
+    group = {'display_name': 'Null Lab', 'backend': None,
+             'templates': [{'name': 'vm', 'backend': None,
+                            'template_locations': {'node-a': 7001}}]}
+    assert resolve_group_backend(group) == 'proxmox'
+    assert validate_group_backends(group, ('proxmox',)) == []
+
+
 # Catches a group offered to students on a backend the operator never enabled.
 def test_disabled_backend_is_reported():
     errors = validate_group_backends(valid_aws_group(), ('proxmox',))

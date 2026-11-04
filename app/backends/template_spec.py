@@ -31,10 +31,22 @@ def _templates(group: Mapping) -> list:
     return list(group.get('templates') or [])
 
 
+def _selected(mapping: Mapping, default: Any) -> Any:
+    """The `backend` selector, or `default` when it is absent. YAML null
+    (`backend:` with no value) counts as absent; any other value, falsey or
+    not (false, "", []), is the operator's choice and is validated as given."""
+    value = mapping.get('backend')
+    return default if value is None else value
+
+
+def _group_backend(group: Mapping) -> Any:
+    return _selected(group, BACKEND_PROXMOX)
+
+
 def _machine_backends(group: Mapping) -> List[Any]:
     """Each machine's backend, machine override first, in template order."""
-    group_backend = group.get('backend') or BACKEND_PROXMOX
-    return [template.get('backend') or group_backend for template in _templates(group)]
+    group_backend = _group_backend(group)
+    return [_selected(template, group_backend) for template in _templates(group)]
 
 
 def _distinct(values: Sequence[Any]) -> List[Any]:
@@ -57,7 +69,11 @@ def _mixed_message(backends: Sequence[Any]) -> str:
 
 def resolve_group_backend(group: Mapping) -> str:
     name = _group_name(group)
-    group_backend = group.get('backend') or BACKEND_PROXMOX
+    group_backend = _group_backend(group)
+    # Checked on its own: machines that all override it would otherwise hide it.
+    if group_backend not in KNOWN_BACKENDS:
+        raise TemplateConfigError(
+            f"deployment_group {name!r}: {_unknown_backend_message(group_backend)}")
     backends = _distinct(_machine_backends(group)) or [group_backend]
     if len(backends) > 1:
         raise TemplateConfigError(f"deployment_group {name!r}: {_mixed_message(backends)}")
@@ -104,10 +120,13 @@ def backend_block(template: Mapping, backend: str) -> Mapping:
 def validate_group_backends(group: Mapping, enabled: Sequence[str]) -> List[str]:
     prefix = f"deployment_group {_group_name(group)!r}: "
     errors = []
+    group_backend = _group_backend(group)
     machine_backends = _machine_backends(group)
-    backends = _distinct(machine_backends) or [group.get('backend') or BACKEND_PROXMOX]
+    backends = _distinct(machine_backends) or [group_backend]
 
-    unknown = [backend for backend in backends if backend not in KNOWN_BACKENDS]
+    # The group selector too, even when every machine overrides it.
+    unknown = [backend for backend in _distinct([group_backend] + backends)
+               if backend not in KNOWN_BACKENDS]
     known = [backend for backend in backends if backend in KNOWN_BACKENDS]
     errors.extend(prefix + _unknown_backend_message(backend) for backend in unknown)
     if len(backends) > 1:

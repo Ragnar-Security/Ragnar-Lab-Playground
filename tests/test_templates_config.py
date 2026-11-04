@@ -19,7 +19,10 @@ CATALOG_PATHS = [
 
 
 @pytest.mark.parametrize("catalog_path", CATALOG_PATHS, ids=["test-fixture", "example"])
-def test_enabled_groups_have_consistent_node_maps_and_positive_resources(catalog_path):
+def test_enabled_groups_have_consistent_node_maps_and_positive_resources(catalog_path, monkeypatch):
+    # Pinned: these are Proxmox catalogs, whatever ENABLED_BACKENDS the shell exports.
+    monkeypatch.setattr(importlib.import_module("app.config"),
+                        "ENABLED_BACKENDS", ("proxmox",))
     config = yaml.safe_load(catalog_path.read_text())
     errors, warnings = validate_template_config(config)
     assert errors == []
