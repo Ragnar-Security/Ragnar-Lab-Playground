@@ -664,6 +664,12 @@ class AWSBackend:
                 # the EbsBlockDevice shape, so none of the AMI's is lost.
                 pinned = {key: value for key, value in ebs.items()
                           if key in ebs_fields and value is not None}
+                # An AMI reports Encrypted=False for an unencrypted disk; sent
+                # back, it would be an explicit request that can conflict
+                # with the account's EBS encryption-by-default. Left out, the
+                # snapshot's state and that default decide, as for any disk.
+                if pinned.get('Encrypted') is False:
+                    del pinned['Encrypted']
                 # EC2 merges an override with neither, but moto refuses it.
                 if 'SnapshotId' not in pinned and 'VolumeSize' not in pinned:
                     raise BackendError(

@@ -737,17 +737,24 @@ def _stop_at_run_instances(ec2):
     return sent
 
 
-@pytest.mark.parametrize('inherited', [
-    {'VolumeSize': 50, 'VolumeType': 'io2', 'Iops': 4000,
-     'Encrypted': True, 'KmsKeyId': 'alias/example-lab-key'},
-    {'VolumeSize': 40, 'VolumeType': 'gp3', 'Iops': 3000, 'Throughput': 250,
-     'Encrypted': False},
-], ids=['io2-encrypted', 'gp3-throughput'])
+@pytest.mark.parametrize('inherited, sent_ebs', [
+    ({'VolumeSize': 50, 'VolumeType': 'io2', 'Iops': 4000,
+      'Encrypted': True, 'KmsKeyId': 'alias/example-lab-key'},
+     {'VolumeSize': 50, 'VolumeType': 'io2', 'Iops': 4000,
+      'Encrypted': True, 'KmsKeyId': 'alias/example-lab-key'}),
+    # Encrypted=False is the AMI reporting "not encrypted", not a request to
+    # stay so: it is left out, so the snapshot's state and the account's
+    # encryption-by-default decide, as for any disk the request omits.
+    ({'VolumeSize': 40, 'VolumeType': 'gp3', 'Iops': 3000, 'Throughput': 250,
+      'Encrypted': False},
+     {'VolumeSize': 40, 'VolumeType': 'gp3', 'Iops': 3000, 'Throughput': 250}),
+], ids=['io2-encrypted', 'gp3-unencrypted'])
 def test_disposable_ami_disks_keep_every_inherited_ebs_setting(
-        aws_instance_backend, monkeypatch, inherited):
+        aws_instance_backend, monkeypatch, inherited, sent_ebs):
     # Catches restating an inherited data disk from its snapshot and size
     # alone: the launch would silently drop its volume type, IOPS,
-    # throughput or encryption key, changing the disk the AMI defines.
+    # throughput or encryption key, changing the disk the AMI defines; or an
+    # explicit Encrypted=False overriding the account's encryption default.
     backend, spec, ec2, resources = aws_instance_backend
     _with_image_mappings(monkeypatch, ec2, extra=[
         {'DeviceName': '/dev/sdf', 'Ebs': dict(inherited, DeleteOnTermination=False)}])
@@ -756,7 +763,8 @@ def test_disposable_ami_disks_keep_every_inherited_ebs_setting(
         backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
     [request] = sent
     mappings = {m['DeviceName']: m['Ebs'] for m in request['BlockDeviceMappings']}
-    assert mappings['/dev/sdf'] == dict(inherited, DeleteOnTermination=True)
+    assert mappings['/dev/sdf'] == dict(sent_ebs, DeleteOnTermination=True)
+    assert ('Encrypted' in mappings['/dev/sdf']) is inherited['Encrypted']
     # The root keeps its resize-only rule: everything else is the AMI's.
     assert mappings['/dev/sda1'] == {'VolumeSize': 24, 'DeleteOnTermination': True}
 
