@@ -227,6 +227,8 @@ SSH_TABLE = "jumpbox_ssh"
 SSH_NFT_FILE = "/etc/nftables.d/jumpbox-ssh.nft"
 SSH_UNIT_NAME = "jumpbox-ssh-filter.service"
 SSH_STAFF_IF = "tailscale0"
+VLAN_TABLE = "jumpbox_vlan_isolation"
+VLAN_NFT_FILE = "/etc/nftables.d/jumpbox-vlan-isolation.nft"
 
 
 def _staff_networks(addresses):
@@ -341,6 +343,79 @@ def render_ssh_filter_unit(nft_file=SSH_NFT_FILE):
     ]) + "\n"
 
 
+def parse_vlan_list(spec):
+    """Comma-separated VLAN tags and first-last ranges -> sorted unique tags (2-4094).
+
+    The empty string is the empty list. Anything else malformed raises ValueError.
+    """
+    if not (spec or "").strip():
+        return []
+    tags = set()
+    for item in spec.split(","):
+        match = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", item)
+        if not match:
+            raise ValueError(f"bad VLAN list item {item!r}; expected TAG or FIRST-LAST")
+        first = int(match.group(1))
+        last = int(match.group(2)) if match.group(2) else first
+        if not 2 <= first <= last <= 4094:
+            raise ValueError(f"VLAN list item {item.strip()!r}: tags must satisfy 2 <= first <= last <= 4094")
+        tags.update(range(first, last + 1))
+    return sorted(tags)
+
+
+def render_vlan_isolation(allow_vlans=()):
+    """nftables table that stops lab VMs routing to each other through the jumpbox.
+
+    Only packets entering AND leaving through vlan* interfaces are dropped, so
+    tailscale0 <-> vlan*, management and the jumpbox's own traffic are untouched;
+    same-VLAN traffic is switched on the trunk and never reaches the forward
+    hook. A KOTH range needs team VLANs to reach the KOTH VLAN, so each tag in
+    allow_vlans is accepted ahead of the drop in either direction.
+    """
+    tags = sorted({int(t) for t in allow_vlans})
+    for tag in tags:
+        if not 2 <= tag <= 4094:
+            raise ValueError(f"VLAN tag {tag} must satisfy 2 <= tag <= 4094")
+    lines = [f"# {HEADER}",
+             f"table inet {VLAN_TABLE}",
+             f"delete table inet {VLAN_TABLE}",
+             f"table inet {VLAN_TABLE} {{",
+             "    chain forward {",
+             "        type filter hook forward priority -10; policy accept;"]
+    if tags:
+        names = "{ " + ", ".join(f'"vlan{t}"' for t in tags) + " }"
+        lines += [f'        iifname "vlan*" oifname {names} accept',
+                  f'        iifname {names} oifname "vlan*" accept']
+    lines += ['        iifname "vlan*" oifname "vlan*" counter drop',
+              "    }",
+              "}"]
+    return "\n".join(lines) + "\n"
+
+
+def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
+    if not re.match(r"^/[A-Za-z0-9_./-]+$", nft_file):
+        raise ValueError(f"invalid nft file path {nft_file!r}")
+    return "\n".join([
+        f"# {HEADER}",
+        "[Unit]",
+        "Description=Isolate routed lab VLANs from each other on the jumpbox (nftables)",
+        "DefaultDependencies=no",
+        "Before=network-pre.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "RemainAfterExit=yes",
+        f"ExecStart=/usr/sbin/nft -f {nft_file}",
+        # Reload swaps the table in one transaction; a restart would run ExecStop first
+        # and leave the VLANs unisolated until ExecStart.
+        f"ExecReload=/usr/sbin/nft -f {nft_file}",
+        f"ExecStop=-/usr/sbin/nft delete table inet {VLAN_TABLE}",
+        "",
+        "[Install]",
+        "WantedBy=multi-user.target",
+    ]) + "\n"
+
+
 def unified_diff(path, current, generated):
     return "".join(difflib.unified_diff(
         current.splitlines(keepends=True), generated.splitlines(keepends=True),
@@ -355,7 +430,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
         "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "ssh-filter",
-        "ssh-filter-unit", "staff-has", "ssh-source", "diff"])
+        "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "staff-has", "ssh-source", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -367,7 +442,8 @@ def main(argv=None):
     parser.add_argument("--routes", default="10.0.0.0/8")
     parser.add_argument("--staff-ips", default="", help="ssh-filter: comma/space separated")
     parser.add_argument("--ports", default="", help="ssh-filter: comma/space separated, default 22")
-    parser.add_argument("--nft-file", default=SSH_NFT_FILE)
+    parser.add_argument("--nft-file")
+    parser.add_argument("--allow-vlans", default="", help="isolate-vlans: tags/ranges exempt from the drop")
     parser.add_argument("--label", help="diff: path shown in the header")
     parser.add_argument("files", nargs="*", help="diff: CURRENT GENERATED")
     args = parser.parse_args(argv)
@@ -397,7 +473,11 @@ def main(argv=None):
             # Normalized source of the SSH_CONNECTION value given after `--`.
             out = f"{session_source(args.files[0] if len(args.files) == 1 else '')}\n"
         elif args.what == "ssh-filter-unit":
-            out = render_ssh_filter_unit(args.nft_file)
+            out = render_ssh_filter_unit(args.nft_file or SSH_NFT_FILE)
+        elif args.what == "isolate-vlans":
+            out = render_vlan_isolation(parse_vlan_list(args.allow_vlans))
+        elif args.what == "isolate-vlans-unit":
+            out = render_vlan_isolation_unit(args.nft_file or VLAN_NFT_FILE)
         elif args.what == "zeek-node":
             out = render_zeek_node(args.trunk_if)
         elif args.what == "zeek-networks":
