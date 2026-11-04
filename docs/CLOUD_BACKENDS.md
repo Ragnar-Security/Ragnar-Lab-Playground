@@ -768,11 +768,15 @@ tools that build the app (`scripts/init_db.py`, `cleanup_db.py`,
 so running one beside the server can revert a KOTH game stuck in
 `deploying` to `draft` and start a second scorer if a game is active.
 
-**Roll back** on the Headscale host, from the backup the apply printed:
+**Roll back** on the Headscale host, from the backup the apply printed. The
+backup is mode 0600, so only its contents are restored: they go into a copy
+of the live file, which keeps the live file's owner and mode, and that copy
+replaces the live file in one rename:
 
 ```bash
 cd <headscale-dir>
-cp -p <host-policy-file>.<stamp> <host-policy-file>.restore
+cp -p <host-policy-file> <host-policy-file>.restore
+cat <host-policy-file>.<stamp> > <host-policy-file>.restore
 docker compose exec -T headscale headscale policy check --file /dev/stdin < <host-policy-file>.restore
 mv -f <host-policy-file>.restore <host-policy-file>
 docker compose kill -s HUP headscale          # or: docker compose restart headscale

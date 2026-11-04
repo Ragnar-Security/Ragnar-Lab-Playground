@@ -83,9 +83,14 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   that must stay into explicit rules in `config/headscale-acl.json` first.
 - **Still one gunicorn worker.**
 - **Rollback** to v1.0.0 needs no database restore (it ignores the new
-  columns) **only while no cloud records exist**: v1.0.0 would treat a cloud
-  record as a Proxmox guest and never destroy its machine. Tear the clouds
-  down first (`docs/CLOUD_BACKENDS.md`, "Teardown and incident response").
+  columns) **only while no cloud records and no cloud failed-deploy survivor
+  lines exist**: v1.0.0 would treat a cloud record as a Proxmox guest and
+  never destroy its machine, and would set a cloud line in
+  `data/untracked-survivors.jsonl` / `.importing` aside as corrupt. Before
+  rolling back, run both checks in the rollback step of
+  `docs/PRODUCTION_DEPLOYMENT.md`; tear the clouds down
+  (`docs/CLOUD_BACKENDS.md`, "Teardown and incident response") and drain the
+  survivor files on the new release until both are clean.
 
 ## [1.0.0] - 2026-10-27
 

@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -314,6 +315,74 @@ def test_changelog_upgrade_notes_name_the_migration_and_new_settings():
     assert len(loops) == 1 and "migrate_add_vm_backend.py" in loops[0].split()
     for name in ("ENABLED_BACKENDS", "LAB_SITE_ID", "docs/CLOUD_BACKENDS.md"):
         assert name in notes
+
+
+# ---- rollback procedures, executed -----------------------------------------
+
+def _fenced_after(text, marker, language):
+    """The first ```language block after `marker`."""
+    start = text.index(marker)
+    match = re.compile(rf"^[ ]*```{language}\n(.*?)^[ ]*```$",
+                       re.MULTILINE | re.DOTALL).search(text, start)
+    assert match, f"no {language} block after {marker!r}"
+    return match.group(1)
+
+
+# Catches the Headscale rollback installing the 0600 backup's mode (the apply
+# script makes backups 0600) over a live policy a non-root Headscale may need
+# to read through its group or other bits.
+def test_headscale_rollback_restores_contents_and_keeps_the_live_mode(tmp_path):
+    block = _fenced_after(RUNBOOK.read_text(), "**Roll back** on the Headscale host",
+                          "bash")
+    # The file steps only: `cd` and the Headscale container calls need a host.
+    steps = [line for line in block.splitlines()
+             if line.strip() and not line.startswith(("cd ", "docker "))]
+    assert steps, block
+    live, backup = tmp_path / "acl.json", tmp_path / "acl.json.20261104T000000Z"
+    live.write_text('{"acls": ["live"]}\n')
+    live.chmod(0o644)
+    backup.write_text('{"acls": ["backup"]}\n')
+    backup.chmod(0o600)
+    script = "\n".join(steps).replace("<host-policy-file>.<stamp>", backup.name) \
+        .replace("<host-policy-file>", live.name)
+    subprocess.run(["bash", "-euc", script], cwd=tmp_path, check=True)
+    assert live.read_text() == '{"acls": ["backup"]}\n'
+    assert live.stat().st_mode & 0o777 == 0o644
+    assert backup.read_text() == '{"acls": ["backup"]}\n'
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([live.name, backup.name])
+
+
+def _survivor_check():
+    text = (ROOT / "docs" / "PRODUCTION_DEPLOYMENT.md").read_text()
+    block = _fenced_after(text, "**No cloud survivor lines.**", "bash")
+    match = re.search(r"<<'PY'\n(.*?)^[ ]*PY$", block, re.MULTILINE | re.DOTALL)
+    assert match, block
+    return textwrap.dedent(match.group(1))
+
+
+# Catches a pre-cloud rollback declared safe while a cloud survivor exists
+# only in the survivor files (no vm_records row), or the check passing a
+# line it cannot read.
+@pytest.mark.parametrize("pending, importing, safe", [
+    (None, None, True),
+    ('{"vmid": 101, "node": "pve1", "vm_type": "qemu"}\n\n', None, True),
+    ('{"vmid": 101, "backend": "proxmox"}\n', '{"vmid": 102, "backend": "aws"}\n', False),
+    ('{"vmid": 103, "backend": "gcp"}\n', None, False),
+    (None, 'not json\n', False),
+    (None, '[1]\n', False),
+])
+def test_rollback_survivor_check_blocks_any_cloud_line(tmp_path, pending, importing, safe):
+    path = tmp_path / "survivors.jsonl"
+    if pending is not None:
+        path.write_text(pending)
+    if importing is not None:
+        (tmp_path / "survivors.jsonl.importing").write_text(importing)
+    env = dict(os.environ, UNTRACKED_SURVIVORS_FILE=str(path),
+               PROXMOX_HOST="fake-host", PROXMOX_PASSWORD="fake-password")
+    result = subprocess.run([sys.executable, "-"], input=_survivor_check(), text=True,
+                            capture_output=True, cwd=ROOT, env=env)
+    assert result.returncode == (0 if safe else 1), result.stderr
+    assert ("OK: no cloud survivor lines" in result.stdout) is safe
 
 
 # ---- docker-compose.prod.yml -----------------------------------------------

@@ -558,20 +558,80 @@ code does not deliver alerts still queued in `alert_outbox`
 after a rollback.
 
 **A rollback to a release before multi-backend support (v1.0.0) is safe only
-while no cloud records exist.** The old code reads every record as a Proxmox
-guest and never destroys a cloud machine. Check first; if any backend other
-than `proxmox` is listed, tear the clouds down (`docs/CLOUD_BACKENDS.md`,
-"Teardown and incident response") before rolling back:
+while nothing on a cloud depends on the new code.** The old code reads every
+record as a Proxmox guest and never destroys a cloud machine. A cloud
+survivor recorded during a database outage exists **only** in the
+failed-deploy survivor files, with no `vm_records` row: v1.0.0 rejects such a
+line as corrupt and moves it to `.corrupt`, which no release imports, and
+builds before v1.0.0 ignore the files. A clean record query alone therefore
+does not prove the rollback safe. Run both checks **before** checking out
+the old release:
 
-```bash
-docker compose -f docker-compose.prod.yml exec -T db \
-  sh -c 'exec mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e \
-  "SELECT backend, COUNT(*) FROM vm_records WHERE destroyed = 0 GROUP BY backend"'
-```
+1. **No live cloud records.** Only `proxmox` may be listed. Otherwise tear
+   the clouds down first (`docs/CLOUD_BACKENDS.md`, "Teardown and incident
+   response").
 
-The old code also never reads the failed-deploy survivor files (see
+   ```bash
+   docker compose -f docker-compose.prod.yml exec -T db \
+     sh -c 'exec mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e \
+     "SELECT backend, COUNT(*) FROM vm_records WHERE destroyed = 0 GROUP BY backend"'
+   ```
+
+2. **No cloud survivor lines.** `.jsonl` and `.importing` must each be absent
+   or hold only Proxmox lines (a line without `backend` is a Proxmox guest).
+   The check runs in a one-off container of the current image, so it works
+   whether the app is running or stopped, and honours
+   `UNTRACKED_SURVIVORS_FILE`. It prints `OK` and exits 0 when safe; otherwise
+   it lists each blocking line and exits 1. A line it cannot parse blocks too,
+   because it may describe a cloud machine.
+
+   ```bash
+   docker compose -f docker-compose.prod.yml run --rm --no-deps -T vm-automation \
+     python - <<'PY'
+   import json, os
+   from app.config import untracked_survivors_file
+   path = untracked_survivors_file()
+   blocking = []
+   for name in (path, path + '.importing'):
+       if not os.path.exists(name):
+           continue
+       with open(name, encoding='utf-8', errors='replace') as handle:
+           for number, line in enumerate(handle, 1):
+               if not line.strip():
+                   continue
+               try:
+                   backend = json.loads(line).get('backend') or 'proxmox'
+               except (ValueError, AttributeError):
+                   backend = 'unparseable'
+               if backend != 'proxmox':
+                   blocking.append(f'{name}:{number}: backend={backend}')
+   print('\n'.join(blocking) or 'OK: no cloud survivor lines')
+   raise SystemExit(1 if blocking else 0)
+   PY
+   ```
+
+**If the survivor check lists a line, drain the files first.** Only the new
+release can import those lines and destroy their machines:
+
+1. Run the new release with the database up and that cloud still in
+   `ENABLED_BACKENDS`, with its credentials. If you already disabled the
+   cloud, enable it again and restart the app.
+2. Let the import and expiry run. The app imports pending lines at startup
+   and on every expiry pass (once a minute) as already-expired records, and
+   the expiry loop destroys their machines. Do not delete or edit the files
+   by hand.
+3. Re-run both checks until the survivor check prints `OK` and the record
+   query lists only `proxmox`. A cloud record that stays is a machine the
+   portal could not destroy; resolve it by the teardown procedure.
+
+Then stop the app (`docker compose -f docker-compose.prod.yml stop
+vm-automation`), so no deploy can record a new survivor, and run both checks
+once more before the rollback in step 6.
+
+A build before v1.0.0 never reads the survivor files (see
 [Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage)).
-After a rollback, check for them on the host:
+After rolling back to one, check them on the host. Thanks to the checks
+above, any line still in them is a Proxmox guest:
 
 ```bash
 ls -l data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing \
@@ -594,6 +654,11 @@ destroys it. Choose one of these:
   Then delete `.jsonl` and `.importing`, so a later upgrade does not import
   stale lines. The orphan reaper may remove such guests after their
   `Expires:` time plus grace, but do not rely on it.
+- **A line in `.corrupt`** is imported by no release. Check each one by hand
+  as in [Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage);
+  for a line naming `aws` or `gcp`, find the machine in that cloud by its
+  site tag or label and vmid (`docs/CLOUD_BACKENDS.md`, "Teardown and
+  incident response"), before or after the rollback.
 
 The `.lock` and `.import.lock` files beside them are empty lock files. They
 are harmless, and can be deleted whenever the app is stopped.
