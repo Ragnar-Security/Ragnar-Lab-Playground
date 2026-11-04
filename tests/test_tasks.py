@@ -935,3 +935,50 @@ class TestManualDeletionReconciliation:
 
         with app.app_context():
             assert db.session.get(VMRecord, vm_id) is not None
+
+
+def register_cloud_sweep_backend(name):
+    from app.backends import register_backend_factory
+    from tests.test_orphan_reaper import _CloudSweepBackend
+    sweep = _CloudSweepBackend(name)
+    register_backend_factory(name, lambda: sweep)
+    return sweep
+
+
+def test_cloud_only_expiry_pass_runs_the_cloud_sweep(app, monkeypatch):
+    # Catches a cloud-only portal never reaping leaked cloud resources (C6).
+    import importlib
+    from app import orphan_reaper
+    from app.backends import register_backend_factory
+    from tests.test_orphan_reaper import NOW_EPOCH
+    config = importlib.import_module("app.config")
+    monkeypatch.setattr(config, "ENABLED_BACKENDS", ("aws",))
+    monkeypatch.setattr(orphan_reaper, "ORPHAN_REAPER_ENABLED", True)
+    monkeypatch.setattr(orphan_reaper, "_last_sweep_at", None)
+
+    class _SweepStart(datetime):
+        # The fake orphans are aged against NOW_EPOCH, not the real clock.
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(NOW_EPOCH, tz)
+
+    monkeypatch.setattr(orphan_reaper, "datetime", _SweepStart)
+    sweep = register_cloud_sweep_backend("aws")
+    sweep.reset_with_old_orphans(1)
+    register_backend_factory("proxmox", lambda: pytest.fail("Proxmox constructed"))
+    _run_one_expiry_pass(app)
+    assert sweep.resources == []
+
+
+@patch("app.proxmox_service.get_proxmox_connection",
+       side_effect=RuntimeError("Proxmox unreachable"))
+def test_proxmox_outage_pass_still_runs_the_cloud_sweep_without_proxmox(
+        _connect, app, monkeypatch):
+    # Catches the pass-start Proxmox outage skip also skipping cloud cleanup,
+    # or handing the reaper a client it could not open.
+    import importlib
+    config = importlib.import_module("app.config")
+    monkeypatch.setattr(config, "ENABLED_BACKENDS", ("proxmox", "aws"))
+    with patch("app.tasks.maybe_reap_orphaned_vms", return_value=[]) as reaper:
+        _run_one_expiry_pass(app)
+    reaper.assert_called_once_with(None)

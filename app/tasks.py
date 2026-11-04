@@ -374,13 +374,15 @@ def check_and_destroy_expired_vms(app):
 
                 # Orphan cleanup runs after expiry and is time-boxed
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
-                # never stand between an expired VM and its destroy. It is
-                # still the Proxmox sweep only, on the pass's connection, so
-                # a cloud-only portal never opens one.
-                if (BACKEND_PROXMOX in enabled_backends()
-                        and BACKEND_PROXMOX not in skipped):
-                    maybe_reap_orphaned_vms(
-                        get_backend(BACKEND_PROXMOX).connect())
+                # never stand between an expired VM and its destroy. It runs
+                # every pass, so a cloud-only portal still sweeps its cloud
+                # leftovers (ruling C6). The Proxmox sweep uses the pass's
+                # connection and is left out when Proxmox is not enabled or
+                # was unreachable at the start of this pass.
+                proxmox = (get_backend(BACKEND_PROXMOX).connect()
+                           if BACKEND_PROXMOX in enabled_backends()
+                           and BACKEND_PROXMOX not in skipped else None)
+                maybe_reap_orphaned_vms(proxmox)
         
         except Exception as e:
             logger.error(f"Error in expiration checker: {str(e)}")
