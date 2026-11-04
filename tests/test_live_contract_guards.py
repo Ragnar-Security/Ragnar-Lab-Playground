@@ -61,7 +61,8 @@ class _Path:
 
 
 class FakeProxmox(_Path):
-    """Just enough of the proxmoxer surface for one clone/start/stop/delete."""
+    """Just enough of the proxmoxer surface for one clone/start/stop/delete,
+    plus the node and guest-agent reads ProxmoxBackend makes."""
 
     def __init__(self, guests=()):
         super().__init__(self, ())
@@ -74,13 +75,20 @@ class FakeProxmox(_Path):
         self.reject_linked = False
         self.before_clone = None
         self.fail_config_put = False
+        # Failure knobs and node state for ProxmoxBackend tests.
+        self.fail_stop = set()
+        self.delete_kwargs = {}
+        self.cluster_error = None
+        self.corrupt_config = set()
+        self.extra_nodes = []
+        self.node_memory = {}
         self._upids = itertools.count(1)
 
     def add_guest(self, vmid, name, node='node1', template=0, status='stopped',
-                  description='', vm_type='qemu'):
+                  description='', vm_type='qemu', ips=()):
         self.guests[int(vmid)] = {
             'vmid': int(vmid), 'name': name, 'node': node, 'type': vm_type,
-            'status': status, 'template': template,
+            'status': status, 'template': template, 'ips': list(ips),
             'config': {'name': name, 'memory': '1024', 'cores': 1,
                        'template': template, 'description': description},
         }
@@ -95,12 +103,35 @@ class FakeProxmox(_Path):
                 if call[0] in ('POST', 'PUT', 'DELETE')
                 and len(call[1]) > 3 and call[1][3] == str(vmid)]
 
+    def _node_read(self, parts):
+        """Answer the node-level GETs, or None when `parts` is not one."""
+        if parts == ('nodes',):
+            names = sorted({g['node'] for g in self.guests.values()}
+                           | set(self.extra_nodes))
+            return [{'node': name, 'status': 'online'} for name in names]
+        if len(parts) == 3 and parts[0] == 'nodes' and parts[2] == 'status':
+            memory = self.node_memory.get(
+                parts[1], {'total': 64 * 1024 ** 3, 'used': 8 * 1024 ** 3})
+            return {'memory': dict(memory), 'cpu': 0.1}
+        if len(parts) == 3 and parts[0] == 'nodes' and parts[2] in ('qemu', 'lxc'):
+            return [{'vmid': g['vmid'], 'name': g['name'],
+                     'status': g['status'], 'template': g['template']}
+                    for g in self.guests.values()
+                    if g['node'] == parts[1] and g['type'] == parts[2]]
+        return None
+
     def handle(self, method, parts, kwargs):
         self.calls.append((method, parts, kwargs))
         if parts == ('cluster', 'resources'):
+            if self.cluster_error is not None:
+                raise self.cluster_error
             return [{k: g[k] for k in ('vmid', 'name', 'node', 'type',
                                        'status', 'template')}
                     for g in self.guests.values()]
+        if method == 'GET':
+            answer = self._node_read(parts)
+            if answer is not None:
+                return answer
         if parts[0] == 'nodes' and parts[2] == 'tasks':
             return dict(self.tasks[parts[3]])
         node, vmid, rest = parts[1], int(parts[3]), parts[4:]
@@ -125,6 +156,10 @@ class FakeProxmox(_Path):
             raise _missing(node, vmid)
         if rest == ('config',):
             if method == 'GET':
+                if vmid in self.corrupt_config:
+                    # The cluster still lists the guest; only its config
+                    # read fails, with the same text as a missing guest.
+                    raise _missing(node, vmid)
                 return dict(guest['config'])
             if self.fail_config_put:
                 raise ResourceException(400, 'Parameter verification failed',
@@ -135,11 +170,26 @@ class FakeProxmox(_Path):
             guest['status'] = 'running'
             return self._task()
         if rest == ('status', 'stop'):
+            if vmid in self.fail_stop:
+                raise ResourceException(500, 'Internal Server Error',
+                                        'VM is locked')
             guest['status'] = 'stopped'
             return self._task()
         if rest == ('status', 'current'):
             return {'status': guest['status'], 'vmid': vmid}
+        if rest == ('agent', 'network-get-interfaces') and method == 'GET':
+            if not guest['ips']:
+                raise ResourceException(500, 'Internal Server Error',
+                                        'QEMU guest agent is not running')
+            return {'result': [
+                {'name': 'lo', 'ip-addresses': [
+                    {'ip-address': '127.0.0.1', 'ip-address-type': 'ipv4'}]},
+                {'name': 'eth0', 'ip-addresses': [
+                    {'ip-address': ip, 'ip-address-type': 'ipv4'}
+                    for ip in guest['ips']]},
+            ]}
         if method == 'DELETE' and rest == ():
+            self.delete_kwargs[vmid] = dict(kwargs)
             if vmid in self.fail_delete:
                 raise ResourceException(500, 'Internal Server Error',
                                         'storage is locked')

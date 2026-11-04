@@ -407,6 +407,11 @@ def get_cluster_vm_index(proxmox: ProxmoxAPI, *,
             'type': row.get('type'),
             'status': row.get('status'),
         }
+        # ProxmoxBackend.list_managed must tell templates from guests without
+        # a per-guest config read. Only when the row reports it, so an entry
+        # for a row without the field keeps exactly its previous shape.
+        if 'template' in row:
+            index[vmid]['template'] = row['template']
     with _vm_index_lock:
         _vm_index_cache = index
         _vm_index_fetched_at = time.monotonic()
