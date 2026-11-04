@@ -5,11 +5,15 @@ its attribute names are part of the plan's contract (ruling I5): tests read
 what the fake now holds, never a list of mock calls.
 """
 
+import importlib
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Callable, Dict, List, Mapping, Optional, Set
+from typing import Callable, Dict, Iterator, List, Mapping, Optional, Set
+from unittest.mock import patch
 
+from app.backends import register_backend_factory, reset_backends_for_tests
 from app.backends.base import (
     GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, BackendError,
     DestroyPolicy, DestroyRefused, LaunchedVM, ManagedResource,
@@ -244,3 +248,23 @@ def make_memory_backend_case(app, name: str = 'aws') -> BackendContractCase:
     return BackendContractCase(backend=backend, spec=spec,
                                expected_ips=[MEMORY_IP],
                                expected_status='running', cleanup=cleanup)
+
+
+@contextmanager
+def registered_fake_backend(name: str) -> Iterator[FakeBackend]:
+    """Enable `name` alongside the configured backends, served by a fresh fake.
+
+    The registry is reset on exit, so a test can never hand its fake (and its
+    state) to the next test through the process-wide instance cache.
+    """
+    config = importlib.import_module('app.config')
+    enabled = tuple(config.ENABLED_BACKENDS)
+    if name not in enabled:
+        enabled += (name,)
+    backend = FakeBackend(name)
+    with patch.object(config, 'ENABLED_BACKENDS', enabled):
+        register_backend_factory(name, lambda: backend)
+        try:
+            yield backend
+        finally:
+            reset_backends_for_tests()

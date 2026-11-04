@@ -59,6 +59,10 @@ class _Path:
     def delete(self, **kwargs):
         return self._api.handle('DELETE', self._parts, kwargs)
 
+    def create(self, **kwargs):
+        # proxmoxer's alias for POST, which create_lxc_container uses.
+        return self._api.handle('POST', self._parts, kwargs)
+
 
 class FakeProxmox(_Path):
     """Just enough of the proxmoxer surface for one clone/start/stop/delete,
@@ -112,7 +116,9 @@ class FakeProxmox(_Path):
         if len(parts) == 3 and parts[0] == 'nodes' and parts[2] == 'status':
             memory = self.node_memory.get(
                 parts[1], {'total': 64 * 1024 ** 3, 'used': 8 * 1024 ** 3})
-            return {'memory': dict(memory), 'cpu': 0.1}
+            # Admission skips a node without uptime as offline.
+            return {'memory': dict(memory), 'cpu': 0.1, 'uptime': 1000,
+                    'cpuinfo': {'cpus': 8}}
         if len(parts) == 3 and parts[0] == 'nodes' and parts[2] in ('qemu', 'lxc'):
             return [{'vmid': g['vmid'], 'name': g['name'],
                      'status': g['status'], 'template': g['template']}
@@ -134,6 +140,14 @@ class FakeProxmox(_Path):
                 return answer
         if parts[0] == 'nodes' and parts[2] == 'tasks':
             return dict(self.tasks[parts[3]])
+        if method == 'POST' and parts[0] == 'nodes' and parts[2:] == ('lxc',):
+            vmid = int(kwargs['vmid'])
+            if vmid in self.guests:
+                raise ResourceException(500, 'Internal Server Error',
+                                        f'CT {vmid} already exists')
+            self.add_guest(vmid, kwargs['hostname'], node=parts[1], vm_type='lxc')
+            self.guests[vmid]['config'].update(kwargs)
+            return self._task()
         node, vmid, rest = parts[1], int(parts[3]), parts[4:]
         guest = self.guests.get(vmid)
         if method == 'POST' and rest == ('clone',):

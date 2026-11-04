@@ -313,12 +313,12 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
             proxmox, count=1, reservation_id=vmid_reservation_id)
         with patch('app.proxmox_service.ProxmoxAPI', return_value=proxmox), \
              patch(
-                 'app.routes.vm_creation.renew_node_reservation',
+                 'app.proxmox_service.renew_node_reservation',
                  create=True,
                  side_effect=renew_node_reservation,
              ) as renew, \
              patch(
-                 'app.routes.vm_creation.renew_vmid_reservation',
+                 'app.proxmox_service.renew_vmid_reservation',
                  side_effect=renew_vmid_reservation,
              ) as renew_vmid:
             result = create_single_vm_task(
@@ -361,7 +361,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
 
         with patch('app.proxmox_service.ProxmoxAPI', return_value=proxmox), \
              patch(
-                 'app.routes.vm_creation.renew_node_reservation',
+                 'app.proxmox_service.renew_node_reservation',
                  return_value=False,
              ):
             result = create_single_vm_task(
@@ -421,7 +421,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
         worker = threading.Thread(
             target=self._deploy_in_thread, args=(proxmox, outcome))
         with patch(
-            'app.routes.vm_creation.release_node_reservation',
+            'app.proxmox_service.release_node_reservation',
             side_effect=checked_release,
         ):
             worker.start()
@@ -547,7 +547,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
                  'app.routes.vm_creation._cleanup_with_sweep',
                  return_value=set(),
              ), patch(
-                 'app.routes.vm_creation.release_node_reservation',
+                 'app.proxmox_service.release_node_reservation',
                  side_effect=checked_release,
              ):
             with self.assertRaises(DeployFailed):
@@ -634,7 +634,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
                  'app.routes.vm_creation._cleanup_with_sweep',
                  side_effect=RuntimeError('cleanup connection failed'),
              ), patch(
-                 'app.routes.vm_creation.release_node_reservation',
+                 'app.proxmox_service.release_node_reservation',
                  side_effect=checked_release,
              ):
             with self.assertRaises(DeployFailed):

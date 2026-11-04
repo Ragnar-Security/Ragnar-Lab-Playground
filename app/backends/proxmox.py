@@ -1,7 +1,8 @@
-"""Proxmox VE behind the VMBackend contract: the read and destroy half.
+"""Proxmox VE behind the VMBackend contract.
 
-An adapter, not a rewrite. Identity, absence, inventory and task waits are
-the incident-hardened functions in app.proxmox_service, and the display
+An adapter, not a rewrite. Admission, identity, absence, inventory and task
+waits are the incident-hardened functions in app.proxmox_service, the clone
+and NIC helpers are the ones in app.routes.vm_creation, and the display
 probes are the ones in app.routes.utils; this module only sequences them.
 Every call goes through the module attribute so the existing patch points
 (app.proxmox_service.ProxmoxAPI, .wait_for_proxmox_task, ...) still govern.
@@ -11,12 +12,13 @@ Callers hold vm_lifecycle_lock(vmid) around every mutation, as they do today.
 
 import logging
 from datetime import datetime
-from typing import List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from app import proxmox_service
 from app.backends.base import (
-    BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, BackendError,
-    DestroyPolicy, DestroyRefused, ManagedResource, VMRef,
+    BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH,
+    AdmissionRefused, BackendError, DestroyPolicy, DestroyRefused, LaunchedVM,
+    ManagedResource, VMRef, VMSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,7 +52,7 @@ def _is_template(entry) -> bool:
 
 
 class ProxmoxBackend:
-    """VMBackend for Proxmox VE. admit/create arrive in T7."""
+    """VMBackend for Proxmox VE."""
 
     def __init__(self, name: str = BACKEND_PROXMOX, client=None):
         self.name = name
@@ -74,13 +76,156 @@ class ProxmoxBackend:
         proxmox_service.reset_cluster_vm_index()
         _route_utils().invalidate_vm_ip_cache(ref.location, ref.vmid)
 
-    # Admission (create side arrives in T7)
+    # Admission and create
+
+    def admit(self, spec: VMSpec, *, reservation_id: str,
+              load_balancing_config: Optional[Mapping]) -> str:
+        locations = spec.template.get('template_locations') or {}
+        node = proxmox_service.select_best_node(
+            self.client,
+            required_memory_mb=spec.memory_mb,
+            required_cores=spec.cores,
+            load_balancing_config=load_balancing_config,
+            available_nodes=list(locations) if locations else None,
+            reservation_id=reservation_id,
+        )
+        if not node:
+            raise AdmissionRefused('No suitable nodes available')
+        return node
 
     def renew_admission(self, reservation_id: str) -> bool:
         return proxmox_service.renew_node_reservation(reservation_id)
 
     def release_admission(self, reservation_id: Optional[str]) -> bool:
         return proxmox_service.release_node_reservation(reservation_id)
+
+    @staticmethod
+    def _renew_leases(heartbeat: Callable[[], None], spec: VMSpec,
+                      when: str) -> None:
+        """Renew admission, then the bundle's VMID lease; raise if either lapsed.
+
+        Queued work waits behind the per-node clone limit: without renewals a
+        busy classroom outlives the leak-safety TTL and becomes invisible to
+        admission control and the allocator.
+        """
+        try:
+            heartbeat()
+        except RuntimeError as error:
+            raise RuntimeError(f'{error} {when}') from error
+        if (spec.deployment_id
+                and not proxmox_service.renew_vmid_reservation(spec.deployment_id)):
+            raise RuntimeError(f'VMID reservation expired {when}')
+
+    def create(self, spec: VMSpec, location: str, *,
+               heartbeat: Callable[[], None],
+               clone_semaphores: Optional[Mapping] = None,
+               on_claim: Optional[Callable[[Optional[int], Optional[str]], None]] = None
+               ) -> LaunchedVM:
+        """Clone or create the guest on `location`, configure it and start it.
+
+        `clone_semaphores` maps node -> the shared per-node ZFS clone limit;
+        a node without one clones unlimited, as it always has. `on_claim`
+        hears (vmid, node) before each attempt that may leave a guest of ours
+        behind, and (None, None) when Proxmox refused because the VMID was
+        already someone else's, so failed-deploy cleanup targets only guests
+        this create can own.
+        """
+        # Lazy: app.routes.vm_creation imports the provisioning layer, which
+        # imports this module.
+        from app.routes import vm_creation
+        claim = on_claim or (lambda vmid, node: None)
+        config = dict(spec.template)
+        node = location
+        vmid = spec.vmid
+        entry_vlan = spec.entry_slot if spec.is_entry_point else None
+        internal_vlan = spec.internal_slot
+        source_vmid = config['template_locations'].get(node) or config['source_vmid']
+
+        if config['storage_locations'] and node in config['storage_locations']:
+            config['storage_device'] = config['storage_locations'][node]
+            logger.info(f"Using node-specific storage '{config['storage_device']}' for {node}")
+
+        def create_guest(create, target_vmid):
+            claim(target_vmid, node)
+            try:
+                return create(target_vmid)
+            except Exception as error:
+                if 'already exists' in str(error).lower():
+                    claim(None, None)
+                raise
+
+        def clone(target_vmid):
+            return vm_creation.create_qemu_vm(
+                self.client, node, node, target_vmid, spec.vm_name, source_vmid,
+                config, spec.expires_at, internal_vlan, entry_vlan)
+
+        def clone_with_collision_retry():
+            nonlocal vmid
+            try:
+                return create_guest(clone, vmid)
+            except Exception as error:
+                if 'already exists' not in str(error).lower() or not spec.deployment_id:
+                    raise
+                vmid = proxmox_service.get_next_available_vmid(
+                    self.client, reservation_id=spec.deployment_id)
+                logger.warning(
+                    "Clone VMID collision; retrying once with freshly "
+                    "reserved VMID %s", vmid)
+                return create_guest(clone, vmid)
+
+        if config['type'] == 'lxc':
+            self._renew_leases(heartbeat, spec, 'before create')
+            create_guest(
+                lambda target_vmid: vm_creation.create_lxc_container(
+                    self.client, node, target_vmid, spec.vm_name, config,
+                    spec.expires_at, internal_vlan, entry_vlan),
+                vmid)
+        elif config['type'] == 'qemu':
+            if not source_vmid:
+                raise Exception('QEMU template requires source_vmid')
+            semaphore = (clone_semaphores or {}).get(node)
+            if semaphore:
+                acquired = False
+                while not acquired:
+                    acquired = semaphore.acquire(
+                        timeout=vm_creation.RESERVATION_HEARTBEAT_SECONDS)
+                    try:
+                        self._renew_leases(
+                            heartbeat, spec, 'while waiting for clone capacity')
+                    except Exception:
+                        if acquired:
+                            semaphore.release()
+                        raise
+                try:
+                    logger.info(
+                        f"[VM {vmid}] Acquired clone semaphore for node {node}")
+                    node = clone_with_collision_retry()
+                finally:
+                    semaphore.release()
+                    logger.info(
+                        f"[VM {vmid}] Released clone semaphore for node {node}")
+            else:
+                self._renew_leases(heartbeat, spec, 'before clone')
+                logger.warning(
+                    f"[VM {vmid}] No semaphore found for node {node}; "
+                    "proceeding without clone limit")
+                node = clone_with_collision_retry()
+        else:
+            raise Exception(f'Unsupported VM type: {config["type"]}')
+
+        try:
+            heartbeat()
+        except RuntimeError as error:
+            raise RuntimeError(f'{error} before VM start') from error
+        # Once the clone exists, Proxmox inventory itself protects the VMID.
+        # Renewal here is best effort; treating a just-expired lease as clone
+        # failure would destroy a successfully-created guest.
+        if spec.deployment_id:
+            proxmox_service.renew_vmid_reservation(spec.deployment_id)
+        vm_creation.start_vm(self.client, node, vmid, config['type'])
+        logger.info(f"VM {vmid} ({spec.vm_name}) created and started on {node}")
+        return LaunchedVM(vmid=vmid, vm_type=config['type'], location=node,
+                          network_slot=spec.network_slot)
 
     # Identity and destroy
 

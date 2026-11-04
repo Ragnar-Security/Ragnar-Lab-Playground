@@ -14,7 +14,15 @@ from app.backends.base import (
     BACKEND_PROXMOX, KNOWN_BACKENDS, BackendNotEnabled, VMBackend,
 )
 
-_DEFAULT_FACTORIES: Dict[str, Callable[[], VMBackend]] = {}
+
+def _proxmox_factory() -> VMBackend:
+    from app.backends.proxmox import ProxmoxBackend
+    return ProxmoxBackend()
+
+
+_DEFAULT_FACTORIES: Dict[str, Callable[[], VMBackend]] = {
+    BACKEND_PROXMOX: _proxmox_factory,
+}
 
 _backend_factories: Dict[str, Callable[[], VMBackend]] = dict(_DEFAULT_FACTORIES)
 _backend_instances: Dict[str, VMBackend] = {}

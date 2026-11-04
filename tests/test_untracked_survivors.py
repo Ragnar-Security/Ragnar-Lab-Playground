@@ -99,7 +99,7 @@ def _deploy_with_database_down(app):
                    side_effect=_create_result), \
              patch('app.routes.vm_creation._cleanup_with_sweep',
                    return_value=set()), \
-             patch('app.routes.vm_creation.release_node_reservation',
+             patch('app.proxmox_service.release_node_reservation',
                    side_effect=lambda rid: released.append(rid) or True), \
              patch.object(db.session, 'commit', side_effect=outage):
             with pytest.raises(Exception):

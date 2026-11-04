@@ -357,14 +357,18 @@ class TestAPIRoutes(unittest.TestCase):
         new=lambda reservation_id: True,
     )
     @patch(
-        'app.routes.vm_creation.renew_node_reservation',
+        'app.proxmox_service.renew_vmid_reservation',
+        new=lambda reservation_id: True,
+    )
+    @patch(
+        'app.proxmox_service.renew_node_reservation',
         new=lambda reservation_id: True,
     )
     @patch('app.routes.vm_creation.find_vms_by_name_prefix')
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     def test_create_vm_success(self, mock_select_node, mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
         """Test successful VM creation with pre-allocated VMIDs"""
         # Setup mocks

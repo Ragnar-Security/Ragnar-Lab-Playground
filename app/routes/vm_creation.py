@@ -20,9 +20,6 @@ from ..models import db, VMRecord
 from ..proxmox_service import (
     get_proxmox_connection,
     get_next_available_vmid,
-    select_best_node,
-    release_node_reservation,
-    renew_node_reservation,
     release_vmid_reservation,
     renew_vmid_reservation,
     wait_for_proxmox_task,
@@ -34,7 +31,11 @@ from ..proxmox_service import (
     VM_GUEST_ABSENT,
     VM_GUEST_MATCH,
 )
+from .. import vm_provisioning
 from ..auth import login_required, get_authenticated_user
+from ..backends import enabled_backends, get_backend
+from ..backends.base import BACKEND_PROXMOX, VMSpec
+from ..backends.template_spec import backend_block
 from ..utils import sanitize_name
 from ..template_manager import load_template_config, get_deployment_group_by_name, get_group_mode
 from ..models import StudentGroup, StudentGroupMember
@@ -556,20 +557,39 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
                           load_balancing_config, user_entry_vlan, user_internal_vlan,
                           expiration_time, node_semaphores, owner_group_id=None,
                           koth_game_id=None, flask_app=None,
-                          vmid_reservation_id=None):
-    """Create one VM while holding its admission reservation.
+                          vmid_reservation_id=None, backend_name=BACKEND_PROXMOX):
+    """Create one VM on `backend_name` while holding its admission reservation.
 
     The caller owns a successful task's reservation and releases it only
     after the corresponding VMRecord commit. Failed task reservations are
     returned too, so bundle cleanup can finish before capacity is reusable.
+    `node_semaphores` are Proxmox's per-node clone limits (None for a cloud
+    bundle). Every result names its backend, admission reservation and
+    deployment so finalization can release and clean up through it.
     """
     config = {}
-    target_node = None
+    spec = None
     vm_name = None
-    claimed_vmid = None
+    # (vmid, node) of a Proxmox guest this task may have created.
+    claimed = None
     reservation_id = uuid4().hex
+    identity = {
+        '_backend': backend_name,
+        '_reservation_id': reservation_id,
+        '_vmid_reservation_id': vmid_reservation_id,
+        'deployment_id': vmid_reservation_id,
+    }
     try:
-        config = extract_template_config(template_config)
+        block = backend_block(template_config, backend_name)
+        if backend_name == BACKEND_PROXMOX:
+            config = extract_template_config(block)
+            template = config
+        else:
+            # Name, entry point and the recorded sizes are catalog-level; the
+            # provider's machine spec is the backend's own block.
+            config = dict(extract_template_config(template_config),
+                          storage=block['disk_gb'])
+            template = block
         if koth_game_id is not None:
             vm_name = build_koth_vm_name(koth_game_id, config['name'])
         elif owner_group_id is not None:
@@ -577,171 +597,62 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
         else:
             vm_name = build_vm_name(student_name, config['name'])
 
-        # Get Proxmox connection
-        proxmox = get_proxmox_connection()
-
-        available_nodes = (
-            list(config['template_locations'].keys())
-            if config['template_locations'] else None)
-
-        # ThreadPoolExecutor workers do not inherit Flask's app context.
-        # Supplying it here gives each selection a fresh scoped DB session,
-        # so a just-committed VMRecord is visible before its reservation is
-        # released.
         if flask_app is None:
             raise RuntimeError(
                 'VM creation requires an app context for admission control')
+        backend = get_backend(backend_name)
+        spec = VMSpec(
+            vmid=assigned_vmid, vm_name=vm_name, display_name=config['name'],
+            backend=backend_name, template=template,
+            memory_mb=config['memory'], cores=config['cores'],
+            storage_gb=config['storage'],
+            is_entry_point=config['is_entry_point'],
+            entry_slot=user_entry_vlan if config['is_entry_point'] else None,
+            internal_slot=user_internal_vlan,
+            expires_at=expiration_time,
+            deployment_id=vmid_reservation_id,
+            owner=student_name,
+        )
+
+        def heartbeat():
+            if not backend.renew_admission(reservation_id):
+                raise RuntimeError('Admission reservation expired')
+
+        create_options = None
+        if backend_name == BACKEND_PROXMOX:
+            def on_claim(vmid, node):
+                nonlocal claimed
+                claimed = None if vmid is None else (vmid, node)
+
+            create_options = {'clone_semaphores': node_semaphores,
+                              'on_claim': on_claim}
+
+        # ThreadPoolExecutor workers do not inherit Flask's app context.
+        # Supplying it here gives each admission a fresh scoped DB session,
+        # so a just-committed VMRecord is visible before its reservation is
+        # released; the collision retry's allocation and distributed router
+        # and slot locks need it too.
         with flask_app.app_context():
-            target_node = select_best_node(
-                proxmox,
-                required_memory_mb=config['memory'],
-                required_cores=config['cores'],
+            _location, launched = vm_provisioning.create_vm(
+                spec, reservation_id=reservation_id,
                 load_balancing_config=load_balancing_config,
-                available_nodes=available_nodes,
-                reservation_id=reservation_id,
-            )
-
-        if not target_node:
-            raise Exception('No suitable nodes available')
-
-        # Get source VMID for cloning
-        source_vmid = config['template_locations'].get(target_node) or config['source_vmid']
-        source_node = target_node
-
-        # Determine VLAN tags
-        internal_vlan = user_internal_vlan
-        entry_vlan = user_entry_vlan if config['is_entry_point'] else None
-
-        # Resolve storage device for the target node
-        if config['storage_locations'] and target_node in config['storage_locations']:
-            config['storage_device'] = config['storage_locations'][target_node]
-            logger.info(f"Using node-specific storage '{config['storage_device']}' for {target_node}")
-
-        def create_qemu_for_assigned_vmid():
-            nonlocal claimed_vmid
-            claimed_vmid = assigned_vmid
-            try:
-                return create_qemu_vm(
-                    proxmox, target_node, source_node, assigned_vmid,
-                    vm_name, source_vmid, config, expiration_time,
-                    internal_vlan, entry_vlan)
-            except Exception as create_error:
-                if 'already exists' in str(create_error).lower():
-                    claimed_vmid = None
-                raise
-
-        def clone_qemu_with_collision_retry():
-            nonlocal assigned_vmid
-            try:
-                return create_qemu_for_assigned_vmid()
-            except Exception as clone_error:
-                if ('already exists' not in str(clone_error).lower()
-                        or not vmid_reservation_id):
-                    raise
-                with flask_app.app_context():
-                    assigned_vmid = get_next_available_vmid(
-                        proxmox,
-                        reservation_id=vmid_reservation_id,
-                    )
-                logger.warning(
-                    "Clone VMID collision; retrying once with freshly "
-                    "reserved VMID %s", assigned_vmid)
-                return create_qemu_for_assigned_vmid()
-
-        # Keep queued work alive while it waits behind the per-node clone
-        # limit. Without heartbeats, a busy classroom can wait longer than
-        # the leak-safety TTL and become invisible to admission control.
-        if config['type'] == 'lxc':
-            if not renew_node_reservation(reservation_id):
-                raise RuntimeError('Admission reservation expired before create')
-            if (vmid_reservation_id
-                    and not renew_vmid_reservation(vmid_reservation_id)):
-                raise RuntimeError('VMID reservation expired before create')
-            claimed_vmid = assigned_vmid
-            try:
-                create_lxc_container(
-                    proxmox, target_node, assigned_vmid, vm_name, config,
-                    expiration_time, internal_vlan, entry_vlan)
-            except Exception as create_error:
-                if 'already exists' in str(create_error).lower():
-                    claimed_vmid = None
-                raise
-        elif config['type'] == 'qemu':
-            if not source_vmid:
-                raise Exception('QEMU template requires source_vmid')
-
-            node_semaphore = node_semaphores.get(target_node)
-            if node_semaphore:
-                acquired = False
-                while not acquired:
-                    acquired = node_semaphore.acquire(
-                        timeout=RESERVATION_HEARTBEAT_SECONDS)
-                    if not renew_node_reservation(reservation_id):
-                        if acquired:
-                            node_semaphore.release()
-                        raise RuntimeError(
-                            'Admission reservation expired while waiting '
-                            'for clone capacity')
-                    if (vmid_reservation_id
-                            and not renew_vmid_reservation(
-                                vmid_reservation_id)):
-                        if acquired:
-                            node_semaphore.release()
-                        raise RuntimeError(
-                            'VMID reservation expired while waiting '
-                            'for clone capacity')
-                try:
-                    logger.info(
-                        f"[VM {assigned_vmid}] Acquired clone semaphore "
-                        f"for node {target_node}")
-                    target_node = clone_qemu_with_collision_retry()
-                finally:
-                    node_semaphore.release()
-                    logger.info(
-                        f"[VM {assigned_vmid}] Released clone semaphore "
-                        f"for node {target_node}")
-            else:
-                if not renew_node_reservation(reservation_id):
-                    raise RuntimeError(
-                        'Admission reservation expired before clone')
-                if (vmid_reservation_id
-                        and not renew_vmid_reservation(
-                            vmid_reservation_id)):
-                    raise RuntimeError(
-                        'VMID reservation expired before clone')
-                logger.warning(
-                    f"[VM {assigned_vmid}] No semaphore found for node "
-                    f"{target_node}; proceeding without clone limit")
-                target_node = clone_qemu_with_collision_retry()
-        else:
-            raise Exception(f'Unsupported VM type: {config["type"]}')
-
-        if not renew_node_reservation(reservation_id):
-            raise RuntimeError('Admission reservation expired before VM start')
-        # Once the clone exists, Proxmox inventory itself protects the VMID.
-        # Renewal here is best effort; treating a just-expired lease as clone
-        # failure would destroy a successfully-created guest.
-        if vmid_reservation_id:
-            renew_vmid_reservation(vmid_reservation_id)
-        start_vm(proxmox, target_node, assigned_vmid, config['type'])
-        logger.info(
-            f"VM {assigned_vmid} ({vm_name}) created and started on "
-            f"{target_node}")
+                heartbeat=heartbeat, create_options=create_options)
 
         return {
             'success': True,
             'vm_index': vm_index,
-            'vmid': assigned_vmid,
+            'vmid': launched.vmid,
             'vm_name': vm_name,
             'vm_display_name': config['name'],
-            'vm_type': config['type'],
-            'node': target_node,
+            'vm_type': launched.vm_type,
+            'node': launched.location,
             'memory': config['memory'],
             'cores': config['cores'],
             'storage': config['storage'],
             'is_entry_point': config['is_entry_point'],
-            '_reservation_id': reservation_id,
-            '_vmid_reservation_id': vmid_reservation_id,
+            'provider_id': launched.provider_id,
+            'network_slot': launched.network_slot,
+            **identity,
         }
     except Exception as e:
         logger.error(f"Error creating VM {config.get('name', vm_index)}: {e}")
@@ -750,16 +661,18 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
             'error': str(e),
             'template_name': config.get('name', f'vm{vm_index}'),
             'vm_index': vm_index,
-            '_reservation_id': reservation_id,
-            '_vmid_reservation_id': vmid_reservation_id,
+            'provider_id': None,
+            'network_slot': spec.network_slot if spec is not None else None,
+            **identity,
         }
-        if claimed_vmid is not None and target_node and config and vm_name:
+        if claimed is not None and config and vm_name:
+            claimed_vmid, claimed_node = claimed
             result.update({
                 'vmid': claimed_vmid,
                 'vm_name': vm_name,
                 'vm_display_name': config['name'],
                 'vm_type': config['type'],
-                'node': target_node,
+                'node': claimed_node,
                 'memory': config['memory'],
                 'cores': config['cores'],
                 'storage': config['storage'],
@@ -768,27 +681,34 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
         return result
 
 
+def _admission_backend(result):
+    # Results without a backend (test doubles of create_single_vm_task)
+    # are Proxmox admissions, as every result was before backends existed.
+    return get_backend(result.get('_backend') or BACKEND_PROXMOX)
+
+
 def _release_vm_reservations(vm_results) -> None:
     for result in vm_results:
-        release_node_reservation(result.get('_reservation_id'))
+        _admission_backend(result).release_admission(
+            result.get('_reservation_id'))
 
 
 @contextmanager
 def _heartbeat_deployment_reservations(vm_results, vmid_reservation_id):
     """Renew create leases until cleanup and survivor tracking finish."""
-    reservation_ids = {
-        result.get('_reservation_id')
+    reservations = [
+        (_admission_backend(result), result['_reservation_id'])
         for result in vm_results
         if result.get('_reservation_id')
-    }
+    ]
     stopped = threading.Event()
 
     def heartbeat():
         while not stopped.is_set():
             if vmid_reservation_id:
                 renew_vmid_reservation(vmid_reservation_id)
-            for reservation_id in reservation_ids:
-                renew_node_reservation(reservation_id)
+            for backend, reservation_id in reservations:
+                backend.renew_admission(reservation_id)
             stopped.wait(RESERVATION_HEARTBEAT_SECONDS)
 
     worker = threading.Thread(
@@ -944,7 +864,8 @@ def _collect_vm_results(
         for result in created_vms + failed_vms:
             reservation_id = result.get('_reservation_id')
             if (reservation_id
-                    and not renew_node_reservation(reservation_id)):
+                    and not _admission_backend(result).renew_admission(
+                        reservation_id)):
                 logger.error(
                     "Admission reservation %s expired before bundle "
                     "finalization", reservation_id)
@@ -962,10 +883,10 @@ class DeployFailed(Exception):
 def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                   entry_vlan, internal_vlan, uptime_minutes, user_id,
                   load_balancing_config=None, owner_group_id=None,
-                  koth_game_id=None):
-    """Parallel-clone a bundle of templates and persist VMRecord rows.
+                  koth_game_id=None, backend_name=BACKEND_PROXMOX):
+    """Parallel-create a bundle of templates and persist VMRecord rows.
 
-    This is the same orchestration the /create handler uses (load balancer,
+    This is the same orchestration the /create handler uses (admission,
     per-node ZFS clone semaphores, ThreadPoolExecutor across templates,
     cleanup on partial failure). KOTH calls this so its VMs go through the
     exact same code path as a regular group-mode lab.
@@ -973,11 +894,13 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
     Parameters:
         deployment_group_name: stored in VMRecord.template_name as
             "<deployment_group_name>/<template_display_name>".
-        templates: list of template dicts from templates.yaml.
+        templates: catalog machine entries from templates.yaml; each is
+            resolved to `backend_name`'s block.
         owning_identifier: stored in VMRecord.student_name. For student
             deploys, this is the student login_id; for group deploys, the
             group slug; for KOTH, the game id stringified or 'koth'.
-        entry_vlan / internal_vlan: per-deployment VLAN tags.
+        entry_vlan / internal_vlan: per-deployment VLAN tags (a cloud
+            backend's network slots).
         uptime_minutes: initial expiration window.
         user_id: created_by_user_id on the VMRecord (the admin/student
             who clicked deploy).
@@ -986,13 +909,20 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
             path in create_single_vm_task and the FK on VMRecord).
         koth_game_id: set for KOTH deploys. Mutually exclusive with
             owner_group_id from a naming standpoint (koth wins).
+        backend_name: the backend every machine of the bundle runs on.
 
     Returns: list[VMRecord] in the same order the templates were submitted
     (insertion order preserved by collecting via a dict, not as_completed).
 
     Raises: DeployFailed on any template clone failure (already cleaned up).
     """
-    proxmox = get_proxmox_connection()
+    get_backend(backend_name)  # refuse a disabled backend before reserving
+    # Whenever Proxmox is enabled the allocator must see its inventory, even
+    # for a cloud bundle: VMIDs are one namespace, and a manually created
+    # Proxmox guest must not share one with a cloud VM. A cloud-only portal
+    # has no cluster to read.
+    proxmox = (get_backend(BACKEND_PROXMOX).client
+               if BACKEND_PROXMOX in enabled_backends() else None)
     flask_app = current_app._get_current_object()
     vmid_reservation_id = uuid4().hex
     base_vmid = get_next_available_vmid(
@@ -1007,15 +937,18 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
             for idx, template in enumerate(templates)
         ]
         logger.info(
-            f"deploy_bundle: {deployment_group_name} ({len(templates)} VMs), "
+            f"deploy_bundle: {deployment_group_name} ({len(templates)} VMs) "
+            f"on {backend_name}, "
             f"vmids {base_vmid}-{base_vmid + len(templates) - 1}, "
             f"owning={owning_identifier!r} group={owner_group_id} "
             f"koth={koth_game_id}"
         )
 
-        all_nodes = proxmox.nodes.get()
-        node_semaphores = get_node_clone_semaphores(
-            n['node'] for n in all_nodes)
+        node_semaphores = None
+        if backend_name == BACKEND_PROXMOX:
+            all_nodes = proxmox.nodes.get()
+            node_semaphores = get_node_clone_semaphores(
+                n['node'] for n in all_nodes)
 
         initial_expiration = (
             datetime.now() + timedelta(minutes=uptime_minutes))
@@ -1035,7 +968,7 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                         entry_vlan, internal_vlan,
                         initial_expiration, node_semaphores,
                         owner_group_id, koth_game_id, flask_app,
-                        vmid_reservation_id,
+                        vmid_reservation_id, backend_name,
                     )
                 except Exception as submit_error:
                     logger.exception(
@@ -1046,8 +979,12 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                         'template_name': template.get(
                             'name', f'vm{idx}'),
                         'vm_index': idx,
+                        '_backend': backend_name,
                         '_reservation_id': None,
                         '_vmid_reservation_id': vmid_reservation_id,
+                        'deployment_id': vmid_reservation_id,
+                        'provider_id': None,
+                        'network_slot': None,
                     })
                     break
                 futures[future] = (idx, template, vmid)
@@ -1129,7 +1066,11 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
 
 def log_vm_to_database(vm_info, deployment_group_name, student_name, expiration_time, user_id,
                        owner_group_id=None, koth_game_id=None):
-    """Stage one VMRecord; the bundle orchestrator owns the transaction."""
+    """Stage one VMRecord; the bundle orchestrator owns the transaction.
+
+    The backend identity is what lets every later lifecycle path find and
+    destroy the guest after a restart.
+    """
     vm_record = VMRecord(
         vmid=vm_info['vmid'],
         vm_name=vm_info['vm_name'],
@@ -1147,6 +1088,10 @@ def log_vm_to_database(vm_info, deployment_group_name, student_name, expiration_
         is_entry_point=vm_info.get('is_entry_point', False),
         owner_group_id=owner_group_id,
         koth_game_id=koth_game_id,
+        backend=vm_info.get('_backend') or BACKEND_PROXMOX,
+        provider_id=vm_info.get('provider_id'),
+        deployment_id=vm_info.get('deployment_id'),
+        network_slot=vm_info.get('network_slot'),
     )
     db.session.add(vm_record)
     return vm_record

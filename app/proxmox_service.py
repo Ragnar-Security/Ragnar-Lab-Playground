@@ -597,7 +597,7 @@ def get_vm_details(proxmox, vmid, node):
 
 
 def get_next_available_vmid(
-        proxmox: ProxmoxAPI, *,
+        proxmox: Optional[ProxmoxAPI] = None, *,
         count: int = 1,
         reservation_id: str) -> int:
     """Reserve and return the first VMID in a contiguous free block.
@@ -607,6 +607,10 @@ def get_next_available_vmid(
     receive overlapping blocks. The mark, not the inventory snapshot,
     serializes the app's own allocations; the Proxmox read therefore runs
     before the lock and never holds it across a network call.
+
+    ``proxmox`` is None on a portal without Proxmox: there is no cluster
+    inventory to avoid, and the mark, every VMRecord and the live
+    reservations still bound the block.
 
     ``reservation_id`` may be reused to extend a deployment's reservation
     when a defensive duplicate-VMID retry needs a fresh ID. Callers release
@@ -618,7 +622,8 @@ def get_next_available_vmid(
         raise ValueError('VMID reservation identifier is required')
 
     inventory_max = 0
-    for row in proxmox.cluster.resources.get(type='vm') or []:
+    rows = proxmox.cluster.resources.get(type='vm') if proxmox is not None else []
+    for row in rows or []:
         try:
             inventory_max = max(inventory_max, int(row['vmid']))
         except (KeyError, TypeError, ValueError):
