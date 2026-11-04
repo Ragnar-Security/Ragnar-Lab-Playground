@@ -1,0 +1,246 @@
+"""Stateful in-memory VMBackend and the shared contract-case harness.
+
+Later tasks (T7, T8, T16, T19) assert against FakeBackend's public state, so
+its attribute names are part of the plan's contract (ruling I5): tests read
+what the fake now holds, never a list of mock calls.
+"""
+
+import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Callable, Dict, List, Mapping, Optional, Set
+
+from app.backends.base import (
+    GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, BackendError,
+    DestroyPolicy, DestroyRefused, LaunchedVM, ManagedResource,
+    SlotNetworkMissing, VMBackend, VMRef, VMSpec,
+)
+
+MEMORY_LOCATION = 'memory-zone'
+MEMORY_IP = '192.0.2.10'
+
+
+class FakeBackend:
+    """A cloud-shaped backend whose whole provider state is these fields."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.instances: Dict[int, LaunchedVM] = {}
+        self.reservations: Set[str] = set()
+        self.deployment_networks: Set[str] = set()
+        self.slot_networks: Set[int] = set()
+        self.router_running = False
+        self.destroyed: Dict[int, DestroyPolicy] = {}
+        self.expiry: Dict[int, int] = {}
+        self.observed_locks: Dict[str, Set[int]] = {}
+        # Failure knobs.
+        self.inspect_result: Optional[str] = None
+        self.fail_create_after_launch = False
+        self.fail_next_create = False
+        self.fail_set_expiry = False
+        self.lose_slot_once = False
+        # What a real provider would carry as tags on the instance.
+        self._instance_tags: Dict[int, Dict[str, object]] = {}
+
+    def _observe_locks(self, method: str) -> None:
+        # The lifecycle-lock table is the seam T7 asserts lock scope through:
+        # which keys this thread held when the operation ran, not which
+        # context managers were entered somewhere.
+        from app import proxmox_service
+        me = threading.get_ident()
+        with proxmox_service._vm_lifecycle_locks_guard:
+            held = {key for key, entry in proxmox_service._vm_lifecycle_locks.items()
+                    if entry['owner'] == me}
+        self.observed_locks.setdefault(method, set()).update(held)
+
+    # Admission
+
+    def admit(self, spec: VMSpec, *, reservation_id: str,
+              load_balancing_config: Optional[Mapping]) -> str:
+        self.reservations.add(reservation_id)
+        return MEMORY_LOCATION
+
+    def renew_admission(self, reservation_id: str) -> bool:
+        return reservation_id in self.reservations
+
+    def release_admission(self, reservation_id: Optional[str]) -> bool:
+        if reservation_id not in self.reservations:
+            return False
+        self.reservations.discard(reservation_id)
+        return True
+
+    # Instances
+
+    def create(self, spec: VMSpec, location: str, *,
+               heartbeat: Callable[[], None]) -> LaunchedVM:
+        self._observe_locks('create')
+        slot = spec.network_slot
+        if self.lose_slot_once:
+            # Models the slot being released between ensure_slot and create.
+            self.lose_slot_once = False
+            self.slot_networks.discard(slot)
+        if slot not in self.slot_networks:
+            raise SlotNetworkMissing(f'slot network {slot} does not exist')
+        if self.fail_next_create:
+            self.fail_next_create = False
+            raise RuntimeError('injected create failure before launch')
+        heartbeat()
+        launched = LaunchedVM(vmid=spec.vmid, vm_type=self.name,
+                              location=MEMORY_LOCATION, network_slot=slot,
+                              provider_id=f'provider-{spec.vmid}')
+        self.instances[spec.vmid] = launched
+        self._instance_tags[spec.vmid] = {
+            'vm_name': spec.vm_name, 'deployment_id': spec.deployment_id}
+        self.expiry[spec.vmid] = int(spec.expires_at.timestamp())
+        self.deployment_networks.add(spec.deployment_id)
+        if self.fail_create_after_launch:
+            raise RuntimeError('injected create failure')
+        return launched
+
+    def inspect(self, ref: VMRef) -> str:
+        if self.inspect_result is not None:
+            return self.inspect_result
+        launched = self.instances.get(ref.vmid)
+        if launched is None:
+            return GUEST_ABSENT
+        # No provider id (create raised after launch) resolves by VMID alone,
+        # as the clouds resolve by site + VMID tags (ruling C7).
+        if ref.provider_id is not None and ref.provider_id != launched.provider_id:
+            return GUEST_MISMATCH
+        return GUEST_MATCH
+
+    def _forget(self, vmid: int) -> None:
+        self.instances.pop(vmid, None)
+        self._instance_tags.pop(vmid, None)
+        self.expiry.pop(vmid, None)
+
+    def destroy(self, ref: VMRef, policy: DestroyPolicy) -> None:
+        identity = self.inspect(ref)
+        if identity == GUEST_MISMATCH:
+            raise DestroyRefused(f'VMID {ref.vmid} identity does not match')
+        if identity not in (GUEST_MATCH, GUEST_ABSENT):
+            raise BackendError(f'VMID {ref.vmid} identity is {identity}')
+        self.destroyed[ref.vmid] = policy
+        self._forget(ref.vmid)
+
+    def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
+        return self.inspect(ref) == GUEST_ABSENT
+
+    def ip_addresses(self, ref: VMRef) -> List[str]:
+        return [MEMORY_IP] if self.inspect(ref) == GUEST_MATCH else []
+
+    def status(self, ref: VMRef) -> str:
+        return 'running' if self.inspect(ref) == GUEST_MATCH else 'unknown'
+
+    def set_expiry(self, ref: VMRef, expires_at: datetime) -> None:
+        if self.fail_set_expiry:
+            raise BackendError('injected set_expiry failure')
+        if self.inspect(ref) != GUEST_MATCH:
+            raise BackendError(f'VMID {ref.vmid} is not a matching instance')
+        self.expiry[ref.vmid] = int(expires_at.timestamp())
+
+    # Inventory
+
+    def list_managed(self) -> List[ManagedResource]:
+        resources = [
+            ManagedResource(
+                backend=self.name, kind='instance', provider_id=launched.provider_id,
+                name=self._instance_tags[vmid]['vm_name'], vmid=vmid,
+                location=launched.location,
+                deployment_id=self._instance_tags[vmid]['deployment_id'],
+                network_slot=launched.network_slot,
+                expires_at_epoch=self.expiry.get(vmid), status='running')
+            for vmid, launched in sorted(self.instances.items())]
+        resources += [
+            ManagedResource(backend=self.name, kind='deployment-network',
+                            provider_id=f'deployment-{deployment_id}',
+                            name=f'deployment-{deployment_id}',
+                            deployment_id=deployment_id)
+            for deployment_id in sorted(self.deployment_networks)]
+        resources += [
+            ManagedResource(backend=self.name, kind='slot-network',
+                            provider_id=f'slot-{slot}', name=f'slot-{slot}',
+                            network_slot=slot)
+            for slot in sorted(self.slot_networks)]
+        return resources
+
+    def delete_resource(self, resource: ManagedResource) -> None:
+        if resource.backend != self.name:
+            raise BackendError(f'{resource.provider_id} belongs to {resource.backend}')
+        if resource.kind == 'instance':
+            launched = self.instances.get(resource.vmid)
+            if launched is not None and launched.provider_id != resource.provider_id:
+                raise DestroyRefused(f'VMID {resource.vmid} identity does not match')
+            self._forget(resource.vmid)
+        elif resource.kind == 'deployment-network':
+            self.deployment_networks.discard(resource.deployment_id)
+        elif resource.kind == 'slot-network':
+            self.slot_networks.discard(resource.network_slot)
+        else:
+            raise BackendError(f'unknown resource kind {resource.kind!r}')
+
+    # Networks and router
+
+    def cleanup_deployment(self, deployment_id: str) -> None:
+        self.deployment_networks.discard(deployment_id)
+
+    def ensure_slot(self, slot: int) -> None:
+        self._observe_locks('ensure_slot')
+        self.slot_networks.add(slot)
+
+    def release_slot(self, slot: int) -> None:
+        self.slot_networks.discard(slot)
+
+    def ensure_router_running(self) -> None:
+        self._observe_locks('ensure_router_running')
+        self.router_running = True
+
+    def stop_router(self) -> None:
+        self.router_running = False
+
+
+@dataclass
+class BackendContractCase:
+    backend: VMBackend
+    spec: VMSpec
+    expected_ips: list[str]
+    expected_status: str
+    cleanup: Callable[[], None]
+    # Proxmox's inventory is the cluster-index projection, which carries no
+    # expiry (ruling C5); its case sets this False.
+    inventory_reports_expiry: bool = True
+
+    def ref(self, launched: LaunchedVM, location: str) -> VMRef:
+        """The ref a persisted record of this launch would produce.
+
+        `location` is what admit() returned; the record keeps where the guest
+        actually launched (a cloud admits per backend but launches per zone).
+        """
+        return VMRef(vmid=self.spec.vmid, vm_name=self.spec.vm_name,
+                     vm_type=launched.vm_type, location=launched.location,
+                     backend=self.spec.backend, provider_id=launched.provider_id,
+                     deployment_id=self.spec.deployment_id,
+                     network_slot=launched.network_slot)
+
+
+def make_memory_backend_case(app, name: str = 'aws') -> BackendContractCase:
+    backend = FakeBackend(name)
+    spec = VMSpec(
+        vmid=100, vm_name=f'{name}-memory-100', display_name='memory-100',
+        backend=name,
+        template={'image_id': 'ami-placeholder', 'instance_type': 'small',
+                  'disk_gb': 20},
+        memory_mb=1024, cores=1, storage_gb=20,
+        is_entry_point=True, entry_slot=101, internal_slot=201,
+        expires_at=datetime.now() + timedelta(hours=1),
+        deployment_id='a' * 32, owner='student-a')
+
+    def cleanup() -> None:
+        # The shared tests start the router and ensure the slot (ruling C3);
+        # the fake owns nothing else.
+        backend.release_slot(spec.network_slot)
+        backend.stop_router()
+
+    return BackendContractCase(backend=backend, spec=spec,
+                               expected_ips=[MEMORY_IP],
+                               expected_status='running', cleanup=cleanup)

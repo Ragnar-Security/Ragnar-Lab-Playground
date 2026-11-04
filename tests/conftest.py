@@ -13,6 +13,7 @@ os.environ['TEMPLATES_FILE'] = os.path.join(
 )
 
 from app import create_app
+from app.backends import reset_backends_for_tests
 from app.models import db
 
 
@@ -52,6 +53,15 @@ def _isolated_untracked_survivors_file(tmp_path, monkeypatch):
     """Keep the failed-deploy fallback file out of the checkout's data/."""
     monkeypatch.setenv(
         'UNTRACKED_SURVIVORS_FILE', str(tmp_path / 'untracked-survivors.jsonl'))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_backend_registry():
+    """Backends are process singletons: without this, one test's stateful
+    fake or patched Proxmox client answers the next test's calls."""
+    reset_backends_for_tests()
+    yield
+    reset_backends_for_tests()
 
 
 @pytest.fixture
