@@ -46,6 +46,9 @@ GCP_TEST_CONFIG = {
     'GCP_OPERATION_TIMEOUT_SECONDS': 10,
 }
 INSTANCE_PATH = r'zones/[^/]+/instances/[^/]+'
+AGGREGATED_PATH = r'aggregated/instances'
+INSERT_PATH = f'zones/{ZONE}/instances'
+OTHER_ZONE = 'us-east1-b'
 
 
 @pytest.fixture
@@ -138,21 +141,22 @@ def test_create_retry_uses_request_id_once(backend, gce, spec):
     # Catches a retried insert starting a second billing instance.
     first = backend.create(spec, ZONE, heartbeat=lambda: None)
     second = backend.create(spec, ZONE, heartbeat=lambda: None)
+    third = backend.create(spec, ZONE, heartbeat=lambda: None)
     assert list(gce.instances) == [(ZONE, 'lp-test-site-101')]
-    assert first.provider_id == second.provider_id == NAME
-    request_id = _request_id('instance-insert', DEPLOYMENT, VMID)
-    assert ('POST', f'zones/{ZONE}/instances', request_id) in gce.request_results
+    assert first.provider_id == second.provider_id == third.provider_id == NAME
+    assert _insert_request_ids(gce) == [_request_id('instance-insert', DEPLOYMENT, VMID, 0)]
 
 
 def test_request_ids_are_stable_nonzero_rfc4122_uuids():
     # Catches requestId changing across processes (Python's randomized
     # hash()) so a retry is not deduplicated, or a value Compute rejects.
-    value = _request_id('instance-insert', DEPLOYMENT, VMID)
+    value = _request_id('instance-insert', DEPLOYMENT, VMID, 0)
     parsed = uuid.UUID(value)
-    assert value == _request_id('instance-insert', DEPLOYMENT, VMID)
+    assert value == _request_id('instance-insert', DEPLOYMENT, VMID, 0)
     assert parsed.version == 5 and parsed.variant == uuid.RFC_4122 and parsed.int != 0
-    assert value != _request_id('instance-insert', DEPLOYMENT, VMID + 1)
-    assert value != _request_id('instance-delete', DEPLOYMENT, VMID)
+    assert value != _request_id('instance-insert', DEPLOYMENT, VMID + 1, 0)
+    assert value != _request_id('instance-insert', DEPLOYMENT, VMID, 1)
+    assert value != _request_id('instance-delete', DEPLOYMENT, VMID, 0)
 
 
 def test_create_heartbeats_while_the_operation_runs(backend, gce, spec):
@@ -241,14 +245,16 @@ def test_absent_is_positive_but_transport_failure_is_unknown(backend, gce, spec)
     assert backend.confirm_absent(ref) is True
 
 
+@pytest.mark.parametrize('path', [INSTANCE_PATH, AGGREGATED_PATH])
 @pytest.mark.parametrize('fault', [
-    {'status': 403}, {'status': 429}, {'status': 503},
+    {'status': 403}, {'status': 404}, {'status': 429}, {'status': 503},
     {'invalid_json': True}, {'transport': True},
 ])
-def test_every_ambiguous_read_is_unknown_never_absent(backend, gce, spec, fault):
-    # Catches a 403/429/5xx, garbage body or dropped connection read as absence.
+def test_every_ambiguous_read_is_unknown_never_absent(backend, gce, spec, path, fault):
+    # Catches a 403/404/429/5xx, garbage body or dropped connection, from
+    # discovery or the zonal read after it, being read as absence.
     ref = _launch(backend, spec)
-    gce.fail('GET', INSTANCE_PATH, times=2, **fault)
+    gce.fail('GET', path, times=2, **fault)
     assert backend.inspect(ref) == GUEST_UNKNOWN
     assert backend.confirm_absent(ref) is False
 
@@ -425,7 +431,7 @@ def test_list_managed_names_round_trip_to_the_portal_vm_name(backend, gce, spec)
 def test_list_managed_failure_raises_never_empty(backend, gce, spec, fault):
     # Catches an inventory outage read as "nothing exists" by the sweeper.
     _launch(backend, spec)
-    gce.fail('GET', r'zones/[^/]+/instances', **fault)
+    gce.fail('GET', AGGREGATED_PATH, **fault)
     with pytest.raises(BackendError):
         backend.list_managed()
 
@@ -474,6 +480,159 @@ def test_delete_resource_propagates_unknown_identity(backend, gce, spec):
         backend.delete_resource(resource)
     assert not isinstance(raised.value, DestroyRefused)
     assert (ZONE, NAME) in gce.instances
+
+
+# Discovery: the instance's zone and its absence come from the project-wide
+# aggregated list, never from a location string.
+
+@pytest.mark.parametrize('location', [OTHER_ZONE, 'zz-fake9-q'])
+def test_a_wrong_zone_in_the_record_never_reads_as_absence(backend, gce, spec, location):
+    # Catches a record whose node names another real zone, or a fabricated
+    # zone-shaped one, 404ing into "absent" and being retired while billing.
+    ref = replace(_launch(backend, spec), location=location)
+    assert backend.inspect(ref) == GUEST_MATCH
+    assert backend.confirm_absent(ref) is False
+    assert backend.status(ref) == 'running'
+    new_expiry = spec.expires_at + timedelta(hours=2)
+    backend.set_expiry(ref, new_expiry)
+    assert _labels(gce)[TAG_EXPIRES] == str(expires_epoch(new_expiry))
+    backend.destroy(ref, DestroyPolicy.STRICT)
+    assert gce.instances == {}
+    assert backend.confirm_absent(ref) is True
+
+
+def test_changing_gcp_zone_after_launch_keeps_the_vm_found(backend, gce, spec, monkeypatch):
+    # Catches an operator's GCP_ZONE change hiding every VM launched before
+    # it, so reconcile retires their records and the sweeper never sees them.
+    ref = _launch(backend, spec)
+    monkeypatch.setattr(importlib.import_module('app.config'), 'GCP_ZONE', OTHER_ZONE)
+    survivor = replace(ref, provider_id=None, location='gcp')
+    assert backend.inspect(ref) == backend.inspect(survivor) == GUEST_MATCH
+    assert backend.confirm_absent(ref) is False and backend.confirm_absent(survivor) is False
+    [listed] = backend.list_managed()
+    assert listed.location == ZONE
+    backend.delete_resource(replace(listed, location=OTHER_ZONE))
+    assert gce.instances == {}
+
+
+@pytest.mark.parametrize('reports', [('warning',), ('unreachables',)])
+def test_an_unreachable_zone_makes_absence_unknown(backend, gce, spec, reports):
+    # Catches an aggregated list that could not reach every zone being read
+    # as "no such instance anywhere".
+    ref = _launch(backend, spec)
+    del gce.instances[(ZONE, NAME)]
+    gce.unreachable_zones = {OTHER_ZONE}
+    gce.unreachable_reports = reports
+    assert backend.inspect(ref) == GUEST_UNKNOWN
+    assert backend.confirm_absent(ref) is False
+    with pytest.raises(BackendError) as raised:
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    assert not isinstance(raised.value, DestroyRefused)
+    with pytest.raises(BackendError):
+        backend.list_managed()
+    gce.unreachable_zones = set()
+    assert backend.confirm_absent(ref) is True
+
+
+def test_an_instance_in_an_unreachable_zone_is_never_absent(backend, gce, spec):
+    # Catches a VM in a zone the list could not reach being retired.
+    ref = _launch(backend, spec)
+    gce.unreachable_zones = {ZONE}
+    assert backend.inspect(ref) == GUEST_UNKNOWN
+    assert backend.confirm_absent(ref) is False
+
+
+def test_the_same_name_in_two_zones_is_unknown(backend, gce, spec):
+    # Catches discovery picking one of two same-named instances and acting on it.
+    ref = _launch(backend, spec)
+    gce.add_subnetwork('us-east1', 'other-subnet', '172.22.0.0/24')
+    gce.add_instance(OTHER_ZONE, NAME, labels=_labels(gce), subnetwork=('us-east1', 'other-subnet'))
+    assert backend.inspect(ref) == GUEST_UNKNOWN
+    assert backend.confirm_absent(ref) is False
+    with pytest.raises(BackendError):
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    assert {(ZONE, NAME), (OTHER_ZONE, NAME)} <= set(gce.instances)
+
+
+def test_a_delete_404_for_an_instance_that_still_exists_raises(backend, gce, spec):
+    # Catches a DELETE answered 404 being reported as a destroyed VM while
+    # discovery still finds it.
+    ref = _launch(backend, spec)
+    gce.fail('DELETE', INSTANCE_PATH, status=404)
+    with pytest.raises(BackendError):
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    assert (ZONE, NAME) in gce.instances
+
+
+# Insert attempts
+
+def _insert_request_ids(gce):
+    return [request_id for method, path, request_id in gce.request_results
+            if (method, path) == ('POST', INSERT_PATH)]
+
+
+@pytest.mark.parametrize('cause', ['quota', 'missing-subnetwork'])
+def test_terminal_insert_failure_then_corrected_cause_launches_the_same_spec(
+        backend, gce, spec, cause):
+    # Catches a failed insert's requestId replaying the failure forever, so
+    # the VM can never be created once the cause is fixed.
+    if cause == 'quota':
+        gce.next_operation_error = {'code': 'QUOTA_EXCEEDED', 'message': 'CPUS quota exceeded'}
+    else:
+        gce.subnetwork_failure = 'async'
+        subnetwork = gce.subnetworks.pop((REGION, SUBNET))
+    with pytest.raises(OperationFailed):
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert gce.instances == {}
+    if cause != 'quota':
+        gce.subnetworks[(REGION, SUBNET)] = subnetwork
+    launched = backend.create(spec, ZONE, heartbeat=lambda: None)
+    again = backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert launched == again and list(gce.instances) == [(ZONE, NAME)]
+    assert _insert_request_ids(gce) == [
+        _request_id('instance-insert', DEPLOYMENT, VMID, 0),
+        _request_id('instance-insert', DEPLOYMENT, VMID, 1)]
+
+
+def test_a_failed_insert_whose_absence_is_unproven_keeps_its_request_id(backend, gce, spec):
+    # Catches a fresh requestId being issued while an instance from the
+    # failed attempt might still exist somewhere in the project.
+    gce.next_operation_error = {'code': 'QUOTA_EXCEEDED', 'message': 'CPUS quota exceeded'}
+    gce.fail('GET', AGGREGATED_PATH, status=503)
+    with pytest.raises(OperationFailed) as first:
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    with pytest.raises(OperationFailed) as second:
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert second.value.operation['name'] == first.value.operation['name']
+    assert _insert_request_ids(gce) == [_request_id('instance-insert', DEPLOYMENT, VMID, 0)]
+    # The replay proved absence, so the next try is a new attempt.
+    assert backend.create(spec, ZONE, heartbeat=lambda: None).provider_id == NAME
+    assert list(gce.instances) == [(ZONE, NAME)]
+
+
+@pytest.mark.parametrize('ambiguity', ['timeout', 'transport'])
+def test_an_ambiguous_insert_retry_reuses_its_request_id(
+        backend, gce, spec, monkeypatch, ambiguity):
+    # Catches a retry after a timed-out wait or lost response issuing a new
+    # requestId, which could start a second instance.
+    if ambiguity == 'timeout':
+        now = [0.0]
+
+        def clock():
+            now[0] += 4.0
+            return now[0]
+
+        monkeypatch.setattr(gcp_module, '_clock', clock)
+        gce.stall_operations = True
+    else:
+        gce.fail('POST', INSERT_PATH, transport=True)
+    with pytest.raises(BackendError) as raised:
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert not isinstance(raised.value, OperationFailed)
+    gce.stall_operations = False
+    assert backend.create(spec, ZONE, heartbeat=lambda: None).provider_id == NAME
+    assert list(gce.instances) == [(ZONE, NAME)]
+    assert _insert_request_ids(gce) == [_request_id('instance-insert', DEPLOYMENT, VMID, 0)]
 
 
 # Operations
@@ -639,3 +798,48 @@ def test_fake_replays_a_repeated_request_id_without_changing_state(gce):
     other = gce.request('POST', url, params={'requestId': str(uuid.uuid4())}, json=body)
     assert other.status_code == 409
     assert list(gce.instances) == [(ZONE, NAME)]
+
+
+def _instances_url():
+    return f'https://compute.googleapis.com/compute/v1/projects/{PROJECT}/zones/{ZONE}/instances'
+
+
+def _insert_body(subnet=SUBNET):
+    return {'name': NAME, 'machineType': f'zones/{ZONE}/machineTypes/e2-small',
+            'disks': [{'boot': True, 'autoDelete': True}],
+            'networkInterfaces': [{'subnetwork': (
+                f'projects/{PROJECT}/regions/{REGION}/subnetworks/{subnet}')}]}
+
+
+def test_fake_replays_a_failed_operation_for_a_repeated_request_id(gce):
+    # Catches the fake retrying a failed insert under its old requestId,
+    # which would hide the replay that makes a new attempt id necessary.
+    gce.next_operation_error = {'code': 'QUOTA_EXCEEDED', 'message': 'quota'}
+    request_id = str(uuid.uuid4())
+    first = gce.request('POST', _instances_url(), params={'requestId': request_id},
+                        json=_insert_body())
+    second = gce.request('POST', _instances_url(), params={'requestId': request_id},
+                         json=_insert_body())
+    assert first.status_code == second.status_code == 200
+    assert first.json() == second.json()
+    assert second.json()['status'] == 'DONE'
+    assert second.json()['error']['errors'][0]['code'] == 'QUOTA_EXCEEDED'
+    assert gce.instances == {} and len(gce.operations) == 1
+
+
+@pytest.mark.parametrize('mode', ['sync', 'async'])
+def test_fake_reports_a_missing_subnetwork_synchronously_or_in_the_operation(gce, mode):
+    # Catches the fake modelling only one of the two ways Compute may refuse
+    # an insert into a subnetwork that is gone.
+    gce.subnetwork_failure = mode
+    response = gce.request('POST', _instances_url(), params={'requestId': str(uuid.uuid4())},
+                           json=_insert_body('lp-test-site-s-999'))
+    if mode == 'sync':
+        assert response.status_code == 404 and gce.operations == {}
+    else:
+        assert response.status_code == 200
+        operation = response.json()
+        assert operation['status'] == 'DONE'
+        assert operation['error']['errors'][0]['code'] == 'RESOURCE_NOT_FOUND'
+        assert len(gce.operations) == 1
+    assert gce.instances == {}

@@ -153,6 +153,14 @@ class FakeGCESession(requests.Session):
         its change is not applied.
     stall_operations: new operations stay RUNNING, and /wait returns them
         unchanged, until this is cleared.
+    subnetwork_failure: 'sync' (an insert into a missing subnetwork is
+        refused with 404, no operation) or 'async' (an operation is created
+        and finishes DONE with a RESOURCE_NOT_FOUND error).
+    known_zones: zones the aggregated list reports, holding instances or not.
+    unreachable_zones: zones the aggregated list cannot reach: their
+        instances are omitted, and the page reports them in each form named
+        by unreachable_reports ('warning': a scope warning UNREACHABLE;
+        'unreachables': the top-level unreachables list).
     """
 
     def __init__(self, project: str = 'example-project'):
@@ -173,6 +181,10 @@ class FakeGCESession(requests.Session):
         self._pending: Dict[Tuple[str, Optional[str], str], Callable[[], None]] = {}
         self._ids = itertools.count(1000)
         self._next_host: Dict[Tuple[str, str], int] = {}
+        self.subnetwork_failure = 'sync'
+        self.known_zones = {'us-central1-a', 'us-central1-b', 'us-east1-b'}
+        self.unreachable_zones: set = set()
+        self.unreachable_reports: Tuple[str, ...] = ('warning', 'unreachables')
 
     # Test controls
 
@@ -241,10 +253,13 @@ class FakeGCESession(requests.Session):
                     method, path, params, url, ('zones', zone), 'insert',
                     self._instance_link(zone, (body or {}).get('name')),
                     lambda: self._validate_instance_insert(zone, body, url),
-                    lambda: self._insert_instance(zone, body))
+                    lambda: self._insert_instance(zone, body),
+                    refuse=lambda: self._missing_subnetwork(body))
             case ('GET', ['zones', zone, 'instances']):
                 return self._list([v for (z, _), v in self.instances.items() if z == zone],
                                   params, url)
+            case ('GET', ['aggregated', 'instances']):
+                return self._aggregated_instances(params, url)
             case ('GET', ['zones', zone, 'instances', name]):
                 return self._get(self.instances, (zone, name), url)
             case ('DELETE', ['zones', zone, 'instances', name]):
@@ -336,24 +351,65 @@ class FakeGCESession(requests.Session):
             return _error(404, 'notFound', f'The resource {url!r} was not found', url)
         return None
 
-    def _list(self, items: List[dict], params: dict, url: str) -> FakeResponse:
+    def _select(self, items: List[dict], params: dict, url: str):
+        """The `items` that pass the request's filter; a FakeResponse when
+        the filter cannot be parsed."""
         expression = params.get('filter')
         if expression and not self.loose_filter:
             clauses = _parse_filter(expression)
             if clauses is None:
                 return _error(400, 'invalid', f'Invalid list filter expression {expression!r}', url)
             items = [item for item in items if _matches(item, clauses)]
-        items = sorted(items, key=lambda item: item.get('name', ''))
+        return items
+
+    def _page(self, items: List, params: dict) -> Tuple[List, Optional[str]]:
         start = int(params.get('pageToken') or 0)
         size = self.page_size or len(items) or 1
         if params.get('maxResults') is not None:
             size = min(size, int(params['maxResults']))
-        page = items[start:start + size]
+        token = str(start + size) if start + size < len(items) else None
+        return items[start:start + size], token
+
+    def _list(self, items: List[dict], params: dict, url: str) -> FakeResponse:
+        items = self._select(items, params, url)
+        if isinstance(items, FakeResponse):
+            return items
+        page, token = self._page(sorted(items, key=lambda item: item.get('name', '')), params)
         body = {'kind': 'compute#list', 'id': url}
         if page:
             body['items'] = page  # Compute omits `items` on an empty page
-        if start + size < len(items):
-            body['nextPageToken'] = str(start + size)
+        if token is not None:
+            body['nextPageToken'] = token
+        return FakeResponse(200, body, url=url)
+
+    def _aggregated_instances(self, params: dict, url: str) -> FakeResponse:
+        reachable = [instance for (zone, _), instance in self.instances.items()
+                     if zone not in self.unreachable_zones]
+        items = self._select(reachable, params, url)
+        if isinstance(items, FakeResponse):
+            return items
+        ordered = sorted(items, key=lambda item: (item['zone'], item.get('name', '')))
+        page, token = self._page(ordered, params)
+        zones = self.known_zones | {zone for zone, _ in self.instances}
+        scopes = {}
+        for zone in sorted(zones):
+            scope = f'zones/{zone}'
+            if zone in self.unreachable_zones:
+                if 'warning' in self.unreachable_reports:
+                    scopes[scope] = {'warning': {
+                        'code': 'UNREACHABLE', 'message': f'{scope} is unreachable',
+                        'data': [{'key': 'scope', 'value': scope}]}}
+                continue
+            instances = [item for item in page if item['zone'].endswith('/' + scope)]
+            scopes[scope] = {'instances': instances} if instances else {'warning': {
+                'code': 'NO_RESULTS_ON_PAGE',
+                'message': 'There are no results for scope on this page.',
+                'data': [{'key': 'scope', 'value': scope}]}}
+        body = {'kind': 'compute#instanceAggregatedList', 'id': url, 'items': scopes}
+        if self.unreachable_zones and 'unreachables' in self.unreachable_reports:
+            body['unreachables'] = sorted(f'zones/{zone}' for zone in self.unreachable_zones)
+        if token is not None:
+            body['nextPageToken'] = token
         return FakeResponse(200, body, url=url)
 
     # Mutations and operations
@@ -434,15 +490,23 @@ class FakeGCESession(requests.Session):
         interfaces = body.get('networkInterfaces') or []
         if not interfaces:
             return _error(400, 'invalid', 'A network interface is required', url)
-        for interface in interfaces:
-            match = _SUBNETWORK_PATH.fullmatch(str(interface.get('subnetwork', '')))
-            if not match or tuple(match.groups()) not in self.subnetworks:
-                return _error(404, 'notFound',
-                              f'The resource {interface.get("subnetwork")!r} was not found', url)
+        missing = self._missing_subnetwork(body)
+        if missing is not None and self.subnetwork_failure == 'sync':
+            return _error(404, 'notFound', missing['message'], url)
         if (zone, body['name']) in self.instances:
             return _error(409, 'alreadyExists',
                           f'The resource {self._instance_link(zone, body["name"])!r} already exists',
                           url)
+        return None
+
+    def _missing_subnetwork(self, body) -> Optional[dict]:
+        """The operation error for a NIC whose subnetwork does not exist."""
+        for interface in (body or {}).get('networkInterfaces') or []:
+            link = str(interface.get('subnetwork', ''))
+            match = _SUBNETWORK_PATH.fullmatch(link)
+            if not match or tuple(match.groups()) not in self.subnetworks:
+                return {'code': 'RESOURCE_NOT_FOUND',
+                        'message': f"The resource '{link}' was not found"}
         return None
 
     def _new_instance(self, zone, body) -> dict:

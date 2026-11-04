@@ -4,9 +4,12 @@ and capped admission, over the v1 JSON REST API only (no gRPC client).
 Identity is the label set written at insert, never the DB row: an instance
 is this record's only when its name and every contract label agree. The
 instance name is deterministic, so a ref without a provider id (a create that
-raised after the insert) needs no lookup (ruling C7). Absence needs positive
-evidence, an HTTP 404 from a fresh GET; every other failure is GUEST_UNKNOWN,
-so a transient error can never retire a record whose instance still bills.
+raised after the insert) needs no lookup (ruling C7). Where an instance is,
+and whether it exists at all, comes only from the project-wide aggregated
+list, never from a record's location: a 404 from the wrong zone says nothing.
+Absence needs that list to have reached every zone and to hold no instance of
+the name; every other answer is GUEST_UNKNOWN, so neither a transient error
+nor a stale zone can retire a record whose instance still bills.
 
 Every mutation returns an operation, which is waited on until DONE within
 GCP_OPERATION_TIMEOUT_SECONDS. An operation that finishes with errors, or
@@ -21,10 +24,11 @@ google.auth is imported only when a backend builds its own session.
 import importlib
 import re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Callable, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Iterable, Iterator, List, Mapping, Optional, Tuple
 from urllib.parse import quote
 
 import requests
@@ -48,13 +52,16 @@ KIND_INSTANCE = 'instance'
 # Fixed, so a requestId derived from the same identity is the same in every
 # process: a retried insert then returns the original operation.
 _REQUEST_NAMESPACE = uuid.UUID('98db2938-13e7-466b-9ee7-1aeb5bc01359')
+# The only aggregated-list warning that leaves the answer complete: a scope
+# that simply holds nothing on this page. Any other (UNREACHABLE above all)
+# means some zone may hold an instance the list did not show.
+_COMPLETE_WARNINGS = ('NO_RESULTS_ON_PAGE',)
 _SET_LABELS_ATTEMPTS = 3
 _HTTP_TIMEOUT_SECONDS = 60
 # Compute's server-side /wait returns within about two minutes; a longer read
 # timeout lets it, and the operation deadline still bounds the whole wait.
 _WAIT_READ_TIMEOUT_CAP_SECONDS = 150
 _NAME = re.compile(r'[a-z]([-a-z0-9]{0,61}[a-z0-9])?')
-_ZONE = re.compile(r'[a-z]+-[a-z]+[0-9]+-[a-z]')
 _DECIMAL = re.compile(r'[0-9]+')
 _STATUS = {
     'RUNNING': 'running', 'TERMINATED': 'stopped',
@@ -133,6 +140,16 @@ def _labels(instance: Mapping) -> dict:
     return labels if isinstance(labels, dict) else {}
 
 
+def _check_warning(warning, scope: str, what: str) -> None:
+    """Raise unless an aggregated-list warning leaves the answer complete."""
+    if not warning:
+        return
+    code = warning.get('code') if isinstance(warning, dict) else None
+    if code not in _COMPLETE_WARNINGS:
+        message = warning.get('message') if isinstance(warning, dict) else warning
+        raise BackendError(f'{what}: {scope} answered incompletely ({code}: {message})')
+
+
 def _operation_errors(operation: Mapping) -> Optional[str]:
     error = operation.get('error')
     if not error:
@@ -164,9 +181,10 @@ def _default_session() -> requests.Session:
 class _Resolution:
     """The instance a ref names, or why it names none."""
 
-    def __init__(self, verdict: str, zone: str, name: str, instance=None, reason: str = ''):
+    def __init__(self, verdict: str, zone: Optional[str], name: str, instance=None,
+                 reason: str = ''):
         self.verdict = verdict  # GUEST_MATCH / _ABSENT / _MISMATCH / _UNKNOWN
-        self.zone = zone
+        self.zone = zone        # the zone discovery found it in; None otherwise
         self.name = name
         self.instance = instance
         self.reason = reason
@@ -179,6 +197,11 @@ class GCPBackend:
         # `_session`, never `session`: vm_provisioning.provider_session()
         # treats a backend attribute named `session` as a context factory.
         self._session = session if session is not None else _default_session()
+        # The insert attempt per (deployment, VMID), part of its requestId.
+        # In-process is enough: a later deploy has a new deployment id, and a
+        # restart that starts again at 0 only replays what that id did.
+        self._insert_attempts: dict = {}
+        self._attempts_lock = threading.Lock()
 
     # REST
 
@@ -324,11 +347,31 @@ class GCPBackend:
             'tags': {'items': [deployment_network_name(site, spec.deployment_id),
                                f'{site_prefix(site)}lab']},
         }
+        key = (spec.deployment_id, spec.vmid)
+        with self._attempts_lock:
+            attempt = self._insert_attempts.get(key, 0)
         heartbeat()
-        self._mutate(
-            'POST', ('zones', location, 'instances'), what=f'launch of VM {spec.vmid}',
-            params={'requestId': _request_id('instance-insert', spec.deployment_id, spec.vmid)},
-            body=body, heartbeat=heartbeat)
+        try:
+            self._mutate(
+                'POST', ('zones', location, 'instances'), what=f'launch of VM {spec.vmid}',
+                params={'requestId': _request_id('instance-insert', spec.deployment_id,
+                                                 spec.vmid, attempt)},
+                body=body, heartbeat=heartbeat)
+        except OperationFailed:
+            # Compute keeps a requestId's result, so a terminally failed
+            # insert retried under the same id replays its failure forever.
+            # A new id is safe only once no instance of the name exists
+            # anywhere; until then the replay is the retry that cannot
+            # start a twin. A timeout or lost response never gets here.
+            try:
+                absent = self._discover(name) is None
+            except BackendError:
+                absent = False
+            if absent:
+                with self._attempts_lock:
+                    if self._insert_attempts.get(key, 0) == attempt:
+                        self._insert_attempts[key] = attempt + 1
+            raise
         resolution = self._fetch(location, name, {k: v for k, v in labels.items()
                                                   if k != TAG_EXPIRES})
         if resolution.verdict != GUEST_MATCH:
@@ -342,13 +385,16 @@ class GCPBackend:
 
     # Identity
 
-    def _zone(self, location: Optional[str]) -> str:
-        # A record's node is its instance's zone. A survivor may carry
-        # location='gcp' (T8), which names no zone: resolution must not
-        # depend on it, so anything not shaped like a zone is the configured one.
-        if isinstance(location, str) and _ZONE.fullmatch(location):
-            return location
-        return _config().GCP_ZONE
+    def _discover(self, name: str) -> Optional[str]:
+        """The zone holding the instance `name`, or None when the project
+        holds none, from one complete aggregated list. Raises BackendError
+        when the list fails, misses a zone, or finds the name twice."""
+        found = [zone for zone, instance in self._aggregated(
+                     f'(name = "{name}")', what=f'discovery of instance {name}')
+                 if instance.get('name') == name]
+        if len(found) > 1:
+            raise BackendError(f'{len(found)} instances are named {name}: zones {sorted(found)}')
+        return found[0] if found else None
 
     def _expected_labels(self, ref: VMRef) -> dict:
         expected = {TAG_SITE: _config().LAB_SITE_ID, TAG_VMID: str(ref.vmid),
@@ -360,15 +406,12 @@ class GCPBackend:
         return expected
 
     def _fetch(self, zone: str, name: str, expected: Mapping[str, str]) -> _Resolution:
-        """A fresh GET of one instance, judged against its name and `expected`."""
-        # Checked locally: a garbled name must never 404 its way to "absent".
-        if not isinstance(name, str) or not _NAME.fullmatch(name):
-            return _Resolution(GUEST_UNKNOWN, zone, name, reason=f'malformed name {name!r}')
+        """A fresh GET of one instance in the zone discovery found it in,
+        judged against its name and `expected`. Never absence: a 404 here is
+        a delete racing discovery or a moved instance, so it is unknown."""
         try:
             instance = self._send('GET', ('zones', zone, 'instances', name))
         except requests.RequestException as error:
-            if _http_status(error) == 404:
-                return _Resolution(GUEST_ABSENT, zone, name)
             return _Resolution(GUEST_UNKNOWN, zone, name, reason=str(error))
         labels = _labels(instance)
         problems = [f'{key}={labels.get(key)!r}' for key, value in expected.items()
@@ -379,24 +422,41 @@ class GCPBackend:
             return _Resolution(GUEST_MISMATCH, zone, name, instance, ', '.join(problems))
         return _Resolution(GUEST_MATCH, zone, name, instance)
 
+    def _identify(self, name, expected: Mapping[str, str]) -> _Resolution:
+        # Checked locally: a garbled name must never be listed as "absent".
+        if not isinstance(name, str) or not _NAME.fullmatch(name):
+            return _Resolution(GUEST_UNKNOWN, None, name, reason=f'malformed name {name!r}')
+        try:
+            zone = self._discover(name)
+        except BackendError as error:
+            return _Resolution(GUEST_UNKNOWN, None, name, reason=str(error))
+        if zone is None:
+            return _Resolution(GUEST_ABSENT, None, name)
+        return self._fetch(zone, name, expected)
+
     def _resolve(self, ref: VMRef) -> _Resolution:
+        # ref.location is never consulted: discovery finds the zone.
         name = ref.provider_id or instance_name(_config().LAB_SITE_ID, ref.vmid)
-        return self._fetch(self._zone(ref.location), name, self._expected_labels(ref))
+        return self._identify(name, self._expected_labels(ref))
 
     def inspect(self, ref: VMRef) -> str:
         return self._resolve(ref).verdict
 
     def _delete_instance(self, resolution: _Resolution) -> None:
-        """Delete an instance a fresh read just proved is the caller's; one
-        already gone (404) is done. Its boot disk goes with it (autoDelete)."""
+        """Delete an instance a fresh read just proved is the caller's. Its
+        boot disk goes with it (autoDelete)."""
         zone, name = resolution.zone, resolution.name
-        self._mutate(
+        done = self._mutate(
             'DELETE', ('zones', zone, 'instances', name), what=f'delete of instance {name}',
             # The provider's numeric id makes a recreated namesake a
             # different request, never a replay of this one.
             params={'requestId': _request_id('instance-delete', zone, name,
                                              resolution.instance.get('id', ''))},
             tolerate=404)
+        # A zonal 404 is not absence on its own: only discovery decides.
+        if done is None and self._discover(name) is not None:
+            raise BackendError(f'delete of instance {name} got 404 in {zone}, '
+                               'but the instance still exists')
 
     def destroy(self, ref: VMRef, policy: DestroyPolicy) -> None:
         # Compute deletes a running instance directly, so every policy is
@@ -415,8 +475,8 @@ class GCPBackend:
 
     def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
         # `error` is never evidence: a 404 from another call (a subnetwork,
-        # an operation) says nothing about the instance. Only a 404 from a
-        # fresh GET of the instance does.
+        # an operation, another zone) says nothing about the instance. Only
+        # a complete discovery that finds no instance of the name does.
         return self._resolve(ref).verdict == GUEST_ABSENT
 
     # Display reads
@@ -466,28 +526,52 @@ class GCPBackend:
 
     # Inventory
 
-    def _list(self, path: Tuple[str, ...], *, filter_expression: str, what: str) -> List[dict]:
-        """Every item of one Compute list, following nextPageToken."""
-        items, token, seen = [], None, set()
+    def _pages(self, path: Tuple[str, ...], params: dict, *, what: str) -> Iterator[dict]:
+        """Every page of one Compute list, following nextPageToken."""
+        token, seen = None, set()
         while True:
-            params = {'filter': filter_expression}
+            query = dict(params)
             if token is not None:
-                params['pageToken'] = token
+                query['pageToken'] = token
             try:
-                page = self._send('GET', path, params=params)
+                page = self._send('GET', path, params=query)
             except requests.RequestException as error:
                 raise BackendError(f'{what} unavailable: {error}') from error
-            page_items = page.get('items', [])
-            if not isinstance(page_items, list) or not all(
-                    isinstance(item, dict) for item in page_items):
-                raise BackendError(f'{what}: malformed page')
-            items.extend(page_items)
+            yield page
             token = page.get('nextPageToken')
             if not token:
-                return items
-            if token in seen:
-                raise BackendError(f'{what}: page token {token!r} repeated')
+                return
+            if not isinstance(token, str) or token in seen:
+                raise BackendError(f'{what}: page token {token!r} repeated or malformed')
             seen.add(token)
+
+    def _aggregated(self, filter_expression: str, *, what: str) -> List[Tuple[str, dict]]:
+        """(zone, instance) for every instance the project-wide aggregated
+        list returns. Raises BackendError unless every zone answered: a list
+        that missed a zone cannot prove anything absent."""
+        found = []
+        for page in self._pages(('aggregated', 'instances'), {'filter': filter_expression},
+                                what=what):
+            if page.get('unreachables'):
+                raise BackendError(f'{what}: unreachable {page["unreachables"]!r}')
+            _check_warning(page.get('warning'), 'the project', what)
+            scopes = page.get('items', {})
+            if not isinstance(scopes, dict):
+                raise BackendError(f'{what}: malformed page')
+            for scope, scoped in scopes.items():
+                if not isinstance(scoped, dict):
+                    raise BackendError(f'{what}: malformed scope {scope!r}')
+                _check_warning(scoped.get('warning'), scope, what)
+                instances = scoped.get('instances', [])
+                if not isinstance(instances, list):
+                    raise BackendError(f'{what}: malformed scope {scope!r}')
+                for instance in instances:
+                    zone = _last_segment(instance.get('zone')) if isinstance(
+                        instance, dict) else None
+                    if not zone or scope != f'zones/{zone}':
+                        raise BackendError(f'{what}: malformed instance in {scope!r}')
+                    found.append((zone, instance))
+        return found
 
     def list_managed(self) -> List[ManagedResource]:
         """Every instance this site launched, from one fresh paginated read.
@@ -496,12 +580,10 @@ class GCPBackend:
         site = config.LAB_SITE_ID
         # Validated before it is quoted into the filter expression.
         validate_site_id(site)
-        instances = self._list(
-            ('zones', config.GCP_ZONE, 'instances'),
-            filter_expression=f'(labels.{TAG_SITE} = "{site}")',
-            what='Compute instance inventory')
+        instances = self._aggregated(f'(labels.{TAG_SITE} = "{site}")',
+                                     what='Compute instance inventory')
         resources = []
-        for instance in instances:
+        for zone, instance in instances:
             labels = _labels(instance)
             # Re-checked locally: a loose provider filter confers no
             # ownership, and the site's router carries the site label too.
@@ -516,7 +598,7 @@ class GCPBackend:
                 backend=BACKEND_GCP, kind=KIND_INSTANCE, provider_id=name,
                 name=description if isinstance(description, str) else '',
                 vmid=_decimal(labels.get(TAG_VMID)),
-                location=_last_segment(instance.get('zone')),
+                location=zone,
                 deployment_id=labels.get(TAG_DEPLOYMENT),
                 network_slot=_decimal(labels.get(TAG_SLOT)),
                 expires_at_epoch=float(expires) if expires is not None else None,
@@ -525,10 +607,11 @@ class GCPBackend:
         return resources
 
     def delete_resource(self, resource: ManagedResource) -> None:
-        """Delete one listed resource after re-proving, from a fresh GET,
-        that it still carries the identity it was listed with: the listing
-        may be minutes old. Absent is done; a changed identity raises
-        DestroyRefused; an unverifiable one raises BackendError."""
+        """Delete one listed resource after re-proving, from fresh discovery
+        and a GET, that it still carries the identity it was listed with: the
+        listing may be minutes old, and its location is not trusted. Absent
+        is done; a changed identity raises DestroyRefused; an unverifiable
+        one raises BackendError."""
         if resource.backend != self.name:
             raise BackendError(
                 f'{resource.backend} {resource.kind} {resource.provider_id} '
@@ -542,7 +625,7 @@ class GCPBackend:
                            (TAG_SLOT, resource.network_slot)):
             if value is not None:
                 expected[key] = str(value)
-        resolution = self._fetch(self._zone(resource.location), resource.provider_id, expected)
+        resolution = self._identify(resource.provider_id, expected)
         if resolution.verdict == GUEST_ABSENT:
             return
         if resolution.verdict == GUEST_MISMATCH:
