@@ -18,12 +18,14 @@ from app.proxmox_service import vm_lifecycle_lock
 from tests.backends.fake_backend import (
     FakeBackend, make_aws_backend_case, make_memory_backend_case,
 )
+from tests.backends.fake_gce import make_gcp_backend_case
 from tests.backends.proxmox_case import make_proxmox_backend_case
 
 
 @pytest.fixture(params=[make_memory_backend_case,
                         make_proxmox_backend_case,
-                        make_aws_backend_case],
+                        make_aws_backend_case,
+                        make_gcp_backend_case],
                 ids=lambda factory: factory.__name__)
 def backend_case(request, app):
     case = request.param(app)

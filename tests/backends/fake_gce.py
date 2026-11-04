@@ -13,27 +13,64 @@ labelFingerprint 412, and a repeated mutation with the same endpoint and
 requestId returns the original operation without changing state.
 
 None of this observes Google's real behaviour: the list-filter grammar, the
-status codes chosen for synchronous refusals, and `/wait` returning an
-unchanged non-DONE operation are modelled, not measured (T19 live-confirms).
+aggregated-list warnings, the status codes chosen for synchronous refusals,
+and `/wait` returning an unchanged non-DONE operation are modelled, not
+measured (T19 live-confirms).
+
+make_gcp_backend_case builds the shared-contract case on this fake.
 """
 
 import copy
+import importlib
 import ipaddress
 import itertools
 import json as jsonlib
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
+from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
 import requests
+
+from app.backends.base import VMSpec
+from app.backends.cloud_common import TAG_KIND, TAG_SITE
+from app.backends.gcp import GCPBackend
+from tests.backends.fake_backend import BackendContractCase
 
 API_ROOT = 'https://compute.googleapis.com/compute/v1/projects/'
 # Compute's own links use this host, not the API root: a backend must read
 # only their final segment.
 LINK_ROOT = 'https://www.googleapis.com/compute/v1/projects/'
 CREATION_TIMESTAMP = '2026-01-02T03:04:05.000-08:00'
+_FIREWALL_SERVER_FIELDS = ('kind', 'id', 'creationTimestamp', 'selfLink')
+
+# The neutral GCP world the focused tests and the contract case share.
+GCP_TEST_PROJECT = 'example-project'
+GCP_TEST_REGION = 'us-central1'
+GCP_TEST_ZONE = 'us-central1-a'
+GCP_TEST_ROUTER = 'lab-router'
+GCP_TEST_CONFIG = {
+    'LAB_SITE_ID': 'test-site', 'GCP_PROJECT': GCP_TEST_PROJECT,
+    'GCP_REGION': GCP_TEST_REGION, 'GCP_ZONE': GCP_TEST_ZONE,
+    'GCP_NETWORK': 'lab-vpc', 'GCP_LAB_CIDR': '172.21.0.0/16',
+    'GCP_ROUTER_INSTANCE': GCP_TEST_ROUTER, 'GCP_MAX_VMS': 2,
+    'GCP_OPERATION_TIMEOUT_SECONDS': 10,
+}
+
+
+def gcp_test_spec() -> VMSpec:
+    return VMSpec(
+        vmid=101, vm_name='test-gcp-101', display_name='Test GCP VM', backend='gcp',
+        template={'image': 'projects/example-project/global/images/lab-image',
+                  'machine_type': 'e2-small', 'disk_gb': 30},
+        memory_mb=2048, cores=1, storage_gb=30, is_entry_point=True,
+        entry_slot=100, internal_slot=200,
+        expires_at=datetime.now() + timedelta(hours=1),
+        deployment_id='0123456789abcdef0123456789abcdef', owner='test-owner')
+
 
 _NAME = re.compile(r'[a-z]([-a-z0-9]{0,61}[a-z0-9])?')
 _LABEL_KEY = re.compile(r'[a-z][a-z0-9_-]{0,62}')
@@ -161,6 +198,9 @@ class FakeGCESession(requests.Session):
         instances are omitted, and the page reports them in each form named
         by unreachable_reports ('warning': a scope warning UNREACHABLE;
         'unreachables': the top-level unreachables list).
+    known_regions / unreachable_regions: the same for aggregated subnetworks.
+    start_status / stop_status: the state a start or stop operation leaves
+        the instance in (a router that never settles, for instance).
     """
 
     def __init__(self, project: str = 'example-project'):
@@ -185,6 +225,10 @@ class FakeGCESession(requests.Session):
         self.known_zones = {'us-central1-a', 'us-central1-b', 'us-east1-b'}
         self.unreachable_zones: set = set()
         self.unreachable_reports: Tuple[str, ...] = ('warning', 'unreachables')
+        self.known_regions = {'us-central1', 'us-east1'}
+        self.unreachable_regions: set = set()
+        self.start_status = 'RUNNING'
+        self.stop_status = 'TERMINATED'
 
     # Test controls
 
@@ -198,7 +242,7 @@ class FakeGCESession(requests.Session):
                                    invalid_json, transport, times))
 
     def add_subnetwork(self, region: str, name: str, ip_cidr_range: str,
-                       network: str = 'lab-network') -> dict:
+                       network: str = 'lab-vpc') -> dict:
         subnetwork = self._new_subnetwork(region, {
             'name': name, 'ipCidrRange': ip_cidr_range,
             'network': f'projects/{self.project}/global/networks/{network}'})
@@ -218,6 +262,26 @@ class FakeGCESession(requests.Session):
         instance['status'] = status
         self.instances[(zone, name)] = instance
         return instance
+
+    def add_router(self, zone: str, name: str, *, status: str = 'TERMINATED',
+                   site: str = 'test-site', kind: str = 'router') -> dict:
+        """The operator's router: labelled with its site and kind, no lab NIC."""
+        router = self._new_instance(zone, {
+            'name': name, 'labels': {TAG_SITE: site, TAG_KIND: kind},
+            'machineType': f'zones/{zone}/machineTypes/e2-small',
+            'networkInterfaces': [], 'tags': {'items': []}})
+        router['status'] = status
+        self.instances[(zone, name)] = router
+        return router
+
+    def add_firewall(self, body: dict) -> dict:
+        """A firewall some other actor created, written straight to state."""
+        self._insert_firewall(body)
+        return self.firewalls[body['name']]
+
+    def firewall_server_fields(self, name: str) -> dict:
+        """The output-only fields Compute added to firewall `name`."""
+        return {key: self.firewalls[name][key] for key in _FIREWALL_SERVER_FIELDS}
 
     # requests.Session surface
 
@@ -258,8 +322,8 @@ class FakeGCESession(requests.Session):
             case ('GET', ['zones', zone, 'instances']):
                 return self._list([v for (z, _), v in self.instances.items() if z == zone],
                                   params, url)
-            case ('GET', ['aggregated', 'instances']):
-                return self._aggregated_instances(params, url)
+            case ('GET', ['aggregated', ('instances' | 'subnetworks') as collection]):
+                return self._aggregated(collection, params, url)
             case ('GET', ['zones', zone, 'instances', name]):
                 return self._get(self.instances, (zone, name), url)
             case ('DELETE', ['zones', zone, 'instances', name]):
@@ -382,32 +446,37 @@ class FakeGCESession(requests.Session):
             body['nextPageToken'] = token
         return FakeResponse(200, body, url=url)
 
-    def _aggregated_instances(self, params: dict, url: str) -> FakeResponse:
-        reachable = [instance for (zone, _), instance in self.instances.items()
-                     if zone not in self.unreachable_zones]
+    def _aggregated(self, collection: str, params: dict, url: str) -> FakeResponse:
+        if collection == 'instances':
+            table, scope_kind, field = self.instances, 'zones', 'zone'
+            known, unreachable = self.known_zones, self.unreachable_zones
+        else:
+            table, scope_kind, field = self.subnetworks, 'regions', 'region'
+            known, unreachable = self.known_regions, self.unreachable_regions
+        reachable = [item for (location, _), item in table.items()
+                     if location not in unreachable]
         items = self._select(reachable, params, url)
         if isinstance(items, FakeResponse):
             return items
-        ordered = sorted(items, key=lambda item: (item['zone'], item.get('name', '')))
+        ordered = sorted(items, key=lambda item: (item[field], item.get('name', '')))
         page, token = self._page(ordered, params)
-        zones = self.known_zones | {zone for zone, _ in self.instances}
         scopes = {}
-        for zone in sorted(zones):
-            scope = f'zones/{zone}'
-            if zone in self.unreachable_zones:
+        for location in sorted(known | {location for location, _ in table}):
+            scope = f'{scope_kind}/{location}'
+            if location in unreachable:
                 if 'warning' in self.unreachable_reports:
                     scopes[scope] = {'warning': {
                         'code': 'UNREACHABLE', 'message': f'{scope} is unreachable',
                         'data': [{'key': 'scope', 'value': scope}]}}
                 continue
-            instances = [item for item in page if item['zone'].endswith('/' + scope)]
-            scopes[scope] = {'instances': instances} if instances else {'warning': {
+            listed = [item for item in page if item[field].endswith('/' + scope)]
+            scopes[scope] = {collection: listed} if listed else {'warning': {
                 'code': 'NO_RESULTS_ON_PAGE',
                 'message': 'There are no results for scope on this page.',
                 'data': [{'key': 'scope', 'value': scope}]}}
-        body = {'kind': 'compute#instanceAggregatedList', 'id': url, 'items': scopes}
-        if self.unreachable_zones and 'unreachables' in self.unreachable_reports:
-            body['unreachables'] = sorted(f'zones/{zone}' for zone in self.unreachable_zones)
+        body = {'kind': 'compute#aggregatedList', 'id': url, 'items': scopes}
+        if unreachable and 'unreachables' in self.unreachable_reports:
+            body['unreachables'] = sorted(f'{scope_kind}/{location}' for location in unreachable)
         if token is not None:
             body['nextPageToken'] = token
         return FakeResponse(200, body, url=url)
@@ -559,7 +628,8 @@ class FakeGCESession(requests.Session):
         instance['labelFingerprint'] = self._fingerprint()
 
     def _set_status(self, zone, name, action) -> None:
-        self.instances[(zone, name)]['status'] = 'RUNNING' if action == 'start' else 'TERMINATED'
+        self.instances[(zone, name)]['status'] = (
+            self.start_status if action == 'start' else self.stop_status)
 
     # Subnetworks
 
@@ -631,3 +701,35 @@ class FakeGCESession(requests.Session):
             'selfLink': self._firewall_link(body['name']),
         })
         self.firewalls[body['name']] = firewall
+
+
+def make_gcp_backend_case(app) -> BackendContractCase:
+    """GCPBackend against FakeGCESession: the lab network's project and a
+    stopped operator router, no slot subnetwork and no firewall yet.
+
+    The config patch is started here and stopped by cleanup(), because it
+    must outlive this call into the parametrized test; GCPBackend reads
+    config at call time, so it applies for the case's lifetime.
+    """
+    fake = FakeGCESession(GCP_TEST_PROJECT)
+    fake.add_router(GCP_TEST_ZONE, GCP_TEST_ROUTER, status='TERMINATED')
+    config_patch = patch.multiple(importlib.import_module('app.config'), **GCP_TEST_CONFIG)
+    config_patch.start()
+    spec = gcp_test_spec()
+    backend = GCPBackend(session=fake)
+
+    def cleanup() -> None:
+        # The shared tests start the router and ensure the slot (ruling C3)
+        # and have already deleted the instance.
+        try:
+            backend.release_slot(spec.network_slot)
+            backend.stop_router()
+        finally:
+            config_patch.stop()
+            for table in (fake.instances, fake.subnetworks, fake.firewalls,
+                          fake.operations, fake.request_results):
+                table.clear()
+
+    # The first address the fake hands out in the slot's subnetwork.
+    return BackendContractCase(backend=backend, spec=spec, expected_ips=['172.21.25.2'],
+                               expected_status='running', cleanup=cleanup)

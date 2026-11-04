@@ -19,16 +19,19 @@ from app.backends import gcp as gcp_module
 from app.backends.base import (
     BACKEND_GCP, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, GUEST_UNKNOWN,
     AdmissionRefused, BackendError, DestroyPolicy, DestroyRefused, LaunchedVM,
-    ManagedResource, VMRef, VMSpec,
+    ManagedResource, SlotNetworkMissing, VMRef,
 )
 from app.backends.cloud_common import (
     TAG_DEPLOYMENT, TAG_EXPIRES, TAG_KIND, TAG_SITE, TAG_SLOT, TAG_VMID,
-    expires_epoch,
+    deployment_key, expires_epoch, router_lock_key, slot_lock_key,
 )
 from app.backends.gcp import GCPBackend, OperationFailed, _request_id
 from app.models import NodeMemoryReservation, VMRecord, db
+from app.proxmox_service import vm_lifecycle_lock
 from app.routes.vm_creation import named_instances
-from tests.backends.fake_gce import CREATION_TIMESTAMP, FakeGCESession
+from tests.backends.fake_gce import (
+    CREATION_TIMESTAMP, GCP_TEST_CONFIG, FakeGCESession, gcp_test_spec,
+)
 
 PROJECT = 'example-project'
 REGION = 'us-central1'
@@ -40,21 +43,31 @@ SLOT = 100
 IMAGE = 'projects/example-project/global/images/lab-image'
 NAME = 'lp-test-site-101'
 SUBNET = 'lp-test-site-s-100'
-GCP_TEST_CONFIG = {
-    'LAB_SITE_ID': SITE, 'GCP_PROJECT': PROJECT, 'GCP_REGION': REGION,
-    'GCP_ZONE': ZONE, 'GCP_NETWORK': 'lab-network', 'GCP_MAX_VMS': 2,
-    'GCP_OPERATION_TIMEOUT_SECONDS': 10,
-}
+SLOT_CIDR = '172.21.25.0/26'
+FIREWALL = 'lp-test-site-d-0123456789abcdef'
+NETWORK = 'projects/example-project/global/networks/lab-vpc'
+ROUTER = 'lab-router'
 INSTANCE_PATH = r'zones/[^/]+/instances/[^/]+'
 AGGREGATED_PATH = r'aggregated/instances'
 INSERT_PATH = f'zones/{ZONE}/instances'
 OTHER_ZONE = 'us-east1-b'
+CREATED = datetime.fromisoformat(CREATION_TIMESTAMP).timestamp()
+
+
+def _deployment_rule(name=FIREWALL, **overrides):
+    """The rule create makes for a deployment, as another writer would."""
+    return dict({'name': name, 'network': NETWORK, 'direction': 'INGRESS', 'priority': 1000,
+                 'sourceTags': [name], 'targetTags': [name],
+                 'allowed': [{'IPProtocol': 'all'}]}, **overrides)
 
 
 @pytest.fixture
 def gce():
+    """A project whose slot 100 is ensured and whose deployment already has
+    its firewall, so instance tests start where a real create would."""
     session = FakeGCESession(PROJECT)
-    session.add_subnetwork(REGION, SUBNET, '172.21.100.0/24')
+    session.add_subnetwork(REGION, SUBNET, SLOT_CIDR)
+    session.add_firewall(_deployment_rule())
     return session
 
 
@@ -69,14 +82,7 @@ def backend(app, monkeypatch, gce):
 
 @pytest.fixture
 def spec():
-    return VMSpec(
-        vmid=VMID, vm_name='test-gcp-101', display_name='Test GCP VM',
-        backend=BACKEND_GCP,
-        template={'image': IMAGE, 'machine_type': 'e2-small', 'disk_gb': 30},
-        memory_mb=2048, cores=1, storage_gb=30, is_entry_point=True,
-        entry_slot=SLOT, internal_slot=200,
-        expires_at=datetime.now() + timedelta(hours=1),
-        deployment_id=DEPLOYMENT, owner='test-owner')
+    return gcp_test_spec()
 
 
 def _ref(spec, launched):
@@ -88,6 +94,10 @@ def _ref(spec, launched):
 
 def _launch(backend, spec):
     return _ref(spec, backend.create(spec, ZONE, heartbeat=lambda: None))
+
+
+def _instances(backend):
+    return [r for r in backend.list_managed() if r.kind == 'instance']
 
 
 def _labels(gce):
@@ -175,12 +185,13 @@ def test_create_heartbeats_while_the_operation_runs(backend, gce, spec):
     assert seen == [0, 0, 1]
 
 
-def test_create_into_a_missing_subnetwork_raises(backend, gce, spec):
-    # Catches a refused insert being reported as a launched VM.
-    del gce.subnetworks[(REGION, SUBNET)]
-    with pytest.raises(BackendError):
+def test_create_without_slot_subnetwork_raises_slot_network_missing(backend, gce, spec):
+    # Catches a launch into a slot a concurrent retirement just released (I3).
+    gce.subnetworks.clear()
+    gce.firewalls.clear()
+    with pytest.raises(SlotNetworkMissing):
         backend.create(spec, ZONE, heartbeat=lambda: None)
-    assert gce.instances == {}
+    assert gce.instances == {} and gce.firewalls == {}
 
 
 # Identity, status and addresses
@@ -194,7 +205,7 @@ def test_get_operations_map_identity_status_and_private_ips(backend, gce, spec):
     assert backend.status(ref) == 'running'
     instance['networkInterfaces'][0]['accessConfigs'] = [{'natIP': '203.0.113.9'}]
     assert backend.ip_addresses(ref) == [instance['networkInterfaces'][0]['networkIP']]
-    assert backend.ip_addresses(ref) == ['172.21.100.2']
+    assert backend.ip_addresses(ref) == ['172.21.25.2']
     instance['labels'][TAG_VMID] = '999'
     assert backend.inspect(ref) == GUEST_MISMATCH
     assert backend.status(ref) == 'unknown'
@@ -397,9 +408,9 @@ def test_list_managed_pages_and_filters_foreign_labels(backend, gce, spec):
         expires_at_epoch=float(expires_epoch(spec.expires_at)),
         created_at_epoch=datetime.fromisoformat(CREATION_TIMESTAMP).timestamp(),
         status='running')
-    assert backend.list_managed() == [expected]
+    assert _instances(backend) == [expected]
     gce.loose_filter = False
-    assert backend.list_managed() == [expected]
+    assert _instances(backend) == [expected]
     assert ref.provider_id == expected.provider_id
 
 
@@ -410,7 +421,7 @@ def test_list_managed_keeps_malformed_owned_instances(backend, gce, spec):
         TAG_SITE: SITE, TAG_KIND: 'instance', TAG_VMID: 'seven',
         TAG_SLOT: '-1', TAG_EXPIRES: '12x'})
     gce.instances[(ZONE, 'lp-test-site-7')]['creationTimestamp'] = 'yesterday'
-    [resource] = backend.list_managed()
+    [resource] = _instances(backend)
     assert (resource.provider_id, resource.vmid, resource.network_slot,
             resource.expires_at_epoch, resource.created_at_epoch, resource.deployment_id) == (
         'lp-test-site-7', None, None, None, None, None)
@@ -421,7 +432,7 @@ def test_list_managed_names_round_trip_to_the_portal_vm_name(backend, gce, spec)
     # inventory name is not the portal's vm_name (labels cannot hold it).
     _launch(backend, spec)
     assert gce.instances[(ZONE, NAME)]['description'] == spec.vm_name
-    [managed] = backend.list_managed()
+    [managed] = _instances(backend)
     assert managed.name == spec.vm_name
     assert named_instances(backend, 'test-gcp-') == [
         {'vmid': VMID, 'node': ZONE, 'vm_type': 'gcp', 'name': spec.vm_name}]
@@ -509,7 +520,7 @@ def test_changing_gcp_zone_after_launch_keeps_the_vm_found(backend, gce, spec, m
     survivor = replace(ref, provider_id=None, location='gcp')
     assert backend.inspect(ref) == backend.inspect(survivor) == GUEST_MATCH
     assert backend.confirm_absent(ref) is False and backend.confirm_absent(survivor) is False
-    [listed] = backend.list_managed()
+    [listed] = _instances(backend)
     assert listed.location == ZONE
     backend.delete_resource(replace(listed, location=OTHER_ZONE))
     assert gce.instances == {}
@@ -571,21 +582,38 @@ def _insert_request_ids(gce):
             if (method, path) == ('POST', INSERT_PATH)]
 
 
-@pytest.mark.parametrize('cause', ['quota', 'missing-subnetwork'])
+def _release_slot_during_insert(gce, monkeypatch):
+    """Remove the slot's subnetwork when the next instance insert arrives: a
+    retirement releasing it between create's slot check and its insert."""
+    request = gce.request
+    fired = []
+
+    def racing(method, url, **kwargs):
+        if not fired and method == 'POST' and url.endswith('/' + INSERT_PATH):
+            fired.append(True)
+            gce.subnetworks.pop((REGION, SUBNET), None)
+        return request(method, url, **kwargs)
+
+    monkeypatch.setattr(gce, 'request', racing)
+
+
+@pytest.mark.parametrize('cause', ['quota', 'released-subnetwork'])
 def test_terminal_insert_failure_then_corrected_cause_launches_the_same_spec(
-        backend, gce, spec, cause):
+        backend, gce, spec, monkeypatch, cause):
     # Catches a failed insert's requestId replaying the failure forever, so
     # the VM can never be created once the cause is fixed.
     if cause == 'quota':
         gce.next_operation_error = {'code': 'QUOTA_EXCEEDED', 'message': 'CPUS quota exceeded'}
+        with pytest.raises(OperationFailed):
+            backend.create(spec, ZONE, heartbeat=lambda: None)
     else:
         gce.subnetwork_failure = 'async'
-        subnetwork = gce.subnetworks.pop((REGION, SUBNET))
-    with pytest.raises(OperationFailed):
-        backend.create(spec, ZONE, heartbeat=lambda: None)
+        _release_slot_during_insert(gce, monkeypatch)
+        with pytest.raises(SlotNetworkMissing) as raised:
+            backend.create(spec, ZONE, heartbeat=lambda: None)
+        assert isinstance(raised.value.__cause__, OperationFailed)
+        gce.add_subnetwork(REGION, SUBNET, SLOT_CIDR)  # create_vm re-ensures (I3)
     assert gce.instances == {}
-    if cause != 'quota':
-        gce.subnetworks[(REGION, SUBNET)] = subnetwork
     launched = backend.create(spec, ZONE, heartbeat=lambda: None)
     again = backend.create(spec, ZONE, heartbeat=lambda: None)
     assert launched == again and list(gce.instances) == [(ZONE, NAME)]
@@ -843,3 +871,510 @@ def test_fake_reports_a_missing_subnetwork_synchronously_or_in_the_operation(gce
         assert operation['error']['errors'][0]['code'] == 'RESOURCE_NOT_FOUND'
         assert len(gce.operations) == 1
     assert gce.instances == {}
+
+
+# Slot networks
+
+def _ensure_slot(backend, slot=SLOT):
+    with vm_lifecycle_lock(slot_lock_key(BACKEND_GCP, slot)):
+        backend.ensure_slot(slot)
+
+
+def _release_slot(backend, slot=SLOT):
+    with vm_lifecycle_lock(slot_lock_key(BACKEND_GCP, slot)):
+        backend.release_slot(slot)
+
+
+def test_ensure_and_release_slot_are_idempotent_and_use_the_derived_cidr(backend, gce):
+    # Catches two slot owners being placed on an overlapping/default network.
+    gce.subnetworks.clear()
+    with vm_lifecycle_lock(slot_lock_key(BACKEND_GCP, 100)):
+        backend.ensure_slot(100)
+        backend.ensure_slot(100)
+    subnet = gce.subnetworks[(REGION, 'lp-test-site-s-100')]
+    assert subnet['ipCidrRange'] == '172.21.25.0/26'
+    assert subnet['network'].endswith('/global/networks/lab-vpc')
+    assert subnet['privateIpGoogleAccess'] is False
+    assert len(gce.subnetworks) == 1
+    with vm_lifecycle_lock(slot_lock_key(BACKEND_GCP, 100)):
+        backend.release_slot(100)
+        backend.release_slot(100)
+    assert gce.subnetworks == {}
+
+
+@pytest.mark.parametrize('winner, adopted', [
+    ({}, True),
+    ({'ip_cidr_range': '172.21.26.0/26'}, False),
+    ({'network': 'other-vpc'}, False),
+])
+def test_a_slot_insert_race_adopts_only_an_exactly_placed_winner(
+        backend, gce, monkeypatch, winner, adopted):
+    # Catches a lost create race launching a slot into another network or
+    # CIDR that happens to hold the slot's name.
+    gce.subnetworks.clear()
+    request = gce.request
+
+    def racing(method, url, **kwargs):
+        if method == 'POST' and url.endswith(f'/regions/{REGION}/subnetworks'):
+            gce.add_subnetwork(REGION, SUBNET, winner.get('ip_cidr_range', SLOT_CIDR),
+                               network=winner.get('network', 'lab-vpc'))
+        return request(method, url, **kwargs)
+
+    monkeypatch.setattr(gce, 'request', racing)
+    if adopted:
+        _ensure_slot(backend)
+    else:
+        with pytest.raises(BackendError):
+            _ensure_slot(backend)
+    assert list(gce.subnetworks) == [(REGION, SUBNET)]
+
+
+@pytest.mark.parametrize('field, value', [
+    ('ipCidrRange', '172.21.26.0/26'),
+    ('network', 'projects/example-project/global/networks/other-vpc'),
+    ('creationTimestamp', None),
+])
+def test_ensure_slot_and_create_refuse_a_misplaced_slot_subnetwork(backend, gce, spec, field, value):
+    # Catches a VM launched into a same-named subnetwork at the wrong CIDR
+    # or in another network.
+    gce.subnetworks[(REGION, SUBNET)][field] = value
+    with pytest.raises(BackendError):
+        _ensure_slot(backend)
+    with pytest.raises(BackendError) as raised:
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert not isinstance(raised.value, SlotNetworkMissing)
+    assert gce.instances == {}
+
+
+@pytest.mark.parametrize('mode', ['sync', 'async'])
+def test_a_slot_released_during_the_insert_raises_slot_network_missing(
+        backend, gce, spec, monkeypatch, mode):
+    # Catches a launch that lost its slot mid-insert failing for good
+    # instead of letting create_vm re-ensure the slot and retry once (I3).
+    gce.subnetwork_failure = mode
+    _release_slot_during_insert(gce, monkeypatch)
+    with pytest.raises(SlotNetworkMissing):
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert gce.instances == {}
+    _ensure_slot(backend)
+    assert backend.create(spec, ZONE, heartbeat=lambda: None).provider_id == NAME
+    assert list(gce.instances) == [(ZONE, NAME)]
+
+
+def test_release_slot_refuses_a_subnetwork_it_cannot_prove_is_its_own(backend, gce):
+    # Catches a release deleting a same-named subnetwork in another network.
+    gce.subnetworks[(REGION, SUBNET)]['network'] = 'projects/example-project/global/networks/x'
+    with pytest.raises(DestroyRefused):
+        _release_slot(backend)
+    assert (REGION, SUBNET) in gce.subnetworks
+
+
+# Deployment firewalls
+
+def test_create_uses_only_the_per_deployment_firewall(backend, gce, spec):
+    # Catches broad lateral ingress or accidental ownership of the static tailnet rule.
+    gce.firewalls.clear()
+    backend.ensure_slot(100)
+    backend.create(spec, ZONE, heartbeat=lambda: None)
+    name = 'lp-test-site-d-0123456789abcdef'
+    assert list(gce.firewalls) == [name]
+    assert gce.firewalls[name] == {
+        **gce.firewall_server_fields(name),
+        'name': name,
+        'network': 'projects/example-project/global/networks/lab-vpc',
+        'direction': 'INGRESS',
+        'priority': 1000,
+        'sourceTags': [name],
+        'targetTags': [name],
+        'allowed': [{'IPProtocol': 'all'}],
+    }
+    assert 'sourceRanges' not in gce.firewalls[name]
+    assert 'destinationRanges' not in gce.firewalls[name]
+    assert gce.instances[(ZONE, 'lp-test-site-101')]['tags']['items'] == [
+        name, 'lp-test-site-lab']
+    assert 'lp-test-site-lab' not in gce.firewalls
+
+
+@pytest.mark.parametrize('field, value', [
+    ('network', 'projects/example-project/global/networks/other-vpc'),
+    ('direction', 'EGRESS'),
+    ('priority', 900),
+    ('sourceTags', ['lp-test-site-lab']),
+    ('targetTags', ['lp-test-site-lab']),
+    ('allowed', [{'IPProtocol': 'tcp', 'ports': ['22']}]),
+    ('sourceRanges', ['0.0.0.0/0']),
+    ('destinationRanges', ['0.0.0.0/0']),
+    ('disabled', True),
+])
+def test_existing_firewall_must_match_every_security_field(backend, gce, spec, field, value):
+    # Catches a lab joining a same-named rule that grants more (or other)
+    # access than its own deployment's.
+    gce.firewalls[FIREWALL][field] = value
+    before = dict(gce.firewalls[FIREWALL])
+    with pytest.raises(BackendError):
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+    assert gce.instances == {}
+    assert gce.firewalls[FIREWALL] == before
+
+
+@pytest.mark.parametrize('winner, adopted', [
+    ({}, True), ({'allowed': [{'IPProtocol': 'tcp'}]}, False),
+])
+def test_a_firewall_insert_race_adopts_only_an_exact_winner(
+        backend, gce, spec, monkeypatch, winner, adopted):
+    # Catches a lost create race attaching the lab to a foreign rule.
+    gce.firewalls.clear()
+    request = gce.request
+
+    def racing(method, url, **kwargs):
+        if method == 'POST' and url.endswith('/global/firewalls'):
+            gce.add_firewall(_deployment_rule(**winner))
+        return request(method, url, **kwargs)
+
+    monkeypatch.setattr(gce, 'request', racing)
+    if adopted:
+        backend.create(spec, ZONE, heartbeat=lambda: None)
+        assert list(gce.instances) == [(ZONE, NAME)]
+    else:
+        with pytest.raises(BackendError):
+            backend.create(spec, ZONE, heartbeat=lambda: None)
+        assert gce.instances == {}
+    assert list(gce.firewalls) == [FIREWALL]
+
+
+def test_cleanup_deployment_deletes_only_its_exact_firewall_and_is_idempotent(backend, gce, spec):
+    # Catches cleanup deleting the operator's tailnet rule, another
+    # deployment's or another site's firewall, or failing when already clean.
+    ref = _launch(backend, spec)
+    others = ['lp-test-site-lab', 'lp-test-site-d-ffffffffffffffff',
+              'lp-other-site-d-0123456789abcdef']
+    for name in others:
+        gce.add_firewall(_deployment_rule(name))
+    backend.destroy(ref, DestroyPolicy.STRICT)
+    backend.cleanup_deployment(DEPLOYMENT)
+    backend.cleanup_deployment(DEPLOYMENT)
+    assert sorted(gce.firewalls) == sorted(others)
+
+
+@pytest.mark.parametrize('field, value', [
+    ('creationTimestamp', None), ('creationTimestamp', 'yesterday'),
+    ('sourceTags', ['lp-test-site-lab']), ('targetTags', [FIREWALL, 'other']),
+    ('network', 'projects/example-project/global/networks/other-vpc'),
+])
+def test_cleanup_deployment_refuses_a_forged_exact_name_firewall(backend, gce, field, value):
+    # Catches cleanup deleting a rule that only shares the deployment's name.
+    gce.firewalls[FIREWALL][field] = value
+    with pytest.raises(DestroyRefused):
+        backend.cleanup_deployment(DEPLOYMENT)
+    assert FIREWALL in gce.firewalls
+
+
+def test_network_operation_failure_keeps_the_resource_visible_for_retry(backend, gce, spec):
+    # Catches a refused network delete being reported as cleaned up, so the
+    # caller and the sweeper would never retry it.
+    ref = _launch(backend, spec)
+    with pytest.raises(OperationFailed):
+        _release_slot(backend)  # the instance still uses it
+    gce.next_operation_error = {'code': 'RESOURCE_NOT_READY', 'message': 'busy'}
+    with pytest.raises(OperationFailed):
+        backend.cleanup_deployment(DEPLOYMENT)
+    kinds = {r.kind for r in backend.list_managed()}
+    assert kinds == {'instance', 'slot-network', 'deployment-network'}
+    backend.destroy(ref, DestroyPolicy.STRICT)
+    backend.cleanup_deployment(DEPLOYMENT)
+    _release_slot(backend)
+    assert backend.list_managed() == []
+
+
+def test_a_failed_instance_delete_can_be_retried(backend, gce, spec):
+    # Catches a delete's requestId replaying its failure on every later
+    # destroy, so the VM bills forever.
+    ref = _launch(backend, spec)
+    gce.next_operation_error = {'code': 'RESOURCE_NOT_READY', 'message': 'busy'}
+    with pytest.raises(OperationFailed):
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    backend.destroy(ref, DestroyPolicy.STRICT)
+    assert gce.instances == {}
+
+
+# Inventory of every kind
+
+def _networks(backend):
+    return sorted((r for r in backend.list_managed() if r.kind != 'instance'),
+                  key=lambda r: (r.kind, r.name))
+
+
+def test_list_managed_parses_only_owned_subnets_and_firewalls_with_timestamps(backend, gce):
+    # Catches the sweeper adopting the operator's tailnet rule, another
+    # site's network, or a resource it cannot age.
+    for name in ('lp-test-site-s-007', 'lp-test-site-s-abc', 'lp-test-site-s-501',
+                 'lp-other-site-s-5', 'lp-test-site-lab'):
+        gce.add_subnetwork(REGION, name, f'10.{len(gce.subnetworks)}.0.0/26')
+    gce.add_subnetwork(REGION, 'lp-test-site-s-7', '10.50.0.0/26', network='other-vpc')
+    gce.add_subnetwork(REGION, 'lp-test-site-s-8', '10.51.0.0/26')
+    gce.subnetworks[(REGION, 'lp-test-site-s-8')]['creationTimestamp'] = 'yesterday'
+    gce.add_subnetwork('us-east1', 'lp-test-site-s-9', '10.52.0.0/26')
+    for name in ('lp-test-site-lab', 'lp-test-site-d-0123', 'lp-test-site-d-0123456789ABCDEF',
+                 'lp-other-site-d-0123456789abcdef', 'lp-test-site-d-0123456789abcdef0'):
+        gce.add_firewall(_deployment_rule(name))
+    gce.add_firewall(_deployment_rule('lp-test-site-d-aaaaaaaaaaaaaaaa',
+                                      sourceTags=['lp-test-site-lab']))
+    gce.add_firewall(_deployment_rule('lp-test-site-d-bbbbbbbbbbbbbbbb'))
+    gce.firewalls['lp-test-site-d-bbbbbbbbbbbbbbbb']['creationTimestamp'] = None
+    gce.page_size = 1
+    link = 'https://www.googleapis.com/compute/v1/projects/example-project'
+    assert _networks(backend) == [
+        ManagedResource(backend='gcp', kind='deployment-network',
+                        provider_id=f'{link}/global/firewalls/{FIREWALL}', name=FIREWALL,
+                        deployment_id='0123456789abcdef', created_at_epoch=CREATED),
+        ManagedResource(backend='gcp', kind='slot-network',
+                        provider_id=f'{link}/regions/{REGION}/subnetworks/{SUBNET}',
+                        name=SUBNET, location=REGION, network_slot=SLOT,
+                        created_at_epoch=CREATED),
+        ManagedResource(backend='gcp', kind='slot-network',
+                        provider_id=f'{link}/regions/us-east1/subnetworks/lp-test-site-s-9',
+                        name='lp-test-site-s-9', location='us-east1', network_slot=9,
+                        created_at_epoch=CREATED),
+    ]
+
+
+def test_firewall_inventory_reports_the_deployment_key(backend, gce, spec):
+    # Catches the firewall's deployment identity disagreeing with AWS and T15 (C1).
+    backend.create(spec, ZONE, heartbeat=lambda: None)
+    [firewall] = [r for r in backend.list_managed() if r.kind == 'deployment-network']
+    assert firewall.deployment_id == deployment_key(spec.deployment_id) == '0123456789abcdef'
+
+
+def test_inventory_attributes_every_kind_for_the_sweeper(backend, gce, spec):
+    # Catches T15's cloud sweep never reaping GCP networks because the
+    # instances that hold them report no slot or deployment.
+    _launch(backend, spec)
+    resources = {r.kind: r for r in backend.list_managed()}
+    assert set(resources) == {'instance', 'slot-network', 'deployment-network'}
+    instance = resources['instance']
+    assert (instance.network_slot, instance.deployment_id) == (SLOT, DEPLOYMENT)
+    assert resources['slot-network'].network_slot == instance.network_slot
+    assert resources['deployment-network'].deployment_id == deployment_key(instance.deployment_id)
+    assert all(r.created_at_epoch == CREATED for r in resources.values())
+
+
+@pytest.mark.parametrize('region', ['us-east1'])
+def test_an_unreachable_region_fails_the_inventory(backend, gce, region):
+    # Catches a slot subnetwork in an unreachable region being read as gone.
+    gce.unreachable_regions = {region}
+    with pytest.raises(BackendError):
+        backend.list_managed()
+
+
+def test_delete_resource_removes_each_known_kind_and_rejects_unknown_kind(backend, gce, spec):
+    # Catches the sweeper being unable to dispatch GCP network leftovers.
+    ref = _launch(backend, spec)
+    resources = {r.kind: r for r in backend.list_managed()}
+    with pytest.raises(BackendError):
+        backend.delete_resource(replace(resources['slot-network'], kind='router'))
+    backend.delete_resource(resources['instance'])
+    backend.delete_resource(resources['deployment-network'])
+    backend.delete_resource(resources['slot-network'])
+    assert gce.instances == gce.subnetworks == gce.firewalls == {}
+    for resource in resources.values():
+        backend.delete_resource(resource)  # absent: done
+    assert backend.confirm_absent(ref) is True
+
+
+@pytest.mark.parametrize('kind, mutate', [
+    ('slot-network', lambda gce: gce.subnetworks[(REGION, SUBNET)].update(
+        network='projects/example-project/global/networks/x')),
+    ('slot-network', lambda gce: gce.subnetworks[(REGION, SUBNET)].update(
+        creationTimestamp=None)),
+    ('deployment-network', lambda gce: gce.firewalls[FIREWALL].update(
+        targetTags=['lp-test-site-lab'])),
+    ('deployment-network', lambda gce: gce.firewalls[FIREWALL].update(
+        creationTimestamp='garbled')),
+])
+def test_delete_resource_rereads_and_refuses_forged_or_relabelled_ownership(
+        backend, gce, kind, mutate):
+    # Catches a stale listing deleting a network that no longer proves it is ours.
+    [resource] = [r for r in backend.list_managed() if r.kind == kind]
+    mutate(gce)
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(resource)
+    assert (REGION, SUBNET) in gce.subnetworks and FIREWALL in gce.firewalls
+
+
+@pytest.mark.parametrize('kind, provider_id', [
+    ('slot-network', 'lp-other-site-s-100'),
+    ('slot-network', 'lp-test-site-s-101'),
+    ('slot-network', 'https://www.googleapis.com/compute/v1/projects/other-project/regions/'
+                     'us-central1/subnetworks/lp-test-site-s-100'),
+    ('deployment-network', 'lp-test-site-lab'),
+    ('deployment-network', 'lp-test-site-d-ffffffffffffffff'),
+])
+def test_delete_resource_refuses_a_forged_listing_without_touching_anything(
+        backend, gce, kind, provider_id):
+    # Catches a forged or mismatched listing reaching a DELETE.
+    [resource] = [r for r in backend.list_managed() if r.kind == kind]
+    gce.add_firewall(_deployment_rule('lp-test-site-lab'))
+    before = (dict(gce.subnetworks), dict(gce.firewalls))
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(replace(resource, provider_id=provider_id))
+    assert (dict(gce.subnetworks), dict(gce.firewalls)) == before
+
+
+@pytest.mark.parametrize('kind, path', [
+    ('slot-network', r'regions/[^/]+/subnetworks/[^/]+'),
+    ('deployment-network', r'global/firewalls/[^/]+'),
+])
+def test_delete_resource_network_unverifiable_raises(backend, gce, kind, path):
+    # Catches a read failure during a sweep being read as permission to delete.
+    [resource] = [r for r in backend.list_managed() if r.kind == kind]
+    gce.fail('GET', path, status=503)
+    with pytest.raises(BackendError) as raised:
+        backend.delete_resource(resource)
+    assert not isinstance(raised.value, DestroyRefused)
+    assert (REGION, SUBNET) in gce.subnetworks and FIREWALL in gce.firewalls
+
+
+# Display reads use the discovered resource
+
+def test_status_and_ips_come_from_discovery_without_a_zonal_read(backend, gce, spec):
+    # Catches a /list render paying a second zonal GET per VM, or showing a
+    # VM whose listed labels do not match.
+    ref = _launch(backend, spec)
+    gce.fail('GET', INSTANCE_PATH, status=500, times=10)
+    assert backend.status(ref) == 'running'
+    assert backend.ip_addresses(ref) == ['172.21.25.2']
+    gce.instances[(ZONE, NAME)]['labels'][TAG_DEPLOYMENT] = 'f' * 32
+    assert backend.status(ref) == 'unknown'
+    assert backend.ip_addresses(ref) == []
+    gce.fail('GET', AGGREGATED_PATH, status=503, times=2)
+    assert backend.status(ref) == 'unknown'
+    assert backend.ip_addresses(ref) == []
+
+
+# Router
+
+@pytest.fixture
+def router_clock(monkeypatch):
+    """A clock that jumps 4s per read and a sleep that returns at once, so
+    settle deadlines are reachable without waiting."""
+    now = [0.0]
+
+    def clock():
+        now[0] += 4.0
+        return now[0]
+
+    monkeypatch.setattr(gcp_module, '_clock', clock)
+    monkeypatch.setattr(gcp_module, '_sleep', lambda seconds: None)
+
+
+def _router_status(gce):
+    return gce.instances[(ZONE, ROUTER)]['status']
+
+
+def _start(backend):
+    with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
+        backend.ensure_router_running()
+
+
+def _stop(backend):
+    with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
+        backend.stop_router()
+
+
+def test_router_start_and_stop_use_the_reserved_lock_boundary(backend, gce):
+    # Catches a launch racing an idle-stop and losing its only VPN route.
+    gce.add_router(ZONE, 'lab-router', status='TERMINATED')
+    with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
+        backend.ensure_router_running()
+    assert gce.instances[(ZONE, 'lab-router')]['status'] == 'RUNNING'
+    with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
+        backend.stop_router()
+    assert gce.instances[(ZONE, 'lab-router')]['status'] == 'TERMINATED'
+    assert all(r.name != 'lab-router' for r in backend.list_managed())
+
+
+def test_router_start_and_stop_are_idempotent(backend, gce):
+    # Catches a redundant start/stop operation (or a failure) on a router
+    # already in the wanted state.
+    gce.add_router(ZONE, ROUTER, status='RUNNING')
+    _start(backend)
+    assert _router_status(gce) == 'RUNNING' and gce.operations == {}
+    gce.instances[(ZONE, ROUTER)]['status'] = 'TERMINATED'
+    _stop(backend)
+    assert _router_status(gce) == 'TERMINATED' and gce.operations == {}
+
+
+def test_router_in_another_zone_is_found_by_discovery(backend, gce):
+    # Catches the router being looked up only in GCP_ZONE.
+    gce.add_router(OTHER_ZONE, ROUTER, status='TERMINATED')
+    _start(backend)
+    assert gce.instances[(OTHER_ZONE, ROUTER)]['status'] == 'RUNNING'
+
+
+@pytest.mark.parametrize('setup', [
+    lambda gce, config: None,  # absent
+    lambda gce, config: gce.add_router(ZONE, ROUTER, site='other-site'),
+    lambda gce, config: gce.add_router(ZONE, ROUTER, kind='instance'),
+    lambda gce, config: setattr(config, 'GCP_ROUTER_INSTANCE', ''),
+    lambda gce, config: (gce.add_router(ZONE, ROUTER), setattr(gce, 'unreachable_zones',
+                                                               {OTHER_ZONE})),
+])
+def test_router_absent_unconfigured_or_not_this_sites_raises(backend, gce, monkeypatch, setup):
+    # Catches a launch proceeding with no router, or a misconfigured name
+    # starting or stopping a machine that is not this site's router.
+    config = importlib.import_module('app.config')
+    monkeypatch.setattr(config, 'GCP_ROUTER_INSTANCE', ROUTER)
+    setup(gce, config)
+    before = {key: dict(value) for key, value in gce.instances.items()}
+    with pytest.raises(BackendError):
+        _start(backend)
+    with pytest.raises(BackendError):
+        _stop(backend)
+    assert gce.instances == before and gce.operations == {}
+
+
+@pytest.mark.parametrize('action, knob, stuck', [
+    ('start', 'start_status', 'STAGING'),
+    ('start', 'start_status', 'TERMINATED'),
+    ('stop', 'stop_status', 'STOPPING'),
+    ('stop', 'stop_status', 'RUNNING'),
+])
+def test_router_operation_that_never_reaches_its_state_raises(
+        backend, gce, router_clock, action, knob, stuck):
+    # Catches a start or stop reported as done while the router is not
+    # (yet, or ever) in the required state.
+    gce.add_router(ZONE, ROUTER, status='TERMINATED' if action == 'start' else 'RUNNING')
+    setattr(gce, knob, stuck)
+    with pytest.raises(BackendError):
+        _start(backend) if action == 'start' else _stop(backend)
+    assert _router_status(gce) == stuck
+
+
+def _settles_on_second_read(gce, monkeypatch, status):
+    """The router becomes `status` from its second fresh read on: it was
+    mid-transition when first read."""
+    reads = []
+    request = gce.request
+
+    def settling(method, url, **kwargs):
+        if method == 'GET' and url.endswith(f'/zones/{ZONE}/instances/{ROUTER}'):
+            reads.append(1)
+            if len(reads) == 2:
+                gce.instances[(ZONE, ROUTER)]['status'] = status
+        return request(method, url, **kwargs)
+
+    monkeypatch.setattr(gce, 'request', settling)
+
+
+@pytest.mark.parametrize('first, settled, action, final', [
+    ('STOPPING', 'TERMINATED', 'start', 'RUNNING'),
+    ('STAGING', 'RUNNING', 'stop', 'TERMINATED'),
+])
+def test_router_transitional_states_are_waited_out(
+        backend, gce, router_clock, monkeypatch, first, settled, action, final):
+    # Catches a start refused while the router is still stopping, or a stop
+    # issued to a router that is still starting.
+    gce.add_router(ZONE, ROUTER, status=first)
+    _settles_on_second_read(gce, monkeypatch, settled)
+    _start(backend) if action == 'start' else _stop(backend)
+    assert _router_status(gce) == final
