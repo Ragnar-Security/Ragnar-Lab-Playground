@@ -31,6 +31,12 @@ _ALREADY_STOPPED_HINTS = (
 STOP_TIMEOUT_SECONDS = 60
 DELETE_TIMEOUT_SECONDS = 120
 
+# _stop outcomes. _GONE: fresh inventory proved the guest absent after the
+# stop raised, so there is nothing left to delete.
+_STOPPED = 'stopped'
+_STOP_FAILED = 'stop_failed'
+_GONE = 'gone'
+
 
 def _route_utils():
     # Imported lazily: app.routes imports every blueprint, and those import
@@ -83,27 +89,46 @@ class ProxmoxBackend:
             self.client, ref.vmid, node=ref.location, vm_name=ref.vm_name,
             vm_type=ref.vm_type)
 
-    def _stop(self, ref: VMRef) -> bool:
-        """Stop the guest; False when it may still be running."""
+    def _wait(self, ref: VMRef, upid, timeout: int):
+        # The 60 s stop / 120 s delete, 1 s poll every source path passes.
+        return proxmox_service.wait_for_proxmox_task(
+            self.client, ref.location, upid, timeout=timeout, poll_interval=1)
+
+    def _stop(self, ref: VMRef, policy: DestroyPolicy) -> str:
+        """_STOPPED, _STOP_FAILED (may still be running) or _GONE."""
         try:
             upid = self._endpoint(ref).status.stop.post()
-            if upid:
-                result = proxmox_service.wait_for_proxmox_task(
-                    self.client, ref.location, upid,
-                    timeout=STOP_TIMEOUT_SECONDS, poll_interval=1)
+            # Each source path's own wait condition: expiry (tasks._stop_vm)
+            # skipped the wait on a falsy UPID; admin bulk, failed-deploy
+            # cleanup and student destroy always waited.
+            if upid or policy is not DestroyPolicy.STRICT:
+                result = self._wait(ref, upid, STOP_TIMEOUT_SECONDS)
                 if not result.get('success'):
-                    logger.error("Stop task for VM %s failed: %s", ref.vmid,
-                                 result.get('error', result.get('status')))
-                    return False
-            return True
+                    logger.warning("Stop task for VM %s failed: %s", ref.vmid,
+                                   result.get('error', result.get('status')))
+                    return _STOP_FAILED
+            return _STOPPED
         except Exception as error:
-            if any(hint in str(error).lower() for hint in _ALREADY_STOPPED_HINTS):
-                logger.info("VM %s already stopped or not found", ref.vmid)
-                return True
+            if policy is DestroyPolicy.STRICT:
+                if any(hint in str(error).lower()
+                       for hint in _ALREADY_STOPPED_HINTS):
+                    logger.info("VM %s already stopped or not found", ref.vmid)
+                    return _STOPPED
+            elif policy is DestroyPolicy.BEST_EFFORT and (
+                    proxmox_service.confirm_proxmox_absence(
+                        self.client, ref.vmid, error)):
+                # Failed-deploy cleanup has always confirmed a stop error
+                # against fresh inventory and skipped the delete. Admin bulk
+                # shares the policy and gains this on purpose: it used to
+                # send a DELETE to a guest inventory had already proven gone.
+                logger.info("VM %s confirmed absent after stop request",
+                            ref.vmid)
+                return _GONE
             logger.warning("Stop request for VM %s failed: %s", ref.vmid, error)
-            return False
+            return _STOP_FAILED
 
-    def _delete(self, ref: VMRef, force_corrupt: bool) -> None:
+    def _delete(self, ref: VMRef, policy: DestroyPolicy,
+                force_corrupt: bool) -> None:
         """Delete the guest; raise BackendError unless it is gone."""
         if not force_corrupt:
             kwargs = {}
@@ -122,11 +147,18 @@ class ProxmoxBackend:
                             ref.vmid)
                 return
             raise BackendError(f'destroy of VM {ref.vmid} failed: {error}') from error
+        if upid is None and policy is DestroyPolicy.FORCE_CORRUPT:
+            # Student destroy has only ever waited on a delete UPID it got
+            # back; expiry, admin bulk and failed-deploy always waited.
+            return
         try:
-            result = proxmox_service.wait_for_proxmox_task(
-                self.client, ref.location, upid,
-                timeout=DELETE_TIMEOUT_SECONDS, poll_interval=1)
+            result = self._wait(ref, upid, DELETE_TIMEOUT_SECONDS)
         except Exception as error:
+            # The waiter raises only TimeoutError, which no source path ever
+            # treated as absence (confirm_proxmox_absence refuses it).
+            if proxmox_service.confirm_proxmox_absence(
+                    self.client, ref.vmid, error):
+                return
             raise BackendError(
                 f'destroy task for VM {ref.vmid} did not finish: {error}') from error
         if not result.get('success'):
@@ -158,15 +190,22 @@ class ProxmoxBackend:
                 logger.warning("VM %s has config issues (%s); force deleting",
                                ref.vmid, error)
 
-        if not force_corrupt and not self._stop(ref):
-            if policy is DestroyPolicy.STRICT:
-                # Expiry: a guest that would not stop may be mid-operation;
-                # the record stays and the next pass retries.
-                raise DestroyRefused(f'VM {ref.vmid} did not stop; not deleting')
-            logger.warning("VM %s did not stop; deleting anyway (%s)",
-                           ref.vmid, policy.value)
+        if not force_corrupt:
+            stopped = self._stop(ref, policy)
+            if stopped == _GONE:
+                self._forget_guest(ref)
+                return
+            if stopped == _STOP_FAILED:
+                if policy is DestroyPolicy.STRICT:
+                    # Expiry: a guest that would not stop may be
+                    # mid-operation; the record stays and the next pass
+                    # retries.
+                    raise DestroyRefused(
+                        f'VM {ref.vmid} did not stop; not deleting')
+                logger.warning("VM %s did not stop; deleting anyway (%s)",
+                               ref.vmid, policy.value)
 
-        self._delete(ref, force_corrupt)
+        self._delete(ref, policy, force_corrupt)
         self._forget_guest(ref)
 
     def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:

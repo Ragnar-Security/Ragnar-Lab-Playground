@@ -18,9 +18,11 @@ from app.backends.base import (
 from app.proxmox_service import (
     RESERVATION_TTL_SECONDS, reset_cluster_vm_index,
 )
+from app import proxmox_service
 from tests.backends.proxmox_case import (
     GUEST_IP, TEMPLATE_VMID, build_proxmox_case, forget_proxmox_caches,
 )
+from tests.test_live_contract_guards import _missing
 
 
 @pytest.fixture
@@ -33,6 +35,39 @@ def proxmox_case():
 def proxmox_case_factory():
     yield build_proxmox_case
     forget_proxmox_caches()
+
+
+@pytest.fixture
+def task_waits(monkeypatch):
+    """Every (node, upid, timeout, poll_interval) the adapter waited on.
+
+    The arguments are the contract here: they are what each source path
+    passed. A UPID the fake never issued (a falsy one) answers non-OK at
+    once, where real polling would spin until the timeout.
+    """
+    waits = []
+    real = proxmox_service.wait_for_proxmox_task
+
+    def recording(proxmox, node, upid, timeout=300, poll_interval=3):
+        waits.append((node, upid, timeout, poll_interval))
+        if upid not in proxmox.tasks:
+            return {'success': False, 'status': 'stopped', 'error': 'no such task'}
+        return real(proxmox, node, upid, timeout=timeout,
+                    poll_interval=poll_interval)
+    monkeypatch.setattr('app.proxmox_service.wait_for_proxmox_task', recording)
+    return waits
+
+
+def _answer_none(api, monkeypatch, method, rest):
+    """Perform the operation, then answer None instead of its UPID."""
+    answer = api.handle
+
+    def handle(m, parts, kwargs):
+        result = answer(m, parts, kwargs)
+        if m == method and parts[0] == 'nodes' and parts[4:] == rest:
+            return None
+        return result
+    monkeypatch.setattr(api, 'handle', handle)
 
 
 # --- destroy policies --------------------------------------------------------
@@ -138,6 +173,65 @@ def test_destroy_reads_fresh_inventory_even_when_one_is_cached(proxmox_case):
     with pytest.raises(DestroyRefused):
         case.backend.destroy(case.ref, DestroyPolicy.BEST_EFFORT)
     assert case.api.guests[case.ref.vmid]['name'] == 'replacement'
+
+
+# Catches the stop or delete waits drifting from the 60 s / 120 s, 1 s poll
+# every source path passes.
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_each_policy_waits_with_the_source_timeouts(
+        proxmox_case, task_waits, policy):
+    case = proxmox_case
+    case.backend.destroy(case.ref, policy)
+    assert [(node, timeout, poll) for node, _upid, timeout, poll in task_waits] == [
+        ('node-a', 60, 1), ('node-a', 120, 1)]
+    assert all(upid in case.api.tasks for _n, upid, _t, _p in task_waits)
+
+
+# Catches the student destroy polling a delete that returned no UPID: it has
+# only ever waited on one it got back (vm_lifecycle.py delete_upid is not None).
+def test_force_corrupt_does_not_poll_a_missing_delete_upid(
+        proxmox_case, task_waits, monkeypatch):
+    case = proxmox_case
+    _answer_none(case.api, monkeypatch, 'DELETE', ())
+    case.backend.destroy(case.ref, DestroyPolicy.FORCE_CORRUPT)
+    assert case.ref.vmid not in case.api.guests
+    assert [(timeout, poll) for _n, _u, timeout, poll in task_waits] == [(60, 1)]
+
+
+# Catches the stop-wait condition being normalized: expiry skips the wait on a
+# falsy stop UPID; admin, failed-deploy and student destroy always waited.
+@pytest.mark.parametrize('policy,waits_on_none', [
+    (DestroyPolicy.STRICT, False),
+    (DestroyPolicy.BEST_EFFORT, True),
+    (DestroyPolicy.FORCE_CORRUPT, True),
+])
+def test_stop_wait_on_a_falsy_upid_follows_the_source_path(
+        proxmox_case, task_waits, monkeypatch, policy, waits_on_none):
+    case = proxmox_case
+    _answer_none(case.api, monkeypatch, 'POST', ('status', 'stop'))
+    case.backend.destroy(case.ref, policy)
+    assert case.ref.vmid not in case.api.guests
+    assert any(upid is None for _n, upid, _t, _p in task_waits) is waits_on_none
+
+
+# Catches BEST_EFFORT issuing a DELETE to a guest fresh inventory already
+# proves gone after its stop raised (failed-deploy cleanup's confirmation).
+def test_best_effort_confirms_absence_after_a_stop_error_without_deleting(
+        proxmox_case, monkeypatch):
+    case = proxmox_case
+    vmid, node = case.ref.vmid, case.ref.location
+    case.api.fail_delete.add(vmid)
+    answer = case.api.handle
+
+    def guest_vanishes_on_stop(method, parts, kwargs):
+        if method == 'POST' and parts[4:] == ('status', 'stop'):
+            case.api.guests.pop(vmid, None)
+            raise _missing(node, vmid)
+        return answer(method, parts, kwargs)
+    monkeypatch.setattr(case.api, 'handle', guest_vanishes_on_stop)
+    case.backend.destroy(case.ref, DestroyPolicy.BEST_EFFORT)
+    assert not [call for call in case.api.calls if call[0] == 'DELETE']
+    assert vmid not in case.api.delete_kwargs
 
 
 # --- identity and absence ----------------------------------------------------
