@@ -60,7 +60,7 @@
 - **Ruling M1–M10, M13, M15–M18, M21 (applied as proposed)**, with M17 resolved by asserting state (no `VMIDReservation` row) where possible and accepting the remaining call-order assertions. Why: plan text and test precision. Cost if wrong: none.
 - **Ruling M11: the Proxmox orphan sweep keeps its existing implementation; `ProxmoxBackend.list_managed` feeds reconcile and the cloud-generic sweep logic only.** Why: the raw path is proven and incident-tested. Cost if wrong: two sweep code paths.
 - **Ruling M12: `validate_template_config` errors are shown to admins through the existing deployment-group listing, `GET /templates` (`config_errors`, admin-only), and `/create` still refuses invalid groups** (T4, T9). Why: the spec says errors are shown to the admin and that function had no production caller. Cost if wrong: one extra response field for admins.
-- **Ruling M14: `validate_config()` refuses a Proxmox `FIXED_NODE` named `aws` or `gcp`, and T20 documents that such node names are unsupported** (T2, T20). Why: cloud admission reservations use those node names and would consume that Proxmox node's capacity. Cost if wrong: a site with such a node name must rename it.
+- **Ruling M14: Proxmox node names `aws`/`gcp` are refused wherever the portal accepts a node name — `validate_config()` refuses `FIXED_NODE` (T2), and `validate_template_config()` refuses a group's `load_balancing.fixed_node` and any `template_locations`/`storage_locations` key (top-level or in a nested `proxmox:` block) equal to either name, case-insensitive (T4); T20 documents that such node names are unsupported** (T2, T4, T20). Why: cloud admission reservations use those node names and would consume that Proxmox node's capacity (`app/proxmox_service.py:205-220`). Cost if wrong: a site with such a node name must rename it.
 - **Ruling M19, M20:** T20 says the policy must be re-run after roster, group, VLAN or KOTH changes, and documents as accepted that in a mixed portal a Proxmox outage blocks cloud deploys through the allocator's inventory read. Why: spec requirement and a deliberate trade-off. Cost if wrong: operators forget a re-run without the runbook line.
 
 ---
@@ -422,6 +422,8 @@ git commit -m "backend: define lifecycle protocol and registry" -m "Co-Authored-
 
 The spec says these errors are shown to the admin, but `validate_template_config()` has no production caller today (its only reference is the definition at `app/template_manager.py:138`). The existing path that lists deployment groups to admins is `GET /templates` (`app/routes/templates.py:27-80`), where admins already bypass the assignment/group-mode/KOTH filters; ruling M12 wires the errors there, admin-only, so a misconfigured cloud group is visible before anyone clicks deploy. `/create` still refuses such a group (T9). Non-admin responses are unchanged.
 
+Reserved node names (ruling M14): Proxmox node names enter the portal in three places — `FIXED_NODE` (checked by T2), a deployment group's `load_balancing.fixed_node` (read at `app/proxmox_service.py:960`), and the keys of a machine's `template_locations`/`storage_locations` (top-level or inside a nested `proxmox:` block). Cloud admission reserves capacity under node names `aws`/`gcp`, so `validate_template_config()` adds one error per offending value: `deployment_group '<name>': Proxmox node name '<value>' is reserved for the <aws|gcp> backend` (comparison case-insensitive; message keeps the operator's spelling).
+
 - [ ] **Step 1: Write failing resolution and validation tests**
 
 ```python
@@ -466,6 +468,29 @@ def test_koth_cloud_group_is_rejected():
     errors = validate_group_backends(valid_aws_group(koth_mode=True), ('proxmox', 'aws'))
     assert any('koth_mode' in error and 'proxmox' in error for error in errors)
 
+# tests/test_template_manager.py
+# Catches a Proxmox node named like a cloud backend sharing its admission reservations (M14).
+@pytest.mark.parametrize('group', [
+    {'display_name': 'LB Lab', 'load_balancing': {'enabled': False, 'fixed_node': 'AWS'},
+     'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001}}]},
+    {'display_name': 'LB Lab', 'templates': [
+        {'name': 'vm', 'template_locations': {'gcp': 7001}}]},
+    {'display_name': 'LB Lab', 'templates': [
+        {'name': 'vm', 'proxmox': {'storage_locations': {'aws': 'local-lvm'}}}]},
+])
+def test_proxmox_node_named_like_a_backend_is_rejected(group, monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    assert any("'LB Lab'" in e and 'reserved for the' in e for e in errors)
+
+def test_ordinary_proxmox_node_names_are_not_flagged(monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    group = {'display_name': 'LB Lab', 'load_balancing': {'fixed_node': 'node-a'},
+             'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001},
+                            'storage_locations': {'node-a': 'local-lvm'}}]}
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    assert not [e for e in errors if 'reserved for the' in e]
+
 # tests/test_templates_route.py (inside TemplatesGroupFilterTestCase)
 # Catches backend validation errors never reaching the admin who must fix the YAML (M12).
 def test_admin_sees_config_errors_and_students_do_not(self):
@@ -491,7 +516,7 @@ Expected: FAIL because backend resolution and validation do not exist.
 
 - [ ] **Step 3: Implement pure template resolution and wire validation**
 
-Keep all helpers side-effect free and raise `TemplateConfigError` only from `resolve_group_backend()`/`backend_block()` when a caller requests an unusable selection. `validate_group_backends()` returns every error for admin display. Have `validate_template_config()` extend its existing error list for every group using `app.config.ENABLED_BACKENDS`; retain existing group-mode checks and unknown-key warnings. In `get_templates_list()`, when the authenticated user is an admin, add `'config_errors': validate_template_config(config)[0]` to the JSON response; a validation exception must not break the listing (log it and return `config_errors: ['template validation failed: <message>']`).
+Keep all helpers side-effect free and raise `TemplateConfigError` only from `resolve_group_backend()`/`backend_block()` when a caller requests an unusable selection. `validate_group_backends()` returns every error for admin display. Have `validate_template_config()` extend its existing error list for every group using `app.config.ENABLED_BACKENDS`, plus the reserved-node-name errors from Context (checked for every group regardless of which backends are enabled); retain existing group-mode checks and unknown-key warnings. In `get_templates_list()`, when the authenticated user is an admin, add `'config_errors': validate_template_config(config)[0]` to the JSON response; a validation exception must not break the listing (log it and return `config_errors: ['template validation failed: <message>']`).
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -652,7 +677,7 @@ Every current destructive path maps as follows, with the existing behavior that 
 
 No existing production call site moves in T6, so no existing test patch point changes yet. Focused adapter tests patch `app.proxmox_service.ProxmoxAPI` and `app.proxmox_service.wait_for_proxmox_task` at their definition sites. T8 updates route/task patch points when it replaces those call chains.
 
-`FakeProxmox` (`tests/test_live_contract_guards.py:63-150`) today answers only clone/config/start/stop/current/delete and the cluster index, and raises for any other path (`handle()` indexes `parts[3]` for every non-cluster, non-task path, so `nodes.get()` cannot be served). Extend it additively — `calls`, `mutations()`, and every existing behaviour stay unchanged for `tests/test_live_contract_guards.py` (ruling I6): `fail_stop: set[int]` (stop POST raises `ResourceException(500, 'Internal Server Error', 'VM is locked')`), `delete_kwargs: dict[int, dict]` (records the kwargs of each DELETE), `cluster_error: Optional[Exception]` (raised by the cluster-resources read), `corrupt_config: set[int]` (config GET raises the unreadable-config `ResourceException(500, ..., 'Configuration file ... does not exist')` while the guest stays listed), `GET nodes` (one row per distinct guest node plus `extra_nodes`, each `{'node', 'status': 'online'}`), `GET nodes/<n>/status` (`{'memory': {'total', 'used'}, 'cpu': 0.1}` from a per-node `node_memory` dict), `GET nodes/<n>/qemu` and `nodes/<n>/lxc` (that node's guests of that type), and `GET nodes/<n>/qemu/<vmid>/agent/network-get` (an interface list built from a per-guest `ips` list; an empty list raises the guest-agent-not-running error).
+`FakeProxmox` (`tests/test_live_contract_guards.py:63-150`) today answers only clone/config/start/stop/current/delete and the cluster index, and raises for any other path (`handle()` indexes `parts[3]` for every non-cluster, non-task path, so `nodes.get()` cannot be served). It already has one failure knob this task relies on unchanged: `fail_config_put: bool` (default `False`; when `True`, every config PUT raises `ResourceException(400, 'Parameter verification failed', 'net0: invalid bridge')` and leaves the guest config unchanged, `tests/test_live_contract_guards.py:76,129-131`), which `set_expiry`'s description write hits. Extend it additively — `calls`, `mutations()`, `fail_config_put`, and every existing behaviour stay unchanged for `tests/test_live_contract_guards.py` (ruling I6): `fail_stop: set[int]` (stop POST raises `ResourceException(500, 'Internal Server Error', 'VM is locked')`), `delete_kwargs: dict[int, dict]` (records the kwargs of each DELETE), `cluster_error: Optional[Exception]` (raised by the cluster-resources read), `corrupt_config: set[int]` (config GET raises the unreadable-config `ResourceException(500, ..., 'Configuration file ... does not exist')` while the guest stays listed), `GET nodes` (one row per distinct guest node plus `extra_nodes`, each `{'node', 'status': 'online'}`), `GET nodes/<n>/status` (`{'memory': {'total', 'used'}, 'cpu': 0.1}` from a per-node `node_memory` dict), `GET nodes/<n>/qemu` and `nodes/<n>/lxc` (that node's guests of that type), and `GET nodes/<n>/qemu/<vmid>/agent/network-get` (an interface list built from a per-guest `ips` list; an empty list raises the guest-agent-not-running error).
 
 `tests/backends/proxmox_case.py` defines `ProxmoxCase` and `build_proxmox_case()`: a `FakeProxmox` holding one running guest `vmid=100`, name `student-test-vm`, on `node-a`, of `vm_type`, with description `Expires: <expires_at.isoformat()>` (expires one hour ahead), `ips=['10.1.0.5']`, plus one template guest `vmid=9000`; `corrupt_config=True` adds 100 to `corrupt_config`; it returns `ProxmoxCase(backend=ProxmoxBackend(client=api), api=api, ref=VMRef(...for vmid 100...), expires_at=expires_at)`. It also defines `make_proxmox_backend_case(app) -> BackendContractCase`, which T7 activates. `tests/backends/test_proxmox_backend.py` defines the fixtures `proxmox_case` (returns `build_proxmox_case()`) and `proxmox_case_factory` (returns the `build_proxmox_case` function).
 
@@ -742,6 +767,8 @@ def test_set_expiry_raises_backend_error_on_config_failure(proxmox_case):
     case.api.fail_config_put = True
     with pytest.raises(BackendError):
         case.backend.set_expiry(case.ref, case.expires_at + timedelta(hours=1))
+    assert case.api.guests[case.ref.vmid]['config']['description'] == (
+        f'Expires: {case.expires_at.isoformat()}')
 ```
 
 The cluster-read count measures provider round trips, the behaviour `tests/test_deploy_efficiency.py` already pins; it is not a mock-call assertion. Also test `ip_addresses()` maps no answer to `[]` while retaining `10.*`, `status()` maps unreadable-listed config to `'config_error'`, `set_expiry()` writes exactly `Expires: <local isoformat>`, no-op cloud hooks do not mutate the fake, `renew_admission`/`release_admission` round-trip a real `NodeMemoryReservation` row, and `delete_resource()` re-verifies identity.
@@ -793,7 +820,7 @@ git commit -m "proxmox: adapt read and destroy operations" -m "Co-Authored-By: C
 
 **Interfaces:**
 - Consumes: T3 `VMSpec`/`LaunchedVM`/registry/`SlotNetworkMissing`/`FakeBackend` state, T4 `backend_block`, T5 router/slot lock keys, T6 `ProxmoxBackend` (including its renew/release delegation and the `FakeProxmox` fake), and the existing reservation/VMID/clone helpers.
-- Produces: fixed `app.vm_provisioning.create_vm(spec, *, reservation_id, load_balancing_config, heartbeat) -> Tuple[str, LaunchedVM]`, `destroy_vm(ref, policy) -> None`, `after_record_retired(ref) -> None`, and `release_slot_if_unused(backend: str, slot: int) -> None` (the slot half of `after_record_retired`, which T8's failed-deploy path also calls); `get_next_available_vmid(proxmox: Optional[ProxmoxAPI] = None, *, count: int = 1, reservation_id: str) -> int`; backend-generic `create_single_vm_task` and `deploy_bundle(..., backend_name='proxmox')`, which passes the Proxmox client to the allocator and node semaphores only when Proxmox is enabled and the bundle is Proxmox; VM records populated with backend/provider/deployment/slot identity; the first complete production registry factory plus Proxmox shared-contract case; test-only `registered_fake_backend(name: str) -> ContextManager[FakeBackend]` (adds `name` to the current `app.config.ENABLED_BACKENDS` tuple, registers a fresh `FakeBackend(name)`, resets the registry on exit) and the `memory_backend_case` fixture.
+- Produces: fixed `app.vm_provisioning.create_vm(spec, *, reservation_id, load_balancing_config, heartbeat) -> Tuple[str, LaunchedVM]`, `destroy_vm(ref, policy) -> None`, `after_record_retired(ref) -> None`, and `release_slot_if_unused(backend: str, slot: int) -> None` (the slot half of `after_record_retired`, which T8's failed-deploy path and T15's slot reaper also use); `get_next_available_vmid(proxmox: Optional[ProxmoxAPI] = None, *, count: int = 1, reservation_id: str) -> int`; backend-generic `create_single_vm_task` and `deploy_bundle(..., backend_name='proxmox')`, which passes the Proxmox client to the allocator whenever Proxmox is enabled (whatever the bundle's backend, so a mixed portal's cloud bundle still avoids manually occupied Proxmox VMIDs) and builds node clone semaphores only for a Proxmox bundle; VM records populated with backend/provider/deployment/slot identity; the first complete production registry factory plus Proxmox shared-contract case; test-only `registered_fake_backend(name: str) -> ContextManager[FakeBackend]` (adds `name` to the current `app.config.ENABLED_BACKENDS` tuple, registers a fresh `FakeBackend(name)`, resets the registry on exit) and the `memory_backend_case` fixture (in `tests/backends/conftest.py`, so only tests under `tests/backends/` may request it).
 
 **Context:** Preserve the current Proxmox order and leases in `app/routes/vm_creation.py:995-1127`: reserve one contiguous VMID block, admit each machine, honor the per-node clone semaphore, renew node and VMID leases while queued, create/start, commit all records atomically, then release reservations; failures retain reservations through cleanup/survivor tracking. Keep `create_lxc_container`, `create_qemu_vm`, `start_vm`, `extract_template_config`, and `get_node_clone_semaphores` as the proven low-level Proxmox helpers; `ProxmoxBackend` imports them lazily inside `create()` to avoid an import cycle and does not reimplement clone/NIC/storage behavior. Register Proxmox as a lazy factory (`def _proxmox_factory(): from .proxmox import ProxmoxBackend; return ProxmoxBackend()`, ruling I8) so importing `app.backends` never imports a backend module.
 
@@ -893,6 +920,22 @@ def test_deploy_bundle_persists_backend_identity(app, memory_backend_case):
         assert record.vm_type == 'aws'
         assert record.node == 'memory-zone'
 
+# Catches a cloud deploy_bundle constructing ProxmoxAPI or reading Proxmox nodes (I19).
+# Lives here, not in tests/test_vmid_allocator.py, because memory_backend_case is a
+# tests/backends/ fixture.
+def test_cloud_bundle_on_cloud_only_portal_never_constructs_proxmox(
+        app, memory_backend_case, monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    with patch('app.proxmox_service.ProxmoxAPI',
+               side_effect=AssertionError('ProxmoxAPI constructed')), app.app_context():
+        records = deploy_bundle(
+            deployment_group_name='Cloud Lab',
+            templates=[{'name': 'vm', 'backend': 'aws', 'entry_point': True,
+                        'aws': dict(memory_backend_case.spec.template)}],
+            owning_identifier='test-owner', entry_vlan=101, internal_vlan=201,
+            uptime_minutes=60, user_id=None, backend_name='aws')
+    assert [r.backend for r in records] == ['aws']
+
 # tests/test_vmid_allocator.py
 # Catches a cloud-only portal trying to contact a disabled Proxmox cluster (I19).
 def test_allocator_uses_database_and_reservations_without_proxmox(app):
@@ -916,20 +959,6 @@ def test_allocator_still_observes_proxmox_inventory_when_available(app):
         base = proxmox_service.get_next_available_vmid(
             proxmox, count=1, reservation_id='mixed-bundle')
     assert base == 9501
-
-# Catches a cloud deploy_bundle constructing ProxmoxAPI or reading Proxmox nodes.
-def test_cloud_bundle_on_cloud_only_portal_never_constructs_proxmox(
-        app, memory_backend_case, monkeypatch):
-    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
-    with patch('app.proxmox_service.ProxmoxAPI',
-               side_effect=AssertionError('ProxmoxAPI constructed')), app.app_context():
-        records = deploy_bundle(
-            deployment_group_name='Cloud Lab',
-            templates=[{'name': 'vm', 'backend': 'aws', 'entry_point': True,
-                        'aws': dict(memory_backend_case.spec.template)}],
-            owning_identifier='test-owner', entry_vlan=101, internal_vlan=201,
-            uptime_minutes=60, user_id=None, backend_name='aws')
-    assert [r.backend for r in records] == ['aws']
 ```
 
 The lock-observation seam is `app.proxmox_service._vm_lifecycle_locks` (`app/proxmox_service.py:47-78`): T3's `FakeBackend` records, on entry to `ensure_router_running`, `ensure_slot` and `create`, the set of keys whose entry `owner == threading.get_ident()` into `observed_locks[method_name]` — state, not a mock call list. `lose_slot_once` makes the next `create()` remove its slot from `slot_networks`, clear the flag and raise `SlotNetworkMissing`. `FakeProxmox` is `tests/test_live_contract_guards.py`'s fake as extended by T6. Add Proxmox regression assertions that the same fake boundary still sees contiguous VMIDs, exact clone semaphore limit, lease renewal (the heartbeat raises `RuntimeError` when `renew_admission` returns `False`, at the four call points above), clone collision retry, QEMU/LXC NIC configuration, start-before-commit, atomic DB rollback, and reservation release only after commit/cleanup. Every result dict carries `_backend`, `_reservation_id`, `provider_id`, `deployment_id`, and `network_slot` for finalization. `deploy_bundle` receives catalog machine entries (`{'name', 'backend', 'aws': {...}}`) and resolves each through T4's `backend_block` before building `VMSpec.template` (ruling I19; the earlier draft passed an already-resolved block, which `extract_template_config` at `vm_creation.py:572` would not accept).
@@ -1145,13 +1174,15 @@ def test_extend_counts_only_successful_provider_updates(
         app, client, memory_backend_case):
     case = memory_backend_case
     record = persist_case_record(case, expires_in=timedelta(minutes=30))
+    record_id, original_expiry = record.id, record.expires_at  # scalars, before the request
     case.backend.fail_set_expiry = True
     login_owner(client, record.created_by_user_id)
     with patch('app.template_manager.load_template_config',
                return_value=valid_aws_catalog(extend_time_minutes=60)):
         body = client.post('/extend', data={'deployment_group': 'Cloud Lab'}).get_json()
     assert body['success'] is True and body['extended_count'] == 0
-    assert db.session.get(VMRecord, record.id).expires_at == record.expires_at + timedelta(minutes=60)
+    db.session.expire_all()
+    assert db.session.get(VMRecord, record_id).expires_at == original_expiry + timedelta(minutes=60)
 
 # Catches a backend removed from ENABLED_BACKENDS leaving live VMs undestroyable and silent (I18).
 def test_record_of_disabled_backend_is_retained_retried_and_alerted(
@@ -1179,7 +1210,7 @@ def test_cloud_only_empty_pass_delivers_alert_without_proxmox(
 
 Extend `tests/test_untracked_survivors.py` with one cloud line asserting backend/provider/deployment/slot round-trip and one legacy line asserting `backend == 'proxmox'` with the other three `None`. Add state-based group/KOTH cleanup tests, and retain every existing asynchronous task, stale VMID, KOTH FK, missing-sighting, cache-efficiency, authorization, and exact-name cleanup assertion after patch-point updates.
 
-Every test uses the one calling convention fixed in T7 (ruling I5): `memory_backend_case` is a fixture from `tests/backends/conftest.py` that already returns a registered case for backend `'aws'` (never call it). Define the remaining helpers in `tests/backends/test_lifecycle_dispatch.py` rather than hiding behavior in mocks: `persist_case_record(case, *, expired=False, expires_in=timedelta(hours=1), backend=None)` inserts and commits one live `VMRecord` from `case.spec` and returns it — the owner is a committed `User` whose id is `created_by_user_id`, `expires_at` is in the past when `expired`, and when `backend` is `None` it first launches the instance through `case.backend.create(...)` and stores its `provider_id`, whereas an explicit other `backend` (the disabled-backend test) stores that backend name, `vm_type`, and `provider_id=None` with no fake instance; `persist_two_case_records(case)` inserts two live rows sharing deployment/slot; `retire_and_finalize(record)` captures `VMRef`, retires and commits the row, then calls `after_record_retired`; `retire_rows_together_then_finalize(first, second)` uses two app contexts synchronized by a barrier, calls `after_record_retired` after each committed retirement, and returns collected exceptions; `run_one_expiry_pass(app, enabled=None)` stops the infinite loop after one pass using the existing 60-second sleep technique of `tests/test_tasks.py:466` and optionally overrides enabled backends; `deploy_case_bundle(case, failure)` calls `deploy_bundle(..., backend_name='aws')` with full catalog machine entries (T7) — for `failure='second'` two machines with `fail_next_create` armed for the second, for `failure='after_launch'` one machine with `fail_create_after_launch` armed. `login_owner(client, user_id)` sets `session['user_id']`/`session['session_version']` through `client.session_transaction()` exactly like `tests/test_node_resources_api.py:14-26`; `admin_client` is that same fixture (an `is_admin=True` user) copied into this module, because `tests/conftest.py` defines none. `valid_aws_catalog(extend_time_minutes=1440)` returns the `Cloud Lab` AWS catalog and `valid_gcp_catalog()` resolves the same group to GCP. `queued_alert` enqueues one alert with `app.alert_outbox.enqueue_alert(alert_type='test', severity='info', message='queued')` inside an app context, commits, and exposes `delivered` as a property reading whether that `AlertOutbox` row's `status == 'sent'`. `registered_fake_backend` (T7) adds `'gcp'` to the enabled tuple without removing `'aws'`.
+Every test uses the one calling convention fixed in T7 (ruling I5): `memory_backend_case` is a fixture from `tests/backends/conftest.py` that already returns a registered case for backend `'aws'` (never call it). Define the remaining helpers in `tests/backends/test_lifecycle_dispatch.py` rather than hiding behavior in mocks: `persist_case_record(case, *, expired=False, expires_in=timedelta(hours=1), backend=None, spec=None)` inserts and commits one live `VMRecord` from `spec or case.spec` and returns it — the owner is a committed `User` whose id is `created_by_user_id`, `expires_at` is in the past when `expired`, and when `backend` is `None` it first launches the instance through the real orchestration, `app.vm_provisioning.create_vm(spec, reservation_id=f'persist-{spec.vmid}', load_balancing_config=None, heartbeat=lambda: None)` — which starts the router and ensures the slot before `create()`, exactly as production does (T3's fake `create()` raises `SlotNetworkMissing` on a slot that was never ensured) — then stores the returned `provider_id` and calls `case.backend.release_admission(f'persist-{spec.vmid}')` so no lingering reservation blocks later slot-release or router assertions; an explicit other `backend` (the disabled-backend test) stores that backend name, `vm_type`, and `provider_id=None` with no fake instance and no orchestration; `persist_two_case_records(case)` calls `persist_case_record` for `case.spec` and for `replace(case.spec, vmid=case.spec.vmid + 1, vm_name=case.spec.vm_name + '-2')`, so both rows share deployment and slot; `retire_and_finalize(record)` captures `VMRef`, retires and commits the row, then calls `after_record_retired`; `retire_rows_together_then_finalize(first, second)` uses two app contexts synchronized by a barrier, calls `after_record_retired` after each committed retirement, and returns collected exceptions; `run_one_expiry_pass(app, enabled=None)` stops the infinite loop after one pass using the existing 60-second sleep technique of `tests/test_tasks.py:466` and optionally overrides enabled backends; `deploy_case_bundle(case, failure)` calls `deploy_bundle(..., backend_name='aws')` with full catalog machine entries (T7) — for `failure='second'` two machines with `fail_next_create` armed for the second, for `failure='after_launch'` one machine with `fail_create_after_launch` armed. `login_owner(client, user_id)` sets `session['user_id']`/`session['session_version']` through `client.session_transaction()` exactly like `tests/test_node_resources_api.py:14-26`; `admin_client` is that same fixture (an `is_admin=True` user) copied into this module, because `tests/conftest.py` defines none. `valid_aws_catalog(extend_time_minutes=1440)` returns the `Cloud Lab` AWS catalog and `valid_gcp_catalog()` resolves the same group to GCP. `queued_alert` enqueues one alert with `app.alert_outbox.enqueue_alert(alert_type='test', severity='info', message='queued')` inside an app context, commits, and exposes `delivered` as a property reading whether that `AlertOutbox` row's `status == 'sent'`. `registered_fake_backend` (T7) adds `'gcp'` to the enabled tuple without removing `'aws'`.
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -1229,17 +1260,32 @@ Moved patch points:
 
 ```python
 # tests/test_api_routes.py
-# Catches cloud /create running through the real deploy path with a stale Proxmox-first order.
-def test_create_cloud_group_deploys_on_the_resolved_backend(app, student_client):
+# Catches the Proxmox-only VLAN gate still deciding a tagged cloud deployment (I9):
+# the gate is forced to refuse, yet the cloud deploy with valid slot tags must succeed.
+def test_create_cloud_group_succeeds_when_the_proxmox_vlan_gate_would_refuse(
+        app, student_client):
     with registered_fake_backend('aws') as fake, patch(
             'app.routes.vm_creation.load_template_config',
-            return_value=valid_aws_catalog()):
+            return_value=valid_aws_catalog()), patch(
+            'app.routes.vm_creation.validate_user_vlans',
+            return_value=(False, 'Proxmox VLAN gate refused')):
         response = student_client.post('/create', data={'deployment_group': 'Cloud Lab'})
     assert response.get_json()['success'] is True
     with app.app_context():
         [record] = VMRecord.query.all()
         assert (record.backend, record.network_slot) == ('aws', 101)
     assert record.vmid in fake.instances
+
+# Catches the same forced gate refusal being ignored for Proxmox groups.
+def test_create_proxmox_group_still_obeys_the_vlan_gate(app, student_client):
+    with patch('app.routes.vm_creation.load_template_config',
+               return_value=valid_proxmox_catalog()), patch(
+            'app.routes.vm_creation.validate_user_vlans',
+            return_value=(False, 'Proxmox VLAN gate refused')):
+        body = student_client.post('/create', data={'deployment_group': 'Proxmox Lab'}).get_json()
+    assert body == {'success': False, 'error': 'Proxmox VLAN gate refused'}
+    with app.app_context():
+        assert VMIDReservation.query.count() == 0
 
 # Catches a cloud deploy reaching allocation with no slot identity (I9).
 @pytest.mark.parametrize('entry,internal,missing', [
@@ -2143,21 +2189,31 @@ T19 must live-confirm that firewall `allowed: [{'IPProtocol': 'all'}]` plus only
 - Test: `tests/test_vm_orphan_cleanup.py` (unchanged positive-evidence regression suite)
 
 **Interfaces:**
-- Consumes: `enabled_backends() -> Tuple[str, ...]`, `get_backend(name: str) -> VMBackend`; `ManagedResource`; `VMBackend.list_managed() -> List[ManagedResource]` and `delete_resource(resource: ManagedResource) -> None`; `BACKEND_AWS`, `BACKEND_GCP`, `BACKEND_PROXMOX`; `VMRecord.backend`, `.vmid`, `.deployment_id`, `.network_slot`, `.destroyed`; `VMIDReservation.vmid`, `.reservation_id`, `.expires_at`; `site_prefix(LAB_SITE_ID)` and `deployment_key(deployment_id: str) -> str` from `app.backends.cloud_common`; `vm_lifecycle_lock(key)`; the T12/T14 guarantee that `list_managed()` returns only this site and `delete_resource()` re-reads provider state and refuses a resource that no longer has this site's exact tag/name-prefix ownership evidence; the contract that a `kind='deployment-network'` resource's `deployment_id` is `deployment_key(...)` on both clouds while an instance's is the full id.
+- Consumes: `enabled_backends() -> Tuple[str, ...]`, `get_backend(name: str) -> VMBackend`; `ManagedResource`; `VMBackend.list_managed() -> List[ManagedResource]` and `delete_resource(resource: ManagedResource) -> None`; `BACKEND_AWS`, `BACKEND_GCP`, `BACKEND_PROXMOX`; `VMRecord.backend`, `.vmid`, `.deployment_id`, `.network_slot`, `.destroyed`; `VMIDReservation.vmid`, `.reservation_id`, `.expires_at`; `NodeMemoryReservation.node`, `.expires_at` (epoch seconds); `coordination.lease_clock()`; `site_prefix(LAB_SITE_ID)`, `deployment_key(deployment_id: str) -> str` and `slot_lock_key(backend, slot)` from `app.backends.cloud_common`; `vm_lifecycle_lock(key)`; the T12/T14 guarantee that `list_managed()` returns only this site and `delete_resource()` re-reads provider state and refuses a resource that no longer has this site's exact tag/name-prefix ownership evidence; the contract that a `kind='deployment-network'` resource's `deployment_id` is `deployment_key(...)` on both clouds while an instance's is the full id; T7's slot-release guard (`release_slot_if_unused`: no live record for `(backend, slot)` and no unexpired `NodeMemoryReservation` with `node == backend`, checked under `slot_lock_key`).
 - Produces: `reap_orphaned_cloud_resources(*, now_epoch: Optional[float] = None, grace_minutes: Optional[int] = None, dry_run: Optional[bool] = None, max_seconds: Optional[float] = None, max_candidates: Optional[int] = None, clock: Optional[Callable[[], float]] = None) -> List[dict]`, each report exactly `{"backend", "kind", "provider_id", "name", "status"}` with status `reaped`, `dry_run` or `delete_failed`; `reap_orphaned_vms(proxmox=None, ...) -> List[dict]` remains the combined entry point and skips the Proxmox pass when `proxmox is None`; `maybe_reap_orphaned_vms(proxmox=None, *, monotonic_now=None) -> List[dict]` keeps its kill switch and ten-minute throttle; `check_and_destroy_expired_vms` calls `maybe_reap_orphaned_vms(get_backend('proxmox').client if 'proxmox' in enabled_backends() else None)` on every pass.
 
 **Context:** The current Proxmox path protects any retained `VMRecord` (including a destroyed row), KOTH references, reservations, templates, and non-`student-`/`group-` names; it rechecks under `vm_lifecycle_lock(vmid)` and requires fresh inventory before treating a provider error as absence. Preserve that code and all existing tests byte-for-behaviour (ruling M11: the Proxmox orphan sweep keeps its existing raw implementation; `ProxmoxBackend.list_managed` feeds reconcile and the cloud-generic sweep logic only). Add cloud inventory after the Proxmox pass, using the same pass start time and remaining item budget. T8 left the reaper call Proxmox-conditional (`app/tasks.py:342` today passes the Proxmox client); a cloud-only portal would then never sweep (ruling C6), so this task makes the call unconditional and lets `reap_orphaned_vms(None)` run only the cloud pass.
 
-Cloud eligibility is deliberately different and exact: an instance needs no live (`destroyed=False`) record for `(backend, vmid)`, no unexpired VMID reservation for its VMID, a parseable expiry tag, and `expiry + grace < now`; a deployment network needs no live record, unexpired reservation, or managed instance with its deployment key and `created_at + grace < now`; a slot network needs no live record on that backend/slot, no managed instance in that slot, and `created_at + grace < now`. Deployment identity is compared by key (ruling C1): index live records by `deployment_key(record.deployment_id)`, unexpired VMID reservations by `deployment_key(reservation.reservation_id)` (the bundle reservation id is the deployment id), and managed instances by `deployment_key(instance.deployment_id)`, then look up the network's `deployment_id` (already a key). Comparing a 16-character key with 32-character ids would find no owner and delete a live deployment's firewall after one grace period. Missing timestamps, malformed identities, templates, backend mismatches, provider/list failures, and ownership refusals are unknown—not permission to delete. `delete_resource()` returning is the positive evidence of absence; an exception yields `delete_failed` and leaves the resource for a later pass.
+Cloud eligibility is deliberately different and exact: an instance needs no live (`destroyed=False`) record for `(backend, vmid)`, no unexpired VMID reservation for its VMID, a parseable expiry tag, and `expiry + grace < now`; a deployment network needs no live record, unexpired reservation, or managed instance with its deployment key and `created_at + grace < now`; a slot network needs no live record on that backend/slot, no managed instance in that slot, no unexpired `NodeMemoryReservation` with `node == backend` (`expires_at > coordination.lease_clock()`, the clock admission writes them with, not the sweep's `now_epoch`; an in-flight admission may be about to launch into the slot — the same guard as T7's `release_slot_if_unused`, Global Constraints), and `created_at + grace < now`. Deployment identity is compared by key (ruling C1): index live records by `deployment_key(record.deployment_id)`, unexpired VMID reservations by `deployment_key(reservation.reservation_id)` (the bundle reservation id is the deployment id), and managed instances by `deployment_key(instance.deployment_id)`, then look up the network's `deployment_id` (already a key). Comparing a 16-character key with 32-character ids would find no owner and delete a live deployment's firewall after one grace period. Missing timestamps, malformed identities, templates, backend mismatches, provider/list failures, and ownership refusals are unknown—not permission to delete. `delete_resource()` returning is the positive evidence of absence; an exception yields `delete_failed` and leaves the resource for a later pass.
 
-Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper.py:204` `_recheck_and_reap`, ruling I14): immediately before `delete_resource(kind='instance')`, take `vm_lifecycle_lock(vmid)`, `db.session.rollback()` (MySQL REPEATABLE READ would otherwise hide a row committed since the sweep's first query), re-query a live record for `(backend, vmid)` and an unexpired VMID reservation for the VMID, and skip with no report if either now exists. The sweep queries records and reservations once, before taking the inventory snapshots.
+Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper.py:204` `_recheck_and_reap`, ruling I14): immediately before `delete_resource(kind='instance')`, take `vm_lifecycle_lock(vmid)`, `db.session.rollback()` (MySQL REPEATABLE READ would otherwise hide a row committed since the sweep's first query), re-query a live record for `(backend, vmid)` and an unexpired VMID reservation for the VMID, and skip with no report if either now exists. Slot networks get the matching recheck: immediately before `delete_resource(kind='slot-network')`, take `vm_lifecycle_lock(slot_lock_key(resource.backend, resource.network_slot))` — the lock `create_vm`'s `ensure_slot` and `release_slot_if_unused` use — roll back, re-query a live record for `(backend, network_slot)` and any unexpired `NodeMemoryReservation` with `node == backend` (compared with `coordination.lease_clock()`, the clock reservations are written with), and skip with no report if either now exists; delete while still holding the lock. The sweep queries records and reservations once, before taking the inventory snapshots.
 
 - [ ] **Step 1: Write the failing cloud sweep tests without weakening the Proxmox tests**
 
-  Add a small stateful `_CloudSweepBackend` in `tests/test_orphan_reaper.py`: `resources` is a list of `ManagedResource`; `list_managed()` returns a copy of it and then calls the optional `on_list()` hook; `delete_resource()` raises `BackendError` for any resource in its `refuse` set, otherwise removes the exact object after checking `resource.backend == self.name` and appends its `provider_id` to `deleted`; `clock` is a fake monotonic clock that `delete_resource()` advances by `advance_clock_per_delete` seconds. `reset_with_old_orphans(n, advance_clock_per_delete=0)` replaces `resources` with `n` slot networks created `NOW_EPOCH - 7200`, clears `deleted`, and sets the advance. Register it through `register_backend_factory`, patch `app.config.ENABLED_BACKENDS=('aws',)`, and reset the registry after each test; the fixture exposes it as `backend`. Module helpers: `NOW_EPOCH = 1_900_000_000`; `managed_instance(backend, provider_id, vmid, expires, deployment_id='9' * 32, slot=None)`, `managed_network(provider_id, deployment_key, created)`, and `managed_slot(provider_id, slot, created)` build `ManagedResource`s whose `name` equals `provider_id`; `add_live_record(backend, vmid=900, deployment_id=None, network_slot=None)` commits a live `VMRecord`; `add_live_vmid_reservation(vmid, expires_at, reservation_id=None)` commits a `VMIDReservation`; `deleted_ids(backend)` returns `set(backend.deleted)`; `report(backend, kind, provider_id, status)` returns the exact report dict with `name=provider_id`. Pin these production bugs with comments and assertions:
+  Add a small stateful `_CloudSweepBackend` in `tests/test_orphan_reaper.py`: `resources` is a list of `ManagedResource`; `list_managed()` returns a copy of it and then calls the optional `on_list()` hook; `delete_resource()` raises `BackendError` for any resource in its `refuse` set, otherwise removes the exact object after checking `resource.backend == self.name` and appends its `provider_id` to `deleted`; `clock` is a fake monotonic clock that `delete_resource()` advances by `advance_clock_per_delete` seconds. `reset_with_old_orphans(n, advance_clock_per_delete=0)` replaces `resources` with `n` slot networks created `NOW_EPOCH - 7200`, clears `deleted`, and sets the advance. Every cloud test requests it explicitly through the `backend` fixture declared below (pytest injects fixtures only through requested arguments). Module helpers: `NOW_EPOCH = 1_900_000_000`; `managed_instance(backend, provider_id, vmid, expires, deployment_id='9' * 32, slot=None)`, `managed_network(provider_id, deployment_key, created)`, and `managed_slot(provider_id, slot, created)` build `ManagedResource`s whose `name` equals `provider_id`; `add_live_record(backend, vmid=900, deployment_id=None, network_slot=None)` commits a live `VMRecord`; `add_live_vmid_reservation(vmid, expires_at, reservation_id=None)` commits a `VMIDReservation`; `add_node_reservation(node, reservation_id='r-sweep')` commits a `NodeMemoryReservation(memory_bytes=1, expires_at=coordination.lease_clock() + 600)`; `deleted_ids(backend)` returns `set(backend.deleted)`; `report(backend, kind, provider_id, status)` returns the exact report dict with `name=provider_id`. Pin these production bugs with comments and assertions:
 
   ```python
-  def test_cloud_instance_needs_no_record_no_vmid_lease_and_expiry_past_grace(app):
+  @pytest.fixture
+  def backend(app, monkeypatch):
+      # The cloud sweep's only provider: registered, enabled, reset after the test.
+      sweep = _CloudSweepBackend('aws')
+      monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+      register_backend_factory('aws', lambda: sweep)
+      with app.app_context():
+          yield sweep
+      reset_backends_for_tests()
+
+  def test_cloud_instance_needs_no_record_no_vmid_lease_and_expiry_past_grace(app, backend):
       # Catches a stale provider expiry deleting a still-tracked or in-flight VM.
       backend.resources = [
           managed_instance("aws", "i-delete", 801, expires=NOW_EPOCH - 3601),
@@ -2172,7 +2228,7 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
       assert [(r["provider_id"], r["status"]) for r in reports] == [("i-delete", "reaped")]
       assert {r.provider_id for r in backend.resources} == {"i-record", "i-reserved", "i-young", "i-untimed"}
 
-  def test_deployment_network_requires_no_record_reservation_or_instance_and_old_age(app):
+  def test_deployment_network_requires_no_record_reservation_or_instance_and_old_age(app, backend):
       # Catches removal of a firewall/SG while its deployment is live or creating,
       # including the 16-character key vs 32-character id mismatch (C1).
       old, young = NOW_EPOCH - 3601, NOW_EPOCH - 3599
@@ -2193,7 +2249,7 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
       assert deleted_ids(backend) == {"net-orphan"}
       assert reports == [report("aws", "deployment-network", "net-orphan", "reaped")]
 
-  def test_slot_network_requires_no_same_backend_record_or_instance_and_old_age(app):
+  def test_slot_network_requires_no_same_backend_record_or_instance_and_old_age(app, backend):
       # Catches deleting a shared slot subnet still used by a VM.
       old, young = NOW_EPOCH - 3601, NOW_EPOCH - 3599
       backend.resources = [
@@ -2210,19 +2266,34 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
       reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH, grace_minutes=60)
       assert deleted_ids(backend) == {"slot-orphan", "slot-other-backend-record"}
 
-  def test_cloud_instance_delete_rechecks_under_vmid_lock(app):
+  def test_cloud_instance_delete_rechecks_under_vmid_lock(app, backend):
       # Catches deleting an instance whose VMRecord committed after the sweep's first query (I14).
       orphan = managed_instance("aws", "i-late", 806, expires=NOW_EPOCH - 3601)
       backend.resources = [orphan]
       backend.on_list = lambda: add_live_record(backend="aws", vmid=806)
       assert reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH, grace_minutes=60) == []
       assert backend.resources == [orphan]
+
+  def test_cloud_slot_delete_rechecks_reservation_under_slot_lock(app, backend):
+      # Catches the reaper deleting a slot subnet an admission reserved after the sweep listed it (New 6).
+      slot = managed_slot("slot-late", 18, NOW_EPOCH - 7200)
+      backend.resources = [slot]
+      backend.on_list = lambda: add_node_reservation(node="aws")
+      assert reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH, grace_minutes=60) == []
+      assert backend.resources == [slot]
+
+  def test_cloud_slot_is_not_eligible_while_backend_has_unexpired_reservation(app, backend):
+      # Catches the initial eligibility pass ignoring an in-flight admission.
+      add_node_reservation(node="aws")
+      backend.reset_with_old_orphans(1)
+      assert reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH, grace_minutes=60) == []
+      assert backend.deleted == []
   ```
 
   `slot-other-backend-record` has only a GCP record for the same numeric slot; it remains eligible on AWS and proves the query is scoped by `(backend, network_slot)`. Also add:
 
   ```python
-  def test_cloud_dry_run_reports_but_mutates_nothing(app):
+  def test_cloud_dry_run_reports_but_mutates_nothing(app, backend):
       # Catches dry-run mode deleting provider resources.
       backend.reset_with_old_orphans(3)
       before = list(backend.resources)
@@ -2230,7 +2301,7 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
       assert [r["status"] for r in reports] == ["dry_run"] * 3
       assert backend.resources == before
 
-  def test_cloud_item_and_time_budgets_stop_starting_new_deletes(app):
+  def test_cloud_item_and_time_budgets_stop_starting_new_deletes(app, backend):
       # Catches a large backlog of leaks starving the next expiry pass.
       backend.reset_with_old_orphans(5)
       assert len(reap_orphaned_cloud_resources(now_epoch=NOW_EPOCH, max_candidates=2)) == 2
@@ -2240,7 +2311,7 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
           now_epoch=NOW_EPOCH, max_seconds=120, clock=backend.clock)) == 2
       assert len(backend.deleted) == 2
 
-  def test_cloud_delete_refusal_is_reported_and_resource_remains(app):
+  def test_cloud_delete_refusal_is_reported_and_resource_remains(app, backend):
       # Catches an ownership refusal being reported as reaped.
       refused = managed_slot("slot-refused", 17, NOW_EPOCH - 7200)
       backend.resources = [refused]
@@ -2272,7 +2343,7 @@ Instances get the same per-VMID recheck the Proxmox path has (`app/orphan_reaper
 
 - [ ] **Step 3: Implement the cloud pass behind the existing schedule and safety guards**
 
-  In `app/orphan_reaper.py`, keep the current Proxmox candidate loop and `_recheck_and_reap` semantics unchanged and skip that loop when `proxmox is None`. Query live records and unexpired VMID reservations once per sweep, then build one inventory snapshot per enabled cloud backend, reject any row whose `.backend` differs, and index managed instances by deployment key and slot. Use epoch seconds for provider tags/reservations and the existing configured grace in minutes. Check the elapsed/item budget immediately before each `delete_resource`; count dry-runs, successful deletes, and failed delete attempts as started items. A provider inventory exception aborts that backend with no deletes. Combine Proxmox and cloud reports while sharing `ORPHAN_REAPER_MAX_PASS_SECONDS` and `ORPHAN_REAPER_MAX_PASS_GUESTS`; do not rename the config keys in this task. Never call a raw SDK from the reaper. In `app/tasks.py`, replace the Proxmox-conditional reaper call with the unconditional call in Produces; existing tests patching `app.tasks.maybe_reap_orphaned_vms` keep that patch point.
+  In `app/orphan_reaper.py`, keep the current Proxmox candidate loop and `_recheck_and_reap` semantics unchanged and skip that loop when `proxmox is None`. Query live records, unexpired VMID reservations, and unexpired node reservations per backend once per sweep, then build one inventory snapshot per enabled cloud backend, reject any row whose `.backend` differs, and index managed instances by deployment key and slot. Use epoch seconds for provider tags/reservations and the existing configured grace in minutes. Before each instance delete run the per-VMID recheck and before each slot-network delete run the slot-lock recheck described in Context, deleting while the lock is held. Check the elapsed/item budget immediately before each `delete_resource`; count dry-runs, successful deletes, and failed delete attempts as started items (a recheck skip is not started). A provider inventory exception aborts that backend with no deletes. Combine Proxmox and cloud reports while sharing `ORPHAN_REAPER_MAX_PASS_SECONDS` and `ORPHAN_REAPER_MAX_PASS_GUESTS`; do not rename the config keys in this task. Never call a raw SDK from the reaper. In `app/tasks.py`, replace the Proxmox-conditional reaper call with the unconditional call in Produces; existing tests patching `app.tasks.maybe_reap_orphaned_vms` keep that patch point.
 
 - [ ] **Step 4: Run focused and full unit suites**
 
@@ -2308,10 +2379,24 @@ Lock invariant (ruling C4, identical to T7's): the admission reservation is inse
 
 - [ ] **Step 1: Write failing fake-backend tests for idle timing, reservations, locking, and order**
 
-  Use a stateful fake backend whose `stop_router()` changes `router_running` to `False`. Register it rather than asserting mock call lists.
+  Use a stateful fake backend whose `stop_router()` changes `router_running` to `False`. Register it rather than asserting mock call lists. The fixture is **not** autouse: `tests/test_tasks.py` already holds the Proxmox expiry/reconcile suites that T8 requires to keep their behaviour, and switching `ENABLED_BACKENDS` to `('aws',)` module-wide would make their Proxmox records raise `BackendNotEnabled`. Only the router tests below request it.
 
   ```python
-  def test_router_stops_only_after_one_continuous_idle_window(app):
+  @pytest.fixture
+  def router_backend(app, monkeypatch):
+      # Router-idle tests only: one enabled fake AWS backend with a running router.
+      fake = FakeBackend('aws')
+      fake.router_running = True
+      monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+      monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 30)
+      register_backend_factory('aws', lambda: fake)
+      _reset_router_idle_state_for_tests()
+      with app.app_context():
+          yield fake
+      _reset_router_idle_state_for_tests()
+      reset_backends_for_tests()
+
+  def test_router_stops_only_after_one_continuous_idle_window(app, router_backend):
       # Catches stopping immediately when the last row disappears.
       add_live_record(backend="aws")
       assert _stop_idle_cloud_routers(now_epoch=1_000) == []
@@ -2319,9 +2404,9 @@ Lock invariant (ruling C4, identical to T7's): the admission reservation is inse
       assert _stop_idle_cloud_routers(now_epoch=1_001) == []
       assert _stop_idle_cloud_routers(now_epoch=2_800) == []
       assert _stop_idle_cloud_routers(now_epoch=2_801) == ["aws"]
-      assert backend.router_running is False
+      assert router_backend.router_running is False
 
-  def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app):
+  def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app, router_backend):
       # Catches a stop racing a new deployment that has reserved capacity but no VMRecord yet.
       observe_idle_at(1_000)
       add_node_reservation(node="aws", expires_at=2_000)
@@ -2329,36 +2414,37 @@ Lock invariant (ruling C4, identical to T7's): the admission reservation is inse
       remove_reservation()
       assert _stop_idle_cloud_routers(now_epoch=1_200) == []  # first idle observation
       assert _stop_idle_cloud_routers(now_epoch=2_999) == []
-      assert backend.router_running is True
+      assert router_backend.router_running is True
       assert _stop_idle_cloud_routers(now_epoch=3_000) == ["aws"]
 
-  def test_unexpired_admission_reservation_blocks_stop_without_any_record(app):
+  def test_unexpired_admission_reservation_blocks_stop_without_any_record(app, router_backend):
       # Catches a stop between a launch's router start and its VMRecord commit (C4).
       observe_idle_at(0)
       add_node_reservation(node="aws", expires_at=10_060)
       assert _stop_idle_cloud_routers(now_epoch=10_000) == []
-      assert backend.router_running is True
+      assert router_backend.router_running is True
 
-  def test_expired_reservation_does_not_block_stop(app):
+  def test_expired_reservation_does_not_block_stop(app, router_backend):
       # Catches a leaked lease keeping the router billing forever (M13).
       observe_idle_at(0)
       add_node_reservation(node="aws", expires_at=9_999)
       assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
 
-  def test_router_lock_rechecks_workload_before_stop(app):
+  def test_router_lock_rechecks_workload_before_stop(app, router_backend):
       # Catches launch admission landing while the idle worker waits for the router lock.
       observe_idle_at(0)
-      arrange_lock_owner_to_insert_reservation_before_yield(backend="aws")
+      arrange_lock_owner_to_insert_reservation_before_yield(app, backend="aws", expires_at=10_060)
       assert _stop_idle_cloud_routers(now_epoch=10_000) == []
-      assert backend.router_running is True
+      assert router_backend.router_running is True
 
-  def test_router_idle_step_runs_after_reconcile_alerts_and_orphan_sweep(app):
+  def test_router_idle_step_runs_after_reconcile_alerts_and_orphan_sweep(
+          app, router_backend, expiry_events):
       # Catches shared-cost cleanup moving ahead of the safety-critical expiry phases.
       _run_one_expiry_pass(app)
-      assert events == ["destroy", "reconcile", "alerts", "orphans", "routers"]
+      assert expiry_events == ["destroy", "reconcile", "alerts", "orphans", "routers"]
   ```
 
-  Helpers, defined in `tests/test_tasks.py`: an autouse fixture registers one `FakeBackend('aws')` (from `tests/backends/fake_backend.py`) as `backend` with `router_running=True`, patches `app.config.ENABLED_BACKENDS=('aws',)` and `AWS_ROUTER_IDLE_MINUTES=30`, and calls `_reset_router_idle_state_for_tests()` before and after. `add_live_record(backend)` commits one live `VMRecord` with that backend; `retire_record()` deletes it and commits. `observe_idle_at(t)` asserts `_stop_idle_cloud_routers(now_epoch=t) == []` with no workload, which records the first idle observation. `add_node_reservation(node, expires_at, reservation_id='r-idle')` commits a `NodeMemoryReservation(memory_bytes=1)`; `remove_reservation()` deletes `'r-idle'`. `arrange_lock_owner_to_insert_reservation_before_yield(backend)` starts a thread that enters an app context, takes `vm_lifecycle_lock(router_lock_key(backend))`, sets a `threading.Event`, sleeps 0.2 s, inserts and commits an unexpired reservation, and releases; the helper returns after the event is set, so the idle check must wait for the lock and then see the reservation. `events` is a list appended to by patches of `app.tasks.reconcile_missing_vm_records`, `app.tasks.dispatch_pending_alerts`, `app.tasks.maybe_reap_orphaned_vms` and `app.tasks._stop_idle_cloud_routers`, and by the fake's `destroy` for one seeded expired record; the order assertion is a call recording by nature (accepted, ruling M17).
+  Helpers, defined in `tests/test_tasks.py`: `FakeBackend` comes from `tests/backends/fake_backend.py`; `add_live_record(backend)` commits one live `VMRecord` with that backend; `retire_record()` deletes it and commits. `observe_idle_at(t)` asserts `_stop_idle_cloud_routers(now_epoch=t) == []` with no workload, which records the first idle observation. `add_node_reservation(node, expires_at, reservation_id='r-idle')` commits a `NodeMemoryReservation(memory_bytes=1)`; `remove_reservation()` deletes `'r-idle'`. `arrange_lock_owner_to_insert_reservation_before_yield(app, backend, expires_at)` starts a thread that enters an app context, takes `vm_lifecycle_lock(router_lock_key(backend))`, sets a `threading.Event`, sleeps 0.2 s, inserts and commits a reservation with that `expires_at`, and releases; the helper returns after the event is set, so the idle check must wait for the lock and then see the reservation. `expiry_events` is a fixture (requested only by the ordering test) returning a list appended to by monkeypatches of `app.tasks.reconcile_missing_vm_records`, `app.tasks.dispatch_pending_alerts`, `app.tasks.maybe_reap_orphaned_vms` and `app.tasks._stop_idle_cloud_routers`, and by a wrapper around `router_backend.destroy` for one seeded expired AWS record; the order assertion is a call recording by nature (accepted, ruling M17).
 
   Add a separate assertion that a `stop_router()` exception keeps `router_running=True`, returns no backend, and retains the elapsed idle timestamp so the next pass retries rather than claiming success.
 
@@ -2873,7 +2959,7 @@ Marker gating today is all-or-nothing: `tests/live/conftest.py:23-30` skips ever
   * `## Router Tailscale flags`: for each cloud CIDR show `tailscale up --login-server=<headscale-url> --advertise-routes=<cloud-cidr> --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false`; approve routes; explain return route/source check/canIpForward requirements and ephemeral public IP release on stop.
   * `## Capacity and quota checks`: mandatory max-VM caps; AWS 200-subnet default is roughly 100 simultaneous student/group slot pairs; request regional vCPU/instance/subnet quotas before class; equivalent GCP CPU/instance/address/route/firewall quotas; use a one-student rehearsal.
   * `## Cost model`: reproduce the spec's table exactly—free VPC/network objects; AWS router about `$0.009/h` and 8-GB gp3 about `$0.64/month` stopped; GCP router about `$0.013/h` and 10-GB disk about `$0.40/month` stopped; no `$0.045/h + $0.045/GB` AWS NAT; AWS `t3.medium` about `$0.042/h`; GCP `e2-medium` about `$0.034/h`; 30-GB lab disk about `$0.003/h`; worked 90-student/four-hour totals about `$16` AWS and `$13` GCP; date/region re-check warning.
-  * `## Configure and validate the portal`: migrate, fill `.env`, add backend blocks, run preflight, start, and verify router/one VM/cleanup inventory; credentials use boto3 chain and GCP ADC, never tracked secrets. State two accepted limits: a Proxmox node may not be named `aws` or `gcp` (admission reservations for clouds use those names as their node key, and T2 refuses such a `FIXED_NODE`); and in a portal with Proxmox enabled, a Proxmox outage also blocks cloud deploys because VMID allocation still reads Proxmox inventory to avoid manually occupied VMIDs (accepted trade-off, ruling M20).
+  * `## Configure and validate the portal`: migrate, fill `.env`, add backend blocks, run preflight, start, and verify router/one VM/cleanup inventory; credentials use boto3 chain and GCP ADC, never tracked secrets. State two accepted limits: a Proxmox node may not be named `aws` or `gcp` (admission reservations for clouds use those names as their node key; startup refuses such a `FIXED_NODE`, and the admin template validation reports such a `load_balancing.fixed_node` or `template_locations`/`storage_locations` key); and in a portal with Proxmox enabled, a Proxmox outage also blocks cloud deploys because VMID allocation still reads Proxmox inventory to avoid manually occupied VMIDs (accepted trade-off, ruling M20).
   * `## Apply the Headscale policy`: run `scripts/apply_headscale_policy.sh` dry-run, review diff, use `--apply`, explain policy check/backup/read-back/conditional restart; rollback by restoring the timestamped ACL backup, `headscale policy check --file`, restart/reload, and verify `policy get`. Say that the policy is a snapshot of the roster, groups, VLAN assignments and non-ended KOTH games, so it must be re-run after any roster import, group create/delete/membership change, VLAN reassignment, or KOTH game creation/ending. Say that the render keeps every `acls` rule of the operator base file except the blanket rule whose `src` is exactly `["autogroup:member"]`, so infrastructure rules (for example a rule letting the portal host's tailnet identity probe KOTH services) belong in the base file; every roster login is granted the entry/internal blocks of every KOTH game whose status is not `ended`.
   * `## Apply jumpbox VLAN isolation`: instructor console/recovery prerequisite; dry-run then `sudo scripts/jumpbox_configure.sh --apply --no-try --isolate-vlans`; verify tailnet-to-own lab works and cross-VLAN fails. Document `--allow-vlans <list|range>` (for example `--allow-vlans 300-305`), which exempts the listed VLAN tags from the inter-VLAN drop in both directions; set it to the KOTH VLAN range only if KOTH boxes must reach each other or team VLANs must reach KOTH VLANs across VLANs, and re-run with the new range when KOTH tags change. Roll back with `systemctl disable --now jumpbox-vlan-isolation.service`, remove only its nft/unit files, `systemctl daemon-reload`, and confirm its table is absent.
   * `## Teardown and incident response`: stop new creates, let expiry/reaper run, query site-tag/prefix inventory, never manually delete a mismatched-site resource, provider-specific manual cleanup and router stop, and post-cleanup zero-resource proof.
