@@ -55,9 +55,12 @@ def test_backend_lifecycle_contract(backend_case):
     assert case.backend.confirm_absent(ref)
 
 
-# Catches a policy enum accepted by the protocol but ignored by an adapter.
+# Acceptance smoke: catches an adapter that rejects a policy value or leaves
+# a healthy matching guest behind under it. It does not prove a policy is
+# enforced — clouds terminate in one call, so every policy behaves the same
+# there; enforcement on stop failure is pinned per adapter (Proxmox in T6).
 @pytest.mark.parametrize('policy', list(DestroyPolicy))
-def test_backend_destroy_policies(backend_case, policy):
+def test_every_policy_destroys_a_healthy_matching_guest(backend_case, policy):
     case = backend_case
     case.backend.ensure_router_running()
     case.backend.ensure_slot(case.spec.network_slot)
