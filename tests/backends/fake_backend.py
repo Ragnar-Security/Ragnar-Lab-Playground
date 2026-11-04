@@ -268,3 +268,53 @@ def registered_fake_backend(name: str) -> Iterator[FakeBackend]:
             yield backend
         finally:
             reset_backends_for_tests()
+
+
+# Display state -> the status a backend reports, for the listing fakes below.
+_DISPLAY_STATUS = {'present': 'running', 'missing': 'missing',
+                   'config_error': 'config_error', 'unknown': 'unknown'}
+
+
+class StaticDisplayBackend:
+    """A backend whose every guest reads as one display state.
+
+    Stands in where a route-level test used to patch `_verify_vm_exists` and
+    `_get_vm_ip_addresses`: `state` is the old verify verdict and `ips` the
+    old address answer, so the test's assertions stay as they were.
+    """
+
+    def __init__(self, state: str, ips=(), name: str = 'proxmox'):
+        self.name = name
+        self.state = state
+        self.ips = list(ips)
+
+    def inspect(self, ref: VMRef) -> str:
+        return GUEST_ABSENT if self.state == 'missing' else GUEST_MATCH
+
+    def status(self, ref: VMRef) -> str:
+        return _DISPLAY_STATUS[self.state]
+
+    def ip_addresses(self, ref: VMRef) -> List[str]:
+        return list(self.ips)
+
+    def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
+        return self.state == 'missing'
+
+
+class StaticInventoryBackend:
+    """A backend whose list_managed() is a fixed Proxmox-shaped inventory.
+
+    `inventory` holds the {vmid, node, vm_type, name} rows the retired
+    find_vms_by_name_prefix returned, so sweep tests keep their data.
+    """
+
+    def __init__(self, inventory, name: str = 'proxmox'):
+        self.name = name
+        self.inventory = list(inventory)
+
+    def list_managed(self) -> List[ManagedResource]:
+        return [ManagedResource(backend=self.name, kind='instance',
+                                provider_id=str(row['vmid']), name=row.get('name'),
+                                vmid=row['vmid'], location=row['node'],
+                                vm_type=row['vm_type'])
+                for row in self.inventory]

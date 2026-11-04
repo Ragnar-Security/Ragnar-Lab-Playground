@@ -73,7 +73,7 @@ class TestParallelVMCreation(unittest.TestCase):
         db.drop_all()
         self.app_context.pop()
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
     @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
@@ -139,7 +139,7 @@ class TestParallelVMCreation(unittest.TestCase):
         # Verify all 3 VMs should get sequential VMIDs: 100, 101, 102
         self.assertEqual(response.status_code, 200)
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
     @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
@@ -194,7 +194,7 @@ class TestParallelVMCreation(unittest.TestCase):
         self.assertEqual(len(created_vmids), len(set(created_vmids)),
                         f"VMID collision detected! VMIDs created: {created_vmids}")
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
     @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
@@ -261,7 +261,7 @@ class TestParallelVMCreation(unittest.TestCase):
         self.assertLessEqual(concurrent_count['max'], 2,
                            f"Semaphore failed! Max concurrent clones: {concurrent_count['max']}, expected <= 2")
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
     @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
@@ -323,7 +323,11 @@ class TestParallelVMCreation(unittest.TestCase):
             ]
         }
 
-        response = self.client.post('/create', data={'deployment_group': 'failure-test'})
+        # Cleanup's stop and destroy waits run in ProxmoxBackend, which
+        # calls the waiter at its definition site.
+        with patch('app.proxmox_service.wait_for_proxmox_task',
+                   side_effect=_next_task_result):
+            response = self.client.post('/create', data={'deployment_group': 'failure-test'})
 
         # Verify request failed
         data = response.get_json()
@@ -357,7 +361,7 @@ class TestParallelVMCreation(unittest.TestCase):
             'app.routes.vm_creation.load_template_config',
             return_value=config,
         ), patch(
-            'app.routes.vm_creation.find_vms_by_name_prefix',
+            'app.backends.proxmox.ProxmoxBackend.list_managed',
             return_value=[],
         ), patch(
             'app.proxmox_service.ProxmoxAPI',

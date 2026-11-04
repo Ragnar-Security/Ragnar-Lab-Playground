@@ -17,7 +17,9 @@ logger = logging.getLogger(__name__)
 from ..auth import login_required, admin_required, get_authenticated_user
 from ..models import db, VMRecord, User, StudentLabAssignment, _iso_local
 from .. import password_reset_links
-from .. import proxmox_service, tasks
+from .. import proxmox_service, tasks, vm_provisioning
+from ..backends import backend_for
+from ..backends.base import GUEST_ABSENT, GUEST_MATCH, DestroyPolicy, VMRef
 from .utils import _config_issue_alerts_sent
 
 # Create admin blueprint
@@ -415,7 +417,7 @@ def list_all_vms():
 @login_required
 @admin_required
 def bulk_destroy():
-    """Destroy multiple VMs: stop in Proxmox, delete from Proxmox, remove DB record."""
+    """Destroy multiple VMs on their backends, then retire their DB records."""
     data = request.get_json() if request.is_json else {}
     vm_ids = data.get('vm_ids', [])
     if not vm_ids:
@@ -423,7 +425,6 @@ def bulk_destroy():
 
     destroyed = 0
     errors = []
-    proxmox = proxmox_service.get_proxmox_connection()
 
     for vm_id in vm_ids:
         candidate = db.session.get(VMRecord, vm_id)
@@ -438,61 +439,31 @@ def bulk_destroy():
             if not vm or vm.destroyed:
                 continue
 
-            identity = proxmox_service.inspect_vm_guest(
-                proxmox, vm.vmid, node=vm.node, vm_name=vm.vm_name,
-                vm_type=vm.vm_type)
-            if identity == proxmox_service.VM_GUEST_ABSENT:
-                tasks._forget_vm_caches(vm.node, vm.vmid)
-                tasks._retire_vm_record(vm)
-                destroyed += 1
-                db.session.commit()
-                continue
-            if identity != proxmox_service.VM_GUEST_MATCH:
-                errors.append(
-                    f"VM {vm.vmid}: guest identity could not be verified")
-                continue
-
-            endpoint = (
-                proxmox.nodes(vm.node).qemu(vm.vmid)
-                if vm.vm_type == 'qemu'
-                else proxmox.nodes(vm.node).lxc(vm.vmid)
-            )
+            ref = VMRef.from_record(vm)
             try:
-                try:
-                    stop_upid = endpoint.status.stop.post()
-                    stop_result = proxmox_service.wait_for_proxmox_task(
-                        proxmox, vm.node, stop_upid,
-                        timeout=60, poll_interval=1)
-                    if not stop_result.get('success'):
-                        logger.debug(
-                            "Stop task for VM %s returned non-OK: %s",
-                            vm.vmid,
-                            stop_result.get(
-                                'error', stop_result.get('status')))
-                except Exception as stop_error:
-                    logger.warning(
-                        "Stop request for VM %s failed; attempting destroy: %s",
-                        vm.vmid, stop_error)
-
-                delete_upid = endpoint.delete()
-                delete_result = proxmox_service.wait_for_proxmox_task(
-                    proxmox, vm.node, delete_upid,
-                    timeout=120, poll_interval=1)
-                if not delete_result.get('success'):
-                    errors.append(
-                        f"VM {vm.vmid}: "
-                        f"{delete_result.get('error', delete_result.get('status'))}")
-                    continue
+                backend = backend_for(ref)
+                with vm_provisioning.provider_session(backend):
+                    identity = backend.inspect(ref)
+                    if identity == GUEST_MATCH:
+                        # Deletes even when the stop fails: an admin clearing
+                        # VMs wants them gone, not retried next pass.
+                        vm_provisioning.destroy_vm(
+                            ref, DestroyPolicy.BEST_EFFORT)
+                    elif identity != GUEST_ABSENT:
+                        errors.append(
+                            f"VM {vm.vmid}: guest identity could not be verified")
+                        continue
             except Exception as error:
-                if not proxmox_service.confirm_proxmox_absence(
-                        proxmox, vm.vmid, error):
-                    errors.append(f"VM {vm.vmid}: {str(error)}")
-                    continue
+                errors.append(f"VM {vm.vmid}: {str(error)}")
+                continue
 
-            tasks._forget_vm_caches(vm.node, vm.vmid)
             tasks._retire_vm_record(vm)
             destroyed += 1
             db.session.commit()
+            tasks._forget_vm_caches(ref.location, ref.vmid)
+        # After the commit and outside the VMID lock; every path that did
+        # not retire the record has already continued.
+        vm_provisioning.after_record_retired(ref)
 
     db.session.commit()
     return jsonify({

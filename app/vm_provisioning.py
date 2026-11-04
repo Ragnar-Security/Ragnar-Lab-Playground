@@ -17,7 +17,8 @@ neither lock.
 """
 
 import logging
-from typing import Any, Callable, Mapping, Optional, Tuple
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Mapping, Optional, Tuple
 
 from app import coordination
 from app.backends import backend_for, get_backend
@@ -77,6 +78,19 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
 
 def destroy_vm(ref: VMRef, policy: DestroyPolicy) -> None:
     backend_for(ref).destroy(ref, policy)
+
+
+def provider_session(backend: VMBackend) -> ContextManager:
+    """One provider connection for several operations on one guest.
+
+    Proxmox opens a connection per operation (a login each); a lifecycle
+    path that inspects then destroys, or a /list render, groups them into
+    one, as the routes always did. Backends without connections of their
+    own need nothing.
+    """
+    session = getattr(backend, 'session', None)
+    return session() if session is not None else nullcontext()
+
 
 
 def release_slot_if_unused(backend: str, slot: int) -> None:

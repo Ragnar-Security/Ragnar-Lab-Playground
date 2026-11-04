@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from app import create_app
 from app.routes.utils import VM_PRESENT
 from app.models import db, User, VMRecord, StudentGroup, StudentGroupMember
+from tests.backends.fake_backend import StaticDisplayBackend
 
 
 class TestAPIRoutes(unittest.TestCase):
@@ -85,8 +86,8 @@ class TestAPIRoutes(unittest.TestCase):
     
     def test_list_vms_empty(self):
         """Test listing VMs when none exist"""
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox:
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT)):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -130,10 +131,8 @@ class TestAPIRoutes(unittest.TestCase):
         db.session.add_all([vm1, vm2])
         db.session.commit()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses', return_value=[]):
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -165,13 +164,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=masked_config):
-            mock_proxmox.return_value = MagicMock()
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -200,13 +197,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=unmasked_config):
-            mock_proxmox.return_value = MagicMock()
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -244,13 +239,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=masked_config):
-            mock_proxmox.return_value = MagicMock()
             response = admin_client.get('/list')
 
         data = json.loads(response.data)
@@ -287,10 +280,8 @@ class TestAPIRoutes(unittest.TestCase):
         db.session.add_all([my_vm, other_vm])
         db.session.commit()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses', return_value=[]):
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -364,7 +355,7 @@ class TestAPIRoutes(unittest.TestCase):
         'app.proxmox_service.renew_node_reservation',
         new=lambda reservation_id: True,
     )
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix')
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed')
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
     @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
@@ -438,7 +429,7 @@ class TestAPIRoutes(unittest.TestCase):
         original_expiration = expires_at
         
         with patch('app.template_manager.load_template_config') as mock_config, \
-             patch('app.routes.vm_lifecycle.get_proxmox_connection') as mock_proxmox:
+             patch('app.proxmox_service.ProxmoxAPI') as mock_proxmox:
             mock_config.return_value = {
                 'deployment_groups': [
                     {
@@ -674,11 +665,8 @@ class TestAPIRoutes(unittest.TestCase):
         """The Extend button can only name a deployment the list told it."""
         self._same_named_deployments(group_slug='testuser')
 
-        with patch('app.routes.vm_listing.get_proxmox_connection'), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=[]):
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         cards = [
@@ -693,9 +681,9 @@ class TestAPIRoutes(unittest.TestCase):
         ])
 
     def _destroy(self, **form):
-        with patch('app.routes.vm_lifecycle.get_proxmox_connection',
+        with patch('app.proxmox_service.ProxmoxAPI',
                    return_value=MagicMock()), \
-             patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+             patch('app.proxmox_service.wait_for_proxmox_task',
                    return_value={'success': True, 'status': 'stopped'}):
             return self.client.post(
                 '/destroy', data={'deployment_group': 'homework1', **form})
@@ -727,7 +715,7 @@ class TestAPIRoutes(unittest.TestCase):
         """A cached pre-fix page must not destroy two deployments at once."""
         individual_id, group_id, _ = self._same_named_deployments()
 
-        with patch('app.routes.vm_lifecycle.get_proxmox_connection') as prox:
+        with patch('app.proxmox_service.ProxmoxAPI') as prox:
             response = self.client.post(
                 '/destroy', data={'deployment_group': 'homework1'})
 
@@ -852,11 +840,8 @@ class TestAPIRoutes(unittest.TestCase):
         [(first_group, _), (second_group, _)], _ = \
             self._two_groups_with_same_lab()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection'), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=[]):
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         cards = [
@@ -870,9 +855,9 @@ class TestAPIRoutes(unittest.TestCase):
             ('group', second_group, [131]),
         ])
     
-    @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_deployment_group(self, mock_proxmox, mock_wait):
         """Test destroying deployment group as student"""
         # Create test VMs
@@ -908,9 +893,9 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertIsNone(VMRecord.query.filter_by(vmid=100).first())
         self.assertIsNone(VMRecord.query.filter_by(vmid=101).first())
 
-    @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_deployment_group_admin_with_student_name(self, mock_proxmox, mock_wait):
         """Test admin destroying deployment group with student_name parameter"""
         # Create admin user and login
@@ -969,7 +954,7 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertIsNone(VMRecord.query.filter_by(vmid=100).first())
         self.assertIsNone(VMRecord.query.filter_by(vmid=101).first())
 
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_admin_without_student_name_fails(self, mock_proxmox):
         """Test that admin must provide student_name parameter"""
         # Create admin user and login
@@ -1001,7 +986,7 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertFalse(data['success'])
         self.assertIn('student_name', data['error'].lower())
     
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_student_cannot_destroy_others_vms(self, mock_proxmox):
         """Test that students cannot destroy other students' VMs"""
         # Create another user

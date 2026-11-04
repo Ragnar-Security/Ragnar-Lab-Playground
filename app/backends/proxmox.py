@@ -297,9 +297,9 @@ class ProxmoxBackend:
         """_STOPPED, _STOP_FAILED (may still be running) or _GONE."""
         try:
             upid = self._endpoint(ref).status.stop.post()
-            # Each source path's own wait condition: expiry (tasks._stop_vm)
-            # skipped the wait on a falsy UPID; admin bulk, failed-deploy
-            # cleanup and student destroy always waited.
+            # Each source path's own wait condition: expiry (STRICT) has
+            # always skipped the wait on a falsy UPID; admin bulk,
+            # failed-deploy cleanup and student destroy always waited.
             if upid or policy is not DestroyPolicy.STRICT:
                 result = self._wait(ref, upid, STOP_TIMEOUT_SECONDS)
                 if not result.get('success'):
@@ -486,7 +486,7 @@ class ProxmoxBackend:
                 backend=self.name, kind='instance', provider_id=str(vmid),
                 name=entry.get('name') or '', vmid=vmid,
                 location=entry.get('node'), status=entry.get('status'),
-                is_template=_is_template(entry))
+                is_template=_is_template(entry), vm_type=entry.get('type'))
             for vmid, entry in sorted(index.items())]
 
     @_operation

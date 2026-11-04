@@ -671,40 +671,6 @@ def get_next_available_vmid(
     return base_vmid
 
 
-def find_vms_by_name_prefix(prefix):
-    """Return [{vmid, node, vm_type, name}, ...] for every VM in Proxmox
-    whose name starts with `prefix`.
-
-    Used to recover stranded KOTH VMs whose VMRecord rows never made it to
-    the DB (e.g. the worker was SIGTERM'd mid-deploy, so our in-process
-    cleanup never ran). Searches both QEMU and LXC across all cluster nodes.
-    """
-    proxmox = get_proxmox_connection()
-    found = []
-    try:
-        nodes = proxmox.nodes.get()
-    except Exception:
-        logger.exception("find_vms_by_name_prefix: failed to enumerate nodes")
-        return found
-    for node in nodes:
-        node_name = node['node']
-        try:
-            for vm in proxmox.nodes(node_name).qemu.get():
-                if (vm.get('name') or '').startswith(prefix):
-                    found.append({'vmid': vm['vmid'], 'node': node_name,
-                                  'vm_type': 'qemu', 'name': vm.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: qemu list failed on {node_name}")
-        try:
-            for lxc in proxmox.nodes(node_name).lxc.get():
-                if (lxc.get('name') or '').startswith(prefix):
-                    found.append({'vmid': lxc['vmid'], 'node': node_name,
-                                  'vm_type': 'lxc', 'name': lxc.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: lxc list failed on {node_name}")
-    return found
-
-
 def get_available_node(proxmox: ProxmoxAPI) -> Optional[str]:
     """
     Get the first available Proxmox node

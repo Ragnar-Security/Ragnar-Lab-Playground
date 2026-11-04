@@ -24,7 +24,9 @@ from ..template_manager import (
 )
 from ..koth_layout import compute_layout
 from .koth import koth_bp
-from .vm_creation import deploy_bundle, DeployFailed, cleanup_vms
+from ..backends import get_backend
+from ..backends.base import BACKEND_PROXMOX
+from .vm_creation import deploy_bundle, DeployFailed, cleanup_vms, named_instances
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,7 @@ def _destroy_game_vms(game_id: int) -> int:
     Idempotent — VMs already destroyed (or already absent in Proxmox) are
     skipped. Returns the total count of VMs destroyed.
     """
-    from ..proxmox_service import find_vms_by_name_prefix
+    # KOTH is Proxmox-only (template validation refuses a cloud KOTH group).
 
     # 1. Destroy any VMs we have a record for.
     record_vms = VMRecord.query.filter_by(koth_game_id=game_id, destroyed=False).all()
@@ -76,7 +78,8 @@ def _destroy_game_vms(game_id: int) -> int:
     # have NO record for. These are the SIGTERM-orphaned ones.
     stranded_infos = []
     try:
-        for vm in find_vms_by_name_prefix(f"koth-{game_id}-"):
+        for vm in named_instances(get_backend(BACKEND_PROXMOX),
+                                  f"koth-{game_id}-"):
             if (vm['vmid'], vm['node']) not in record_keys:
                 stranded_infos.append({
                     'vmid': vm['vmid'],

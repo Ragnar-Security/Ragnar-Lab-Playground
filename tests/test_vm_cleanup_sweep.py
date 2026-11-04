@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 from app.routes.vm_creation import _cleanup_with_sweep
+from tests.backends.fake_backend import StaticInventoryBackend
 
 
 class ExactCleanupSweepTestCase(unittest.TestCase):
@@ -12,8 +13,8 @@ class ExactCleanupSweepTestCase(unittest.TestCase):
             captured.extend(payload)
             return {item['vmid'] for item in payload}
 
-        with patch('app.routes.vm_creation.find_vms_by_name_prefix',
-                   return_value=inventory), \
+        with patch('app.routes.vm_creation.get_backend',
+                   return_value=StaticInventoryBackend(inventory)), \
              patch('app.routes.vm_creation.cleanup_vms',
                    side_effect=cleanup):
             _cleanup_with_sweep([], **kwargs)

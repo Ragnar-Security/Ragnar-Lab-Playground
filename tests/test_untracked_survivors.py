@@ -135,6 +135,8 @@ def test_database_outage_records_survivor_in_durable_fallback_file(
     assert entry['vm_name'] == SURVIVOR_NAME
     assert entry['vm_type'] == 'qemu'
     assert entry['reason']
+    # A Proxmox result names its backend, so the import knows where to look.
+    assert entry['backend'] == 'proxmox'
     assert stat.S_IMODE(os.stat(survivors_file).st_mode) == 0o600
     # The lease stays held exactly as before: capacity is only released
     # once tracking is durable in the database.
@@ -225,6 +227,67 @@ def test_corrupt_line_is_skipped_and_reported_not_fatal(app, survivors_file):
     with open(rejected) as handle:
         assert len(handle.read().splitlines()) == 2
     assert stat.S_IMODE(os.stat(rejected).st_mode) == 0o600
+
+
+# Catches a cloud survivor imported after a restart without the identity
+# that lets expiry find and destroy it on its own backend.
+def test_cloud_line_round_trips_its_backend_identity(app, survivors_file):
+    line = {
+        'vmid': 4400, 'node': 'zone-a', 'vm_name': 'student-bob-web',
+        'vm_type': 'aws', 'backend': 'aws', 'provider_id': 'i-placeholder',
+        'deployment_id': 'b' * 32, 'network_slot': 101, 'reason': 'test',
+        'student_name': 'bob', 'template_name': 'failed-deploy-leftover/lab/web',
+    }
+    with open(survivors_file, 'w') as handle:
+        handle.write(json.dumps(line) + '\n')
+
+    with app.app_context():
+        report = recover_untracked_survivors()
+        record = VMRecord.query.one()
+        assert (record.backend, record.provider_id, record.deployment_id,
+                record.network_slot) == ('aws', 'i-placeholder', 'b' * 32, 101)
+        assert (record.vm_type, record.node) == ('aws', 'zone-a')
+    assert report['imported'] == 1
+
+
+# Catches a line written before backends existed being refused or imported as
+# anything but a Proxmox guest.
+def test_legacy_line_imports_as_proxmox_without_cloud_identity(
+        app, survivors_file):
+    legacy = {
+        'vmid': 4401, 'node': 'pve', 'vm_name': 'student-bob-db',
+        'vm_type': 'qemu', 'reason': 'test', 'student_name': 'bob',
+    }
+    with open(survivors_file, 'w') as handle:
+        handle.write(json.dumps(legacy) + '\n')
+
+    with app.app_context():
+        recover_untracked_survivors()
+        record = VMRecord.query.one()
+        assert record.backend == 'proxmox'
+        assert (record.provider_id, record.deployment_id,
+                record.network_slot) == (None, None, None)
+
+
+# Catches a cloud line whose vm_type or backend could send expiry to the wrong
+# provider being imported instead of quarantined.
+@pytest.mark.parametrize('fields', [
+    {'backend': 'aws', 'vm_type': 'qemu'},
+    {'backend': 'azure', 'vm_type': 'azure'},
+    {'backend': 'aws', 'vm_type': 'aws', 'network_slot': '101'},
+    {'backend': 'aws', 'vm_type': 'aws', 'provider_id': 7},
+])
+def test_line_with_inconsistent_backend_identity_is_corrupt(
+        app, survivors_file, fields):
+    line = {'vmid': 4402, 'node': 'zone-a', 'vm_name': 'student-bob-web',
+            'reason': 'test', **fields}
+    with open(survivors_file, 'w') as handle:
+        handle.write(json.dumps(line) + '\n')
+
+    with app.app_context():
+        report = recover_untracked_survivors()
+        assert VMRecord.query.count() == 0
+    assert report['corrupt'] == [1]
 
 
 @patch('app.proxmox_service.ProxmoxAPI')

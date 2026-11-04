@@ -202,7 +202,9 @@ class ListCallCountTests(unittest.TestCase):
         return p, counts
 
     def _list(self, proxmox):
-        with patch('app.routes.vm_listing.get_proxmox_connection',
+        # Where ProxmoxBackend opens its connection: the real backend runs,
+        # so the counts below are what a production render costs (C5).
+        with patch('app.proxmox_service.get_proxmox_connection',
                    return_value=proxmox), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value={'deployment_groups': []}):

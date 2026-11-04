@@ -8,19 +8,51 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock, mock_open
+from unittest.mock import Mock, call, patch, MagicMock, mock_open
+from app.backends.base import DestroyPolicy, VMRef
+from app.backends.proxmox import ProxmoxBackend
 from app.tasks import (
-    _stop_vm, _delete_vm,
     _log_alert_to_file, _create_database_alert,
     VM_DELETION_MAX_RETRIES
 )
 from app.models import VMRecord, AdminAlert, db
 
 
+def _listed(vm_record):
+    return [{'vmid': vm_record.vmid, 'name': vm_record.vm_name,
+             'node': vm_record.node, 'type': vm_record.vm_type,
+             'status': 'running'}]
+
+
+def _strict_destroy(proxmox, vm_record, inventory=None):
+    """Expiry's stop-then-delete: ProxmoxBackend.destroy under STRICT.
+
+    `inventory` is the sequence of cluster reads; by default the guest is
+    listed, as the identity check before any mutation requires. Returns
+    whether the guest is gone, which is what expiry retires on.
+    """
+    from app.proxmox_service import reset_cluster_vm_index
+    if inventory is None:
+        proxmox.cluster.resources.get.return_value = _listed(vm_record)
+    else:
+        proxmox.cluster.resources.get.side_effect = inventory
+    reset_cluster_vm_index()
+    try:
+        ProxmoxBackend(client=proxmox).destroy(
+            VMRef.from_record(vm_record), DestroyPolicy.STRICT)
+    except Exception:
+        return False
+    return True
+
+
+_TASK_OK = {'success': True, 'status': 'stopped'}
+
+
 class TestVMStopAndDelete:
-    """Test VM stop and delete helper functions"""
-    
-    def test_stop_vm_success(self, app):
+    """Expiry's stop and delete, through ProxmoxBackend's STRICT policy"""
+
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_stop_vm_success(self, _mock_wait, app):
         """Test successful VM stop"""
         with app.app_context():
             # Create test VM record
@@ -40,12 +72,12 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.return_value = None
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is True
             mock_proxmox.nodes().qemu().status.stop.post.assert_called_once()
 
-    @patch('app.tasks.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
     def test_stop_vm_waits_for_async_task(self, mock_wait, app):
         with app.app_context():
@@ -62,13 +94,15 @@ class TestVMStopAndDelete:
             mock_proxmox.nodes().qemu().status.stop.post.return_value = (
                 'UPID:stop')
 
-            assert _stop_vm(mock_proxmox, vm_record) is True
+            assert _strict_destroy(mock_proxmox, vm_record) is True
 
-            mock_wait.assert_called_once_with(
+            # The stop wait; the delete's own wait follows it.
+            assert mock_wait.call_args_list[0] == call(
                 mock_proxmox, 'pve', 'UPID:stop',
                 timeout=60, poll_interval=1)
     
-    def test_stop_vm_already_stopped(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_stop_vm_already_stopped(self, _mock_wait, app):
         """Test stopping a VM that's already stopped"""
         with app.app_context():
             vm_record = VMRecord(
@@ -87,7 +121,7 @@ class TestVMStopAndDelete:
             # Simulate "already stopped" error
             mock_proxmox.nodes().lxc().status.stop.post.side_effect = Exception("already stopped")
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             # Should still return True (graceful handling)
             assert result is True
@@ -110,11 +144,12 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.side_effect = Exception("Network error")
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is False
+            mock_proxmox.nodes().qemu().delete.assert_not_called()
     
-    @patch('app.tasks.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
     def test_delete_vm_success(self, mock_wait, app):
         """Test successful VM deletion"""
@@ -134,12 +169,13 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().delete.return_value = None
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is True
             mock_proxmox.nodes().qemu().delete.assert_called_once()
     
-    def test_delete_vm_not_found(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_delete_vm_not_found(self, _mock_wait, app):
         """Test deleting a VM that doesn't exist"""
         with app.app_context():
             vm_record = VMRecord(
@@ -156,14 +192,17 @@ class TestVMStopAndDelete:
             
             mock_proxmox = Mock()
             mock_proxmox.nodes().lxc().delete.side_effect = Exception("does not exist")
-            mock_proxmox.cluster.resources.get.return_value = []
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            # Listed for the identity check, then gone when the delete's
+            # "does not exist" is confirmed against fresh inventory.
+            result = _strict_destroy(
+                mock_proxmox, vm_record, inventory=[_listed(vm_record), []])
             
             # Should return True (VM already gone)
             assert result is True
     
-    def test_delete_vm_failure(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_delete_vm_failure(self, _mock_wait, app):
         """Test VM deletion failure"""
         with app.app_context():
             vm_record = VMRecord(
@@ -181,7 +220,7 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().delete.side_effect = Exception("Storage locked")
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is False
 
@@ -721,10 +760,14 @@ class TestExpiryNotStarvedByAlerts:
             assert db.session.get(VMRecord, vm_id) is None
 
     @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
-    @patch("app.tasks.get_proxmox_connection",
+    @patch("app.tasks.backend_for",
+           side_effect=RuntimeError("Proxmox unreachable"))
+    # The reaper's connection, now opened by ProxmoxBackend at the
+    # definition site rather than once at the top of the pass.
+    @patch("app.proxmox_service.get_proxmox_connection",
            side_effect=RuntimeError("Proxmox unreachable"))
     def test_proxmox_outage_still_delivers_queued_alerts(
-            self, _connect, _reaper, app):
+            self, _proxmox_connect, _connect, _reaper, app):
         """The alerts that matter most during an outage still go out."""
         from app.models import AlertOutbox
         _queue_webhook_alerts(app, 1)

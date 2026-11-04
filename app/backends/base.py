@@ -136,6 +136,10 @@ class ManagedResource:
     created_at_epoch: Optional[float] = None
     status: Optional[str] = None
     is_template: bool = False
+    # A Proxmox guest's 'qemu'/'lxc', which its identity check and a
+    # survivor record need; None on the clouds, whose instances' vm_type is
+    # the backend name.
+    vm_type: Optional[str] = None
 
 
 class VMBackend(Protocol):

@@ -1,6 +1,7 @@
 import unittest
 from app import create_app
 from app.models import db, User, StudentGroup, KothGame
+from tests.backends.fake_backend import StaticInventoryBackend
 
 
 class KothAdminRoutesTestCase(unittest.TestCase):
@@ -341,15 +342,15 @@ class KothAdminRoutesTestCase(unittest.TestCase):
             {'vmid': 9502, 'node': 'pve2', 'vm_type': 'qemu',
              'name': f'koth-{g.id}-final-app-portal'},
         ]
-        # Note: find_vms_by_name_prefix is a lazy import inside
-        # _destroy_game_vms, so patch it at its definition site
-        # (app.proxmox_service), not at koth_admin's import site.
+        # The sweep reads the Proxmox backend's inventory through
+        # koth_admin's get_backend.
         # cleanup_vms now returns the set of vmids actually destroyed;
         # simulate a successful cleanup by echoing back every attempted vmid.
         def fake_cleanup(payload):
             return {item['vmid'] for item in payload}
 
-        with patch('app.proxmox_service.find_vms_by_name_prefix', return_value=stranded), \
+        with patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend(stranded)), \
              patch('app.routes.koth_admin.cleanup_vms', side_effect=fake_cleanup) as mock_cleanup:
             n = _destroy_game_vms(g.id)
         self.assertEqual(n, 2)
@@ -492,7 +493,8 @@ class KothAdminRoutesTestCase(unittest.TestCase):
         db.session.add(g); db.session.commit()
         # Mock the Proxmox stranded-VM sweep so the test doesn't hit the
         # real cluster (the helper is now invoked by _destroy_game_vms).
-        with patch('app.proxmox_service.find_vms_by_name_prefix', return_value=[]):
+        with patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend([])):
             r = self.client.post(f'/koth/api/games/{g.id}/force-reset')
         self.assertEqual(r.status_code, 200, r.data)
         body = r.get_json()
@@ -540,7 +542,8 @@ class KothAdminRoutesTestCase(unittest.TestCase):
         # echo every attempted vmid back to simulate a successful cleanup.
         with patch('app.routes.koth_admin.cleanup_vms',
                    side_effect=lambda payload: {item['vmid'] for item in payload}), \
-             patch('app.proxmox_service.find_vms_by_name_prefix', return_value=[]):
+             patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend([])):
             r = self.client.post(f'/koth/api/games/{g.id}/force-reset')
         self.assertEqual(r.status_code, 200, r.data)
         body = r.get_json()

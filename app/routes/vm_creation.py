@@ -23,18 +23,14 @@ from ..proxmox_service import (
     release_vmid_reservation,
     renew_vmid_reservation,
     wait_for_proxmox_task,
-    find_vms_by_name_prefix,
-    confirm_proxmox_absence,
-    inspect_vm_guest,
-    reset_cluster_vm_index,
     vm_lifecycle_lock,
-    VM_GUEST_ABSENT,
-    VM_GUEST_MATCH,
 )
 from .. import vm_provisioning
 from ..auth import login_required, get_authenticated_user
 from ..backends import enabled_backends, get_backend
-from ..backends.base import BACKEND_PROXMOX, VMSpec
+from ..backends.base import (
+    BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, DestroyPolicy, VMRef, VMSpec,
+)
 from ..backends.template_spec import backend_block
 from ..utils import sanitize_name
 from ..template_manager import load_template_config, get_deployment_group_by_name, get_group_mode
@@ -258,20 +254,37 @@ def start_vm(proxmox, node, vmid, vm_type):
         proxmox.nodes(node).qemu(vmid).status.start.post()
 
 
+def _entry_backend(vm_info):
+    # Entries written before backends existed (and every Proxmox result
+    # without the key) are Proxmox guests.
+    return vm_info.get('backend') or vm_info.get('_backend') or BACKEND_PROXMOX
+
+
 def cleanup_vms(vm_list):
-    """Stop and destroy VMs, returning only VMIDs confirmed absent."""
+    """Destroy guests through their backends, returning only VMIDs confirmed absent.
+
+    Each entry carries vmid, node, vm_type and vm_name (or name), plus the
+    backend identity (backend or _backend, provider_id, deployment_id,
+    network_slot); an entry without a backend is a Proxmox guest. Every
+    destroy is BEST_EFFORT, the failed-deploy and cascade policy.
+    """
     destroyed: set = set()
     if not vm_list:
         return destroyed
 
     logger.info(f"Cleaning up {len(vm_list)} VMs...")
-    proxmox = get_proxmox_connection()
 
     for vm_info in vm_list:
         vmid = vm_info.get('vmid')
         node = vm_info.get('node')
         vm_type = vm_info.get('vm_type', 'qemu')
         vm_name = vm_info.get('vm_name') or vm_info.get('name')
+        identity_fields = {
+            'backend': _entry_backend(vm_info),
+            'provider_id': vm_info.get('provider_id'),
+            'deployment_id': vm_info.get('deployment_id'),
+            'network_slot': vm_info.get('network_slot'),
+        }
 
         if vmid is None or node is None:
             logger.error(f"cleanup_vms: skipping malformed entry {vm_info!r}")
@@ -302,6 +315,12 @@ def cleanup_vms(vm_list):
                     node = record.node
                     vm_type = record.vm_type
                     vm_name = record.vm_name
+                    identity_fields = {
+                        'backend': record.backend or BACKEND_PROXMOX,
+                        'provider_id': record.provider_id,
+                        'deployment_id': record.deployment_id,
+                        'network_slot': record.network_slot,
+                    }
 
             if vm_name is None:
                 logger.error(
@@ -309,66 +328,38 @@ def cleanup_vms(vm_list):
                     "expected guest name", vmid)
                 continue
 
-            identity = inspect_vm_guest(
-                proxmox, vmid, node=node, vm_name=vm_name, vm_type=vm_type)
-            if identity == VM_GUEST_ABSENT:
-                logger.info(f"VM {vmid} is absent from fresh cluster inventory")
-                destroyed.add(vmid)
-                continue
-            if identity != VM_GUEST_MATCH:
-                logger.error(
-                    "cleanup_vms: refusing to mutate unverified VM %s", vmid)
-                continue
-
-            endpoint = (proxmox.nodes(node).lxc(vmid) if vm_type == 'lxc'
-                        else proxmox.nodes(node).qemu(vmid))
-
+            ref = VMRef(vmid=vmid, vm_name=vm_name, vm_type=vm_type,
+                        location=node, **identity_fields)
             try:
-                stop_upid = endpoint.status.stop.post()
-                stop_result = wait_for_proxmox_task(
-                    proxmox, node, stop_upid, timeout=60, poll_interval=1)
-                if not stop_result['success']:
-                    logger.debug(
-                        f"Stop task for VM {vmid} returned non-OK: "
-                        f"{stop_result.get('error', stop_result['status'])}")
-            except Exception as stop_err:
-                if confirm_proxmox_absence(proxmox, vmid, stop_err):
-                    logger.info(
-                        f"VM {vmid} confirmed absent after stop request")
+                backend = get_backend(ref.backend)
+            except Exception as error:
+                logger.error("cleanup_vms: cannot reach the backend of VM "
+                             "%s: %s", vmid, error)
+                continue
+            with vm_provisioning.provider_session(backend):
+                identity = backend.inspect(ref)
+                if identity == GUEST_ABSENT:
+                    logger.info(f"VM {vmid} is absent from fresh inventory")
                     destroyed.add(vmid)
                     continue
-                # The VM may merely be stopped or have a corrupt config. The
-                # destroy endpoint is still worth trying, but the row remains
-                # unless deletion succeeds or fresh inventory confirms absence.
-                logger.debug(f"Stop request for VM {vmid} raised: {stop_err}")
-
-            try:
-                delete_upid = endpoint.delete()
-            except Exception as del_err:
-                if confirm_proxmox_absence(proxmox, vmid, del_err):
-                    logger.info(
-                        f"VM {vmid} confirmed absent after destroy request")
-                    destroyed.add(vmid)
-                else:
+                if identity != GUEST_MATCH:
                     logger.error(
-                        f"Error submitting destroy for VM {vmid}: {del_err}")
-                continue
-
-            try:
-                delete_result = wait_for_proxmox_task(
-                    proxmox, node, delete_upid, timeout=120, poll_interval=1)
-            except TimeoutError as timeout_error:
-                logger.error(
-                    f"Destroy task for VM {vmid} timed out: {timeout_error}")
-                continue
-            if delete_result['success']:
-                destroyed.add(vmid)
-                reset_cluster_vm_index()
-                logger.info(f"Cleaned up VM {vmid}")
-            else:
-                logger.error(
-                    f"Destroy task for VM {vmid} failed: "
-                    f"{delete_result.get('error', delete_result['status'])}")
+                        "cleanup_vms: refusing to mutate unverified VM %s", vmid)
+                    continue
+                try:
+                    vm_provisioning.destroy_vm(ref, DestroyPolicy.BEST_EFFORT)
+                except Exception as error:
+                    # A destroy that raised may still have removed the guest
+                    # (a timed-out terminate); only fresh inventory says so.
+                    if backend.confirm_absent(ref, error):
+                        logger.info(f"VM {vmid} confirmed absent after a "
+                                    f"failed destroy: {error}")
+                        destroyed.add(vmid)
+                    else:
+                        logger.error(f"Destroy of VM {vmid} failed: {error}")
+                    continue
+            destroyed.add(vmid)
+            logger.info(f"Cleaned up VM {vmid}")
 
     return destroyed
 
@@ -407,62 +398,122 @@ def _expected_vm_names(templates, *, owning_identifier,
     }
 
 
-def _cleanup_with_sweep(created_vms, *, templates, owning_identifier,
-                        owner_group_id=None, koth_game_id=None,
-                        attempted_vms=None):
-    """Clean every exact-name match and return only confirmed deletions.
+def named_instances(backend, prefix):
+    """[{vmid, node, vm_type, name}] of the backend's guests named `prefix`*.
 
-    ``attempted_vms`` receives the complete cleanup payload when supplied so
-    callers can durably track any guest whose deletion remains uncertain.
+    One list_managed() read; templates are never cleanup targets. Raises
+    when the inventory cannot be read, so callers fall back to what they
+    already know instead of reading an outage as "nothing there".
     """
-    prefix = _vm_name_prefix(owning_identifier=owning_identifier,
-                             owner_group_id=owner_group_id,
-                             koth_game_id=koth_game_id)
+    return [
+        {'vmid': resource.vmid, 'node': resource.location,
+         'vm_type': resource.vm_type or backend.name, 'name': resource.name}
+        for resource in backend.list_managed()
+        if resource.kind == 'instance' and not resource.is_template
+        and resource.vmid is not None
+        and (resource.name or '').startswith(prefix)
+    ]
+
+
+def _sweep_proxmox_by_name(payload, *, prefix, templates, owning_identifier,
+                           owner_group_id, koth_game_id):
+    """Add Proxmox guests with this deployment's exact names to `payload`."""
     expected_names = _expected_vm_names(
         templates,
         owning_identifier=owning_identifier,
         owner_group_id=owner_group_id,
         koth_game_id=koth_game_id,
     )
+    known = {(vm['vmid'], vm['node']) for vm in payload}
+    for vm in named_instances(get_backend(BACKEND_PROXMOX), prefix):
+        if (vm.get('name') in expected_names
+                and (vm['vmid'], vm['node']) not in known):
+            matching_template = next(
+                (
+                    template for template in templates
+                    if vm['name'] in _expected_vm_names(
+                        [template],
+                        owning_identifier=owning_identifier,
+                        owner_group_id=owner_group_id,
+                        koth_game_id=koth_game_id,
+                    )
+                ),
+                {},
+            )
+            config = extract_template_config(matching_template)
+            payload.append({
+                'vmid': vm['vmid'],
+                'node': vm['node'],
+                'vm_type': vm['vm_type'],
+                'vm_name': vm['name'],
+                'vm_display_name': config['name'],
+                'memory': config['memory'],
+                'cores': config['cores'],
+                'storage': config['storage'],
+                'is_entry_point': config['is_entry_point'],
+            })
+
+
+def _sweep_cloud_by_deployment(payload, created_vms, backend_name):
+    """Give each cloud result the instance its create left behind.
+
+    A create can raise after the provider launched the instance (a waiter
+    timeout), leaving a result without a provider id (ruling C7). The match
+    is by (deployment_id, vmid), never by name: GCP names an instance
+    lp-<site>-<vmid>, not the portal's vm_name. Results are updated in
+    place, so the survivor record of an instance that will not die names
+    where it actually runs.
+    """
+    wanted = {(vm.get('deployment_id'), vm.get('vmid')): vm
+              for vm in created_vms
+              if vm.get('deployment_id') and vm.get('vmid') is not None}
+    if not wanted:
+        return
+    listed = {id(vm) for vm in payload}
+    for resource in get_backend(backend_name).list_managed():
+        result = wanted.get((resource.deployment_id, resource.vmid))
+        if resource.kind != 'instance' or result is None:
+            continue
+        result['provider_id'] = result.get('provider_id') or resource.provider_id
+        result['node'] = resource.location or result.get('node')
+        if id(result) not in listed:
+            payload.append(result)
+            listed.add(id(result))
+
+
+def _cleanup_with_sweep(created_vms, *, templates, owning_identifier,
+                        owner_group_id=None, koth_game_id=None,
+                        attempted_vms=None, backend_name=BACKEND_PROXMOX):
+    """Clean every guest this deployment may own; return only confirmed deletions.
+
+    A Proxmox bundle also sweeps its exact names; a cloud bundle matches
+    the backend's instances by deployment and VMID instead, and never sweeps
+    Proxmox by name (a same-named Proxmox lab of the same owner is not this
+    deployment's). ``attempted_vms`` receives the complete cleanup payload
+    when supplied so callers can durably track any guest whose deletion
+    remains uncertain.
+    """
+    prefix = _vm_name_prefix(owning_identifier=owning_identifier,
+                             owner_group_id=owner_group_id,
+                             koth_game_id=koth_game_id)
     payload = [
         vm for vm in created_vms
         if vm.get('vmid') is not None
         and vm.get('node')
-        and vm.get('vm_type') in ('qemu', 'lxc')
+        and vm.get('vm_type')
     ]
-    known = {(vm['vmid'], vm['node']) for vm in payload}
     try:
-        for vm in find_vms_by_name_prefix(prefix):
-            if (vm.get('name') in expected_names
-                    and (vm['vmid'], vm['node']) not in known):
-                matching_template = next(
-                    (
-                        template for template in templates
-                        if vm['name'] in _expected_vm_names(
-                            [template],
-                            owning_identifier=owning_identifier,
-                            owner_group_id=owner_group_id,
-                            koth_game_id=koth_game_id,
-                        )
-                    ),
-                    {},
-                )
-                config = extract_template_config(matching_template)
-                payload.append({
-                    'vmid': vm['vmid'],
-                    'node': vm['node'],
-                    'vm_type': vm['vm_type'],
-                    'vm_name': vm['name'],
-                    'vm_display_name': config['name'],
-                    'memory': config['memory'],
-                    'cores': config['cores'],
-                    'storage': config['storage'],
-                    'is_entry_point': config['is_entry_point'],
-                })
+        if backend_name == BACKEND_PROXMOX:
+            _sweep_proxmox_by_name(
+                payload, prefix=prefix, templates=templates,
+                owning_identifier=owning_identifier,
+                owner_group_id=owner_group_id, koth_game_id=koth_game_id)
+        else:
+            _sweep_cloud_by_deployment(payload, created_vms, backend_name)
     except Exception:
         logger.exception(
-            "_cleanup_with_sweep: name-prefix sweep failed for %r "
-            "(falling back to known VM results only)", prefix)
+            "_cleanup_with_sweep: %s inventory sweep failed for %r "
+            "(falling back to known VM results only)", backend_name, prefix)
     if attempted_vms is not None:
         attempted_vms.extend(payload)
     destroyed = cleanup_vms(payload)
@@ -544,8 +595,15 @@ def _preflight_deployment_group(templates, *, owning_identifier,
     prefix = _vm_name_prefix(owning_identifier=owning_identifier,
                              owner_group_id=owner_group_id,
                              koth_game_id=koth_game_id)
-    existing = [vm for vm in find_vms_by_name_prefix(prefix)
-                if vm.get('name') in expected_names]
+    try:
+        inventory = named_instances(get_backend(BACKEND_PROXMOX), prefix)
+    except Exception:
+        # As the per-node listing always did: an unreadable inventory
+        # reports nothing to shadow, and the deploy itself then meets the
+        # outage.
+        logger.exception("Pre-flight inventory read failed for %r", prefix)
+        inventory = []
+    existing = [vm for vm in inventory if vm.get('name') in expected_names]
     if not existing:
         return ('fresh', [])
     if {vm.get('name') for vm in existing} == expected_names:
@@ -682,6 +740,23 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
                 'storage': config['storage'],
                 'is_entry_point': config['is_entry_point'],
             })
+        elif backend_name != BACKEND_PROXMOX and spec is not None:
+            # The bundle's VMID reservation makes this VMID ours alone, so
+            # a cloud instance carrying it and this deployment can only be
+            # this create's, even when create() raised after the launch
+            # (ruling C7). Cleanup inspects it; the cloud sweep supplies the
+            # provider id and zone when the instance exists.
+            result.update({
+                'vmid': spec.vmid,
+                'vm_name': vm_name,
+                'vm_display_name': config['name'],
+                'vm_type': backend_name,
+                'node': backend_name,
+                'memory': config['memory'],
+                'cores': config['cores'],
+                'storage': config['storage'],
+                'is_entry_point': config['is_entry_point'],
+            })
         return result
 
 
@@ -743,7 +818,7 @@ def _persist_failed_deploy_leftovers(
         vmid = vm_info.get('vmid')
         if (vmid is None or vmid in destroyed_vmids or vmid in seen_vmids
                 or not vm_info.get('node')
-                or vm_info.get('vm_type') not in ('qemu', 'lxc')):
+                or not vm_info.get('vm_type')):
             continue
         seen_vmids.add(vmid)
         survivors.append(vm_info)
@@ -769,6 +844,12 @@ def _persist_failed_deploy_leftovers(
             'cores': vm_info.get('cores'),
             'storage': vm_info.get('storage'),
             'is_entry_point': bool(vm_info.get('is_entry_point', False)),
+            # Enough identity for the expiry daemon to find the guest again
+            # through its own backend after a restart.
+            'backend': _entry_backend(vm_info),
+            'provider_id': vm_info.get('provider_id'),
+            'deployment_id': vm_info.get('deployment_id'),
+            'network_slot': vm_info.get('network_slot'),
         }
         for vm_info in survivors
     ]
@@ -808,7 +889,7 @@ def _persist_failed_deploy_leftovers(
 def _finalize_failed_deployment(
         vm_results, *, vmid_reservation_id, templates,
         deployment_group_name, owning_identifier, user_id,
-        owner_group_id=None, koth_game_id=None):
+        owner_group_id=None, koth_game_id=None, backend_name=BACKEND_PROXMOX):
     """Clean a failed deployment and transfer survivors into VMRecords."""
     attempted_vms = list(vm_results)
     with _heartbeat_deployment_reservations(
@@ -821,6 +902,7 @@ def _finalize_failed_deployment(
                 owner_group_id=owner_group_id,
                 koth_game_id=koth_game_id,
                 attempted_vms=attempted_vms,
+                backend_name=backend_name,
             )
         except Exception:
             destroyed = set()
@@ -837,7 +919,24 @@ def _finalize_failed_deployment(
             owner_group_id=owner_group_id,
             koth_game_id=koth_game_id,
         )
+        if backend_name != BACKEND_PROXMOX and not survivors:
+            # Every launched instance is confirmed gone, so nothing uses the
+            # deployment's network. With a survivor it stays for that
+            # record's retirement, or for the sweeper.
+            try:
+                get_backend(backend_name).cleanup_deployment(vmid_reservation_id)
+            except Exception:
+                logger.exception("Could not clean up deployment %s of %s; the "
+                                 "sweeper will retry", vmid_reservation_id,
+                                 backend_name)
     _release_vm_reservations(vm_results)
+    if backend_name != BACKEND_PROXMOX:
+        # Slot networks carry no deployment id, so only this release keeps a
+        # failed deploy from leaking its subnet (ruling I4). After the
+        # bundle's own admissions are gone, which would otherwise hold it.
+        for slot in sorted({vm['network_slot'] for vm in vm_results
+                            if vm.get('network_slot') is not None}):
+            vm_provisioning.release_slot_if_unused(backend_name, slot)
     return destroyed, survivors
 
 
@@ -1007,6 +1106,7 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                 user_id=user_id,
                 owner_group_id=owner_group_id,
                 koth_game_id=koth_game_id,
+                backend_name=backend_name,
             )
             vmid_safe_to_release = True
             leftover = [vm['vmid'] for vm in survivors]
@@ -1049,6 +1149,7 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
                 user_id=user_id,
                 owner_group_id=owner_group_id,
                 koth_game_id=koth_game_id,
+                backend_name=backend_name,
             )
             vmid_safe_to_release = True
             leftover = [vm['vmid'] for vm in survivors]

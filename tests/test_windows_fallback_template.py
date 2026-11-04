@@ -10,6 +10,7 @@ from app import create_app
 from app.models import db, User, VMRecord
 from app.routes.vm_creation import extract_template_config, create_qemu_vm
 from app.routes.utils import VM_PRESENT
+from tests.backends.fake_backend import StaticDisplayBackend
 
 
 class TestFullCloneOption(unittest.TestCase):
@@ -156,17 +157,14 @@ class TestConnectOnApi(unittest.TestCase):
                 expires_at=datetime.now() + timedelta(hours=2),
                 created_by_user_id=self.user.id))
         db.session.commit()
-        # _verify_vm_exists returns (state, error_msg). It used to return a
-        # three-tuple, and this mock still fed one, so /list answered
-        # {"success": false, "error": "too many values to unpack (expected 2)"}
-        # and the assertion below died on a missing 'students' key. Use the
-        # real constant rather than a bare truthy value, so this breaks loudly
-        # if the contract changes again.
-        with patch('app.routes.vm_listing.get_proxmox_connection'), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        # The backend's display verdict, which replaced the
+        # `_verify_vm_exists` mock: that mock once fed a stale three-tuple
+        # and /list answered {"success": false, ...}. Use the real constant
+        # rather than a bare truthy value, so this breaks loudly if the
+        # contract changes again.
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=CONNECT_CONFIG):
             data = json.loads(self.client.get('/list').data)
