@@ -36,7 +36,9 @@ from app.backends.cloud_common import (
     slot_network_name,
 )
 from app.backends.network_slots import cloud_slot_cidr
-from tests.live.cloud_harness import EXPIRY, LIVE_SLOT, CloudContractRun
+from tests.live.cloud_harness import (
+    EXPIRY, LIVE_SLOT, CloudContractRun, is_missing_resource_refusal,
+)
 
 pytestmark = [pytest.mark.live, pytest.mark.live_gcp]
 
@@ -247,23 +249,42 @@ def test_aggregated_list_reports_only_no_results_on_page_as_benign(gcp_backend, 
     gcp_backend.list_managed()  # the backend accepts the same answer
 
 
-def test_wait_may_return_an_unfinished_operation(gcp_run, gcp_backend, compute):
-    # The backend loops while /wait answers an operation that is not DONE,
-    # in the scope the operation names, and bounds each call by its read cap.
+def _stop_and_wait(gcp_run, compute):
+    """Stop a freshly launched instance by hand and wait on the operation
+    with the backend's read cap: (ref, operation, final, /wait calls, cap)."""
     ref = gcp_run.launch_one()
     operation = compute.json('POST', 'zones', ref.location, 'instances', ref.provider_id,
                              'stop', params={'requestId': str(uuid.uuid4())})
-    initial = operation.get('status')
     cap = _wait_cap()
     final, calls = compute.wait_done(operation, read_timeout=cap)
-    _observe(f'stop operation: started {initial!r}; /wait returned {calls}')
+    _observe(f'stop operation: started {operation.get("status")!r}; /wait returned {calls}')
+    return ref, operation, final, calls, cap
+
+
+def test_wait_blocks_less_than_the_read_cap_and_returns_the_finished_operation(
+        gcp_run, gcp_backend, compute):
+    # The backend bounds each /wait by its read cap; a /wait that outlasts it
+    # would read as a timeout on every slow operation.
+    ref, operation, final, calls, cap = _stop_and_wait(gcp_run, compute)
 
     assert final['name'] == operation['name']
     assert final.get('error') is None, final['error']
     assert all(seconds < cap for _, seconds in calls), calls
-    if not any(status != 'DONE' for status, _ in calls):
-        _observe('/wait always returned DONE: an unfinished /wait answer was not observed')
     assert gcp_backend.status(ref) == 'stopped'
+
+
+def test_wait_may_return_an_unfinished_operation(gcp_run, compute):
+    # The backend loops while /wait answers an operation that is not DONE,
+    # in the scope the operation names. Compute returns early only when the
+    # operation outlasts its server-side bound, which a stop rarely does.
+    _ref, operation, final, calls, _cap = _stop_and_wait(gcp_run, compute)
+    unfinished = [(status, seconds) for status, seconds in calls if status != 'DONE']
+    if not unfinished:
+        pytest.skip(f'/wait always returned DONE ({calls}): an unfinished /wait answer '
+                    'was not observed')
+    # Each unfinished answer is the same operation, still in progress.
+    assert all(status in ('PENDING', 'RUNNING') for status, _ in unfinished), unfinished
+    assert final['name'] == operation['name'] and final['status'] == 'DONE'
 
 
 def test_read_timeout_while_waiting_fails_the_call_and_a_retry_completes(
@@ -336,11 +357,18 @@ def test_request_id_reuse_after_a_failed_operation_replays_the_failure(
 
     first = insert(request_id)
     if not first.ok:
+        try:
+            payload = first.json()
+        except ValueError:
+            payload = None
+        if not is_missing_resource_refusal(first.status_code, payload, missing_image):
+            pytest.fail(f'the missing-image insert failed for another reason: '
+                        f'HTTP {first.status_code} {first.text[:500]}')
         again = insert(request_id)
         _observe(f'insert with a missing image: HTTP {first.status_code}, reused id '
                  f'HTTP {again.status_code}')
-        pytest.skip(f'Compute refused the insert immediately (HTTP {first.status_code}); '
-                    'no failed operation exists to replay')
+        pytest.skip(f'Compute refused the missing-image insert immediately (HTTP '
+                    f'{first.status_code}); no failed operation exists to replay')
     failed, _ = compute.wait_done(first.json())
     assert failed.get('error'), f'an insert from a missing image succeeded: {failed}'
 

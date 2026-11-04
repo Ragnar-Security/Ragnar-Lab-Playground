@@ -224,6 +224,28 @@ def _describe(resource: ManagedResource) -> str:
     return f'{resource.kind} {resource.provider_id} ({resource.name!r}{where})'
 
 
+# A synchronous Compute refusal of a request naming a resource that does not
+# exist: 404 notFound, or 400 invalid when the reference is judged malformed.
+MISSING_RESOURCE_STATUSES = (400, 404)
+
+
+def is_missing_resource_refusal(status_code: int, payload, resource: str) -> bool:
+    """Whether a Compute error response refuses a request because `resource`
+    (a name or partial URL) does not exist, as opposed to an auth, quota,
+    rate-limit, server or any other failure. `payload` is the decoded body."""
+    if status_code not in MISSING_RESOURCE_STATUSES:
+        return False
+    error = payload.get('error') if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    entries = error.get('errors') if isinstance(error.get('errors'), list) else []
+    messages = [error.get('message')] + [e.get('message') for e in entries
+                                         if isinstance(e, dict)]
+    name = resource.rstrip('/').rsplit('/', 1)[-1]
+    return any(isinstance(m, str) and name in m for m in messages)
+
+
+
 class CloudContractRun:
     """Owns every resource the cloud contract run creates; use as a context
     manager. Only backend methods touch the provider."""

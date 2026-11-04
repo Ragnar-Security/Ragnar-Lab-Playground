@@ -182,8 +182,10 @@ Where the provider's answer is the point of the check (status codes,
 warning codes, `/wait` timings), the test records it as a `LiveObservation`
 warning, which appears in pytest's warnings summary. A check whose race the
 run could not reproduce (the router already past `pending`, a delete that
-finished before its first `/wait`, an insert refused before any operation
-existed) is reported as SKIPPED with the reason, never as passed.
+finished before its first `/wait`, a `/wait` that never answered with an
+unfinished operation, a missing-image insert refused with 400/404 before any
+operation existed) is reported as SKIPPED with the reason, never as passed.
+Any other refusal of that insert (auth, quota, rate limit, 5xx) fails.
 
 The GCP network and router checks call the `VMBackend` methods
 `ensure_slot`, `release_slot`, `cleanup_deployment`, `ensure_router_running`

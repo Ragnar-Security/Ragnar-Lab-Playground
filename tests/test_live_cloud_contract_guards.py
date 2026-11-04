@@ -23,6 +23,7 @@ from tests.live.cloud_harness import (
     CloudLiveConfig,
     UnsafeLiveRun,
     cloud_live_skip_reason,
+    is_missing_resource_refusal,
     required_env,
     select_live_skip_reason,
 )
@@ -371,3 +372,44 @@ def test_network_cleanup_is_retried_while_the_provider_reports_it_in_use():
         run.launch_one()
     assert fake.busy == 0 and fake.list_managed() == []
     assert len(slept) == 2
+
+
+# --- live response classification ------------------------------------------------
+
+MISSING_IMAGE = 'projects/example-project/global/images/lp-live-test-missing-image'
+
+
+def _compute_error(code, message, reason):
+    return {'error': {'code': code, 'message': message,
+                      'errors': [{'message': message, 'domain': 'global', 'reason': reason}]}}
+
+
+@pytest.mark.parametrize(('status', 'payload'), [
+    (404, _compute_error(404, f"The resource '{MISSING_IMAGE}' was not found", 'notFound')),
+    (400, _compute_error(400, "Invalid value for field 'resource.disks[0].initializeParams"
+                              ".sourceImage': 'lp-live-test-missing-image'.", 'invalid')),
+    (404, {'error': {'code': 404, 'message': 'not found', 'errors': [
+        {'message': f"The resource '{MISSING_IMAGE}' was not found", 'reason': 'notFound'}]}}),
+])
+def test_a_missing_image_refusal_is_recognised(status, payload):
+    assert is_missing_resource_refusal(status, payload, MISSING_IMAGE)
+
+
+@pytest.mark.parametrize(('status', 'payload'), [
+    # Auth, quota/rate limit and server failures must fail the live test, not skip it.
+    (401, _compute_error(401, 'Request had invalid authentication credentials.', 'authError')),
+    (403, _compute_error(403, f"Required 'compute.instances.create' permission for "
+                              f"'{MISSING_IMAGE}'", 'forbidden')),
+    (429, _compute_error(429, 'Rate Limit Exceeded', 'rateLimitExceeded')),
+    (500, _compute_error(500, f'Internal error for {MISSING_IMAGE}', 'backendError')),
+    (503, None),
+    # A 404 about something else (the subnetwork, the zone) is not this refusal.
+    (404, _compute_error(404, "The resource 'projects/example-project/regions/r/"
+                              "subnetworks/lp-live-test-s-1' was not found", 'notFound')),
+    (400, _compute_error(400, 'Invalid value for field machineType', 'invalid')),
+    (404, None),
+    (404, '<html>Not Found</html>'),
+    (404, {'error': 'notFound'}),
+])
+def test_any_other_insert_failure_is_not_a_missing_image_refusal(status, payload):
+    assert not is_missing_resource_refusal(status, payload, MISSING_IMAGE)
