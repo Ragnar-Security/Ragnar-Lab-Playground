@@ -18,10 +18,12 @@ against the shapes those mocks assume, using the app's own helpers:
   `is_proxmox_not_found`);
 - cleanup after a failure injected mid-test.
 
-It is opt-in. Without `LIVE_PROXMOX=1` and the variables below, every test
-here is skipped, so `pytest tests/` and CI skip it without opening a
-connection. The safety guards are unit-tested without a cluster in
-`tests/test_live_contract_guards.py`, which CI does run.
+It is opt-in. Without `LIVE_PROXMOX=1` and the variables below, every
+Proxmox test here (`test_proxmox_contract.py`) is skipped, so `pytest tests/`
+and CI skip it without opening a connection. The safety guards are
+unit-tested without a cluster in `tests/test_live_contract_guards.py`, which
+CI does run. The AWS and GCP runs have their own, separate opt-in; see
+[Live AWS and GCP contract runs](#live-aws-and-gcp-contract-runs) below.
 
 ## Safety rules
 
@@ -147,3 +149,165 @@ pvesh delete /nodes/<node>/qemu/<vmid> --purge 1
 
 For a delete it could not finish, the run prints these commands with the
 VMID, node and name already filled in.
+
+# Live AWS and GCP contract runs
+
+The unit suite runs `AWSBackend` against moto and `GCPBackend` against a
+fake REST session. Neither is evidence of how EC2 or Compute Engine really
+behave. `test_aws_contract.py` and `test_gcp_contract.py` drive the app's own
+backends, through the registry, against a real account and check:
+
+- one full lifecycle per cloud: admission at a cap of one, router, slot
+  network, launch from the configured image, identity (`inspect`), status,
+  private-only addresses inside the slot's CIDR, an expiry update visible in
+  `list_managed()`, a second admission refused at the cap, then teardown and
+  an empty inventory;
+- **AWS:** instance-level `SecurityGroups` populated and no public
+  `Association` on a private launch; `RunInstances` `ClientToken`
+  idempotency after a lost response (a client-side timeout); a deployment
+  security group delete refused with `DependencyViolation` while attached,
+  and surfaced to the caller; `stop_router` while the router is `pending`;
+- **GCP:** the deployment firewall accepted unchanged; the aggregated-list
+  name filter is exact and literal and the hyphenated label key parses;
+  which warning codes Compute sends (`NO_RESULTS_ON_PAGE` must be the only
+  one) and how an unreachable zone shows up; `/wait` returning an unfinished
+  operation and blocking less than the backend's read cap; a read timeout
+  while waiting fails the call and a retry completes the delete; how an
+  insert into a missing subnetwork is refused (and that the backend raises
+  `SlotNetworkMissing` before inserting); whether a reused `requestId`
+  replays a failed operation; the router found by its labels but never
+  listed as managed.
+
+Where the provider's answer is the point of the check (status codes,
+warning codes, `/wait` timings), the test records it as a `LiveObservation`
+warning, which appears in pytest's warnings summary. A check whose race the
+run could not reproduce (the router already past `pending`, a delete that
+finished before its first `/wait`, an insert refused before any operation
+existed) is reported as SKIPPED with the reason, never as passed.
+
+The GCP network and router checks call the `VMBackend` methods
+`ensure_slot`, `release_slot`, `cleanup_deployment`, `ensure_router_running`
+and `stop_router`. They need a `GCPBackend` that implements its networks.
+
+## Cloud safety rules
+
+`tests/live/cloud_harness.py` (`CloudContractRun`) enforces these rules;
+they are unit-tested against the in-memory backend in
+`tests/test_live_cloud_contract_guards.py`, which CI does run:
+
+1. **A dedicated live site.** `LAB_SITE_ID` must be `live-<name>` (at most
+   20 characters, lower-case letters, digits and `-`), used by no portal.
+   Every resource the backends create carries that site, and every
+   inventory is filtered by it.
+2. **One machine at a time.** `AWS_MAX_VMS` / `GCP_MAX_VMS` must be exactly
+   `1`.
+3. **An empty site to start with.** The run refuses to start while
+   `list_managed()` reports anything for the site, and touches none of it.
+   Teardown can therefore only remove what this run created.
+4. **A 30-minute expiry.** Every instance is launched with the app's expiry
+   tag or label 30 minutes out, so the portal's sweeper would recognise it.
+5. **Claimed before launch.** Each instance is claimed before `create` is
+   called, so one whose launch raised half-way is still destroyed.
+6. **Teardown always runs,** pass or fail, in this order: destroy each
+   instance and require positive absence; delete its deployment network;
+   release the slot; release the admission; stop the router. Network deletes
+   are retried for up to five minutes while the provider still reports them
+   in use (EC2 frees a terminated instance's interface asynchronously).
+7. **Zero resources left.** A fresh `list_managed()` of the site must be
+   empty. If it is not, the run deletes exactly what that fresh inventory
+   lists (`delete_resource`, which re-proves ownership) and requires a second
+   empty inventory.
+
+Any cleanup failure fails the test's teardown, even after the test body
+failed, with the provider ids and the inventory commands below filled in.
+
+The run only reads and pins `app.config` values it validated: the site, the
+cap, `ENABLED_BACKENDS` and the cloud settings below are patched into
+`app.config` for the session, so a stray `.env` value cannot widen the cap or
+change the site. Credentials stay in boto3's standard chain (environment,
+shared config, instance role) or Google Application Default Credentials and
+are never printed.
+
+## Cloud environment
+
+Without its flag and every variable below, a provider's tests are skipped
+at collection, before any provider module is imported or client built. The
+flags are independent: `LIVE_AWS=1` alone runs the AWS tests (the Proxmox
+`LIVE_PROXMOX` guard applies only to the Proxmox tests).
+
+| Variable | AWS | GCP | Example | Meaning |
+|----------|-----|-----|---------|---------|
+| `LIVE_AWS` / `LIVE_GCP` | `LIVE_AWS` | `LIVE_GCP` | `1` | Opt in. Any other value skips. |
+| `ENABLED_BACKENDS` | contains `aws` | contains `gcp` | `aws` | As for the app. |
+| `LAB_SITE_ID` | yes | yes | `live-contract` | The dedicated live site. Must start with `live-`. |
+| `AWS_MAX_VMS` / `GCP_MAX_VMS` | `AWS_MAX_VMS` | `GCP_MAX_VMS` | `1` | Must be `1`. |
+| `AWS_REGION`, `AWS_AVAILABILITY_ZONE` | yes | | `us-east-1`, `us-east-1a` | Where the run launches. |
+| `AWS_LAB_VPC_ID`, `AWS_LAB_CIDR` | yes | | `vpc-…`, `172.20.0.0/16` | The lab VPC and its slot base, as for the app. |
+| `AWS_ROUTER_INSTANCE_ID` | yes | | `i-…` | A router tagged `lab-playground-site=<live site>` and `lab-playground-kind=router`. |
+| `LIVE_AWS_IMAGE_ID`, `LIVE_AWS_INSTANCE_TYPE` | yes | | `ami-…`, `t3.micro` | What the run launches. The root disk is 20 GB. |
+| `GCP_PROJECT`, `GCP_REGION`, `GCP_ZONE` | | yes | `my-lab-project`, `us-central1`, `us-central1-a` | Where the run launches. |
+| `GCP_NETWORK`, `GCP_LAB_CIDR` | | yes | `lab-vpc`, `172.21.0.0/16` | The lab VPC network and its slot base, as for the app. |
+| `GCP_ROUTER_INSTANCE` | | yes | `lab-router` | A router labelled `lab-playground-site=<live site>` and `lab-playground-kind=router`. |
+| `LIVE_GCP_IMAGE`, `LIVE_GCP_MACHINE_TYPE` | | yes | `projects/debian-cloud/global/images/family/debian-12`, `e2-small` | What the run launches. The boot disk is 20 GB. |
+
+The timeouts (`AWS_LAUNCH_TIMEOUT_SECONDS`, `AWS_TERMINATE_TIMEOUT_SECONDS`,
+`GCP_OPERATION_TIMEOUT_SECONDS`) are the app's, and default as they do there.
+
+Use a dedicated live VPC (or at least a dedicated router and site) and an
+identity limited to it. The AWS run needs to describe, run, tag, start, stop
+and terminate instances; create, tag and delete subnets and security groups
+and change their rules. The GCP run needs the same on instances,
+subnetworks and firewall rules, plus operation reads.
+
+## Running the cloud contracts
+
+Run one provider at a time, from a checkout without a production `.env`:
+
+```bash
+# AWS
+export LIVE_AWS=1 ENABLED_BACKENDS=aws LAB_SITE_ID=live-contract AWS_MAX_VMS=1 \
+       AWS_REGION=us-east-1 AWS_AVAILABILITY_ZONE=us-east-1a \
+       AWS_LAB_VPC_ID=vpc-... AWS_LAB_CIDR=172.20.0.0/16 \
+       AWS_ROUTER_INSTANCE_ID=i-... \
+       LIVE_AWS_IMAGE_ID=ami-... LIVE_AWS_INSTANCE_TYPE=t3.micro
+uv run python -m pytest tests/live/test_aws_contract.py -v -rs
+```
+
+```bash
+# GCP
+export LIVE_GCP=1 ENABLED_BACKENDS=gcp LAB_SITE_ID=live-contract GCP_MAX_VMS=1 \
+       GCP_PROJECT=my-lab-project GCP_REGION=us-central1 GCP_ZONE=us-central1-a \
+       GCP_NETWORK=lab-vpc GCP_LAB_CIDR=172.21.0.0/16 GCP_ROUTER_INSTANCE=lab-router \
+       LIVE_GCP_IMAGE=projects/debian-cloud/global/images/family/debian-12 \
+       LIVE_GCP_MACHINE_TYPE=e2-small
+uv run python -m pytest tests/live/test_gcp_contract.py -v -rs
+```
+
+Each test launches at most one instance and removes it before the next
+starts. Expect a few minutes per test; the GCP file is the longer one.
+
+## Manual cloud cleanup
+
+A killed process can leave resources in the live site. They carry the
+site tag or label and an expiry 30 minutes out. List them (the run prints
+these with the region, project and site filled in when its teardown fails):
+
+```bash
+# AWS
+aws ec2 describe-instances --region <region> \
+  --filters Name=tag:lab-playground-site,Values=<live site> \
+            Name=instance-state-name,Values=pending,running,stopping,stopped
+aws ec2 describe-security-groups --region <region> --filters Name=tag:lab-playground-site,Values=<live site>
+aws ec2 describe-subnets --region <region> --filters Name=tag:lab-playground-site,Values=<live site>
+
+# GCP
+gcloud compute instances list --project <project> --filter='labels.lab-playground-site=<live site>'
+gcloud compute firewall-rules list --project <project> --filter='name ~ ^lp-<live site>-d-'
+gcloud compute networks subnets list --project <project> --filter='name ~ ^lp-<live site>-s-'
+```
+
+Remove instances first, then security groups or firewall rules, then
+subnets: `aws ec2 terminate-instances`, `delete-security-group`,
+`delete-subnet`; `gcloud compute instances delete`, `firewall-rules delete`,
+`networks subnets delete`. Never remove the router; stop it instead. The
+next run refuses to start until the site is empty again.
