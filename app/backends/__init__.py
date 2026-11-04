@@ -11,7 +11,7 @@ import threading
 from typing import Callable, Dict, Tuple
 
 from app.backends.base import (
-    BACKEND_PROXMOX, KNOWN_BACKENDS, BackendNotEnabled, VMBackend,
+    BACKEND_AWS, BACKEND_PROXMOX, KNOWN_BACKENDS, BackendNotEnabled, VMBackend,
 )
 
 
@@ -20,8 +20,14 @@ def _proxmox_factory() -> VMBackend:
     return ProxmoxBackend()
 
 
+def _aws_factory() -> VMBackend:
+    from app.backends.aws import AWSBackend
+    return AWSBackend()
+
+
 _DEFAULT_FACTORIES: Dict[str, Callable[[], VMBackend]] = {
     BACKEND_PROXMOX: _proxmox_factory,
+    BACKEND_AWS: _aws_factory,
 }
 
 _backend_factories: Dict[str, Callable[[], VMBackend]] = dict(_DEFAULT_FACTORIES)

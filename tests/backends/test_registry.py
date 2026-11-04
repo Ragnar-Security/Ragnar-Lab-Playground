@@ -72,6 +72,9 @@ def test_enabled_backends_reads_config_at_call_time(monkeypatch):
 # Catches a test's stateful fake or patched client leaking into the next test.
 def test_reset_drops_instances_and_registered_factories(monkeypatch):
     monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    # AWS has a production default factory; remove it so only the
+    # registered one could answer after the reset.
+    monkeypatch.delitem(importlib.import_module('app.backends')._DEFAULT_FACTORIES, 'aws')
     first = FakeBackend('aws')
     register_backend_factory('aws', lambda: first)
     assert get_backend('aws') is first
