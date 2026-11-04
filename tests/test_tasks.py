@@ -982,3 +982,255 @@ def test_proxmox_outage_pass_still_runs_the_cloud_sweep_without_proxmox(
     with patch("app.tasks.maybe_reap_orphaned_vms", return_value=[]) as reaper:
         _run_one_expiry_pass(app)
     reaper.assert_called_once_with(None)
+
+
+# ---- idle cloud routers (T16) ----------------------------------------------
+
+import importlib
+import time
+
+from app.backends import register_backend_factory, reset_backends_for_tests
+from app.backends.base import BackendError, LaunchedVM
+from app.backends.cloud_common import router_lock_key
+from app.models import NodeMemoryReservation
+from app.proxmox_service import vm_lifecycle_lock
+from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
+from tests.backends.fake_backend import FakeBackend
+
+config = importlib.import_module("app.config")
+
+_IDLE_VM_NAME = "router-idle-vm"
+
+
+@pytest.fixture
+def router_backend(app, monkeypatch):
+    # Router-idle tests only: one enabled fake AWS backend with a running router.
+    fake = FakeBackend('aws')
+    fake.router_running = True
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 30)
+    register_backend_factory('aws', lambda: fake)
+    _reset_router_idle_state_for_tests()
+    with app.app_context():
+        yield fake
+    _reset_router_idle_state_for_tests()
+    reset_backends_for_tests()
+
+
+def add_live_record(backend, *, vmid=4100, expires_at=None):
+    record = VMRecord(
+        vmid=vmid, vm_name=_IDLE_VM_NAME, vm_type="instance", node=backend,
+        backend=backend, provider_id=f"provider-{vmid}",
+        template_name="cloud/vm", student_name="student",
+        expires_at=expires_at or datetime.now() + timedelta(hours=1))
+    db.session.add(record)
+    db.session.commit()
+    return record
+
+
+def retire_record():
+    VMRecord.query.filter_by(vm_name=_IDLE_VM_NAME).delete()
+    db.session.commit()
+
+
+def observe_idle_at(t):
+    assert _stop_idle_cloud_routers(now_epoch=t) == []
+
+
+def add_node_reservation(node, expires_at, reservation_id='r-idle'):
+    db.session.add(NodeMemoryReservation(
+        reservation_id=reservation_id, node=node, memory_bytes=1,
+        expires_at=expires_at))
+    db.session.commit()
+
+
+def remove_reservation():
+    NodeMemoryReservation.query.filter_by(reservation_id='r-idle').delete()
+    db.session.commit()
+
+
+def arrange_lock_owner_to_insert_reservation_before_yield(app, backend, expires_at):
+    """A launch admission holding the router lock when the idle check arrives."""
+    holding = threading.Event()
+
+    def owner():
+        with app.app_context():
+            with vm_lifecycle_lock(router_lock_key(backend)):
+                holding.set()
+                time.sleep(0.2)
+                add_node_reservation(node=backend, expires_at=expires_at)
+
+    thread = threading.Thread(target=owner)
+    thread.start()
+    assert holding.wait(timeout=5), "lock owner never took the router lock"
+    return thread
+
+
+def test_router_stops_only_after_one_continuous_idle_window(app, router_backend):
+    # Catches stopping immediately when the last row disappears.
+    add_live_record(backend="aws")
+    assert _stop_idle_cloud_routers(now_epoch=1_000) == []
+    retire_record()
+    assert _stop_idle_cloud_routers(now_epoch=1_001) == []
+    assert _stop_idle_cloud_routers(now_epoch=2_800) == []
+    assert _stop_idle_cloud_routers(now_epoch=2_801) == ["aws"]
+    assert router_backend.router_running is False
+
+
+def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app, router_backend):
+    # Catches a stop racing a new deployment that has reserved capacity but no VMRecord yet.
+    observe_idle_at(1_000)
+    add_node_reservation(node="aws", expires_at=2_000)
+    assert _stop_idle_cloud_routers(now_epoch=1_100) == []
+    remove_reservation()
+    assert _stop_idle_cloud_routers(now_epoch=1_200) == []  # first idle observation
+    assert _stop_idle_cloud_routers(now_epoch=2_999) == []
+    assert router_backend.router_running is True
+    assert _stop_idle_cloud_routers(now_epoch=3_000) == ["aws"]
+
+
+def test_unexpired_admission_reservation_blocks_stop_without_any_record(app, router_backend):
+    # Catches a stop between a launch's router start and its VMRecord commit (C4).
+    observe_idle_at(0)
+    add_node_reservation(node="aws", expires_at=10_060)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    assert router_backend.router_running is True
+
+
+def test_expired_reservation_does_not_block_stop(app, router_backend):
+    # Catches a leaked lease keeping the router billing forever (M13).
+    observe_idle_at(0)
+    add_node_reservation(node="aws", expires_at=9_999)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_other_backends_workload_does_not_keep_router_running(app, router_backend):
+    # Catches counting a Proxmox record or another cloud's lease as AWS work.
+    observe_idle_at(0)
+    add_live_record(backend="proxmox")
+    add_node_reservation(node="gcp", expires_at=10_060)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_destroyed_koth_record_does_not_keep_router_running(app, router_backend):
+    # Catches a retained-as-destroyed KOTH row counting as a live guest.
+    record = add_live_record(backend="aws")
+    record.destroyed = True
+    db.session.commit()
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_router_lock_rechecks_workload_before_stop(app, router_backend):
+    # Catches launch admission landing while the idle worker waits for the router lock.
+    observe_idle_at(0)
+    owner = arrange_lock_owner_to_insert_reservation_before_yield(
+        app, backend="aws", expires_at=10_060)
+    try:
+        assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    finally:
+        owner.join(timeout=5)
+    assert router_backend.router_running is True
+
+
+def test_worker_restart_waits_a_fresh_idle_interval(app, router_backend):
+    # Catches a restart stopping at once because no in-memory history says otherwise.
+    observe_idle_at(0)
+    _reset_router_idle_state_for_tests()
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    assert router_backend.router_running is True
+    assert _stop_idle_cloud_routers(now_epoch=11_800) == ["aws"]
+
+
+def test_stopped_router_is_not_stopped_again_every_pass(app, router_backend):
+    # Catches calling the provider every minute once the router is already stopped.
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == ["aws"]
+    router_backend.router_running = True  # only a fresh stop could clear this
+    assert _stop_idle_cloud_routers(now_epoch=1_860) == []
+    assert router_backend.router_running is True
+
+
+def test_failed_router_stop_keeps_its_idle_timestamp_for_retry(app, router_backend):
+    # Catches a failed stop being reported as stopped, or restarting the idle window.
+    def refuse_stop():
+        raise BackendError("router stop wait failed")
+
+    observe_idle_at(0)
+    router_backend.stop_router = refuse_stop
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == []
+    assert router_backend.router_running is True
+    del router_backend.stop_router
+    assert _stop_idle_cloud_routers(now_epoch=1_860) == ["aws"]
+    assert router_backend.router_running is False
+
+
+def test_one_backends_stop_failure_does_not_block_the_other(
+        app, router_backend, monkeypatch):
+    # Catches one cloud's provider error ending the router step for every cloud.
+    gcp = FakeBackend('gcp')
+    gcp.router_running = True
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws', 'gcp'))
+    monkeypatch.setattr(config, 'GCP_ROUTER_IDLE_MINUTES', 30)
+    register_backend_factory('gcp', lambda: gcp)
+
+    def refuse_stop():
+        raise BackendError("router stop wait failed")
+
+    router_backend.stop_router = refuse_stop
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == ["gcp"]
+    assert (router_backend.router_running, gcp.router_running) == (True, False)
+
+
+def test_router_idle_uses_each_backends_configured_minutes(
+        app, router_backend, monkeypatch):
+    # Catches one hard-coded interval for every cloud.
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 5)
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=299) == []
+    assert _stop_idle_cloud_routers(now_epoch=300) == ["aws"]
+
+
+@pytest.fixture
+def expiry_events(router_backend, monkeypatch):
+    events = []
+
+    def recorder(name, result=None):
+        def record(*args, **kwargs):
+            events.append(name)
+            return result
+        return record
+
+    monkeypatch.setattr(vm_tasks, "reconcile_missing_vm_records",
+                        recorder("reconcile", []))
+    monkeypatch.setattr(vm_tasks, "dispatch_pending_alerts", recorder("alerts"))
+    monkeypatch.setattr(vm_tasks, "maybe_reap_orphaned_vms",
+                        recorder("orphans", []))
+    monkeypatch.setattr(vm_tasks, "_stop_idle_cloud_routers",
+                        recorder("routers", []))
+
+    # One expired AWS record whose guest is still there to destroy.
+    vmid = 4200
+    router_backend.instances[vmid] = LaunchedVM(
+        vmid=vmid, vm_type="aws", location="memory-zone", network_slot=None,
+        provider_id=f"provider-{vmid}")
+    router_backend._instance_tags[vmid] = {
+        "vm_name": _IDLE_VM_NAME, "deployment_id": None}
+    add_live_record(backend="aws", vmid=vmid,
+                    expires_at=datetime.now() - timedelta(minutes=5))
+    destroy = router_backend.destroy
+
+    def recording_destroy(ref, policy):
+        events.append("destroy")
+        return destroy(ref, policy)
+
+    router_backend.destroy = recording_destroy
+    return events
+
+
+def test_router_idle_step_runs_after_reconcile_alerts_and_orphan_sweep(
+        app, router_backend, expiry_events):
+    # Catches shared-cost cleanup moving ahead of the safety-critical expiry phases.
+    _run_one_expiry_pass(app)
+    assert expiry_events == ["destroy", "reconcile", "alerts", "orphans", "routers"]
