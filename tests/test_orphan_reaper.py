@@ -970,13 +970,17 @@ def _aws_group(ec2, vpc_id, deployment_id, site='test-site', created=None):
     )['GroupId']
 
 
-def _aws_instance(ec2, image_id, vmid, site='test-site', expires=None):
+def _aws_instance(ec2, image_id, vmid, site='test-site', expires=None, subnet_id=None):
+    # The orphan sits in its tagged slot's real subnet: the delete-time
+    # recheck proves placement, not just tags.
+    placement = {'SubnetId': subnet_id} if subnet_id else {}
     return ec2.run_instances(
         ImageId=image_id, InstanceType='t3.micro', MinCount=1, MaxCount=1,
         TagSpecifications=[{'ResourceType': 'instance', 'Tags': _aws_tags({
             'Name': f'student-alice-{vmid}', TAG_SITE: site, TAG_KIND: 'instance',
             TAG_VMID: str(vmid), TAG_DEPLOYMENT: '9' * 32, TAG_SLOT: '7',
             TAG_EXPIRES: str(int(expires))})}],
+        **placement,
     )['Instances'][0]['InstanceId']
 
 
@@ -995,7 +999,10 @@ def test_aws_sweep_reaps_only_this_sites_unowned_leftovers(aws_sweep):
     recorded_slot = _aws_slot(ec2, vpc_id, 5, created=old)
     orphan_group = _aws_group(ec2, vpc_id, 'a' * 32, created=old)
     foreign_group = _aws_group(ec2, vpc_id, 'a' * 32, site='other-site', created=old)
-    orphan_instance = _aws_instance(ec2, image_id, 901, expires=old)
+    # Slot 7 is in use by the orphan instance, so this sweep keeps it.
+    instance_slot = _aws_slot(ec2, vpc_id, 7, created=old)
+    orphan_instance = _aws_instance(ec2, image_id, 901, expires=old,
+                                    subnet_id=instance_slot)
     foreign_instance = _aws_instance(ec2, image_id, 902, site='other-site', expires=old)
     add_live_record(backend='aws', vmid=903, network_slot=5)
 
@@ -1009,7 +1016,7 @@ def test_aws_sweep_reaps_only_this_sites_unowned_leftovers(aws_sweep):
     assert _instance_state(ec2, orphan_instance) in ('shutting-down', 'terminated')
     assert _instance_state(ec2, foreign_instance) == 'running'
     remaining_subnets = {s['SubnetId'] for s in ec2.describe_subnets()['Subnets']}
-    assert {foreign_slot, recorded_slot} <= remaining_subnets
+    assert {foreign_slot, recorded_slot, instance_slot} <= remaining_subnets
     assert orphan_slot not in remaining_subnets
     remaining_groups = {g['GroupId'] for g in ec2.describe_security_groups()['SecurityGroups']}
     assert foreign_group in remaining_groups and orphan_group not in remaining_groups

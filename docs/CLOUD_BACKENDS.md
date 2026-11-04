@@ -25,7 +25,7 @@ creates carries it, and every inventory, reuse and delete is filtered by it:
 | Resource | AWS identity | GCP identity |
 |---|---|---|
 | Lab instance | tags `lab-playground-site`, `-vmid`, `-deployment`, `-expires`, `-slot`, `-kind=instance`; `Name` is the portal VM name | name `lp-<site-id>-<vmid>` plus the same labels; the portal VM name is in `description` |
-| Root disk | EBS volume tagged like its instance (no expiry), `kind=instance-volume`, `DeleteOnTermination` | boot disk with `autoDelete: true` |
+| Disks | every EBS volume of the launch (the root and any data disk the AMI maps) tagged like its instance (no expiry), `kind=instance-volume`, `DeleteOnTermination`; an AMI mapping that cannot be made disposable is refused | one boot disk with `autoDelete: true` (a Compute image is a single disk) |
 | Slot network | subnet tagged `site`, `slot`, `kind=slot-network`, `lab-playground-created`; `Name` `lp-<site-id>-s-<slot>` | subnetwork named exactly `lp-<site-id>-s-<slot>` in `GCP_NETWORK` |
 | Deployment network | security group `lp-<site-id>-d-<key>` tagged `site`, `deployment`, `kind=deployment-network`, `created` | firewall rule named exactly `lp-<site-id>-d-<key>` whose source and target tags are that name |
 | Router (operator-made) | tags `lab-playground-site=<site-id>`, `lab-playground-kind=router` | labels `lab-playground-site=<site-id>`, `lab-playground-kind=router` |
@@ -38,8 +38,12 @@ Rules the code keeps, and you must keep too:
 
 - **Identity is re-read before every action.** A destroy, an expiry update
   and every sweeper delete first read the resource again and act only if
-  every identity tag or label still matches. A changed identity is refused
-  (`DestroyRefused`) and nothing is mutated.
+  every identity tag or label still matches and the instance still sits in
+  the lab VPC/network and, when its slot is known, that slot's subnet. A
+  changed identity or placement is refused (`DestroyRefused`) and nothing is
+  mutated. Multi-step changes re-read before each step: every AWS
+  security-group rule change, and a router start or stop after waiting out a
+  transition.
 - **Absence needs positive evidence.** Only `InvalidInstanceID.NotFound`, a
   `terminated` instance, or (GCP) a complete project-wide aggregated list
   without the name counts as gone. Any other failure is "unknown", and an
@@ -656,11 +660,11 @@ one strands what was created under the old value:
 
 | Changed | Effect on what exists |
 |---|---|
-| `AWS_LAB_VPC_ID` | Old subnets and security groups are still listed by site tag, but every delete is refused (wrong VPC), and a slot whose old subnet exists cannot be used. |
+| `AWS_LAB_VPC_ID` | Old subnets, security groups and instances are still listed by site tag, but every delete is refused (wrong VPC), so their records cannot be destroyed, and a slot whose old subnet exists cannot be used. |
 | `GCP_NETWORK` | Old subnetworks and firewall rules are no longer listed or deleted; old instances are refused (wrong network), so their records cannot be destroyed. |
 | `GCP_REGION` | Old subnetworks are no longer released by the lifecycle, and the same slot cannot be created in the new region while its old range exists; the sweeper removes unused old ones after the grace period. |
 | `AWS_REGION`, `GCP_PROJECT`, `LAB_SITE_ID` | Everything created before becomes invisible to the portal. |
-| `AWS_AVAILABILITY_ZONE`, `AWS_LAB_CIDR`, `GCP_LAB_CIDR` | A slot whose old subnet exists cannot be used until that subnet is released. |
+| `AWS_AVAILABILITY_ZONE`, `AWS_LAB_CIDR`, `GCP_LAB_CIDR` | A slot whose old subnet exists cannot be used until that subnet is released; an AWS instance in such a slot cannot be destroyed (its slot subnet cannot be identified). |
 
 Change them only after [teardown](#teardown-and-incident-response) has left
 the backend with no records and an empty inventory. If you already changed

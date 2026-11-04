@@ -64,13 +64,15 @@ def _fake_credentials(monkeypatch):
 @pytest.fixture
 def aws_instance_backend(app, monkeypatch):
     _fake_credentials(monkeypatch)
-    _patch_aws_config(monkeypatch)
+    config = _patch_aws_config(monkeypatch)
     with mock_aws(), app.app_context():
         ec2 = boto3.client('ec2', region_name='us-east-1')
         vpc_id = ec2.create_vpc(CidrBlock='172.20.0.0/16')['Vpc']['VpcId']
-        subnet_id = ec2.create_subnet(
-            VpcId=vpc_id, CidrBlock='172.20.250.0/24',
-            AvailabilityZone='us-east-1a')['Subnet']['SubnetId']
+        # The resolver hands out slot 1's real subnet in the lab VPC: every
+        # mutation re-proves an instance's actual placement, not its tags.
+        monkeypatch.setattr(config, 'AWS_LAB_VPC_ID', vpc_id)
+        monkeypatch.setattr(config, 'AWS_LAB_CIDR', '172.20.0.0/16')
+        subnet_id = _subnet(ec2, vpc_id, 1, _slot_tags(1))
         security_group_id = ec2.create_security_group(
             GroupName='test-instance-sg', Description='test', VpcId=vpc_id)['GroupId']
         image_id = register_aws_test_image(ec2)
@@ -561,6 +563,177 @@ def test_delete_resource_propagates_unknown_identity(aws_instance_backend):
     assert instance['State']['Name'] == 'running'
 
 
+# Instance placement on mutation paths
+
+def _contract_tags(spec):
+    """The exact tag set create() writes for `spec` in slot 1."""
+    return {'Name': spec.vm_name, TAG_SITE: 'test-site', TAG_VMID: str(spec.vmid),
+            TAG_DEPLOYMENT: spec.deployment_id,
+            TAG_EXPIRES: str(expires_epoch(spec.expires_at)),
+            TAG_SLOT: '1', TAG_KIND: 'instance'}
+
+
+def _placement(ec2, resources, where):
+    """run_instances placement for a same-tagged twin outside its slot."""
+    if where == 'default VPC':
+        return {}
+    if where == 'other VPC':
+        other_vpc = ec2.create_vpc(CidrBlock='172.20.0.0/16')['Vpc']['VpcId']
+        return {'SubnetId': _subnet(ec2, other_vpc, 1, _slot_tags(1))}
+    if where == 'other slot':
+        return {'SubnetId': _subnet(ec2, resources['vpc_id'], 2, _slot_tags(2))}
+    assert where == 'foreign subnet'
+    return {'SubnetId': _subnet(ec2, resources['vpc_id'], 3,
+                                _slot_tags(1, site='other-site'))}
+
+
+def _instance(ec2, instance_id):
+    [instance] = ec2.describe_instances(
+        InstanceIds=[instance_id])['Reservations'][0]['Instances']
+    return instance
+
+
+@pytest.mark.parametrize('where', ['default VPC', 'other VPC', 'other slot',
+                                   'foreign subnet'])
+def test_mutations_refuse_a_same_tagged_instance_outside_the_lab_placement(
+        aws_instance_backend, where):
+    # Catches destroy, a sweep or an extension acting on an instance that
+    # carries a copy of the record's tags but sits outside the lab VPC or
+    # outside its slot's subnet.
+    backend, spec, ec2, resources = aws_instance_backend
+    twin = ec2.run_instances(
+        ImageId=spec.template['image_id'], InstanceType='t3.micro',
+        MinCount=1, MaxCount=1, **_placement(ec2, resources, where),
+        TagSpecifications=[{'ResourceType': 'instance',
+                            'Tags': _tags(_contract_tags(spec))}],
+    )['Instances'][0]['InstanceId']
+    ref = replace(resources['ref_without_provider'], provider_id=twin)
+    survivor = resources['ref_without_provider']
+    [listed] = [r for r in backend.list_managed() if r.provider_id == twin]
+    before = _instance(ec2, twin)['Tags']
+    assert backend.inspect(ref) == backend.inspect(survivor) == GUEST_MISMATCH
+    for candidate in (ref, survivor):
+        for policy in DestroyPolicy:
+            with pytest.raises(DestroyRefused):
+                backend.destroy(candidate, policy)
+        with pytest.raises(BackendError):
+            backend.set_expiry(candidate, spec.expires_at + timedelta(hours=2))
+        assert backend.confirm_absent(candidate) is False
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(listed)
+    instance = _instance(ec2, twin)
+    assert instance['State']['Name'] == 'running'
+    assert instance['Tags'] == before
+
+
+def test_mutations_refuse_an_instance_without_a_vpc_placement(aws_instance_backend):
+    # Catches an instance that reports no VPC or subnet (no lab NIC)
+    # passing identity on tags alone.
+    backend, spec, ec2, resources = aws_instance_backend
+    launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    ref = resources['ref'](launched)
+    [listed] = [r for r in backend.list_managed() if r.provider_id == launched.provider_id]
+    real = ec2.describe_instances
+
+    def unplaced(**kwargs):
+        response = real(**kwargs)
+        for reservation in response['Reservations']:
+            for instance in reservation['Instances']:
+                for field in ('VpcId', 'SubnetId', 'NetworkInterfaces'):
+                    instance.pop(field, None)
+        return response
+
+    backend._ec2.describe_instances = unplaced
+    assert backend.inspect(ref) == GUEST_MISMATCH
+    with pytest.raises(DestroyRefused):
+        backend.destroy(ref, DestroyPolicy.STRICT)
+    with pytest.raises(DestroyRefused):
+        backend.delete_resource(listed)
+    del backend._ec2.describe_instances  # the fixture's client is the backend's
+    assert _instance(ec2, launched.provider_id)['State']['Name'] == 'running'
+
+
+def test_placement_that_cannot_be_verified_is_unknown_never_absent(aws_instance_backend):
+    # Catches an ambiguous slot subnet being read as absence (retiring a
+    # record whose instance bills) or as ownership (terminating it).
+    backend, spec, ec2, resources = aws_instance_backend
+    launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    ref = resources['ref'](launched)
+    [listed] = [r for r in backend.list_managed() if r.provider_id == launched.provider_id]
+    _subnet(ec2, resources['vpc_id'], 9, _slot_tags(1))  # a second slot-1 subnet
+    assert backend.inspect(ref) == GUEST_UNKNOWN
+    assert backend.confirm_absent(ref) is False
+    for mutate in (lambda: backend.destroy(ref, DestroyPolicy.BEST_EFFORT),
+                   lambda: backend.delete_resource(listed)):
+        with pytest.raises(BackendError) as raised:
+            mutate()
+        assert not isinstance(raised.value, DestroyRefused)
+    assert _instance(ec2, launched.provider_id)['State']['Name'] == 'running'
+
+
+# Launch block devices
+
+def _with_image_mappings(monkeypatch, ec2, extra=(), root=None):
+    """moto 5.2.5 drops every registered mapping but the root from
+    DescribeImages, so an AMI's further disks are added to its answer."""
+    real = ec2.describe_images
+
+    def describe_images(**kwargs):
+        response = real(**kwargs)
+        for image in response['Images']:
+            mappings = image['BlockDeviceMappings']
+            if root is not None:
+                mappings = [root]
+            image['BlockDeviceMappings'] = mappings + list(extra)
+        return response
+
+    monkeypatch.setattr(ec2, 'describe_images', describe_images)
+
+
+def test_create_makes_every_inherited_ebs_volume_disposable(aws_instance_backend, monkeypatch):
+    # Catches an AMI data disk with DeleteOnTermination=false surviving the
+    # instance's termination and billing forever.
+    backend, spec, ec2, resources = aws_instance_backend
+    _with_image_mappings(monkeypatch, ec2, extra=[
+        {'DeviceName': '/dev/sdf', 'Ebs': {'VolumeSize': 5, 'VolumeType': 'standard',
+                                           'DeleteOnTermination': False}},
+        {'DeviceName': '/dev/sdb', 'VirtualName': 'ephemeral0'},
+        {'DeviceName': '/dev/sdc', 'NoDevice': ''},
+    ])
+    launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    instance = _instance(ec2, launched.provider_id)
+    mappings = {m['DeviceName']: m['Ebs'] for m in instance['BlockDeviceMappings']}
+    assert set(mappings) == {'/dev/sda1', '/dev/sdf'}
+    assert all(ebs['DeleteOnTermination'] is True for ebs in mappings.values())
+    volumes = ec2.describe_volumes(
+        VolumeIds=[ebs['VolumeId'] for ebs in mappings.values()])['Volumes']
+    assert sorted(v['Size'] for v in volumes) == [5, 24]
+    for volume in volumes:
+        tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+        assert tags[TAG_KIND] == 'instance-volume'
+        assert tags[TAG_VMID] == '700'
+    backend.destroy(resources['ref'](launched), DestroyPolicy.STRICT)
+    remaining = {v['VolumeId'] for v in ec2.describe_volumes()['Volumes']}
+    assert not remaining & {ebs['VolumeId'] for ebs in mappings.values()}
+
+
+@pytest.mark.parametrize('extra, root', [
+    ([{'Ebs': {'VolumeSize': 5, 'DeleteOnTermination': False}}], None),
+    ([{'DeviceName': '/dev/sdf', 'Ebs': {'DeleteOnTermination': False}}], None),
+    ([{'DeviceName': '/dev/sdf'}], None),
+    ([], {'DeviceName': '/dev/sda1', 'VirtualName': 'ephemeral0'}),
+])
+def test_create_refuses_an_image_mapping_it_cannot_make_disposable(
+        aws_instance_backend, monkeypatch, extra, root):
+    # Catches a launch inheriting an AMI disk whose deletion at termination
+    # the request cannot pin.
+    backend, spec, ec2, resources = aws_instance_backend
+    _with_image_mappings(monkeypatch, ec2, extra=extra, root=root)
+    with pytest.raises(BackendError):
+        backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    assert not [r for r in backend.list_managed() if r.kind == 'instance']
+
+
 def test_ensure_slot_creates_one_private_subnet_with_exact_cidr_az_and_tags(aws_network_backend):
     # Catches slot drift, duplicate subnets, and automatic public-address assignment.
     backend, spec, ec2, resources = aws_network_backend
@@ -1005,6 +1178,100 @@ def test_create_sets_no_rules_on_a_group_whose_ownership_changed_after_lookup(
     assert _flatten_group_rules(group['IpPermissions']) == set()
     assert _flatten_group_rules(group['IpPermissionsEgress']) == {('-1', 'cidr', '0.0.0.0/0')}
     assert not [r for r in backend.list_managed() if r.kind == 'instance']
+
+
+_RULE_MUTATIONS = ('revoke_security_group_egress', 'authorize_security_group_egress',
+                   'revoke_security_group_ingress', 'authorize_security_group_ingress')
+
+
+@pytest.mark.parametrize('after, egress, ingress', [
+    # A fresh group: revoke allow-all egress, grant the two egress rules,
+    # then the two ingress rules (cidr before group).
+    (1, set(), set()),
+    (2, {('-1', 'cidr', '100.64.0.0/10')}, set()),
+    (4, 'isolation', {('-1', 'cidr', '100.64.0.0/10')}),
+])
+def test_convergence_stops_once_the_group_changes_hands_between_rule_mutations(
+        aws_network_backend, monkeypatch, after, egress, ingress):
+    # Catches convergence that proved ownership once and then kept rewriting
+    # the rules of a group retagged to another deployment mid-way.
+    backend, spec, ec2, resources = aws_network_backend
+    group_id = _group(ec2, resources['vpc_id'], spec.deployment_id)
+    _ensure_slot(backend, 1)
+    calls = []
+    for name in _RULE_MUTATIONS:
+        def mutate(_real=getattr(ec2, name), **kwargs):
+            calls.append(kwargs)
+            result = _real(**kwargs)
+            if len(calls) == after:
+                ec2.create_tags(Resources=[group_id],
+                                Tags=_tags({TAG_DEPLOYMENT: 'f' * 32}))
+            return result
+        monkeypatch.setattr(ec2, name, mutate)
+    with pytest.raises(BackendError):
+        backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    assert len(calls) == after
+    [group] = ec2.describe_security_groups(GroupIds=[group_id])['SecurityGroups']
+    if egress == 'isolation':
+        egress = {('-1', 'group', group_id), ('-1', 'cidr', '100.64.0.0/10')}
+    assert _flatten_group_rules(group['IpPermissionsEgress']) == egress
+    assert _flatten_group_rules(group['IpPermissions']) == ingress
+    assert not [r for r in backend.list_managed() if r.kind == 'instance']
+
+
+@pytest.mark.parametrize('retagged', [False, True])
+@pytest.mark.parametrize('action, transitional, waiter, settled, final', [
+    ('start', 'stopping', 'instance_stopped', 'stopped', 'running'),
+    ('stop', 'pending', 'instance_running', 'running', 'stopped'),
+])
+def test_router_ownership_is_rechecked_after_a_transitional_wait(
+        aws_network_backend, monkeypatch, retagged, action, transitional, waiter,
+        settled, final):
+    # Catches a start or stop reaching a machine that stopped being this
+    # site's router while the adapter waited out its transition: EC2's
+    # state waiter never looks at tags.
+    backend, spec, ec2, resources = aws_network_backend
+    router_id = resources['router_instance_id']
+    if action == 'start':
+        ec2.stop_instances(InstanceIds=[router_id])
+        ec2.get_waiter('instance_stopped').wait(
+            InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
+    real_describe, real_waiter = ec2.describe_instances, ec2.get_waiter
+    reads = []
+
+    def describe_instances(**kwargs):
+        # moto settles instantly: the first read sees the transition.
+        response = real_describe(**kwargs)
+        if not reads:
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    instance['State'] = {'Code': 0, 'Name': transitional}
+        reads.append(kwargs)
+        return response
+
+    class _Retagging:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def wait(self, **kwargs):
+            ec2.create_tags(Resources=[router_id], Tags=_tags({TAG_SITE: 'other-site'}))
+            return self._inner.wait(**kwargs)
+
+    def get_waiter(name):
+        inner = real_waiter(name)
+        # Only the transitional wait: the settling wait has the other name.
+        return _Retagging(inner) if retagged and name == waiter else inner
+
+    monkeypatch.setattr(ec2, 'describe_instances', describe_instances)
+    monkeypatch.setattr(ec2, 'get_waiter', get_waiter)
+    run = backend.ensure_router_running if action == 'start' else backend.stop_router
+    with vm_lifecycle_lock(router_lock_key(BACKEND_AWS)):
+        if retagged:
+            with pytest.raises(BackendError):
+                run()
+        else:
+            run()
+    assert _instance_state(ec2, router_id) == (settled if retagged else final)
 
 
 @pytest.mark.parametrize('winner_deployment, adopted', [('d' * 32, True),

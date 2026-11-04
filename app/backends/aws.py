@@ -2,7 +2,8 @@
 admission, slot subnets, per-deployment security groups and the router.
 
 Identity is the tag set written at launch, never the DB row: an instance is
-this record's only when every contract tag agrees, and a ref without a
+this record's only when every contract tag agrees and, before anything acts
+on it, it sits in the lab VPC and its slot's subnet; a ref without a
 provider id (a create that raised after run_instances) is resolved from its
 site/VMID/deployment tags. Absence needs positive evidence (NotFound or a
 terminated instance); every other provider failure is GUEST_UNKNOWN, so a
@@ -46,13 +47,13 @@ from app.backends.network_slots import cloud_slot_cidr
 logger = logging.getLogger(__name__)
 
 KIND_INSTANCE = 'instance'
-# An instance's root EBS volume. Its own kind, never 'instance': inventory
-# and identity match kind='instance', so a volume can never be mistaken for
-# a machine, while a volume a failed DeleteOnTermination leaves behind still
+# An instance's EBS volume. Its own kind, never 'instance': inventory and
+# identity match kind='instance', so a volume can never be mistaken for a
+# machine, while a volume a failed DeleteOnTermination leaves behind still
 # carries its owner's site/VMID/deployment/slot.
 KIND_INSTANCE_VOLUME = 'instance-volume'
-# Instance tags the root volume does not carry: its expiry lives on the
-# instance (set_expiry retags only that).
+# Instance tags the volumes do not carry: its expiry lives on the instance
+# (set_expiry retags only that).
 _INSTANCE_ONLY_TAGS = (TAG_EXPIRES,)
 _NOT_FOUND = 'InvalidInstanceID.NotFound'
 # The states a live (billing or restartable) instance can be in.
@@ -174,12 +175,6 @@ def _carries(resource, pairs: dict) -> bool:
     # on the provider (or a mock) filtering exactly.
     tags = _tag_map(resource)
     return all(tags.get(key) == value for key, value in pairs.items())
-
-
-def _verdict(instance, expected: dict) -> str:
-    if _state(instance) == 'terminated':
-        return GUEST_ABSENT
-    return GUEST_MATCH if _carries(instance, expected) else GUEST_MISMATCH
 
 
 def _volume_tags(instance_tags: dict) -> dict:
@@ -479,12 +474,9 @@ class AWSBackend:
                 f'{deployment_id}: {duplicate}')
         return group['GroupId']
 
-    def _converge_group_rules(self, group_id: str, deployment_id: str) -> None:
-        """Make the group's rules exactly the isolation set, both ways.
-        Egress first, and in each direction revoke before authorize, so
-        the default allow-all egress is gone before anything is granted.
-        Nothing is mutated unless the fresh read still proves the group is
-        this deployment's."""
+    def _require_own_group(self, group_id: str, deployment_id: str) -> dict:
+        """A fresh read of the group, refused unless it is still this
+        deployment's."""
         group, problems = self._owned_network(
             _GROUPS, group_id, self._group_identity(deployment_id))
         if group is None:
@@ -493,28 +485,43 @@ class AWSBackend:
             raise BackendError(
                 f'security group {group_id} is no longer deployment {deployment_id}\'s: '
                 f'{", ".join(problems)}')
+        return group
+
+    def _converge_group_rules(self, group_id: str, deployment_id: str) -> None:
+        """Make the group's rules exactly the isolation set, both ways.
+        Egress first, and in each direction revoke before authorize, so
+        the default allow-all egress is gone before anything is granted.
+        A fresh read proves the group is this deployment's before every
+        mutation: one retagged after the first change gets no further one."""
+        group = self._require_own_group(group_id, deployment_id)
         wanted = _isolation_rules(group_id)
+        mutations = []
         for field, revoke, authorize in (
                 ('IpPermissionsEgress', 'revoke_security_group_egress',
                  'authorize_security_group_egress'),
                 ('IpPermissions', 'revoke_security_group_ingress',
                  'authorize_security_group_ingress')):
             current = _rule_set(group.get(field))
+            mutations += [(revoke, rule, _RULE_NOT_FOUND)
+                          for rule in sorted(current - wanted, key=str)]
+            mutations += [(authorize, rule, _RULE_DUPLICATE)
+                          for rule in sorted(wanted - current, key=str)]
+        for index, (operation, rule, benign) in enumerate(mutations):
+            if index:
+                # The first mutation follows the read above.
+                self._require_own_group(group_id, deployment_id)
             # One rule per call: a batch fails whole on one duplicate, and a
             # concurrent creator converging the same group is not an error.
-            for operation, rules, benign in ((revoke, current - wanted, _RULE_NOT_FOUND),
-                                             (authorize, wanted - current, _RULE_DUPLICATE)):
-                for rule in sorted(rules, key=str):
-                    try:
-                        getattr(self._ec2, operation)(
-                            GroupId=group_id, IpPermissions=[_permission(rule)])
-                    except ClientError as error:
-                        if _error_code(error) != benign:
-                            raise BackendError(
-                                f'could not {operation} on {group_id}: {error}') from error
-                    except BotoCoreError as error:
-                        raise BackendError(
-                            f'could not {operation} on {group_id}: {error}') from error
+            try:
+                getattr(self._ec2, operation)(
+                    GroupId=group_id, IpPermissions=[_permission(rule)])
+            except ClientError as error:
+                if _error_code(error) != benign:
+                    raise BackendError(
+                        f'could not {operation} on {group_id}: {error}') from error
+            except BotoCoreError as error:
+                raise BackendError(
+                    f'could not {operation} on {group_id}: {error}') from error
 
     def _deployment_group(self, deployment_id: str) -> str:
         group = self._own_group(deployment_id)
@@ -583,12 +590,13 @@ class AWSBackend:
     def ensure_router_running(self) -> None:
         config = _config()
         router_id, state = self._router()
-        if state == 'running':
-            return
         if state == 'stopping':
             self._wait_router(router_id, 'instance_stopped',
                               config.AWS_TERMINATE_TIMEOUT_SECONDS)
-            state = 'stopped'
+            # The waiter reads state, never tags: re-prove the router.
+            router_id, state = self._router()
+        if state == 'running':
+            return
         if state == 'stopped':
             self._router_call(router_id, 'start_instances')
         elif state != 'pending':
@@ -598,13 +606,14 @@ class AWSBackend:
     def stop_router(self) -> None:
         config = _config()
         router_id, state = self._router()
-        if state == 'stopped':
-            return
         if state == 'pending':
             # EC2 cannot stop an instance that is still starting.
             self._wait_router(router_id, 'instance_running',
                               config.AWS_LAUNCH_TIMEOUT_SECONDS)
-            state = 'running'
+            # The waiter reads state, never tags: re-prove the router.
+            router_id, state = self._router()
+        if state == 'stopped':
+            return
         if state == 'running':
             self._router_call(router_id, 'stop_instances')
         elif state != 'stopping':
@@ -614,21 +623,57 @@ class AWSBackend:
 
     # Create
 
-    def _root_device_name(self, image_id: str) -> str:
+    def _block_device_mappings(self, image_id: str, disk_gb: int) -> List[dict]:
+        """The launch's BlockDeviceMappings: every EBS disk the AMI adds,
+        each deleted on termination, the root resized to `disk_gb`.
+
+        A mapping the request leaves out keeps the AMI's own flag, and EC2's
+        non-root default is false: an inherited data disk would outlive the
+        instance and bill with no cleanup path (no inventory lists volumes).
+        Instance-store and suppressed (NoDevice) mappings never outlive it.
+        An AMI mapping that cannot be restated as a disposable disk is refused.
+        """
         try:
             images = self._ec2.describe_images(ImageIds=[image_id])['Images']
         except _PROVIDER_ERRORS as error:
             raise BackendError(f'could not describe image {image_id}: {error}') from error
         if len(images) != 1 or not images[0].get('RootDeviceName'):
             raise BackendError(f'image {image_id} has no single root device')
-        return images[0]['RootDeviceName']
+        root = images[0]['RootDeviceName']
+        mappings = []
+        for mapping in images[0].get('BlockDeviceMappings') or []:
+            device = mapping.get('DeviceName')
+            ebs = mapping.get('Ebs')
+            if not device:
+                raise BackendError(f'image {image_id} maps a disk to no device name')
+            if 'VirtualName' in mapping or 'NoDevice' in mapping:
+                continue
+            if not isinstance(ebs, dict):
+                raise BackendError(
+                    f'image {image_id} maps {device} to neither EBS nor an instance store')
+            if device == root:
+                pinned = {'VolumeSize': disk_gb}
+            else:
+                # Restated from the AMI: EC2 merges either way, but moto
+                # refuses an EBS override with neither.
+                pinned = {key: ebs[key] for key in ('SnapshotId', 'VolumeSize')
+                          if ebs.get(key) is not None}
+                if not pinned:
+                    raise BackendError(
+                        f'image {image_id} maps {device} to EBS with no snapshot or size')
+            mappings.append({'DeviceName': device,
+                             'Ebs': dict(pinned, DeleteOnTermination=True)})
+        if root not in {mapping['DeviceName'] for mapping in mappings}:
+            raise BackendError(f'image {image_id} has no EBS root device {root}')
+        return mappings
 
     def create(self, spec: VMSpec, location: str, *,
                heartbeat: Callable[[], None]) -> LaunchedVM:
         config = _config()
         template = spec.template
         subnet_id, group_id = self._network_resolver(spec)
-        root_device = self._root_device_name(template['image_id'])
+        block_devices = self._block_device_mappings(template['image_id'],
+                                                    template['disk_gb'])
         tags = {
             'Name': spec.vm_name,
             TAG_SITE: config.LAB_SITE_ID,
@@ -656,13 +701,10 @@ class AWSBackend:
                     'AssociatePublicIpAddress': False,
                     'DeleteOnTermination': True,
                 }],
-                BlockDeviceMappings=[{
-                    'DeviceName': root_device,
-                    'Ebs': {'VolumeSize': template['disk_gb'],
-                            'DeleteOnTermination': True},
-                }],
+                BlockDeviceMappings=block_devices,
                 TagSpecifications=[
                     {'ResourceType': 'instance', 'Tags': _tags(tags)},
+                    # Every launch-created EBS volume, not only the root.
                     {'ResourceType': 'volume', 'Tags': _tags(_volume_tags(tags))},
                 ],
             )
@@ -689,7 +731,42 @@ class AWSBackend:
             expected[TAG_SLOT] = str(ref.network_slot)
         return expected
 
-    def _describe_id(self, provider_id: str, expected: dict) -> _Resolution:
+    def _placement_problems(self, instance, slot_tag: Optional[str]) -> List[str]:
+        """Why the instance is not in the lab VPC and, when the caller knows
+        its slot, that slot's subnet. Tags alone never place an instance:
+        anything may carry a copy of them. A slot whose subnet cannot be
+        identified raises BackendError, which is neither match nor absence."""
+        config = _config()
+        vpc_id = instance.get('VpcId')
+        if not vpc_id or vpc_id != config.AWS_LAB_VPC_ID:
+            return [f'VpcId={vpc_id!r}']
+        if slot_tag is None:
+            return []
+        subnet = self._own_subnet(int(slot_tag))
+        if subnet is None or instance.get('SubnetId') != subnet['SubnetId']:
+            return [f'SubnetId={instance.get("SubnetId")!r}']
+        return []
+
+    def _judge(self, instance, expected: dict, *, placement: bool) -> _Resolution:
+        """Judge one fresh instance against `expected` and, when the caller
+        may act on the verdict, its actual placement. A terminated instance
+        is absent; a misplaced one is a mismatch, never absent."""
+        if _state(instance) == 'terminated':
+            return _Resolution(GUEST_ABSENT)
+        tags = _tag_map(instance)
+        problems = [f'{key}={tags.get(key)!r}' for key, value in expected.items()
+                    if tags.get(key) != value]
+        if placement and not problems:
+            try:
+                problems = self._placement_problems(instance, expected.get(TAG_SLOT))
+            except BackendError as error:
+                return _Resolution(GUEST_UNKNOWN, instance, str(error))
+        if problems:
+            return _Resolution(GUEST_MISMATCH, instance, ', '.join(problems))
+        return _Resolution(GUEST_MATCH, instance)
+
+    def _describe_id(self, provider_id: str, expected: dict, *,
+                     placement: bool = True) -> _Resolution:
         """A fresh describe of one instance id, judged against `expected`."""
         if not _INSTANCE_ID.fullmatch(provider_id):
             return _Resolution(GUEST_UNKNOWN,
@@ -707,13 +784,15 @@ class AWSBackend:
                      if i.get('InstanceId') == provider_id]
         if not instances:
             return _Resolution(GUEST_ABSENT)
-        return _Resolution(_verdict(instances[0], expected), instances[0])
+        return self._judge(instances[0], expected, placement=placement)
 
-    def _resolve(self, ref: VMRef) -> _Resolution:
+    def _resolve(self, ref: VMRef, *, placement: bool = True) -> _Resolution:
         """A fresh describe of the instance `ref` names. Location is never
-        consulted: a survivor may carry location='aws' (T8)."""
+        consulted: a survivor may carry location='aws' (T8). Placement is
+        judged unless the caller only displays the result."""
         if ref.provider_id is not None:
-            return self._describe_id(ref.provider_id, self._expected_tags(ref))
+            return self._describe_id(ref.provider_id, self._expected_tags(ref),
+                                     placement=placement)
 
         identity = self._identity_tags(ref)
         filters = _filters(identity) + [
@@ -731,7 +810,7 @@ class AWSBackend:
             return _Resolution(
                 GUEST_UNKNOWN,
                 reason=f'{len(candidates)} instances carry the identity of VM {ref.vmid}')
-        return _Resolution(_verdict(candidates[0], self._expected_tags(ref)), candidates[0])
+        return self._judge(candidates[0], self._expected_tags(ref), placement=placement)
 
     def inspect(self, ref: VMRef) -> str:
         return self._resolve(ref).verdict
@@ -754,7 +833,7 @@ class AWSBackend:
         if resolution.verdict == GUEST_MISMATCH:
             raise DestroyRefused(
                 f'instance {resolution.instance["InstanceId"]} no longer carries '
-                f'the identity of VM {ref.vmid}')
+                f'the identity of VM {ref.vmid}: {resolution.reason}')
         if resolution.verdict != GUEST_MATCH:
             raise BackendError(
                 f'identity of VM {ref.vmid} could not be verified: {resolution.reason}')
@@ -763,12 +842,14 @@ class AWSBackend:
     def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
         if _error_code(error) == _NOT_FOUND:
             return True
-        return self._resolve(ref).verdict == GUEST_ABSENT
+        # Absence is decided before placement, which only costs a read here.
+        return self._resolve(ref, placement=False).verdict == GUEST_ABSENT
 
-    # Display reads
+    # Display reads: judged on tags alone, from the fresh describe; nothing
+    # here mutates, so the slot-subnet read placement needs is skipped.
 
     def _live_match(self, ref: VMRef):
-        resolution = self._resolve(ref)
+        resolution = self._resolve(ref, placement=False)
         return resolution.instance if resolution.verdict == GUEST_MATCH else None
 
     def ip_addresses(self, ref: VMRef) -> List[str]:
@@ -884,7 +965,7 @@ class AWSBackend:
         if resolution.verdict == GUEST_MISMATCH:
             raise DestroyRefused(
                 f'instance {resource.provider_id} no longer carries the identity '
-                'it was listed with')
+                f'it was listed with: {resolution.reason}')
         if resolution.verdict != GUEST_MATCH:
             raise BackendError(
                 f'identity of instance {resource.provider_id} could not be '
