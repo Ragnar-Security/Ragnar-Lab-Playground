@@ -75,6 +75,32 @@ services:
       # Per-pass budget so alert delivery cannot hold up expiry.
       - ALERT_DISPATCH_MAX_PASS_SECONDS=${ALERT_DISPATCH_MAX_PASS_SECONDS:-20}
       - ALERT_DISPATCH_MAX_PASS_ALERTS=${ALERT_DISPATCH_MAX_PASS_ALERTS:-50}
+      # VM backends (docs/CLOUD_BACKENDS.md). Empty means unset: Proxmox
+      # only, with the code's defaults. Credentials are never passed here;
+      # they come from the operator-owned compose override in that runbook.
+      - ENABLED_BACKENDS=${ENABLED_BACKENDS:-}
+      - LAB_SITE_ID=${LAB_SITE_ID:-}
+      # The jumpbox's bands, which scripts/export_network_slots.py reads in
+      # this container for the Headscale policy.
+      - JUMPBOX_VLAN_BANDS=${JUMPBOX_VLAN_BANDS:-}
+      - AWS_REGION=${AWS_REGION:-}
+      - AWS_AVAILABILITY_ZONE=${AWS_AVAILABILITY_ZONE:-}
+      - AWS_LAB_VPC_ID=${AWS_LAB_VPC_ID:-}
+      - AWS_LAB_CIDR=${AWS_LAB_CIDR:-}
+      - AWS_ROUTER_INSTANCE_ID=${AWS_ROUTER_INSTANCE_ID:-}
+      - AWS_MAX_VMS=${AWS_MAX_VMS:-}
+      - AWS_ROUTER_IDLE_MINUTES=${AWS_ROUTER_IDLE_MINUTES:-}
+      - AWS_LAUNCH_TIMEOUT_SECONDS=${AWS_LAUNCH_TIMEOUT_SECONDS:-}
+      - AWS_TERMINATE_TIMEOUT_SECONDS=${AWS_TERMINATE_TIMEOUT_SECONDS:-}
+      - GCP_PROJECT=${GCP_PROJECT:-}
+      - GCP_REGION=${GCP_REGION:-}
+      - GCP_ZONE=${GCP_ZONE:-}
+      - GCP_NETWORK=${GCP_NETWORK:-}
+      - GCP_LAB_CIDR=${GCP_LAB_CIDR:-}
+      - GCP_ROUTER_INSTANCE=${GCP_ROUTER_INSTANCE:-}
+      - GCP_MAX_VMS=${GCP_MAX_VMS:-}
+      - GCP_ROUTER_IDLE_MINUTES=${GCP_ROUTER_IDLE_MINUTES:-}
+      - GCP_OPERATION_TIMEOUT_SECONDS=${GCP_OPERATION_TIMEOUT_SECONDS:-}
     volumes:
       - ./data:/app/data
       - type: bind

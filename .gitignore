@@ -20,6 +20,8 @@ env/
 .claude/*
 scripts/site.env
 config/headscale-acl.json
+# Operator-owned cloud credentials override (docs/CLOUD_BACKENDS.md).
+/docker-compose.cloud.yml
 
 # Isolated worktrees (local working state, never repository content).
 .worktrees/

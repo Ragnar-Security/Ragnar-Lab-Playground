@@ -34,6 +34,9 @@ Before deploying to production, ensure:
 - [ ] Ports 80 and 443 are reachable for the Caddy frontend
 - [ ] Backup strategy is planned and documented
 - [ ] You have reviewed the security considerations
+- [ ] For an AWS or Google Cloud backend: the one-time cloud setup, IAM,
+      quotas and live contract run in [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md)
+      are done
 
 ## Initial Setup
 
@@ -443,10 +446,17 @@ restart before this release.
 loop writes deletion-failure and orphan-reaped alerts there and delivers them
 from it, so the table must exist before the new code's first expiry pass.
 
+`migrate_add_vm_backend.py` adds `backend`, `provider_id`, `deployment_id`
+and `network_slot` to `vm_records`, plus an index on `deployment_id`.
+Existing rows become `backend='proxmox'` through the column default. The new
+code reads these columns for every record it creates, extends or destroys,
+so they must exist before it starts; the old code ignores them.
+
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
+                 migrate_add_vm_backend.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -458,7 +468,8 @@ the migration itself, the file is not there yet. Inject it for this one run:
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
+                 migrate_add_vm_backend.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration
@@ -474,6 +485,11 @@ docker compose -f ./docker-compose.prod.yml down && \
   docker compose -f ./docker-compose.prod.yml up -d --build
 ```
 
+A host whose `.env` sets `COMPOSE_FILE` (a release image, or the cloud
+credentials override in `docs/CLOUD_BACKENDS.md`) runs plain
+`docker compose down && docker compose up -d --build` instead; an explicit
+`-f docker-compose.prod.yml` would drop the override.
+
 **5. Verify.** All five checks must pass.
 
 ```bash
@@ -487,6 +503,11 @@ curl -s -o /dev/null -w '%{http_code}\n' https://lab.example.edu/koth/api/_diag 
 The last two must be `401`. A `200` means an authenticated route is open to
 anyone.
 
+With a cloud backend enabled, also run the one-VM check in
+[`docs/CLOUD_BACKENDS.md`](CLOUD_BACKENDS.md) ("Configure and validate the
+portal", step 6): router start, a private address in the slot, destroy, and
+an empty inventory.
+
 For an authenticated check without a password, drive the app's own test
 client inside the container. `PYTHONPATH=/app` is required, because the
 script does not live in the application directory. Pick an **enabled** admin:
@@ -498,7 +519,10 @@ docker compose -f docker-compose.prod.yml exec -T -e PYTHONPATH=/app \
   vm-automation python - <<'PY'
 from app import create_app
 from app.models import User
-app = create_app()
+# start_background_tasks=False: no KOTH boot recovery or second scorer beside
+# the live server. (scripts/init_db.py, cleanup_db.py, import_students.py and
+# migrate_add_vlan.py still run that recovery; avoid them during a game.)
+app = create_app(start_background_tasks=False)
 with app.app_context():
     admin = User.query.filter_by(is_admin=True, disabled=False).first()
 c = app.test_client()
@@ -532,6 +556,18 @@ database restore is only for a migration that changes existing data. The old
 code does not deliver alerts still queued in `alert_outbox`
 (`SELECT * FROM alert_outbox WHERE status = 'pending'`), so read those by hand
 after a rollback.
+
+**A rollback to a release before multi-backend support (v1.0.0) is safe only
+while no cloud records exist.** The old code reads every record as a Proxmox
+guest and never destroys a cloud machine. Check first; if any backend other
+than `proxmox` is listed, tear the clouds down (`docs/CLOUD_BACKENDS.md`,
+"Teardown and incident response") before rolling back:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T db \
+  sh -c 'exec mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e \
+  "SELECT backend, COUNT(*) FROM vm_records WHERE destroyed = 0 GROUP BY backend"'
+```
 
 The old code also never reads the failed-deploy survivor files (see
 [Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage)).
@@ -1052,6 +1088,7 @@ If you encounter issues:
 - [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) - Development setup
 - [USER_AUTH_GUIDE.md](USER_AUTH_GUIDE.md) - Authentication system
 - [DOCKER.md](DOCKER.md) - Docker configuration details
+- [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md) - AWS and Google Cloud backends: setup, Headscale policy, VLAN isolation, teardown
 
 ---
 
