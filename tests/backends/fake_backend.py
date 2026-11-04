@@ -6,6 +6,7 @@ what the fake now holds, never a list of mock calls.
 """
 
 import importlib
+import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import Callable, Dict, Iterator, List, Mapping, Optional, Set
 from unittest.mock import patch
 
 from app.backends import register_backend_factory, reset_backends_for_tests
+from app.backends.aws import AWSBackend
 from app.backends.base import (
     GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, BackendError,
     DestroyPolicy, DestroyRefused, LaunchedVM, ManagedResource,
@@ -247,6 +249,120 @@ def make_memory_backend_case(app, name: str = 'aws') -> BackendContractCase:
 
     return BackendContractCase(backend=backend, spec=spec,
                                expected_ips=[MEMORY_IP],
+                               expected_status='running', cleanup=cleanup)
+
+
+# The moto EC2 world the focused AWS tests and the AWS contract case share.
+AWS_TEST_ZONE = 'us-east-1a'
+AWS_TEST_VPC_CIDR = '172.20.0.0/16'
+AWS_TEST_CONFIG = {
+    'AWS_REGION': 'us-east-1', 'AWS_AVAILABILITY_ZONE': AWS_TEST_ZONE,
+    'LAB_SITE_ID': 'test-site', 'AWS_MAX_VMS': 2,
+    'AWS_LAUNCH_TIMEOUT_SECONDS': 10, 'AWS_TERMINATE_TIMEOUT_SECONDS': 10,
+}
+AWS_TEST_ENV = {
+    'AWS_ACCESS_KEY_ID': 'testing', 'AWS_SECRET_ACCESS_KEY': 'testing',
+    'AWS_SECURITY_TOKEN': 'testing', 'AWS_SESSION_TOKEN': 'testing',
+    'AWS_DEFAULT_REGION': 'us-east-1',
+}
+
+
+def register_aws_test_image(ec2) -> str:
+    """A moto AMI with a real snapshot-backed root device."""
+    volume_id = ec2.create_volume(Size=8, AvailabilityZone=AWS_TEST_ZONE)['VolumeId']
+    snapshot_id = ec2.create_snapshot(VolumeId=volume_id)['SnapshotId']
+    return ec2.register_image(
+        Name='test-image', Architecture='x86_64', RootDeviceName='/dev/sda1',
+        VirtualizationType='hvm',
+        BlockDeviceMappings=[{'DeviceName': '/dev/sda1', 'Ebs': {
+            'SnapshotId': snapshot_id, 'VolumeSize': 8,
+            'DeleteOnTermination': True, 'VolumeType': 'gp3'}}])['ImageId']
+
+
+def aws_test_spec(image_id: str) -> VMSpec:
+    return VMSpec(
+        vmid=700, vm_name='test-aws-700', display_name='Test AWS VM',
+        backend='aws',
+        template={'image_id': image_id, 'instance_type': 't3.micro', 'disk_gb': 24},
+        memory_mb=1024, cores=1, storage_gb=24, is_entry_point=True,
+        entry_slot=1, internal_slot=2,
+        expires_at=datetime.now() + timedelta(hours=1),
+        deployment_id='d' * 32, owner='test-owner')
+
+
+class RecordingAWSBackend(AWSBackend):
+    """The production AWSBackend, which also records each launched
+    instance's private address into the case's expected_ips. It adds one
+    read-only describe; no provider operation differs."""
+
+    def __init__(self, ec2_client, *, expected_ips: List[str]):
+        super().__init__(ec2_client=ec2_client)
+        self._expected_ips = expected_ips
+
+    def create(self, spec: VMSpec, location: str, *,
+               heartbeat: Callable[[], None]) -> LaunchedVM:
+        launched = super().create(spec, location, heartbeat=heartbeat)
+        [instance] = self._ec2.describe_instances(
+            InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
+        self._expected_ips[:] = [instance['PrivateIpAddress']]
+        return launched
+
+
+def make_aws_backend_case(app) -> BackendContractCase:
+    """AWSBackend against moto EC2: a lab VPC, an AMI and a stopped router.
+
+    moto and the config patches are started here and stopped by cleanup(),
+    because they must outlive this call into the parametrized test.
+    """
+    import boto3
+    from moto import mock_aws
+
+    started = []
+
+    def start(patcher) -> None:
+        patcher.start()
+        started.append(patcher)
+
+    def stop_all() -> None:
+        while started:
+            started.pop().stop()
+
+    try:
+        start(patch.dict(os.environ, AWS_TEST_ENV))
+        os.environ.pop('AWS_PROFILE', None)  # restored by the dict patch
+        start(mock_aws())
+        ec2 = boto3.client('ec2', region_name='us-east-1')
+        vpc_id = ec2.create_vpc(CidrBlock=AWS_TEST_VPC_CIDR)['Vpc']['VpcId']
+        image_id = register_aws_test_image(ec2)
+        router_id = ec2.run_instances(
+            ImageId=image_id, InstanceType='t3.micro',
+            MinCount=1, MaxCount=1)['Instances'][0]['InstanceId']
+        ec2.stop_instances(InstanceIds=[router_id])
+        ec2.get_waiter('instance_stopped').wait(
+            InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
+        start(patch.multiple(
+            importlib.import_module('app.config'), **AWS_TEST_CONFIG,
+            AWS_LAB_VPC_ID=vpc_id, AWS_LAB_CIDR=AWS_TEST_VPC_CIDR,
+            AWS_ROUTER_INSTANCE_ID=router_id))
+    except BaseException:
+        stop_all()
+        raise
+
+    spec = aws_test_spec(image_id)
+    expected_ips: List[str] = []
+    backend = RecordingAWSBackend(ec2, expected_ips=expected_ips)
+
+    def cleanup() -> None:
+        # The shared tests start the router and ensure the slot (ruling C3)
+        # and have already terminated the instance.
+        try:
+            backend.release_slot(spec.network_slot)
+            backend.stop_router()
+        finally:
+            stop_all()
+
+    return BackendContractCase(backend=backend, spec=spec,
+                               expected_ips=expected_ips,
                                expected_status='running', cleanup=cleanup)
 
 

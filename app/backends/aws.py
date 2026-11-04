@@ -1,5 +1,5 @@
-"""Amazon EC2 behind the VMBackend contract: instance lifecycle and capped
-admission.
+"""Amazon EC2 behind the VMBackend contract: instance lifecycle, capped
+admission, slot subnets, per-deployment security groups and the router.
 
 Identity is the tag set written at launch, never the DB row: an instance is
 this record's only when every contract tag agrees, and a ref without a
@@ -7,6 +7,11 @@ provider id (a create that raised after run_instances) is resolved from its
 site/VMID/deployment tags. Absence needs positive evidence (NotFound or a
 terminated instance); every other provider failure is GUEST_UNKNOWN, so a
 transient error can never retire a record whose instance still bills.
+
+Networks are identified the same way: a slot subnet and a deployment
+security group are this site's only while their identity tags say so, and
+every reuse or delete re-reads them first. Lock scope belongs to the caller
+(ruling C4): the slot and router methods here never take a lifecycle lock.
 
 Configuration is read as `config.<NAME>` at call time (ruling I8): this
 module is imported lazily by the registry factory, and a module-level
@@ -18,8 +23,9 @@ import importlib
 import logging
 import math
 import re
+import time
 from datetime import datetime
-from typing import Callable, List, Mapping, Optional, Tuple
+from typing import Callable, List, Mapping, NamedTuple, Optional, Tuple
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError, WaiterError
@@ -27,13 +33,15 @@ from botocore.exceptions import BotoCoreError, ClientError, WaiterError
 from app.backends.base import (
     BACKEND_AWS, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, GUEST_UNKNOWN,
     BackendError, DestroyPolicy, DestroyRefused, LaunchedVM, ManagedResource,
-    VMRef, VMSpec,
+    SlotNetworkMissing, VMRef, VMSpec,
 )
 from app.backends.cloud_admission import reserve_cloud_capacity
 from app.backends.cloud_common import (
-    TAG_DEPLOYMENT, TAG_EXPIRES, TAG_KIND, TAG_SITE, TAG_SLOT, TAG_VMID,
-    expires_epoch,
+    TAG_CREATED, TAG_DEPLOYMENT, TAG_EXPIRES, TAG_KIND, TAG_SITE, TAG_SLOT,
+    TAG_VMID, deployment_key, deployment_network_name, expires_epoch,
+    slot_network_name,
 )
+from app.backends.network_slots import cloud_slot_cidr
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +63,51 @@ _WAITER_DELAY_SECONDS = 5
 # never depends on how a provider (or moto) phrases the rejection.
 _INSTANCE_ID = re.compile(r'i-(?:[0-9a-f]{8}|[0-9a-f]{17})')
 _PROVIDER_ERRORS = (BotoCoreError, ClientError)
+
+KIND_DEPLOYMENT_NETWORK = 'deployment-network'
+KIND_SLOT_NETWORK = 'slot-network'
+# The tailnet's CGNAT range: besides its own group, the only peers a
+# deployment's VMs may reach or be reached from. No internet rule exists.
+_TAILNET_CIDR = '100.64.0.0/10'
+_GROUP_DUPLICATE = 'InvalidGroup.Duplicate'
+_SUBNET_CONFLICT = 'InvalidSubnet.Conflict'
+_RULE_DUPLICATE = 'InvalidPermission.Duplicate'
+_RULE_NOT_FOUND = 'InvalidPermission.NotFound'
+_DECIMAL = re.compile(r'[0-9]+')
+
+
+class _NetworkKind(NamedTuple):
+    """How one network resource kind is described, identified and deleted."""
+    label: str
+    describe: str      # client operation
+    ids_param: str     # its id-list parameter
+    key: str           # its response list
+    id_field: str
+    not_found: str     # the error code that proves absence
+    delete: str        # client operation, called with {id_field: id}
+    id_pattern: re.Pattern  # EC2's id shapes, the instance-id rule's twin
+
+
+_NETWORK_KINDS = {
+    KIND_DEPLOYMENT_NETWORK: _NetworkKind(
+        'deployment security group', 'describe_security_groups', 'GroupIds',
+        'SecurityGroups', 'GroupId', 'InvalidGroup.NotFound',
+        'delete_security_group', re.compile(r'sg-(?:[0-9a-f]{8}|[0-9a-f]{17})')),
+    KIND_SLOT_NETWORK: _NetworkKind(
+        'slot subnet', 'describe_subnets', 'SubnetIds', 'Subnets', 'SubnetId',
+        'InvalidSubnetID.NotFound', 'delete_subnet',
+        re.compile(r'subnet-(?:[0-9a-f]{8}|[0-9a-f]{17})')),
+}
+_GROUPS = _NETWORK_KINDS[KIND_DEPLOYMENT_NETWORK]
+_SUBNETS = _NETWORK_KINDS[KIND_SLOT_NETWORK]
+
+# A security-group rule source: the permission field and the key inside it.
+_RULE_SOURCES = {
+    'group': ('UserIdGroupPairs', 'GroupId'),
+    'cidr': ('IpRanges', 'CidrIp'),
+    'ipv6': ('Ipv6Ranges', 'CidrIpv6'),
+    'prefix-list': ('PrefixListIds', 'PrefixListId'),
+}
 
 NetworkResolver = Callable[[VMSpec], Tuple[str, str]]
 
@@ -134,6 +187,45 @@ def _volume_tags(instance_tags: dict) -> dict:
     return tags
 
 
+def _created_epoch(tags: dict) -> Optional[int]:
+    # Missing or garbled is None, which the sweeper reads as "never delete".
+    value = tags.get(TAG_CREATED)
+    return int(value) if isinstance(value, str) and _DECIMAL.fullmatch(value) else None
+
+
+def _rule_set(permissions) -> set:
+    """Each permission split into one (protocol, from, to, source kind,
+    source) per source, so rule sets compare however EC2 groups them."""
+    rules = set()
+    for permission in permissions or []:
+        protocol = permission['IpProtocol']
+        # All-protocol rules have no ports, whatever a describe renders.
+        ports = ((None, None) if protocol == '-1'
+                 else (permission.get('FromPort'), permission.get('ToPort')))
+        for kind, (field, key) in _RULE_SOURCES.items():
+            rules.update((protocol, *ports, kind, source[key])
+                         for source in permission.get(field) or [])
+    return rules
+
+
+def _permission(rule: tuple) -> dict:
+    protocol, from_port, to_port, kind, source = rule
+    field, key = _RULE_SOURCES[kind]
+    permission = {'IpProtocol': protocol, field: [{key: source}]}
+    if from_port is not None:
+        permission['FromPort'] = from_port
+    if to_port is not None:
+        permission['ToPort'] = to_port
+    return permission
+
+
+def _isolation_rules(group_id: str) -> set:
+    """A deployment's whole rule set, the same both ways: everything to and
+    from its own group and the tailnet, nothing else."""
+    return {('-1', None, None, 'group', group_id),
+            ('-1', None, None, 'cidr', _TAILNET_CIDR)}
+
+
 class _Resolution:
     """The instance a ref names, or why it names none."""
 
@@ -169,33 +261,271 @@ class AWSBackend:
         from app import proxmox_service
         return proxmox_service.release_node_reservation(reservation_id)
 
-    # Networks (lookup only; the slot subnet and deployment group already
-    # exist when create runs)
+    # Networks. A slot subnet exists from ensure_slot until release_slot; a
+    # deployment's group is created by its first launch and removed by
+    # cleanup_deployment. Both are tagged at creation (never in a later
+    # call), so a crash can never leave one unattributable or ageless (C2).
 
-    def _one(self, kind: str, describe, key: str, pairs: dict) -> str:
+    def _tagged(self, kind: _NetworkKind, pairs: dict) -> list:
+        """Every `kind` carrying `pairs`, from one fresh paginated read."""
         try:
-            pages = self._ec2.get_paginator(describe).paginate(Filters=_filters(pairs))
-            found = [item for page in pages for item in page[key]
-                     if _carries(item, pairs)]
+            pages = self._ec2.get_paginator(kind.describe).paginate(
+                Filters=_filters(pairs))
+            return [item for page in pages for item in page[kind.key]
+                    if _carries(item, pairs)]
         except _PROVIDER_ERRORS as error:
-            raise BackendError(f'could not look up the {kind}: {error}') from error
-        if len(found) != 1:
-            raise BackendError(f'expected exactly one {kind} tagged {pairs}, '
-                               f'found {len(found)}')
-        return found[0]['SubnetId' if key == 'Subnets' else 'GroupId']
+            raise BackendError(f'could not look up {kind.label}s: {error}') from error
+
+    def _delete_network(self, kind: _NetworkKind, provider_id: str) -> None:
+        """Delete one network resource; absent is done. Anything else, a
+        DependencyViolation included, raises so cleanup and the sweeper retry."""
+        try:
+            getattr(self._ec2, kind.delete)(**{kind.id_field: provider_id})
+        except ClientError as error:
+            if _error_code(error) == kind.not_found:
+                return
+            raise BackendError(
+                f'could not delete {kind.label} {provider_id}: {error}') from error
+        except BotoCoreError as error:
+            raise BackendError(
+                f'could not delete {kind.label} {provider_id}: {error}') from error
+
+    def _slot_identity(self, slot: int) -> dict:
+        return {TAG_SITE: _config().LAB_SITE_ID, TAG_SLOT: str(slot),
+                TAG_KIND: KIND_SLOT_NETWORK}
+
+    def _own_subnet(self, slot: int) -> Optional[dict]:
+        """This site's subnet for `slot`, None when there is none. One that
+        carries the identity but sits anywhere but the slot's exact
+        VPC/CIDR/AZ is refused, never reused."""
+        config = _config()
+        found = self._tagged(_SUBNETS, self._slot_identity(slot))
+        if not found:
+            return None
+        if len(found) > 1:
+            raise BackendError(f'{len(found)} subnets claim slot {slot}')
+        subnet = found[0]
+        expected = (config.AWS_LAB_VPC_ID, cloud_slot_cidr(config.AWS_LAB_CIDR, slot),
+                    config.AWS_AVAILABILITY_ZONE)
+        actual = (subnet.get('VpcId'), subnet.get('CidrBlock'),
+                  subnet.get('AvailabilityZone'))
+        if actual != expected:
+            raise BackendError(
+                f'subnet {subnet["SubnetId"]} of slot {slot} is at {actual}, '
+                f'not {expected}')
+        return subnet
+
+    def _create_subnet(self, slot: int) -> dict:
+        config = _config()
+        tags = dict(self._slot_identity(slot),
+                    Name=slot_network_name(config.LAB_SITE_ID, slot),
+                    **{TAG_CREATED: str(int(time.time()))})
+        try:
+            return self._ec2.create_subnet(
+                VpcId=config.AWS_LAB_VPC_ID,
+                CidrBlock=cloud_slot_cidr(config.AWS_LAB_CIDR, slot),
+                AvailabilityZone=config.AWS_AVAILABILITY_ZONE,
+                TagSpecifications=[{'ResourceType': 'subnet', 'Tags': _tags(tags)}],
+            )['Subnet']
+        except ClientError as error:
+            if _error_code(error) != _SUBNET_CONFLICT:
+                raise BackendError(f'could not create slot {slot} subnet: {error}') from error
+            conflict = error
+        except BotoCoreError as error:
+            raise BackendError(f'could not create slot {slot} subnet: {error}') from error
+        # A concurrent creator may have won the CIDR: only a subnet carrying
+        # this slot's identity at its exact placement is acceptable.
+        subnet = self._own_subnet(slot)
+        if subnet is None:
+            raise BackendError(
+                f'the slot {slot} CIDR is held by a subnet without its identity: '
+                f'{conflict}')
+        return subnet
+
+    def ensure_slot(self, slot: int) -> None:
+        """Create or reuse the slot's private subnet. The caller holds
+        vm_lifecycle_lock(slot_lock_key('aws', slot))."""
+        subnet = self._own_subnet(slot) or self._create_subnet(slot)
+        if subnet.get('MapPublicIpOnLaunch') is not False:
+            try:
+                self._ec2.modify_subnet_attribute(
+                    SubnetId=subnet['SubnetId'], MapPublicIpOnLaunch={'Value': False})
+            except _PROVIDER_ERRORS as error:
+                raise BackendError(
+                    f'could not make slot {slot} subnet private: {error}') from error
+
+    def release_slot(self, slot: int) -> None:
+        """Delete the slot's subnet; absent is done. The caller holds
+        vm_lifecycle_lock(slot_lock_key('aws', slot))."""
+        for subnet in self._tagged(_SUBNETS, self._slot_identity(slot)):
+            self._delete_network(_SUBNETS, subnet['SubnetId'])
+
+    def _group_identity(self, deployment_id: str) -> dict:
+        return {TAG_SITE: _config().LAB_SITE_ID, TAG_DEPLOYMENT: deployment_id,
+                TAG_KIND: KIND_DEPLOYMENT_NETWORK}
+
+    def _own_group(self, deployment_id: str) -> Optional[dict]:
+        """This site's group for the deployment, None when there is none;
+        one outside the lab VPC or under another name is refused."""
+        config = _config()
+        found = self._tagged(_GROUPS, self._group_identity(deployment_id))
+        if not found:
+            return None
+        if len(found) > 1:
+            raise BackendError(
+                f'{len(found)} security groups claim deployment {deployment_id}')
+        group = found[0]
+        name = deployment_network_name(config.LAB_SITE_ID, deployment_id)
+        if group.get('VpcId') != config.AWS_LAB_VPC_ID or group.get('GroupName') != name:
+            raise BackendError(
+                f'security group {group["GroupId"]} of deployment {deployment_id} '
+                f'is {group.get("GroupName")!r} in {group.get("VpcId")}, '
+                f'not {name!r} in {config.AWS_LAB_VPC_ID}')
+        return group
+
+    def _create_group(self, deployment_id: str) -> str:
+        config = _config()
+        name = deployment_network_name(config.LAB_SITE_ID, deployment_id)
+        tags = dict(self._group_identity(deployment_id), Name=name,
+                    **{TAG_CREATED: str(int(time.time()))})
+        try:
+            return self._ec2.create_security_group(
+                GroupName=name, VpcId=config.AWS_LAB_VPC_ID,
+                Description='Lab Playground deployment isolation',
+                TagSpecifications=[{'ResourceType': 'security-group',
+                                    'Tags': _tags(tags)}],
+            )['GroupId']
+        except ClientError as error:
+            if _error_code(error) != _GROUP_DUPLICATE:
+                raise BackendError(f'could not create group {name}: {error}') from error
+            duplicate = error
+        except BotoCoreError as error:
+            raise BackendError(f'could not create group {name}: {error}') from error
+        # A concurrent creator may hold the name. The name carries only the
+        # 16-character key, so only this deployment's full identity counts.
+        group = self._own_group(deployment_id)
+        if group is None:
+            raise BackendError(
+                f'group {name} is held without the identity of deployment '
+                f'{deployment_id}: {duplicate}')
+        return group['GroupId']
+
+    def _converge_group_rules(self, group_id: str) -> None:
+        """Make the group's rules exactly the isolation set, both ways.
+        Egress first, and in each direction revoke before authorize, so
+        the default allow-all egress is gone before anything is granted."""
+        try:
+            [group] = self._ec2.describe_security_groups(
+                GroupIds=[group_id])['SecurityGroups']
+        except (*_PROVIDER_ERRORS, ValueError) as error:
+            raise BackendError(f'could not read the rules of {group_id}: {error}') from error
+        wanted = _isolation_rules(group_id)
+        for field, revoke, authorize in (
+                ('IpPermissionsEgress', 'revoke_security_group_egress',
+                 'authorize_security_group_egress'),
+                ('IpPermissions', 'revoke_security_group_ingress',
+                 'authorize_security_group_ingress')):
+            current = _rule_set(group.get(field))
+            # One rule per call: a batch fails whole on one duplicate, and a
+            # concurrent creator converging the same group is not an error.
+            for operation, rules, benign in ((revoke, current - wanted, _RULE_NOT_FOUND),
+                                             (authorize, wanted - current, _RULE_DUPLICATE)):
+                for rule in sorted(rules, key=str):
+                    try:
+                        getattr(self._ec2, operation)(
+                            GroupId=group_id, IpPermissions=[_permission(rule)])
+                    except ClientError as error:
+                        if _error_code(error) != benign:
+                            raise BackendError(
+                                f'could not {operation} on {group_id}: {error}') from error
+                    except BotoCoreError as error:
+                        raise BackendError(
+                            f'could not {operation} on {group_id}: {error}') from error
+
+    def _deployment_group(self, deployment_id: str) -> str:
+        group = self._own_group(deployment_id)
+        group_id = group['GroupId'] if group else self._create_group(deployment_id)
+        self._converge_group_rules(group_id)
+        return group_id
 
     def _resolve_network(self, spec: VMSpec) -> Tuple[str, str]:
-        site = _config().LAB_SITE_ID
-        subnet_id = self._one(
-            'slot subnet', 'describe_subnets', 'Subnets',
-            {TAG_SITE: site, TAG_SLOT: str(spec.network_slot),
-             TAG_KIND: 'slot-network'})
-        group_id = self._one(
-            'deployment security group', 'describe_security_groups',
-            'SecurityGroups',
-            {TAG_SITE: site, TAG_DEPLOYMENT: spec.deployment_id,
-             TAG_KIND: 'deployment-network'})
-        return subnet_id, group_id
+        """The production resolver: the slot subnet ensure_slot made, and
+        the deployment's group, created or reused. A slot released since
+        ensure_slot raises SlotNetworkMissing so create_vm re-ensures it (I3)."""
+        subnet = self._own_subnet(spec.network_slot)
+        if subnet is None:
+            raise SlotNetworkMissing(
+                f'slot {spec.network_slot} has no subnet for VM {spec.vmid}')
+        return subnet['SubnetId'], self._deployment_group(spec.deployment_id)
+
+    def cleanup_deployment(self, deployment_id: str) -> None:
+        """Delete the deployment's security groups; absent is done. Run
+        after its instances are terminated: EC2 refuses to delete a group
+        an interface still uses, and that refusal propagates."""
+        for group in self._tagged(_GROUPS, self._group_identity(deployment_id)):
+            self._delete_network(_GROUPS, group['GroupId'])
+
+    # Router. The caller holds vm_lifecycle_lock(router_lock_key('aws')).
+
+    def _router(self) -> Tuple[str, str]:
+        router_id = _config().AWS_ROUTER_INSTANCE_ID
+        if not router_id:
+            raise BackendError('AWS_ROUTER_INSTANCE_ID is not configured')
+        try:
+            reservations = self._ec2.describe_instances(
+                InstanceIds=[router_id])['Reservations']
+        except _PROVIDER_ERRORS as error:
+            raise BackendError(f'could not read router {router_id}: {error}') from error
+        states = [_state(i) for r in reservations for i in r['Instances']
+                  if i.get('InstanceId') == router_id]
+        if not states:
+            raise BackendError(f'router {router_id} does not exist')
+        return router_id, states[0]
+
+    def _router_call(self, router_id: str, operation: str) -> None:
+        try:
+            getattr(self._ec2, operation)(InstanceIds=[router_id])
+        except _PROVIDER_ERRORS as error:
+            raise BackendError(f'{operation} of router {router_id} failed: {error}') from error
+
+    def _wait_router(self, router_id: str, waiter: str, timeout_seconds: int) -> None:
+        wait = _waiter_config(timeout_seconds)
+        try:
+            self._ec2.get_waiter(waiter).wait(InstanceIds=[router_id], WaiterConfig=wait)
+        except (*_PROVIDER_ERRORS, WaiterError) as error:
+            raise BackendError(f'router {router_id} {waiter} wait failed: {error}') from error
+
+    def ensure_router_running(self) -> None:
+        config = _config()
+        router_id, state = self._router()
+        if state == 'running':
+            return
+        if state == 'stopping':
+            self._wait_router(router_id, 'instance_stopped',
+                              config.AWS_TERMINATE_TIMEOUT_SECONDS)
+            state = 'stopped'
+        if state == 'stopped':
+            self._router_call(router_id, 'start_instances')
+        elif state != 'pending':
+            raise BackendError(f'router {router_id} is {state}')
+        self._wait_router(router_id, 'instance_running', config.AWS_LAUNCH_TIMEOUT_SECONDS)
+
+    def stop_router(self) -> None:
+        config = _config()
+        router_id, state = self._router()
+        if state == 'stopped':
+            return
+        if state == 'pending':
+            # EC2 cannot stop an instance that is still starting.
+            self._wait_router(router_id, 'instance_running',
+                              config.AWS_LAUNCH_TIMEOUT_SECONDS)
+            state = 'running'
+        if state == 'running':
+            self._router_call(router_id, 'stop_instances')
+        elif state != 'stopping':
+            raise BackendError(f'router {router_id} is {state}')
+        self._wait_router(router_id, 'instance_stopped',
+                          config.AWS_TERMINATE_TIMEOUT_SECONDS)
 
     # Create
 
@@ -384,8 +714,9 @@ class AWSBackend:
     # Inventory
 
     def list_managed(self) -> List[ManagedResource]:
-        """Every non-terminated instance this site launched, from one fresh
-        read. A failed read propagates; an empty list would mean "all gone"."""
+        """Every non-terminated instance, deployment group and slot subnet
+        this site created, from fresh reads. A failed read propagates; an
+        empty list would mean "all gone"."""
         site = {TAG_SITE: _config().LAB_SITE_ID}
         try:
             pages = self._ec2.get_paginator('describe_instances').paginate(
@@ -414,15 +745,48 @@ class AWSBackend:
                 expires_at_epoch=_optional_float(tags.get(TAG_EXPIRES)),
                 created_at_epoch=launch_time.timestamp() if launch_time else None,
                 status=_state(instance)))
+        return resources + self._managed_networks()
+
+    def _managed_networks(self) -> List[ManagedResource]:
+        site = _config().LAB_SITE_ID
+        resources = []
+        for group in self._tagged(_GROUPS, {TAG_SITE: site, TAG_KIND: KIND_DEPLOYMENT_NETWORK}):
+            tags = _tag_map(group)
+            deployment = tags.get(TAG_DEPLOYMENT)
+            resources.append(ManagedResource(
+                backend=BACKEND_AWS, kind=KIND_DEPLOYMENT_NETWORK,
+                provider_id=group['GroupId'], name=group.get('GroupName', ''),
+                # The 16-character key on both clouds (ruling C1).
+                deployment_id=deployment_key(deployment) if deployment else None,
+                created_at_epoch=_created_epoch(tags)))
+        for subnet in self._tagged(_SUBNETS, {TAG_SITE: site, TAG_KIND: KIND_SLOT_NETWORK}):
+            tags = _tag_map(subnet)
+            resources.append(ManagedResource(
+                backend=BACKEND_AWS, kind=KIND_SLOT_NETWORK,
+                provider_id=subnet['SubnetId'], name=tags.get('Name', ''),
+                location=subnet.get('AvailabilityZone'),
+                network_slot=_optional_int(tags.get(TAG_SLOT)),
+                created_at_epoch=_created_epoch(tags)))
         return resources
 
     def delete_resource(self, resource: ManagedResource) -> None:
-        if resource.backend != self.name or resource.kind != KIND_INSTANCE:
+        """Delete one listed resource after re-proving, from a fresh
+        describe, that it still carries the identity it was listed with:
+        the listing may be minutes old. Absent is done; a changed identity
+        raises DestroyRefused; an unverifiable one raises BackendError."""
+        if resource.backend != self.name:
             raise BackendError(
                 f'{resource.backend} {resource.kind} {resource.provider_id} '
-                'is not an AWS instance')
-        # The listing may be minutes old: the id must still name this site's
-        # instance with the identity it was listed with.
+                'is not an AWS resource')
+        if resource.kind == KIND_INSTANCE:
+            self._delete_instance(resource)
+        elif resource.kind in _NETWORK_KINDS:
+            self._delete_listed_network(_NETWORK_KINDS[resource.kind], resource)
+        else:
+            raise BackendError(
+                f'AWS has no resource kind {resource.kind!r} ({resource.provider_id})')
+
+    def _delete_instance(self, resource: ManagedResource) -> None:
         expected = {TAG_SITE: _config().LAB_SITE_ID, TAG_KIND: KIND_INSTANCE}
         for key, value in ((TAG_VMID, resource.vmid),
                            (TAG_DEPLOYMENT, resource.deployment_id),
@@ -441,3 +805,41 @@ class AWSBackend:
                 f'identity of instance {resource.provider_id} could not be '
                 f'verified: {resolution.reason}')
         self._terminate(resource.provider_id)
+
+    def _delete_listed_network(self, kind: _NetworkKind, resource: ManagedResource) -> None:
+        provider_id = resource.provider_id
+        # Checked locally, like instance ids: a malformed id must never
+        # read as absent because of how a provider phrases the rejection.
+        if not kind.id_pattern.fullmatch(provider_id or ''):
+            raise BackendError(f'malformed {kind.label} id {provider_id!r}')
+        try:
+            items = getattr(self._ec2, kind.describe)(
+                **{kind.ids_param: [provider_id]})[kind.key]
+        except ClientError as error:
+            if _error_code(error) == kind.not_found:
+                return
+            raise BackendError(
+                f'identity of {kind.label} {provider_id} could not be verified: '
+                f'{error}') from error
+        except BotoCoreError as error:
+            raise BackendError(
+                f'identity of {kind.label} {provider_id} could not be verified: '
+                f'{error}') from error
+        items = [item for item in items if item.get(kind.id_field) == provider_id]
+        if not items:
+            return
+        tags = _tag_map(items[0])
+        deployment = tags.get(TAG_DEPLOYMENT)
+        holds = (
+            tags.get(TAG_SITE) == _config().LAB_SITE_ID
+            and tags.get(TAG_KIND) == resource.kind
+            and (resource.deployment_id is None
+                 or (deployment is not None
+                     and deployment_key(deployment) == resource.deployment_id))
+            and (resource.network_slot is None
+                 or tags.get(TAG_SLOT) == str(resource.network_slot)))
+        if not holds:
+            raise DestroyRefused(
+                f'{kind.label} {provider_id} no longer carries the identity it '
+                'was listed with')
+        self._delete_network(kind, provider_id)
