@@ -120,6 +120,13 @@ To run it nightly, install the units in `scripts/systemd/` and set
 To roll back, set `LAB_PLAYGROUND_VERSION` to the previous version and run
 `docker compose up -d`. Restore the database backup only when the upgrade
 notes say the migrations cannot be undone by a code rollback alone. A version
-without cloud backends ignores the backend columns but cannot destroy cloud
-machines, so roll back to one only once no cloud record is live
-(`docs/CLOUD_BACKENDS.md`, "Teardown and incident response").
+without cloud backends (v1.0.0) ignores the backend columns but never destroys
+a cloud machine, and sets a cloud line in the failed-deploy survivor files
+aside as corrupt. A cloud guest left by a failed deploy during a database
+outage can exist only in those files, with no record. Roll back to such a
+version only when **both** hold: no live cloud record, and no cloud line in
+`data/untracked-survivors.jsonl` or `.importing`. Run the two checks in step
+6, "Roll back", of "Redeploy an Existing Production Host" in
+`docs/PRODUCTION_DEPLOYMENT.md` in the repository. Until both are clean, tear
+the clouds down (`docs/CLOUD_BACKENDS.md`, "Teardown and incident response")
+and let the current release import and destroy the survivors.

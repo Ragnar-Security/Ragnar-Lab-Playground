@@ -94,7 +94,7 @@ The `vm_records` table tracks all created VMs:
 | Column | Type | Description |
 |--------|------|-------------|
 | id | Integer | Primary key |
-| vmid | Integer | Portal VM ID (unique); the Proxmox VMID, and the identity a cloud machine is tagged and named with |
+| vmid | Integer | Portal VM ID (unique); the Proxmox VMID. Cloud machines carry it in a tag (AWS) or label (GCP), and GCP also uses it in the instance name (`lp-<site-id>-<vmid>`) |
 | vm_name | String | VM hostname |
 | vm_type | String | 'lxc' or 'qemu'; 'aws' or 'gcp' for a cloud machine |
 | node | String | Proxmox node name; the availability zone or zone for a cloud machine |
