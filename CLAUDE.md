@@ -249,6 +249,7 @@ app/                        # Flask app (blueprints, models, helpers)
                             # network slots, cloud admission and names
   vm_provisioning.py        # admit -> router -> slot network -> create; retire cleanup
   orphan_reaper.py          # Proxmox + cloud leftover sweep
+  tasks.py                  # expiry loop: destroy, reconcile, reap, stop idle cloud routers
   template_manager.py       # templates.yaml accessors
   models.py                 # SQLAlchemy models
   config.py                 # env-var-driven config + KOTH defaults
@@ -256,7 +257,11 @@ app/                        # Flask app (blueprints, models, helpers)
 docs/                       # user-facing docs
   KING_OF_THE_HILL.md       # KOTH user/admin guide
   PRODUCTION_DEPLOYMENT.md  # deploy guide (read this before changing prod stack)
-scripts/                    # idempotent migration scripts (migrate_*.py)
+  CLOUD_BACKENDS.md         # AWS/GCP operator runbook
+scripts/                    # idempotent migration scripts (migrate_*.py) + ops tools
+  export_network_slots.py   # roster/VLAN/backend export; create_app(start_background_tasks=False)
+  headscale_policy.py       # renders the per-student Headscale policy
+  apply_headscale_policy.sh # export -> render -> diff -> apply (dry run by default)
 static/                     # JS + CSS
 templates/                  # Jinja templates
 templates.example.yaml       # Example VM template + deployment-group catalog
@@ -264,7 +269,9 @@ gunicorn.conf.py            # production worker config — do not bump workers
 run_prod.py                 # gunicorn entry point — monkey.patch_all() first line
 docker-compose.prod.yml     # production stack
 Caddyfile                   # reverse proxy config
-tests/                      # unit tests; tests/integration runs against real Proxmox
+tests/                      # unit tests; tests/integration: Playwright against a fake Proxmox host
+  backends/                 # one contract suite for every backend + AWS/GCP in-memory fakes
+  live/                     # opt-in real Proxmox/AWS/GCP runs (LIVE_PROXMOX/LIVE_AWS/LIVE_GCP=1)
 ```
 
 ## Conventions
