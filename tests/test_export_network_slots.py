@@ -173,6 +173,10 @@ def production_db(app, monkeypatch):
     monkeypatch.setattr(app_package.config, "SQLALCHEMY_DATABASE_URI",
                         app.config["SQLALCHEMY_DATABASE_URI"])
     monkeypatch.setattr(app_package.config, "SQLALCHEMY_ENGINE_OPTIONS", {}, raising=False)
+    # CI runs with FLASK_ENV=testing, which selects TestingConfig. Its
+    # TESTING=True skips boot recovery on the server path as well, so the
+    # export test below would pass whether or not the export skips it.
+    monkeypatch.setattr(app_package.config, "TESTING", False)
     # Deployment validation is not under test, and other suites reload
     # app.config and leave arbitrary settings behind.
     monkeypatch.setattr(app_package, "validate_config", lambda: None)
