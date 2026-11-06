@@ -499,12 +499,12 @@ plan_vlan_isolation() {
 vlan_isolation_activate() {
     if changed "$VLAN_NFT_FILE" || changed "$VLAN_UNIT_FILE"; then
         run systemctl daemon-reload
-        run systemctl enable "$VLAN_UNIT_NAME"
-        if systemctl is-active --quiet "$VLAN_UNIT_NAME"; then
-            run systemctl reload-or-restart "$VLAN_UNIT_NAME"
-        else
-            run systemctl start "$VLAN_UNIT_NAME"
-        fi
+    fi
+    run systemctl enable "$VLAN_UNIT_NAME"
+    if ! systemctl is-active --quiet "$VLAN_UNIT_NAME"; then
+        run systemctl start "$VLAN_UNIT_NAME"
+    elif changed "$VLAN_NFT_FILE" || changed "$VLAN_UNIT_FILE"; then
+        run systemctl reload-or-restart "$VLAN_UNIT_NAME"
     fi
 }
 
