@@ -633,7 +633,8 @@ class AWSBackend:
         Instance-store and suppressed (NoDevice) mappings never outlive it.
         An AMI mapping that cannot be restated as a disposable disk is refused.
         A data disk is restated field-for-field (type, IOPS, throughput,
-        encryption, key), so only its deletion flag differs from the AMI's.
+        encryption, key), except that an `Encrypted=False` is dropped: the
+        snapshot's state and the account's encryption-by-default decide it.
         """
         ebs_fields = self._ec2.meta.service_model.operation_model(
             'RunInstances').input_shape.members['BlockDeviceMappings'] \

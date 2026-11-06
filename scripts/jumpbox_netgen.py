@@ -447,7 +447,11 @@ def main(argv=None):
     parser.add_argument("--allow-vlans", default="", help="isolate-vlans: tags/ranges exempt from the drop")
     parser.add_argument("--label", help="diff: path shown in the header")
     parser.add_argument("files", nargs="*", help="diff: CURRENT GENERATED")
-    args = parser.parse_args(argv)
+    # Callers put options between WHAT and the files (`diff --label L CUR GEN`).
+    # Ubuntu 24.04's Python 3.12.3, the jumpbox's python3, matches the empty
+    # nargs="*" before those options and then rejects the files as
+    # unrecognized arguments. The intermixed parse accepts any order.
+    args = parser.parse_intermixed_args(argv)
 
     try:
         if args.what == "diff":

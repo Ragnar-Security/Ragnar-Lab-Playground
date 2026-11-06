@@ -46,7 +46,10 @@ POLICY_REQUIRED = [
     "HEADSCALE_HOST",
     "HEADSCALE_DIR",
 ]
-POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW", "CHECK_FAIL"]
+POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW", "CHECK_FAIL",
+                 "RELOAD_FAIL"]
+# term_changeover.sh reads this exact line from the policy stage's dry run.
+POLICY_FILE_CURRENT = "  nothing to do: the policy file Headscale serves matches the rendered one."
 
 
 def _clean_env(tmp_path: Path, **values: str) -> dict[str, str]:
@@ -353,8 +356,13 @@ elif args == ["compose", "exec", "-T", "headscale", "headscale", "policy", "chec
         sys.exit("policy check failed")
     json.loads(data)
 elif args == ["compose", "kill", "-s", "HUP", "headscale"]:
-    # Rereads the file; a single-file bind mount still shows the old inode.
     event("reload headscale")
+    if os.environ.get("RELOAD_FAIL"):
+        sys.exit("cannot kill container")
+    # `policy get` reads the file; what Headscale enforces changes only here.
+    # A single-file bind mount ("stale") still shows the replaced inode.
+    if view == "live":
+        shutil.copy(policy, loaded)
 elif args == ["compose", "restart", "headscale"]:
     event("restart headscale")
     if view == "stale":
@@ -477,12 +485,63 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     assert check < docker.index("reload headscale") < len(docker) - 1
     assert docker[-1] == "policy get"
     assert not any("restart" in line for line in docker)
-    assert "verified" in result.stdout
+    assert "verified: the policy file Headscale serves matches the rendered one." in result.stdout
+    assert Path(env["LOADED_POLICY"]).read_text() == desired
 
+    # A matching file is not proof of what Headscale loaded, so --apply still
+    # checks and signals, and installs nothing.
     again = _apply_policy(env, "--apply")
     assert again.returncode == 0, again.stderr
-    assert "nothing to do" in again.stdout
     assert len(_backups(policy)) == 1
+    docker = _log(env, "DOCKER_LOG").splitlines()
+    assert docker.count("reload headscale") == 2
+    rerun = docker[check + 1:]
+    assert not any("restart" in line for line in rerun)
+    rechecks = [i for i, line in enumerate(rerun) if line.startswith("policy check")]
+    assert len(rechecks) == 1 and rechecks[0] < len(rerun) - 1
+    assert rerun[-1] == "reload headscale"
+
+    dry = _apply_policy(env)
+    assert dry.returncode == 0, dry.stderr
+    assert POLICY_FILE_CURRENT in dry.stdout.splitlines()
+    assert _log(env, "DOCKER_LOG").splitlines().count("reload headscale") == 2
+
+
+# Catches a re-run trusting `policy get` (the file) after the reload failed:
+# the file matches, but Headscale still enforces the outgoing policy, which can
+# hold the blanket member rule that lets every student into every lab.
+def test_apply_policy_rerun_after_a_failed_reload_makes_headscale_load_the_policy(tmp_path):
+    env, policy, original, desired = _policy_rig(tmp_path, RELOAD_FAIL="1")
+    first = _apply_policy(env, "--apply")
+    assert first.returncode != 0
+    assert "reload" in first.stderr
+    assert policy.read_text() == desired
+    assert Path(env["LOADED_POLICY"]).read_text() == original
+
+    del env["RELOAD_FAIL"]
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert Path(env["LOADED_POLICY"]).read_text() == desired
+    assert len(_backups(policy)) == 1
+    assert "effective" not in again.stdout
+
+
+# Catches a matching-file --apply signalling a reload of a policy Headscale
+# rejects (an upgrade, or a hand-installed file), then reporting success.
+def test_apply_policy_matching_file_is_checked_before_the_reload(tmp_path):
+    env, policy, _, desired = _policy_rig(tmp_path)
+    policy.write_text(desired)
+    Path(env["LOADED_POLICY"]).write_text(desired)
+    env["CHECK_FAIL"] = "1"
+    result = _apply_policy(env, "--apply")
+
+    assert result.returncode != 0
+    assert "rejects" in result.stderr
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" in docker
+    assert "reload headscale" not in docker
+    assert policy.read_text() == desired
+    assert _backups(policy) == []
 
 
 # Catches a stale read-back being accepted, or answered with more than one restart.
@@ -565,9 +624,11 @@ elif "SELECT login_id, sis_user_id" in sql:
 elif "SELECT (SELECT COUNT(*)" in sql:
     out("0\\t0\\t1\\t0\\t0\\t0\\t0\\n")
 """
-POLICY_STAGE_STUB = """#!/usr/bin/env bash
+POLICY_STAGE_STUB = f"""#!/usr/bin/env bash
+printf 'STAGE INPUTS base=%s file=%s\\n' "${{HEADSCALE_BASE_POLICY-unset}}" \\
+    "${{HEADSCALE_POLICY_FILE-unset}}" >> "$EVENT_LOG"
 printf 'POLICY [%s] SITE_ENV_FILE=%s\\n' "$*" "$SITE_ENV_FILE" >> "$EVENT_LOG"
-printf 'Headscale policy: stub\\n  nothing to do: the effective policy matches.\\n'
+printf 'Headscale policy: stub\\n{POLICY_FILE_CURRENT}\\n'
 """
 
 
@@ -591,6 +652,8 @@ def _term_rig(tmp_path: Path):
         "EMAIL_DOMAIN=example.edu",
         "REMOTE_BACKUP_DIR=/var/backups/lab-playground",
         "KEY_DAYS=45d",
+        "HEADSCALE_BASE_POLICY=config/site-acl.json",
+        "HEADSCALE_POLICY_FILE=/etc/headscale/site-acl.json",
     ]) + "\n")
     roster = tmp_path / "roster.csv"
     roster.write_text("SIS User ID,SIS Login ID\n1001,student1\n")
@@ -643,8 +706,20 @@ def test_term_changeover_dry_run_ends_with_the_policy_dry_run(tmp_path):
     stages = [line for line in result.stdout.splitlines() if re.match(r"\[\d/\d\]", line)]
     assert stages == ["[1/4] Headscale roster", "[2/4] Mounted roster file",
                       "[3/4] Production database", "[4/4] Headscale policy"]
-    assert "nothing to do: the effective policy matches." in result.stdout
+    assert POLICY_FILE_CURRENT in result.stdout.splitlines()
     assert "No changes were made" in result.stdout
+
+
+# Catches the orchestrator no longer recognising the policy stage's
+# "file already matches" line, so a finished changeover never reads as done.
+def test_term_changeover_dry_run_of_a_finished_changeover_reports_complete(tmp_path):
+    repo, env, config, roster = _term_rig(tmp_path)
+    (Path(env["TERM_STATE"]) / "seeded").touch()
+    result = subprocess.run(["bash", str(repo / "scripts" / "term_changeover.sh"), str(roster)],
+                            env=env, capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    assert "Changeover complete. Every stage has nothing to do." in result.stdout
 
 
 # Catches the policy being applied from the outgoing roster, before the purge and reseed.
@@ -663,3 +738,22 @@ def test_term_changeover_applies_the_policy_after_the_new_roster_is_seeded(tmp_p
     assert last_read < policy[0]
     assert "verified: the whitelist has the exact 1 rows." in result.stdout
     assert result.stdout.index("[3/4] Production database") < result.stdout.index("[4/4] Headscale policy")
+
+
+# Catches site.env overwriting the operator's exported policy paths, so the
+# changeover installs the policy somewhere the operator did not choose.
+@pytest.mark.parametrize("exported", [True, False])
+def test_term_changeover_policy_stage_keeps_exported_policy_paths(tmp_path, exported):
+    repo, env, config, roster = _term_rig(tmp_path)
+    if exported:
+        env.update(HEADSCALE_BASE_POLICY="/operator/base.json",
+                   HEADSCALE_POLICY_FILE="/etc/headscale/operator.json")
+        expected = "STAGE INPUTS base=/operator/base.json file=/etc/headscale/operator.json"
+    else:
+        expected = "STAGE INPUTS base=config/site-acl.json file=/etc/headscale/site-acl.json"
+    result = subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env, capture_output=True, text=True, timeout=60)
+
+    assert result.returncode == 0, result.stderr
+    assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected]

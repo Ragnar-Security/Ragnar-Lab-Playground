@@ -111,10 +111,15 @@ def _observe(backend, record):
     return backend, state, status, ips, diagnostic
 
 
-def _uptime(backend, record):
-    # Only Proxmox reports one; the page shows N/A for None.
-    read = getattr(backend, 'uptime', None)
-    return read(VMRef.from_record(record)) if read is not None else None
+def _power_state(backend, record):
+    """(status, uptime) for the detail page, or (None, None) when unread.
+
+    Only Proxmox needs the extra read: its display status is presence, not
+    power, while a cloud backend's status() is already the power state.
+    The page shows N/A for a None uptime.
+    """
+    read = getattr(backend, 'power_state', None)
+    return read(VMRef.from_record(record)) if read is not None else (None, None)
 
 
 @vm_listing_bp.route('/list', methods=['GET'])
@@ -452,7 +457,9 @@ def api_vm_detail(vmid):
                 _backend, state, status, ip_addresses, _diagnostic = _observe(
                     backend, db_vm)
                 if state == VM_PRESENT:
-                    uptime = _uptime(backend, db_vm)
+                    power, uptime = _power_state(backend, db_vm)
+                    # A failed read keeps the present-guest status.
+                    status = power or status
         if status == VM_MISSING:
             return jsonify({'success': False,
                             'error': f'VM {vmid} not found on {db_vm.backend}'}), 404

@@ -71,7 +71,6 @@ def _operation(method):
     return wrapper
 
 
-
 class ProxmoxBackend:
     """VMBackend for Proxmox VE."""
 
@@ -474,7 +473,8 @@ class ProxmoxBackend:
         webhook has always carried so an operator sees why the read failed."""
         utils = _route_utils()
         if state == utils.VM_PRESENT:
-            # What /list has always shown for a guest Proxmox can read.
+            # Presence, not power: what /list has always shown for a guest
+            # Proxmox can read. The detail page asks power_state().
             return 'running', None
         if state == utils.VM_CONFIG_ERROR:
             return 'config_error', error
@@ -500,13 +500,17 @@ class ProxmoxBackend:
         return (*self._status_of(state, error), self._addresses(ref, state))
 
     @_operation
-    def uptime(self, ref: VMRef) -> Optional[int]:
-        """Seconds the guest has run, for the detail page; None when unread."""
+    def power_state(self, ref: VMRef) -> Tuple[Optional[str], Optional[int]]:
+        """(status, uptime) from the guest's own status read, for the detail
+        page: display_read reports presence, which says nothing about
+        whether the guest is powered on. (None, None) when unread."""
         try:
-            return self._endpoint(ref).status.current.get().get('uptime')
+            current = self._endpoint(ref).status.current.get()
         except Exception as error:
-            logger.warning("uptime of VM %s unavailable: %s", ref.vmid, error)
-            return None
+            logger.warning("power state of VM %s unavailable: %s",
+                           ref.vmid, error)
+            return None, None
+        return current.get('status'), current.get('uptime')
 
     @_operation
     def set_expiry(self, ref: VMRef, expires_at: datetime) -> None:

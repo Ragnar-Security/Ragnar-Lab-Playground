@@ -603,6 +603,49 @@ def test_proxmox_detail_reports_guest_uptime(app, client, memory_backend_case):
     forget_proxmox_caches()
 
 
+# Catches the detail page showing a powered-off Proxmox guest as running:
+# presence is all /list reads, but the detail badge is the power state.
+def test_proxmox_detail_reports_a_stopped_guest_as_stopped(
+        app, client, memory_backend_case):
+    api = FakeProxmox()
+    _proxmox_portal(api)
+    record = _proxmox_record(api=api, status='stopped')
+    api.guests[record.vmid]['uptime'] = 0
+    login_owner(client, record.created_by_user_id)
+    body = client.get(f'/api/vms/{record.vmid}').get_json()
+    assert body['success'] is True, body
+    assert body['vm']['status'] == 'stopped'
+    assert body['vm']['uptime'] == 0
+    current_reads = [call for call in api.calls
+                     if call[1][-2:] == ('status', 'current')]
+    assert len(current_reads) == 1
+    forget_proxmox_caches()
+
+
+# Catches a failed power-state read blanking or erroring the detail page
+# instead of keeping the present-guest status it showed before the read.
+def test_proxmox_detail_falls_back_when_the_power_read_fails(
+        app, client, memory_backend_case):
+    api = FakeProxmox()
+    _proxmox_portal(api)
+    record = _proxmox_record(api=api, status='stopped')
+    handle = api.handle
+
+    def failing_current(method, parts, kwargs):
+        if parts[-2:] == ('status', 'current'):
+            raise RuntimeError('Proxmox timed out')
+        return handle(method, parts, kwargs)
+
+    api.handle = failing_current
+    login_owner(client, record.created_by_user_id)
+    body = client.get(f'/api/vms/{record.vmid}').get_json()
+    assert body['success'] is True, body
+    assert body['vm']['status'] == 'running'
+    assert body['vm']['uptime'] is None
+    assert body['vm']['ip_addresses'] == ['10.1.0.5']
+    forget_proxmox_caches()
+
+
 # Catches the /list config-error webhook losing Proxmox's own diagnostic.
 def test_list_config_error_webhook_carries_the_provider_diagnostic(
         app, client, memory_backend_case):

@@ -757,10 +757,11 @@ class GCPBackend:
         return _Resolution(GUEST_MATCH, zone, name, instance)
 
     def _fetch(self, zone: str, name: str, expected: Mapping[str, str]) -> _Resolution:
-        """A fresh GET of one instance in the zone discovery found it in,
-        judged against its name, `expected` and its lab placement: every
-        caller may act on the verdict. Never absence: a 404 here is a delete
-        racing discovery or a moved instance, so it is unknown."""
+        """A fresh GET of one instance in `zone` (where discovery found it, or
+        where create just inserted it), judged against its name, `expected`
+        and its lab placement: every caller may act on the verdict. Never
+        absence: a 404 here is a delete racing discovery or a moved instance,
+        so it is unknown."""
         try:
             instance = self._send('GET', ('zones', zone, 'instances', name))
         except requests.RequestException as error:

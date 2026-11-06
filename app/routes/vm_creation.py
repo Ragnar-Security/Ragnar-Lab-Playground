@@ -1381,8 +1381,10 @@ def create_vm():
 
         try:
             if backend_name == BACKEND_PROXMOX:
-                # An unreachable cluster fails the deploy here, as it always
-                # has; a cloud deploy never needs this connection.
+                # An unreachable cluster fails a Proxmox deploy here, as it
+                # always has. A cloud bundle on a portal with Proxmox enabled
+                # still opens a connection later, in deploy_bundle, so its
+                # VMIDs avoid manually created Proxmox guests (ruling I19).
                 get_proxmox_connection()
 
             # Pre-flight: detect an already-fully-deployed state (idempotent

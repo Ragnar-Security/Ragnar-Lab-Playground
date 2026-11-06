@@ -11,7 +11,8 @@ SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
-    EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS HEADSCALE_SCRIPT HEADSCALE_DB
+    EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS HEADSCALE_SCRIPT HEADSCALE_DB \
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE
 for name in PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
     EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS; do
@@ -523,7 +524,8 @@ policy_output="$(SITE_ENV_FILE="$SITE_ENV_FILE" bash "$APPLY_POLICY" $policy_mod
     || { printf '%s\n' "$policy_output"; die "The Headscale policy stage failed."; }
 printf '%s\n' "$policy_output"
 POLICY_CURRENT=0
-[[ "$policy_output" != *"nothing to do: the effective policy matches."* ]] || POLICY_CURRENT=1
+[[ "$policy_output" != *"nothing to do: the policy file Headscale serves matches the rendered one."* ]] \
+    || POLICY_CURRENT=1
 
 printf '\n'
 if ((APPLY == 0)); then

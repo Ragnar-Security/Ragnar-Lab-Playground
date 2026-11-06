@@ -43,6 +43,16 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `docker-compose.prod.yml` passes the backend settings into the app
   container; an empty value behaves as unset.
 
+### Fixed
+
+- `jumpbox_configure.sh` no longer dies at its first diff with
+  `unrecognized arguments` on Ubuntu 24.04's Python 3.12.3, the jumpbox's
+  `python3`: `jumpbox_netgen.py` accepts options between its command and
+  its files.
+- `term_changeover.sh` keeps exported `HEADSCALE_BASE_POLICY` and
+  `HEADSCALE_POLICY_FILE` values over `scripts/site.env`, as
+  `apply_headscale_policy.sh` already did.
+
 ### Upgrade notes
 
 - **Back up the database first** (`scripts/backup-database.sh`) and record the

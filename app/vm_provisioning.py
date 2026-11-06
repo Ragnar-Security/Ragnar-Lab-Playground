@@ -126,10 +126,11 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
             launched = backend.create(spec, location,
                                       heartbeat=guarded_heartbeat, **options)
         except SlotNetworkMissing:
-            # A retirement released the slot between ensure_slot and create
-            # (release_slot_if_unused cannot see an admission that has not
-            # launched yet). Re-ensuring once is enough: the next release
-            # must again wait for this reservation to go.
+            # Reached only if this create's admission lapsed, or the subnet
+            # was deleted out of band: release_slot_if_unused and the
+            # reaper's slot recheck both refuse while any unexpired
+            # admission exists on the backend, and ours was inserted before
+            # ensure_slot. Re-ensure once.
             logger.warning("Slot %s of %s vanished before launch of VM %s; "
                            "re-ensuring it once", spec.network_slot,
                            spec.backend, spec.vmid)
@@ -156,7 +157,6 @@ def provider_session(backend: VMBackend) -> ContextManager:
     """
     session = getattr(backend, 'session', None)
     return session() if session is not None else nullcontext()
-
 
 
 def release_slot_if_unused(backend: str, slot: int) -> None:

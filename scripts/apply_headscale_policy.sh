@@ -112,12 +112,14 @@ fetch_policy() {
         "cd '$HEADSCALE_DIR' && docker compose exec -T headscale headscale policy get"
 }
 
-# Prints nothing when the effective policy equals the desired one.
+# Prints nothing when the policy file Headscale serves equals the desired one.
+# In file mode `policy get` returns that file, not the policy Headscale has
+# loaded, so a match never proves what is enforced.
 policy_changes() {
     local current="$TMP_DIR/current.json"
-    fetch_policy > "$current" || die "Could not read the effective Headscale policy."
+    fetch_policy > "$current" || die "Could not read the policy file Headscale serves."
     "$PYTHON" "$POLICY_TOOL" diff "$current" "$TMP_DIR/desired.json" \
-        || die "Could not compare the effective Headscale policy."
+        || die "Could not compare the policy file Headscale serves."
 }
 
 resolve_host_policy_file() {
@@ -158,6 +160,15 @@ install_policy() {
     esac
 }
 
+# The check install_policy runs, for a policy that is already in place: a
+# Headscale upgrade or a hand-installed file can hold a policy it now rejects.
+check_policy() {
+    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" \
+        "cd '$HEADSCALE_DIR' && docker compose exec -T headscale headscale policy check --file /dev/stdin >&2" \
+        < "$TMP_DIR/desired.json" \
+        || die "Headscale rejects the rendered policy; not signalling a reload."
+}
+
 # Headscale (file policy mode) reloads its policy on SIGHUP; without it the
 # server keeps enforcing the old rules although the file already matches.
 reload_headscale() {
@@ -186,7 +197,17 @@ fetch_slots > "$TMP_DIR/slots.json" || die "Could not export network slots from 
 
 changes="$(policy_changes)"
 if [[ -z "$changes" ]]; then
-    printf '  nothing to do: the effective policy matches.\n'
+    if ((APPLY == 0)); then
+        printf '  nothing to do: the policy file Headscale serves matches the rendered one.\n'
+        printf '  not checked: which policy Headscale has loaded; --apply signals a reload.\n'
+        exit 0
+    fi
+    # An earlier --apply can have installed this file and then failed to
+    # signal, leaving Headscale on the old rules; SIGHUP is safe to repeat.
+    printf '  nothing to install: the policy file Headscale serves matches the rendered one.\n'
+    check_policy
+    reload_headscale
+    printf '  signalled Headscale to reload that file.\n'
     exit 0
 fi
 printf '%s\n' "$changes"
@@ -204,6 +225,6 @@ if [[ -n "$readback" ]]; then
     printf '  read-back differs; restarting the headscale service once.\n'
     restart_headscale
     readback="$(policy_changes)"
-    [[ -z "$readback" ]] || die "The effective policy still differs after one restart."
+    [[ -z "$readback" ]] || die "The policy file Headscale serves still differs after one restart."
 fi
-printf '  verified: the effective policy matches the rendered one.\n'
+printf '  verified: the policy file Headscale serves matches the rendered one.\n'

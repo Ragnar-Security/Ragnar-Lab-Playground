@@ -736,6 +736,17 @@ new one atomically, signals Headscale (`SIGHUP`) to reload it, and reads it
 back; only if the read-back differs does it restart the headscale service
 once, and it fails if it still differs.
 
+**In file mode `headscale policy get` returns the policy file, not the
+policy Headscale has loaded.** A match therefore proves only that the file
+Headscale serves is the rendered one; the script says exactly that and never
+claims the policy is enforced. When the file already matches, the dry run
+reports `nothing to do` and changes nothing, but `--apply` still runs
+`headscale policy check` on it and then signals `SIGHUP`, without
+reinstalling. That covers an earlier `--apply` that installed
+the file and then failed to signal: Headscale would otherwise keep enforcing
+the old policy, possibly still with the blanket member rule that gives every
+student every lab.
+
 What the policy grants:
 
 - Each roster login `<login>@` reaches its own entry slot, its groups' entry
