@@ -12,8 +12,11 @@ import app.tasks as vm_tasks
 from datetime import datetime, timedelta
 
 
+import pytest
 from proxmoxer.core import ResourceException
 
+from app.backends.base import BackendError, DestroyPolicy, VMRef
+from app.backends.proxmox import ProxmoxBackend
 from app.routes.vm_creation import cleanup_vms
 from app.models import KothBox, KothGame, User, VMRecord, db
 from app import proxmox_service
@@ -39,7 +42,7 @@ def _proxmox_with_qemu_endpoints(mock_api, vmids, *, names=None):
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_creation.wait_for_proxmox_task")
+@patch("app.proxmox_service.wait_for_proxmox_task")
 def test_cleanup_does_not_treat_vmid_containing_404_as_missing(mock_wait, mock_api):
     """A live VM 10404 that rejects destroy must not be reported destroyed."""
     _, endpoints = _proxmox_with_qemu_endpoints(mock_api, [10404])
@@ -57,7 +60,7 @@ def test_cleanup_does_not_treat_vmid_containing_404_as_missing(mock_wait, mock_a
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_creation.wait_for_proxmox_task")
+@patch("app.proxmox_service.wait_for_proxmox_task")
 def test_cleanup_continues_after_delete_task_timeout(mock_wait, mock_api):
     """One timed-out delete task must not prevent later VMs being destroyed."""
     _, endpoints = _proxmox_with_qemu_endpoints(mock_api, [100, 101])
@@ -114,7 +117,7 @@ def _login_student(client):
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_lifecycle.wait_for_proxmox_task")
+@patch("app.proxmox_service.wait_for_proxmox_task")
 def test_destroy_keeps_record_when_async_delete_task_fails(
         mock_wait, mock_api, app, client):
     """An accepted delete UPID is not success until exitstatus is OK."""
@@ -142,7 +145,7 @@ def test_destroy_keeps_record_when_async_delete_task_fails(
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_lifecycle.wait_for_proxmox_task")
+@patch("app.proxmox_service.wait_for_proxmox_task")
 def test_destroy_keeps_live_vmid_10404_after_submit_failure(
         mock_wait, mock_api, app, client):
     """Digits in a live VMID must not masquerade as an HTTP 404."""
@@ -303,10 +306,9 @@ def test_destroy_marks_koth_record_destroyed_instead_of_deleting(
         assert box.vm_record_id == vm_id
 
 
-@patch("app.routes.admin.time.sleep", return_value=None)
 @patch("app.proxmox_service.ProxmoxAPI")
 def test_bulk_destroy_keeps_record_when_delete_task_fails(
-        mock_api, _mock_sleep, app, client):
+        mock_api, app, client):
     """Bulk destroy must await the delete task before dropping a record."""
     vm_id, _ = _admin_with_vm(app)
     _login_admin(client)
@@ -328,9 +330,8 @@ def test_bulk_destroy_keeps_record_when_delete_task_fails(
         )
 
 
-@patch("app.routes.admin.time.sleep", return_value=None)
 @patch("app.proxmox_service.ProxmoxAPI")
-def test_bulk_destroy_keeps_live_vmid_10404(mock_api, _mock_sleep, app, client):
+def test_bulk_destroy_keeps_live_vmid_10404(mock_api, app, client):
     """A VMID containing 404 is not evidence that the live VM is gone."""
     vm_id, _ = _admin_with_vm(app, vmid=10404)
     _login_admin(client)
@@ -349,10 +350,9 @@ def test_bulk_destroy_keeps_live_vmid_10404(mock_api, _mock_sleep, app, client):
         assert db.session.get(VMRecord, vm_id) is not None
 
 
-@patch("app.routes.admin.time.sleep", return_value=None)
 @patch("app.proxmox_service.ProxmoxAPI")
 def test_bulk_destroy_marks_koth_record_destroyed_instead_of_deleting(
-        mock_api, _mock_sleep, app, client):
+        mock_api, app, client):
     """Successful KOTH cleanup must preserve the KothBox foreign key."""
     vm_id, box_id = _admin_with_vm(app, koth=True)
     _login_admin(client)
@@ -439,7 +439,10 @@ def test_expiry_delete_waits_for_task_success(mock_api, app):
             student_name="student",
             expires_at=datetime.now() - timedelta(minutes=1),
         )
-    proxmox, endpoints = _proxmox_with_qemu_endpoints(mock_api, [100])
+    # Listed under the record's own name: the destroy verifies identity
+    # before it mutates anything.
+    proxmox, endpoints = _proxmox_with_qemu_endpoints(
+        mock_api, [100], names={100: "expired"})
     endpoints[100].delete.return_value = "delete-100"
     _set_task_results(proxmox, {
         "delete-100": {
@@ -447,9 +450,10 @@ def test_expiry_delete_waits_for_task_success(mock_api, app):
         },
     })
 
-    assert vm_tasks._delete_vm(proxmox, vm) is False, (
-        "failed asynchronous expiry destroy must remain retryable"
-    )
+    with pytest.raises(BackendError):
+        ProxmoxBackend(client=proxmox).destroy(
+            VMRef.from_record(vm), DestroyPolicy.STRICT)
+    endpoints[100].delete.assert_called_once_with()
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
@@ -518,7 +522,7 @@ def test_expiry_marks_koth_record_destroyed_instead_of_deleting(mock_api, app):
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_creation.wait_for_proxmox_task")
+@patch("app.proxmox_service.wait_for_proxmox_task")
 def test_cleanup_keeps_cluster_listed_vm_after_ambiguous_missing_errors(
         mock_wait, mock_api):
     proxmox, endpoints = _proxmox_with_qemu_endpoints(mock_api, [100])
@@ -597,10 +601,9 @@ def test_expiry_keeps_cluster_listed_vm_after_ambiguous_missing_error(
         assert db.session.get(VMRecord, vm_id) is not None
 
 
-@patch("app.routes.admin.time.sleep", return_value=None)
 @patch("app.proxmox_service.ProxmoxAPI")
 def test_bulk_destroy_keeps_cluster_listed_vm_after_ambiguous_missing_error(
-        mock_api, _mock_sleep, app, client):
+        mock_api, app, client):
     vm_id, _ = _admin_with_vm(app)
     _login_admin(client)
     proxmox, endpoints = _proxmox_with_qemu_endpoints(mock_api, [100])
@@ -702,7 +705,7 @@ def test_destroy_waiting_on_lifecycle_lock_never_touches_replacement(
 
 
 @patch("app.proxmox_service.ProxmoxAPI")
-@patch("app.routes.vm_creation.wait_for_proxmox_task",
+@patch("app.proxmox_service.wait_for_proxmox_task",
        return_value={"success": True, "status": "stopped"})
 def test_cleanup_refuses_untracked_guest_without_expected_name(
         _mock_wait, mock_api):

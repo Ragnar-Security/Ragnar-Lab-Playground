@@ -4,7 +4,8 @@
 
 ### Prerequisites
 - Docker and Docker Compose installed
-- `.env` file configured with Proxmox credentials
+- `.env` file configured with Proxmox credentials, or with the cloud settings
+  of every backend in `ENABLED_BACKENDS` (`.env.example`, `docs/CLOUD_BACKENDS.md`)
 - `templates.yaml` configured with your templates
 
 ### Running with Docker
@@ -93,10 +94,14 @@ The `vm_records` table tracks all created VMs:
 | Column | Type | Description |
 |--------|------|-------------|
 | id | Integer | Primary key |
-| vmid | Integer | Proxmox VM ID (unique) |
+| vmid | Integer | Portal VM ID (unique); the Proxmox VMID. Cloud machines carry it in a tag (AWS) or label (GCP), and GCP also uses it in the instance name (`lp-<site-id>-<vmid>`) |
 | vm_name | String | VM hostname |
-| vm_type | String | 'lxc' or 'qemu' |
-| node | String | Proxmox node name |
+| vm_type | String | 'lxc' or 'qemu'; 'aws' or 'gcp' for a cloud machine |
+| node | String | Proxmox node name; the availability zone or zone for a cloud machine |
+| backend | String | 'proxmox', 'aws' or 'gcp'; rows from before the column existed are 'proxmox' |
+| provider_id | String | Cloud instance identifier; NULL for Proxmox |
+| deployment_id | String | Groups the machines of one launch |
+| network_slot | Integer | The network slot (VLAN tag) the VM was placed in |
 | template_name | String | Template display name |
 | student_name | String | Student identifier |
 | memory | Integer | RAM in MB |
@@ -110,14 +115,18 @@ The `vm_records` table tracks all created VMs:
 
 ## Environment Variables
 
-Create `.env` file with:
+Create `.env` from `.env.example`, which lists every setting. The Proxmox ones:
 ```
 PROXMOX_HOST=<proxmox-host>
 PROXMOX_USER=root@pam
 PROXMOX_TOKEN_ID=your-token-id
 PROXMOX_TOKEN_SECRET=your-token-secret
-VM_UPTIME_MINUTES=4320
 ```
+
+They are required only while `proxmox` is in `ENABLED_BACKENDS` (default
+`proxmox`). Enabling `aws` or `gcp` requires `LAB_SITE_ID` and that cloud's
+`AWS_*` / `GCP_*` settings instead; cloud credentials never go in a tracked
+file (`docs/CLOUD_BACKENDS.md`, "Configure and validate the portal").
 
 ## Volume Mounts
 

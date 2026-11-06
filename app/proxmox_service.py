@@ -407,6 +407,11 @@ def get_cluster_vm_index(proxmox: ProxmoxAPI, *,
             'type': row.get('type'),
             'status': row.get('status'),
         }
+        # ProxmoxBackend.list_managed must tell templates from guests without
+        # a per-guest config read. Only when the row reports it, so an entry
+        # for a row without the field keeps exactly its previous shape.
+        if 'template' in row:
+            index[vmid]['template'] = row['template']
     with _vm_index_lock:
         _vm_index_cache = index
         _vm_index_fetched_at = time.monotonic()
@@ -592,7 +597,7 @@ def get_vm_details(proxmox, vmid, node):
 
 
 def get_next_available_vmid(
-        proxmox: ProxmoxAPI, *,
+        proxmox: Optional[ProxmoxAPI] = None, *,
         count: int = 1,
         reservation_id: str) -> int:
     """Reserve and return the first VMID in a contiguous free block.
@@ -602,6 +607,10 @@ def get_next_available_vmid(
     receive overlapping blocks. The mark, not the inventory snapshot,
     serializes the app's own allocations; the Proxmox read therefore runs
     before the lock and never holds it across a network call.
+
+    ``proxmox`` is None on a portal without Proxmox: there is no cluster
+    inventory to avoid, and the mark, every VMRecord and the live
+    reservations still bound the block.
 
     ``reservation_id`` may be reused to extend a deployment's reservation
     when a defensive duplicate-VMID retry needs a fresh ID. Callers release
@@ -613,7 +622,8 @@ def get_next_available_vmid(
         raise ValueError('VMID reservation identifier is required')
 
     inventory_max = 0
-    for row in proxmox.cluster.resources.get(type='vm') or []:
+    rows = proxmox.cluster.resources.get(type='vm') if proxmox is not None else []
+    for row in rows or []:
         try:
             inventory_max = max(inventory_max, int(row['vmid']))
         except (KeyError, TypeError, ValueError):
@@ -659,40 +669,6 @@ def get_next_available_vmid(
         engine, coordination.VMID_ALLOCATOR, allocate)
     coordination.remember_lease_engine(table, reservation_id, engine)
     return base_vmid
-
-
-def find_vms_by_name_prefix(prefix):
-    """Return [{vmid, node, vm_type, name}, ...] for every VM in Proxmox
-    whose name starts with `prefix`.
-
-    Used to recover stranded KOTH VMs whose VMRecord rows never made it to
-    the DB (e.g. the worker was SIGTERM'd mid-deploy, so our in-process
-    cleanup never ran). Searches both QEMU and LXC across all cluster nodes.
-    """
-    proxmox = get_proxmox_connection()
-    found = []
-    try:
-        nodes = proxmox.nodes.get()
-    except Exception:
-        logger.exception("find_vms_by_name_prefix: failed to enumerate nodes")
-        return found
-    for node in nodes:
-        node_name = node['node']
-        try:
-            for vm in proxmox.nodes(node_name).qemu.get():
-                if (vm.get('name') or '').startswith(prefix):
-                    found.append({'vmid': vm['vmid'], 'node': node_name,
-                                  'vm_type': 'qemu', 'name': vm.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: qemu list failed on {node_name}")
-        try:
-            for lxc in proxmox.nodes(node_name).lxc.get():
-                if (lxc.get('name') or '').startswith(prefix):
-                    found.append({'vmid': lxc['vmid'], 'node': node_name,
-                                  'vm_type': 'lxc', 'name': lxc.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: lxc list failed on {node_name}")
-    return found
 
 
 def get_available_node(proxmox: ProxmoxAPI) -> Optional[str]:

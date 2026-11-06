@@ -3,23 +3,17 @@ VM Lifecycle routes module
 Handles VM extension and destruction operations
 """
 
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify
 from datetime import datetime, timedelta
-import time
 import logging
 
-from .. import tasks
-from ..models import db, VMRecord, User, StudentGroupMember
-from ..proxmox_service import (
-    confirm_proxmox_absence, get_proxmox_connection, inspect_vm_guest,
-    reset_cluster_vm_index, vm_lifecycle_lock, wait_for_proxmox_task,
-    VM_GUEST_ABSENT, VM_GUEST_MATCH,
-)
+from .. import tasks, vm_provisioning
+from ..backends import backend_for
+from ..backends.base import GUEST_ABSENT, GUEST_MATCH, DestroyPolicy, VMRef
+from ..models import db, VMRecord, StudentGroupMember
+from ..proxmox_service import vm_lifecycle_lock
 from ..auth import login_required, get_authenticated_user
-from .utils import (
-    _verify_vm_exists, user_can_access_vm, invalidate_vm_ip_cache,
-    VM_CONFIG_ERROR,
-)
+from .utils import user_can_access_vm
 from sqlalchemy import or_
 
 logger = logging.getLogger(__name__)
@@ -178,7 +172,6 @@ def extend_vm():
         # extension either commits before its expiry re-check (and the VM
         # survives) or waits until the destroy finished (and finds no row),
         # never in between.
-        proxmox = get_proxmox_connection()
         extended_count = 0
         new_expiration = None
 
@@ -196,21 +189,21 @@ def extend_vm():
 
                 new_expiration = vm_record.expires_at + timedelta(minutes=extend_minutes)
                 vm_record.expires_at = new_expiration
+                ref = VMRef.from_record(vm_record)
+                # The database's naive-local expires_at is canonical: the
+                # expiry daemon decides from it, so it commits first and the
+                # provider's copy (the reaper's evidence) follows.
+                db.session.commit()
 
-                # Update VM description in Proxmox
                 try:
-                    if vm_record.vm_type == 'lxc':
-                        proxmox.nodes(vm_record.node).lxc(vm_record.vmid).config.put(
-                            description=f"Expires: {new_expiration.isoformat()}"
-                        )
-                    else:
-                        proxmox.nodes(vm_record.node).qemu(vm_record.vmid).config.put(
-                            description=f"Expires: {new_expiration.isoformat()}"
-                        )
+                    backend_for(ref).set_expiry(ref, new_expiration)
                     extended_count += 1
                 except Exception as e:
-                    logger.warning(f"Warning: Could not update Proxmox description for VM {vm_record.vmid}: {str(e)}")
-                db.session.commit()
+                    # set_expiry raises BackendError by contract (ruling
+                    # I2); anything else here is a provider that could not
+                    # even be reached. Either way the extension stands and
+                    # only provider updates that landed are counted.
+                    logger.warning(f"Warning: Could not update the expiry of VM {vmid} on {ref.backend}: {e}")
 
         if new_expiration is None:
             return jsonify({
@@ -257,7 +250,6 @@ def destroy_vm():
         if error:
             return error
 
-        proxmox = get_proxmox_connection()
         destroyed_vms = []
         failed_vms = []
 
@@ -284,87 +276,26 @@ def destroy_vm():
                         "Skipping stale destroy request for VMID %s", vmid)
                     continue
 
-                identity = inspect_vm_guest(
-                    proxmox, vm_record.vmid,
-                    node=vm_record.node,
-                    vm_name=vm_record.vm_name,
-                    vm_type=vm_record.vm_type,
-                )
-                if identity == VM_GUEST_ABSENT:
-                    invalidate_vm_ip_cache(vm_record.node, vm_record.vmid)
-                    reset_cluster_vm_index()
-                    tasks._retire_vm_record(vm_record)
-                    destroyed_vms.append(vm_record.vm_name)
-                    db.session.commit()
-                    continue
-                if identity != VM_GUEST_MATCH:
-                    failed_vms.append({
-                        'vm_name': vm_record.vm_name,
-                        'vmid': vm_record.vmid,
-                        'error': 'guest identity could not be verified',
-                    })
-                    continue
-
+                # The record's own backend, never the current template: an
+                # operator editing templates.yaml must not redirect a
+                # running VM's destroy to another provider.
+                ref = VMRef.from_record(vm_record)
                 try:
-                    vm_state, _config_error = _verify_vm_exists(
-                        proxmox, vm_record.node, vm_record.vmid,
-                        vm_record.vm_type)
-                    has_config_issues = vm_state == VM_CONFIG_ERROR
-                    endpoint = (
-                        proxmox.nodes(vm_record.node).lxc(vm_record.vmid)
-                        if vm_record.vm_type == 'lxc'
-                        else proxmox.nodes(vm_record.node).qemu(vm_record.vmid)
-                    )
-
-                    if has_config_issues:
-                        current_app.logger.warning(
-                            f"VM {vm_record.vmid} has config issues - "
-                            "attempting force delete")
-                    else:
-                        try:
-                            stop_upid = endpoint.status.stop.post()
-                            stop_result = wait_for_proxmox_task(
-                                proxmox, vm_record.node, stop_upid,
-                                timeout=60, poll_interval=1)
-                            if not stop_result.get('success'):
-                                logger.debug(
-                                    f"Stop task for VM {vm_record.vmid} "
-                                    "returned non-OK: "
-                                    f"{stop_result.get('error', stop_result.get('status'))}")
-                        except Exception as stop_error:
-                            logger.warning(
-                                f"Stop request for VM {vm_record.vmid} "
-                                f"failed (will still attempt delete): {stop_error}")
-
-                    try:
-                        if has_config_issues and vm_record.vm_type == 'qemu':
-                            delete_upid = endpoint.delete(purge=1, skiplock=1)
-                        elif has_config_issues:
-                            delete_upid = endpoint.delete(purge=1, force=1)
-                        else:
-                            delete_upid = endpoint.delete()
-                    except Exception as delete_error:
-                        if confirm_proxmox_absence(
-                                proxmox, vm_record.vmid, delete_error):
-                            delete_upid = None
-                        else:
-                            raise
-
-                    if delete_upid is not None:
-                        delete_result = wait_for_proxmox_task(
-                            proxmox, vm_record.node, delete_upid,
-                            timeout=120, poll_interval=1)
-                        if not delete_result.get('success'):
-                            raise RuntimeError(
-                                f"Destroy task for VM {vm_record.vmid} failed: "
-                                f"{delete_result.get('error', delete_result.get('status'))}")
-
-                    invalidate_vm_ip_cache(vm_record.node, vm_record.vmid)
-                    reset_cluster_vm_index()
-                    tasks._retire_vm_record(vm_record)
-                    destroyed_vms.append(vm_record.vm_name)
-                    db.session.commit()
-
+                    backend = backend_for(ref)
+                    with vm_provisioning.provider_session(backend):
+                        identity = backend.inspect(ref)
+                        if identity == GUEST_MATCH:
+                            # Forces the delete of a guest whose config is
+                            # corrupt: a student has no other way to free it.
+                            vm_provisioning.destroy_vm(
+                                ref, DestroyPolicy.FORCE_CORRUPT)
+                        elif identity != GUEST_ABSENT:
+                            failed_vms.append({
+                                'vm_name': vm_record.vm_name,
+                                'vmid': vm_record.vmid,
+                                'error': 'guest identity could not be verified',
+                            })
+                            continue
                 except Exception as vm_error:
                     failed_vms.append({
                         'vm_name': vm_record.vm_name,
@@ -373,8 +304,16 @@ def destroy_vm():
                     })
                     logger.error(
                         f"Error destroying VM {vm_record.vmid}: {vm_error}")
-        # Commit database changes
-        db.session.commit()
+                    continue
+
+                tasks._retire_vm_record(vm_record)
+                destroyed_vms.append(vm_record.vm_name)
+                db.session.commit()
+                tasks._forget_vm_caches(ref.location, ref.vmid)
+            # After the commit and outside the VMID lock: the last record's
+            # deployment and slot networks go with it. Every path that did
+            # not retire the record has already continued.
+            vm_provisioning.after_record_retired(ref)
 
         # Build response message
         if failed_vms:

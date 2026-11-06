@@ -3,24 +3,31 @@ Background tasks module
 Handles periodic tasks like checking for expired VMs
 """
 
+import importlib
 import time
 import logging
 import os
 import json
 import smtplib
+import threading
 import requests
+from contextlib import ExitStack
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from .proxmox_service import (
-    confirm_proxmox_absence, get_cluster_vm_index, get_proxmox_connection,
-    inspect_vm_guest, reset_cluster_vm_index, vm_lifecycle_lock,
-    wait_for_proxmox_task, VM_GUEST_ABSENT, VM_GUEST_MATCH,
+from typing import Dict, List, Optional
+from .proxmox_service import reset_cluster_vm_index, vm_lifecycle_lock
+from .backends import backend_for, enabled_backends, get_backend
+from .backends.base import (
+    BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, BackendNotEnabled,
+    DestroyPolicy, VMRef,
 )
+from .backends.cloud_common import router_lock_key
 from .orphan_reaper import maybe_reap_orphaned_vms
 from .alert_outbox import dispatch_pending_alerts, enqueue_alert
 from .untracked_survivors import recover_untracked_survivors
-from .models import db, VMRecord, AdminAlert
+from .models import db, NodeMemoryReservation, VMRecord, AdminAlert
+from . import coordination, vm_provisioning
 
 logger = logging.getLogger(__name__)
 
@@ -73,48 +80,68 @@ def _deletion_retry_due(vm_record, now):
     )
 
 
-def reconcile_missing_vm_records(proxmox):
+def reconcile_missing_vm_records(skip_backends=frozenset()):
     """Retire live records whose guest was deleted outside the portal.
 
-    A guest deleted by hand in Proxmox otherwise keeps its record, and with
-    it the admission commitment, until expiry. A record is retired only when
-    fresh cluster inventory has not listed its VMID on two sightings at
-    least ORPHAN_CONFIRM_SECONDS apart with no sighting of it in between,
-    the last confirmed under the VMID lifecycle lock. A failed inventory
-    read is never evidence: it restarts the count. Returns retired VMIDs.
+    A guest deleted by hand in its provider otherwise keeps its record, and
+    with it the admission commitment, until expiry. A record is retired only
+    when fresh inventory has not listed its VMID on two sightings at least
+    ORPHAN_CONFIRM_SECONDS apart with no sighting of it in between, the last
+    confirmed under the VMID lifecycle lock. A failed inventory read is never
+    evidence: it restarts the count. Returns retired VMIDs.
+
+    One list_managed() snapshot per backend per pass (ruling C5), the cost
+    of the single cluster read this pass always made; never a per-record
+    inspect(), which for Proxmox is a fresh inventory read each.
     """
     # Lazy import: app.routes imports this module.
     from .routes.utils import note_vm_state, VM_PRESENT
 
     now = datetime.now()
-    live = [(vm.id, vm.vmid, vm.node) for vm in
-            VMRecord.query.filter(VMRecord.destroyed == False,  # noqa: E712
-                                  VMRecord.expires_at > now).all()]
-    if not live:
-        return []
-    try:
-        index = get_cluster_vm_index(proxmox, max_age=0, allow_stale=False)
-    except Exception as error:
-        logger.warning("Record reconciliation skipped; inventory "
-                       "unavailable: %s", error)
-        return []
+    live = {}
+    for vm in VMRecord.query.filter(VMRecord.destroyed == False,  # noqa: E712
+                                    VMRecord.expires_at > now).all():
+        live.setdefault(vm.backend or BACKEND_PROXMOX, []).append(
+            (vm.id, vm.vmid, vm.node))
 
     retired = []
-    for record_id, vmid, node in live:
-        if int(vmid) in index:
-            note_vm_state(node, vmid, VM_PRESENT)
+    for backend_name, records in sorted(live.items()):
+        if backend_name in skip_backends:
             continue
-        if reconcile_missing_vm_record(proxmox, record_id, vmid, node):
-            retired.append(vmid)
+        try:
+            backend = get_backend(backend_name)
+        except BackendNotEnabled as error:
+            logger.warning("Record reconciliation skipped %d record(s) of "
+                           "%s: %s", len(records), backend_name, error)
+            continue
+        # One connection for the snapshot and every confirmation after it.
+        with ExitStack() as connection:
+            try:
+                connection.enter_context(
+                    vm_provisioning.provider_session(backend))
+                snapshot = backend.list_managed()
+            except Exception as error:
+                logger.warning("Record reconciliation of %s skipped; "
+                               "inventory unavailable: %s", backend_name, error)
+                continue
+            present = {resource.vmid for resource in snapshot
+                       if resource.kind == 'instance'
+                       and resource.vmid is not None}
+            for record_id, vmid, node in records:
+                if int(vmid) in present:
+                    note_vm_state(node, vmid, VM_PRESENT)
+                    continue
+                if reconcile_missing_vm_record(backend, record_id, vmid, node):
+                    retired.append(vmid)
     return retired
 
 
-def reconcile_missing_vm_record(proxmox, record_id, vmid, node):
-    """Retire one record the cluster inventory no longer lists.
+def reconcile_missing_vm_record(backend, record_id, vmid, node):
+    """Retire one record its backend's inventory no longer lists.
 
     Decides under the VMID lifecycle lock on the row as it stands there,
-    re-confirms the absence against fresh inventory, and counts that as a
-    sighting; only a sighting that completes the ORPHAN_CONFIRM_SECONDS
+    re-confirms the absence through `backend.confirm_absent`, and counts that
+    as a sighting; only a sighting that completes the ORPHAN_CONFIRM_SECONDS
     window retires the record, with a `vm_record_reconciled` AdminAlert in
     the same commit. Shared by the reconcile pass and `/list`. Returns
     whether the record was retired.
@@ -128,20 +155,31 @@ def reconcile_missing_vm_record(proxmox, record_id, vmid, node):
         db.session.rollback()
         vm_record = db.session.get(VMRecord, record_id)
         if (vm_record is None or vm_record.destroyed
-                or vm_record.vmid != vmid or vm_record.node != node):
+                or vm_record.vmid != vmid or vm_record.node != node
+                or (vm_record.backend or BACKEND_PROXMOX) != backend.name):
             return False
-        absent = confirm_proxmox_absence(proxmox, vmid)
+        ref = VMRef.from_record(vm_record)
+        try:
+            absent = backend.confirm_absent(ref)
+        except Exception as error:
+            # A confirmation that raised is no sighting either way; it
+            # restarts the count like any other unknown answer.
+            logger.warning("Could not confirm absence of VM %s on %s: %s",
+                           vmid, ref.backend, error)
+            absent = False
         if not note_vm_state(node, vmid,
                              VM_MISSING if absent else VM_UNKNOWN):
             if absent:
                 logger.warning(
-                    "VM %s (%s) is not in the cluster inventory; keeping "
-                    "its record until a later sighting confirms it",
-                    vmid, vm_record.vm_name)
+                    "VM %s (%s) is not in the %s inventory; keeping its "
+                    "record until a later sighting confirms it",
+                    vmid, vm_record.vm_name, ref.backend)
             return False
 
+        inventory = ('Proxmox cluster' if ref.backend == BACKEND_PROXMOX
+                     else ref.backend)
         message = (f"VM {vmid} ({vm_record.vm_name}) on node {node} was "
-                   "deleted outside the portal: the Proxmox cluster "
+                   f"deleted outside the portal: the {inventory} "
                    "inventory no longer lists it. Its record has been "
                    "retired before its expiry.")
         db.session.add(AdminAlert(
@@ -152,6 +190,7 @@ def reconcile_missing_vm_record(proxmox, record_id, vmid, node):
             vm_name=vm_record.vm_name,
             details=json.dumps({
                 'reason': 'absent_from_cluster_inventory',
+                'backend': ref.backend,
                 'vm_type': vm_record.vm_type,
                 'node': node,
                 'student_name': vm_record.student_name,
@@ -163,7 +202,8 @@ def reconcile_missing_vm_record(proxmox, record_id, vmid, node):
         db.session.commit()
         _forget_vm_caches(node, vmid)
         logger.warning("Retired record for VM %s: %s", vmid, message)
-        return True
+    vm_provisioning.after_record_retired(ref)
+    return True
 
 # Alert file path
 ALERT_LOG_FILE = "/app/data/failed_vms.log"
@@ -233,14 +273,15 @@ def check_and_destroy_expired_vms(app):
         try:
             time.sleep(60)  # Check every 60 seconds
             
-            with app.app_context():
+            # The pass's one Proxmox connection, as the loop always opened;
+            # every Proxmox operation below reuses it.
+            with app.app_context(), ExitStack() as pass_sessions:
                 logger.info(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [Worker {worker_id}] Checking for expired VMs...")
                 # A survivor recorded while the database was down becomes a
                 # tracked, already-expired VM that this pass destroys.
                 _run_durable_step(recover_untracked_survivors)
+                skipped = _open_pass_sessions(pass_sessions)
 
-                proxmox = get_proxmox_connection()
-                
                 # Check all active VMs in database for expiration
                 current_time = datetime.now()
                 active_vms = VMRecord.query.filter_by(destroyed=False).all()
@@ -254,6 +295,11 @@ def check_and_destroy_expired_vms(app):
                         time_remaining = (vm_record.expires_at - current_time).total_seconds()
                         
                         if current_time > vm_record.expires_at:
+                            if (vm_record.backend or BACKEND_PROXMOX) in skipped:
+                                # An outage, not a failed delete: no retry
+                                # is counted and no alert raised for it.
+                                logger.info(f"[Worker {worker_id}] VM {vm_record.vmid} waits for {vm_record.backend} to answer")
+                                continue
                             retry_info = f" (retry {vm_record.deletion_retry_count}/{VM_DELETION_MAX_RETRIES})" if vm_record.deletion_retry_count > 0 else ""
                             if _deletion_retry_due(vm_record, current_time):
                                 logger.info(f"[Worker {worker_id}] VM {vm_record.vmid} ({vm_record.vm_name}) has EXPIRED{retry_info}")
@@ -285,18 +331,8 @@ def check_and_destroy_expired_vms(app):
                                 f"to {vm_record.expires_at}; not destroying")
                             continue
 
-                        identity = inspect_vm_guest(
-                            proxmox, vm_record.vmid,
-                            node=vm_record.node,
-                            vm_name=vm_record.vm_name,
-                            vm_type=vm_record.vm_type,
-                        )
-                        deleted = identity == VM_GUEST_ABSENT
-                        if identity == VM_GUEST_MATCH:
-                            deleted = (
-                                _stop_vm(proxmox, vm_record)
-                                and _delete_vm(proxmox, vm_record)
-                            )
+                        ref = VMRef.from_record(vm_record)
+                        deleted = _destroy_expired(ref)
 
                         if deleted:
                             node = vm_record.node
@@ -324,9 +360,13 @@ def check_and_destroy_expired_vms(app):
                                 f"[Worker {worker_id}] VM {vmid} deletion "
                                 f"failed (attempt {retry_count}); record "
                                 "retained for retry")
+                    if deleted:
+                        # After the commit, outside the VMID lock: the last
+                        # record's deployment and slot networks go with it.
+                        vm_provisioning.after_record_retired(ref)
                     time.sleep(1)
 
-                reconcile_missing_vm_records(proxmox)
+                reconcile_missing_vm_records(skip_backends=skipped)
 
                 # Alert delivery runs after expiry and reconcile and is
                 # time-boxed (ALERT_DISPATCH_MAX_PASS_*): hung SMTP or webhook
@@ -338,97 +378,150 @@ def check_and_destroy_expired_vms(app):
 
                 # Orphan cleanup runs after expiry and is time-boxed
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
-                # never stand between an expired VM and its destroy.
+                # never stand between an expired VM and its destroy. It runs
+                # every pass, so a cloud-only portal still sweeps its cloud
+                # leftovers (ruling C6). The Proxmox sweep uses the pass's
+                # connection and is left out when Proxmox is not enabled or
+                # was unreachable at the start of this pass.
+                proxmox = (get_backend(BACKEND_PROXMOX).connect()
+                           if BACKEND_PROXMOX in enabled_backends()
+                           and BACKEND_PROXMOX not in skipped else None)
                 maybe_reap_orphaned_vms(proxmox)
+
+                # Last: a shared cloud router is a cost, not a safety concern,
+                # so stopping one never delays any phase above.
+                _stop_idle_cloud_routers()
         
         except Exception as e:
             logger.error(f"Error in expiration checker: {str(e)}")
             import traceback
             traceback.print_exc()
             if not alerts_dispatched:
-                # A Proxmox outage ends the pass before delivery; the alerts
-                # that matter most during one must still go out.
+                # An outage that ends the pass before delivery must not keep
+                # the alerts that matter most during one from going out.
                 with app.app_context():
                     _run_durable_step(dispatch_pending_alerts)
 
 
-def _stop_vm(proxmox, vm_record):
-    """
-    Stop a VM without deleting it
-    
-    Args:
-        proxmox (ProxmoxAPI): Proxmox API connection
-        vm_record (VMRecord): Database VM record
-    
-    Returns:
-        bool: True if stopped successfully or already stopped, False on failure
-    """
-    vmid = vm_record.vmid
-    vm_type = vm_record.vm_type
-    node = vm_record.node
-    vm_name = vm_record.vm_name
-    
-    try:
-        if vm_type == 'lxc':
-            stop_upid = proxmox.nodes(node).lxc(vmid).status.stop.post()
-        else:  # qemu
-            stop_upid = proxmox.nodes(node).qemu(vmid).status.stop.post()
-        if stop_upid:
-            result = wait_for_proxmox_task(
-                proxmox, node, stop_upid, timeout=60, poll_interval=1)
-            if not result.get('success'):
-                logger.error(
-                    "Stop task for VM %s failed: %s",
-                    vmid, result.get('error', result.get('status')))
-                return False
-        logger.info(f"Stopped {vm_type} VM {vmid} ({vm_name}) on node {node}")
-        return True
-    except Exception as e:
-        error_msg = str(e).lower()
-        # If already stopped or doesn't exist, consider it successful
-        if 'already stopped' in error_msg or 'not running' in error_msg or 'does not exist' in error_msg or 'configuration file' in error_msg:
-            logger.info(f"VM {vmid} already stopped or not found")
-            return True
-        else:
-            logger.error(f"Error stopping VM {vmid}: {str(e)}")
-            return False
+def _open_pass_sessions(stack):
+    """Open the expiry pass's Proxmox connection; return backends to skip.
 
-
-def _delete_vm(proxmox, vm_record):
+    A Proxmox that cannot be reached at the start of a pass is an outage,
+    not a failed delete: its records wait for the next pass without a retry
+    counted or an alert raised, as when the loop opened its connection
+    first. Cloud records and alert delivery go ahead.
     """
-    Delete a VM (should already be stopped)
-    
-    Args:
-        proxmox (ProxmoxAPI): Proxmox API connection
-        vm_record (VMRecord): Database VM record
-    
-    Returns:
-        bool: True if deleted successfully or already deleted, False on failure
-    """
-    vmid = vm_record.vmid
-    vm_type = vm_record.vm_type
-    node = vm_record.node
-    vm_name = vm_record.vm_name
-    
+    if BACKEND_PROXMOX not in enabled_backends():
+        return frozenset()
     try:
-        if vm_type == 'lxc':
-            delete_upid = proxmox.nodes(node).lxc(vmid).delete()
-        else:  # qemu
-            delete_upid = proxmox.nodes(node).qemu(vmid).delete()
-        result = wait_for_proxmox_task(
-            proxmox, node, delete_upid, timeout=120, poll_interval=1)
-        if result.get('success'):
-            logger.info(f"Deleted {vm_type} VM {vmid} ({vm_name}) on node {node}")
-            return True
-        logger.error(
-            "Destroy task for VM %s failed: %s",
-            vmid, result.get('error', result.get('status')))
-        return False
+        stack.enter_context(vm_provisioning.provider_session(
+            get_backend(BACKEND_PROXMOX)))
     except Exception as error:
-        if confirm_proxmox_absence(proxmox, vmid, error):
-            logger.info(f"VM {vmid} confirmed absent from cluster inventory")
-            return True
-        logger.error(f"Error deleting VM {vmid}: {str(error)}")
+        logger.error("Proxmox unreachable (%s); its VMs wait for the next "
+                     "pass", error)
+        return frozenset({BACKEND_PROXMOX})
+    return frozenset()
+
+
+# Process-local, deliberately: there is no durable last-activity column (VM
+# rows are hard-deleted, admission reservations released), so a restarted
+# worker starts a fresh idle interval — a little extra router cost, never a
+# premature stop.
+_router_idle_since: Dict[str, float] = {}
+_router_idle_guard = threading.Lock()
+
+
+def _reset_router_idle_state_for_tests() -> None:
+    with _router_idle_guard:
+        _router_idle_since.clear()
+
+
+def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
+    """Stop each enabled cloud's router once its backend has sat idle for
+    <BACKEND>_ROUTER_IDLE_MINUTES; return the backends stopped.
+
+    Idle means no live VMRecord and no unexpired admission reservation on
+    that backend. The deciding read happens under the router lifecycle
+    lock, which a launch holds around ensure_router_running() after
+    inserting its reservation (ruling C4), so a launch can never find its
+    router stopped under it. Reservation expiry is compared with now_epoch,
+    which is also the idle clock (ruling M13); it defaults to
+    coordination.lease_clock(). A backend's failure is logged and keeps its
+    idle timestamp, so the next pass retries; the other backends go ahead.
+    """
+    if now_epoch is None:
+        now_epoch = coordination.lease_clock()
+    config = importlib.import_module('app.config')
+    stopped = []
+    for name in enabled_backends():
+        if name == BACKEND_PROXMOX:
+            continue
+        try:
+            idle_seconds = getattr(
+                config, f'{name.upper()}_ROUTER_IDLE_MINUTES') * 60
+            with vm_lifecycle_lock(router_lock_key(name)):
+                # End the REPEATABLE READ snapshot taken before the lock.
+                db.session.rollback()
+                live = VMRecord.query.filter_by(
+                    backend=name, destroyed=False).first()
+                admitting = NodeMemoryReservation.query.filter(
+                    NodeMemoryReservation.node == name,
+                    NodeMemoryReservation.expires_at > now_epoch,
+                ).first()
+                # No transaction stays open across the provider's waiter.
+                db.session.rollback()
+                with _router_idle_guard:
+                    if live is not None or admitting is not None:
+                        _router_idle_since.pop(name, None)
+                        continue
+                    since = _router_idle_since.setdefault(name, now_epoch)
+                if now_epoch - since < idle_seconds:
+                    continue
+                get_backend(name).stop_router()
+            with _router_idle_guard:
+                # Forgotten once stopped, so a stopped router is not asked
+                # to stop again every pass.
+                _router_idle_since.pop(name, None)
+            stopped.append(name)
+            logger.info("Stopped the %s router after %d idle minutes",
+                        name, idle_seconds // 60)
+        except Exception:
+            db.session.rollback()
+            logger.exception("Could not stop the idle %s router; retrying "
+                             "next pass", name)
+    return stopped
+
+
+def _destroy_expired(ref):
+    """Destroy one expired guest through the backend its record names.
+
+    Returns whether the guest is confirmed gone. Every failure — a provider
+    error, a refused STRICT delete, an identity mismatch, or a backend later
+    removed from ENABLED_BACKENDS (ruling I18) — keeps the record, which the
+    caller counts as a failed attempt so the retry backoff and the deletion
+    alert see it. The record is the only thing that keeps this guest from
+    running unaccounted.
+    """
+    try:
+        backend = backend_for(ref)
+    except BackendNotEnabled as error:
+        logger.error("VM %s is on %s, which is not enabled (%s); keeping its "
+                     "record for retry", ref.vmid, ref.backend, error)
+        return False
+    try:
+        with vm_provisioning.provider_session(backend):
+            identity = backend.inspect(ref)
+            if identity == GUEST_ABSENT:
+                return True
+            if identity != GUEST_MATCH:
+                logger.error("VM %s identity is %s; not destroying it",
+                             ref.vmid, identity)
+                return False
+            vm_provisioning.destroy_vm(ref, DestroyPolicy.STRICT)
+        return True
+    except Exception as error:
+        logger.error("Error destroying expired VM %s on %s: %s",
+                     ref.vmid, ref.backend, error)
         return False
 
 

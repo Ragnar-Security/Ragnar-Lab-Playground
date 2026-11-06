@@ -34,6 +34,9 @@ Before deploying to production, ensure:
 - [ ] Ports 80 and 443 are reachable for the Caddy frontend
 - [ ] Backup strategy is planned and documented
 - [ ] You have reviewed the security considerations
+- [ ] For an AWS or Google Cloud backend: the one-time cloud setup, IAM,
+      quotas and live contract run in [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md)
+      are done
 
 ## Initial Setup
 
@@ -443,10 +446,17 @@ restart before this release.
 loop writes deletion-failure and orphan-reaped alerts there and delivers them
 from it, so the table must exist before the new code's first expiry pass.
 
+`migrate_add_vm_backend.py` adds `backend`, `provider_id`, `deployment_id`
+and `network_slot` to `vm_records`, plus an index on `deployment_id`.
+Existing rows become `backend='proxmox'` through the column default. The new
+code reads these columns for every record it creates, extends or destroys,
+so they must exist before it starts; the old code ignores them.
+
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
+                 migrate_add_vm_backend.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -458,7 +468,8 @@ the migration itself, the file is not there yet. Inject it for this one run:
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
-                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py; do
+                 migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
+                 migrate_add_vm_backend.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration
@@ -474,6 +485,11 @@ docker compose -f ./docker-compose.prod.yml down && \
   docker compose -f ./docker-compose.prod.yml up -d --build
 ```
 
+A host whose `.env` sets `COMPOSE_FILE` (a release image, or the cloud
+credentials override in `docs/CLOUD_BACKENDS.md`) runs plain
+`docker compose down && docker compose up -d --build` instead; an explicit
+`-f docker-compose.prod.yml` would drop the override.
+
 **5. Verify.** All five checks must pass.
 
 ```bash
@@ -487,6 +503,11 @@ curl -s -o /dev/null -w '%{http_code}\n' https://lab.example.edu/koth/api/_diag 
 The last two must be `401`. A `200` means an authenticated route is open to
 anyone.
 
+With a cloud backend enabled, also run the one-VM check in
+[`docs/CLOUD_BACKENDS.md`](CLOUD_BACKENDS.md) ("Configure and validate the
+portal", step 6): router start, a private address in the slot, destroy, and
+an empty inventory.
+
 For an authenticated check without a password, drive the app's own test
 client inside the container. `PYTHONPATH=/app` is required, because the
 script does not live in the application directory. Pick an **enabled** admin:
@@ -498,7 +519,10 @@ docker compose -f docker-compose.prod.yml exec -T -e PYTHONPATH=/app \
   vm-automation python - <<'PY'
 from app import create_app
 from app.models import User
-app = create_app()
+# start_background_tasks=False: no KOTH boot recovery or second scorer beside
+# the live server. (scripts/init_db.py, cleanup_db.py, import_students.py and
+# migrate_add_vlan.py still run that recovery; avoid them during a game.)
+app = create_app(start_background_tasks=False)
 with app.app_context():
     admin = User.query.filter_by(is_admin=True, disabled=False).first()
 c = app.test_client()
@@ -533,9 +557,81 @@ code does not deliver alerts still queued in `alert_outbox`
 (`SELECT * FROM alert_outbox WHERE status = 'pending'`), so read those by hand
 after a rollback.
 
-The old code also never reads the failed-deploy survivor files (see
+**A rollback to a release before multi-backend support (v1.0.0) is safe only
+while nothing on a cloud depends on the new code.** The old code reads every
+record as a Proxmox guest and never destroys a cloud machine. A cloud
+survivor recorded during a database outage exists **only** in the
+failed-deploy survivor files, with no `vm_records` row: v1.0.0 rejects such a
+line as corrupt and moves it to `.corrupt`, which no release imports, and
+builds before v1.0.0 ignore the files. A clean record query alone therefore
+does not prove the rollback safe. Run both checks **before** checking out
+the old release:
+
+1. **No live cloud records.** Only `proxmox` may be listed. Otherwise tear
+   the clouds down first (`docs/CLOUD_BACKENDS.md`, "Teardown and incident
+   response").
+
+   ```bash
+   docker compose -f docker-compose.prod.yml exec -T db \
+     sh -c 'exec mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE" -e \
+     "SELECT backend, COUNT(*) FROM vm_records WHERE destroyed = 0 GROUP BY backend"'
+   ```
+
+2. **No cloud survivor lines.** `.jsonl` and `.importing` must each be absent
+   or hold only Proxmox lines (a line without `backend` is a Proxmox guest).
+   The check runs in a one-off container of the current image, so it works
+   whether the app is running or stopped, and honours
+   `UNTRACKED_SURVIVORS_FILE`. It prints `OK` and exits 0 when safe; otherwise
+   it lists each blocking line and exits 1. A line it cannot parse blocks too,
+   because it may describe a cloud machine.
+
+   ```bash
+   docker compose -f docker-compose.prod.yml run --rm --no-deps -T vm-automation \
+     python - <<'PY'
+   import json, os
+   from app.config import untracked_survivors_file
+   path = untracked_survivors_file()
+   blocking = []
+   for name in (path, path + '.importing'):
+       if not os.path.exists(name):
+           continue
+       with open(name, encoding='utf-8', errors='replace') as handle:
+           for number, line in enumerate(handle, 1):
+               if not line.strip():
+                   continue
+               try:
+                   backend = json.loads(line).get('backend') or 'proxmox'
+               except (ValueError, AttributeError):
+                   backend = 'unparseable'
+               if backend != 'proxmox':
+                   blocking.append(f'{name}:{number}: backend={backend}')
+   print('\n'.join(blocking) or 'OK: no cloud survivor lines')
+   raise SystemExit(1 if blocking else 0)
+   PY
+   ```
+
+**If the survivor check lists a line, drain the files first.** Only the new
+release can import those lines and destroy their machines:
+
+1. Run the new release with the database up and that cloud still in
+   `ENABLED_BACKENDS`, with its credentials. If you already disabled the
+   cloud, enable it again and restart the app.
+2. Let the import and expiry run. The app imports pending lines at startup
+   and on every expiry pass (once a minute) as already-expired records, and
+   the expiry loop destroys their machines. Do not delete or edit the files
+   by hand.
+3. Re-run both checks until the survivor check prints `OK` and the record
+   query lists only `proxmox`. A cloud record that stays is a machine the
+   portal could not destroy; resolve it by the teardown procedure.
+
+Then stop the app (`docker compose -f docker-compose.prod.yml stop
+vm-automation`), so no deploy can record a new survivor, and run both checks
+once more before the rollback in step 6.
+
+A build before v1.0.0 never reads the survivor files (see
 [Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage)).
-After a rollback, check for them on the host:
+After rolling back to one, check them on the host. Thanks to the checks
+above, any line still in them is a Proxmox guest:
 
 ```bash
 ls -l data/untracked-survivors.jsonl data/untracked-survivors.jsonl.importing \
@@ -558,6 +654,11 @@ destroys it. Choose one of these:
   Then delete `.jsonl` and `.importing`, so a later upgrade does not import
   stale lines. The orphan reaper may remove such guests after their
   `Expires:` time plus grace, but do not rely on it.
+- **A line in `.corrupt`** is imported by no release. Check each one by hand
+  as in [Failed-deploy survivors](#failed-deploy-survivors-recorded-during-a-database-outage);
+  for a line naming `aws` or `gcp`, find the machine in that cloud by its
+  site tag or label and vmid (`docs/CLOUD_BACKENDS.md`, "Teardown and
+  incident response"), before or after the rollback.
 
 The `.lock` and `.import.lock` files beside them are empty lock files. They
 are harmless, and can be deleted whenever the app is stopped.
@@ -1052,6 +1153,7 @@ If you encounter issues:
 - [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) - Development setup
 - [USER_AUTH_GUIDE.md](USER_AUTH_GUIDE.md) - Authentication system
 - [DOCKER.md](DOCKER.md) - Docker configuration details
+- [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md) - AWS and Google Cloud backends: setup, Headscale policy, VLAN isolation, teardown
 
 ---
 

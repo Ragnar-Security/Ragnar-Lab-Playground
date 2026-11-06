@@ -102,6 +102,43 @@ class TemplatesGroupFilterTestCase(unittest.TestCase):
         self.assertIn('Regular', names)
         self.assertIn('KOTH', names)
 
+    # Catches backend validation errors never reaching the admin who must fix the YAML (M12).
+    def test_admin_sees_config_errors_and_students_do_not(self):
+        bad = {'deployment_groups': [
+            {'display_name': 'Cloud Lab', 'enabled': True, 'backend': 'aws',
+             'templates': [{'name': 'vm', 'entry_point': True}]}]}
+        with patch('app.routes.templates.load_template_config', return_value=bad):
+            self._login('admin')
+            admin_body = self.client.get('/templates').get_json()
+            student = self.app.test_client()
+            student.post('/auth/login', data={'login_id': 'solo', 'password': 'x'})
+            student_body = student.get('/templates').get_json()
+        assert any('Cloud Lab' in e and 'aws' in e for e in admin_body['config_errors'])
+        assert 'config_errors' not in student_body
+        # The misconfigured group stays listed so the admin can see what is broken.
+        assert [g['display_name'] for g in admin_body['deployment_groups']] == ['Cloud Lab']
+
+    # Catches a clean catalog showing the admin phantom errors.
+    def test_admin_sees_empty_config_errors_for_clean_catalog(self):
+        self._login('admin')
+        # Pinned: FAKE_CONFIG is a Proxmox catalog, whatever the shell exports.
+        with patch('app.routes.templates.load_template_config', return_value=FAKE_CONFIG), \
+                patch('app.config.ENABLED_BACKENDS', ('proxmox',)):
+            body = self.client.get('/templates').get_json()
+        assert body['success'] is True
+        assert body['config_errors'] == []
+
+    # Catches a validator crash taking the admin's whole group listing down with it.
+    def test_validation_failure_does_not_break_admin_listing(self):
+        self._login('admin')
+        with patch('app.routes.templates.load_template_config', return_value=FAKE_CONFIG), \
+                patch('app.routes.templates.validate_template_config',
+                      side_effect=RuntimeError('boom')):
+            body = self.client.get('/templates').get_json()
+        assert body['success'] is True
+        assert len(body['deployment_groups']) == 2
+        assert body['config_errors'] == ['template validation failed: boom']
+
 
 if __name__ == '__main__':
     unittest.main()

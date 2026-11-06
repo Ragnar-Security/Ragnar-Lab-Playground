@@ -8,19 +8,51 @@ import os
 import json
 import requests
 from datetime import datetime, timedelta
-from unittest.mock import Mock, patch, MagicMock, mock_open
+from unittest.mock import Mock, call, patch, MagicMock, mock_open
+from app.backends.base import DestroyPolicy, VMRef
+from app.backends.proxmox import ProxmoxBackend
 from app.tasks import (
-    _stop_vm, _delete_vm,
     _log_alert_to_file, _create_database_alert,
     VM_DELETION_MAX_RETRIES
 )
 from app.models import VMRecord, AdminAlert, db
 
 
+def _listed(vm_record):
+    return [{'vmid': vm_record.vmid, 'name': vm_record.vm_name,
+             'node': vm_record.node, 'type': vm_record.vm_type,
+             'status': 'running'}]
+
+
+def _strict_destroy(proxmox, vm_record, inventory=None):
+    """Expiry's stop-then-delete: ProxmoxBackend.destroy under STRICT.
+
+    `inventory` is the sequence of cluster reads; by default the guest is
+    listed, as the identity check before any mutation requires. Returns
+    whether the guest is gone, which is what expiry retires on.
+    """
+    from app.proxmox_service import reset_cluster_vm_index
+    if inventory is None:
+        proxmox.cluster.resources.get.return_value = _listed(vm_record)
+    else:
+        proxmox.cluster.resources.get.side_effect = inventory
+    reset_cluster_vm_index()
+    try:
+        ProxmoxBackend(client=proxmox).destroy(
+            VMRef.from_record(vm_record), DestroyPolicy.STRICT)
+    except Exception:
+        return False
+    return True
+
+
+_TASK_OK = {'success': True, 'status': 'stopped'}
+
+
 class TestVMStopAndDelete:
-    """Test VM stop and delete helper functions"""
-    
-    def test_stop_vm_success(self, app):
+    """Expiry's stop and delete, through ProxmoxBackend's STRICT policy"""
+
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_stop_vm_success(self, _mock_wait, app):
         """Test successful VM stop"""
         with app.app_context():
             # Create test VM record
@@ -40,12 +72,12 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.return_value = None
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is True
             mock_proxmox.nodes().qemu().status.stop.post.assert_called_once()
 
-    @patch('app.tasks.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
     def test_stop_vm_waits_for_async_task(self, mock_wait, app):
         with app.app_context():
@@ -61,14 +93,20 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.return_value = (
                 'UPID:stop')
+            mock_proxmox.nodes().qemu().delete.return_value = 'UPID:delete'
 
-            assert _stop_vm(mock_proxmox, vm_record) is True
+            assert _strict_destroy(mock_proxmox, vm_record) is True
 
-            mock_wait.assert_called_once_with(
-                mock_proxmox, 'pve', 'UPID:stop',
-                timeout=60, poll_interval=1)
+            # Exactly one stop wait, then exactly one delete wait.
+            assert mock_wait.call_args_list == [
+                call(mock_proxmox, 'pve', 'UPID:stop',
+                     timeout=60, poll_interval=1),
+                call(mock_proxmox, 'pve', 'UPID:delete',
+                     timeout=120, poll_interval=1),
+            ]
     
-    def test_stop_vm_already_stopped(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_stop_vm_already_stopped(self, _mock_wait, app):
         """Test stopping a VM that's already stopped"""
         with app.app_context():
             vm_record = VMRecord(
@@ -87,7 +125,7 @@ class TestVMStopAndDelete:
             # Simulate "already stopped" error
             mock_proxmox.nodes().lxc().status.stop.post.side_effect = Exception("already stopped")
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             # Should still return True (graceful handling)
             assert result is True
@@ -110,11 +148,12 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().status.stop.post.side_effect = Exception("Network error")
             
-            result = _stop_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is False
+            mock_proxmox.nodes().qemu().delete.assert_not_called()
     
-    @patch('app.tasks.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
     def test_delete_vm_success(self, mock_wait, app):
         """Test successful VM deletion"""
@@ -134,12 +173,13 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().delete.return_value = None
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is True
             mock_proxmox.nodes().qemu().delete.assert_called_once()
     
-    def test_delete_vm_not_found(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_delete_vm_not_found(self, _mock_wait, app):
         """Test deleting a VM that doesn't exist"""
         with app.app_context():
             vm_record = VMRecord(
@@ -156,14 +196,17 @@ class TestVMStopAndDelete:
             
             mock_proxmox = Mock()
             mock_proxmox.nodes().lxc().delete.side_effect = Exception("does not exist")
-            mock_proxmox.cluster.resources.get.return_value = []
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            # Listed for the identity check, then gone when the delete's
+            # "does not exist" is confirmed against fresh inventory.
+            result = _strict_destroy(
+                mock_proxmox, vm_record, inventory=[_listed(vm_record), []])
             
             # Should return True (VM already gone)
             assert result is True
     
-    def test_delete_vm_failure(self, app):
+    @patch('app.proxmox_service.wait_for_proxmox_task', return_value=_TASK_OK)
+    def test_delete_vm_failure(self, _mock_wait, app):
         """Test VM deletion failure"""
         with app.app_context():
             vm_record = VMRecord(
@@ -181,7 +224,7 @@ class TestVMStopAndDelete:
             mock_proxmox = Mock()
             mock_proxmox.nodes().qemu().delete.side_effect = Exception("Storage locked")
             
-            result = _delete_vm(mock_proxmox, vm_record)
+            result = _strict_destroy(mock_proxmox, vm_record)
             
             assert result is False
 
@@ -721,7 +764,8 @@ class TestExpiryNotStarvedByAlerts:
             assert db.session.get(VMRecord, vm_id) is None
 
     @patch("app.tasks.maybe_reap_orphaned_vms", return_value=[])
-    @patch("app.tasks.get_proxmox_connection",
+    # ProxmoxBackend opens the pass's connection at the definition site.
+    @patch("app.proxmox_service.get_proxmox_connection",
            side_effect=RuntimeError("Proxmox unreachable"))
     def test_proxmox_outage_still_delivers_queued_alerts(
             self, _connect, _reaper, app):
@@ -891,3 +935,312 @@ class TestManualDeletionReconciliation:
 
         with app.app_context():
             assert db.session.get(VMRecord, vm_id) is not None
+
+
+def register_cloud_sweep_backend(name):
+    from app.backends import register_backend_factory
+    from tests.test_orphan_reaper import _CloudSweepBackend
+    sweep = _CloudSweepBackend(name)
+    register_backend_factory(name, lambda: sweep)
+    return sweep
+
+
+def test_cloud_only_expiry_pass_runs_the_cloud_sweep(app, monkeypatch):
+    # Catches a cloud-only portal never reaping leaked cloud resources (C6).
+    import importlib
+    from app import orphan_reaper
+    from app.backends import register_backend_factory
+    from tests.test_orphan_reaper import NOW_EPOCH
+    config = importlib.import_module("app.config")
+    monkeypatch.setattr(config, "ENABLED_BACKENDS", ("aws",))
+    monkeypatch.setattr(orphan_reaper, "ORPHAN_REAPER_ENABLED", True)
+    monkeypatch.setattr(orphan_reaper, "_last_sweep_at", None)
+
+    class _SweepStart(datetime):
+        # The fake orphans are aged against NOW_EPOCH, not the real clock.
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(NOW_EPOCH, tz)
+
+    monkeypatch.setattr(orphan_reaper, "datetime", _SweepStart)
+    sweep = register_cloud_sweep_backend("aws")
+    sweep.reset_with_old_orphans(1)
+    register_backend_factory("proxmox", lambda: pytest.fail("Proxmox constructed"))
+    _run_one_expiry_pass(app)
+    assert sweep.resources == []
+
+
+@patch("app.proxmox_service.get_proxmox_connection",
+       side_effect=RuntimeError("Proxmox unreachable"))
+def test_proxmox_outage_pass_still_runs_the_cloud_sweep_without_proxmox(
+        _connect, app, monkeypatch):
+    # Catches the pass-start Proxmox outage skip also skipping cloud cleanup,
+    # or handing the reaper a client it could not open.
+    import importlib
+    config = importlib.import_module("app.config")
+    monkeypatch.setattr(config, "ENABLED_BACKENDS", ("proxmox", "aws"))
+    with patch("app.tasks.maybe_reap_orphaned_vms", return_value=[]) as reaper:
+        _run_one_expiry_pass(app)
+    reaper.assert_called_once_with(None)
+
+
+# ---- idle cloud routers (T16) ----------------------------------------------
+
+import importlib
+import time
+
+from app.backends import register_backend_factory, reset_backends_for_tests
+from app.backends.base import BackendError, LaunchedVM
+from app.backends.cloud_common import router_lock_key
+from app.models import NodeMemoryReservation
+from app.proxmox_service import vm_lifecycle_lock
+from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
+from tests.backends.fake_backend import FakeBackend
+
+config = importlib.import_module("app.config")
+
+_IDLE_VM_NAME = "router-idle-vm"
+
+
+@pytest.fixture(autouse=True)
+def _fresh_router_idle_state():
+    # Every expiry pass in this module runs the router step, so a pass with a
+    # cloud enabled leaves an idle timestamp; no test may inherit one. Enables
+    # no backend: the Proxmox suites above keep their configuration.
+    _reset_router_idle_state_for_tests()
+    yield
+    _reset_router_idle_state_for_tests()
+
+
+@pytest.fixture
+def router_backend(app, monkeypatch):
+    # Router-idle tests only: one enabled fake AWS backend with a running router.
+    fake = FakeBackend('aws')
+    fake.router_running = True
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 30)
+    register_backend_factory('aws', lambda: fake)
+    _reset_router_idle_state_for_tests()
+    with app.app_context():
+        yield fake
+    _reset_router_idle_state_for_tests()
+    reset_backends_for_tests()
+
+
+def add_live_record(backend, *, vmid=4100, expires_at=None):
+    record = VMRecord(
+        vmid=vmid, vm_name=_IDLE_VM_NAME, vm_type="instance", node=backend,
+        backend=backend, provider_id=f"provider-{vmid}",
+        template_name="cloud/vm", student_name="student",
+        expires_at=expires_at or datetime.now() + timedelta(hours=1))
+    db.session.add(record)
+    db.session.commit()
+    return record
+
+
+def retire_record():
+    VMRecord.query.filter_by(vm_name=_IDLE_VM_NAME).delete()
+    db.session.commit()
+
+
+def observe_idle_at(t):
+    assert _stop_idle_cloud_routers(now_epoch=t) == []
+
+
+def add_node_reservation(node, expires_at, reservation_id='r-idle'):
+    db.session.add(NodeMemoryReservation(
+        reservation_id=reservation_id, node=node, memory_bytes=1,
+        expires_at=expires_at))
+    db.session.commit()
+
+
+def remove_reservation():
+    NodeMemoryReservation.query.filter_by(reservation_id='r-idle').delete()
+    db.session.commit()
+
+
+def arrange_lock_owner_to_insert_reservation_before_yield(app, backend, expires_at):
+    """A launch admission holding the router lock when the idle check arrives."""
+    holding = threading.Event()
+
+    def owner():
+        with app.app_context():
+            with vm_lifecycle_lock(router_lock_key(backend)):
+                holding.set()
+                time.sleep(0.2)
+                add_node_reservation(node=backend, expires_at=expires_at)
+
+    thread = threading.Thread(target=owner)
+    thread.start()
+    assert holding.wait(timeout=5), "lock owner never took the router lock"
+    return thread
+
+
+def test_router_stops_only_after_one_continuous_idle_window(app, router_backend):
+    # Catches stopping immediately when the last row disappears.
+    add_live_record(backend="aws")
+    assert _stop_idle_cloud_routers(now_epoch=1_000) == []
+    retire_record()
+    assert _stop_idle_cloud_routers(now_epoch=1_001) == []
+    assert _stop_idle_cloud_routers(now_epoch=2_800) == []
+    assert _stop_idle_cloud_routers(now_epoch=2_801) == ["aws"]
+    assert router_backend.router_running is False
+
+
+def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app, router_backend):
+    # Catches a stop racing a new deployment that has reserved capacity but no VMRecord yet.
+    observe_idle_at(1_000)
+    add_node_reservation(node="aws", expires_at=2_000)
+    assert _stop_idle_cloud_routers(now_epoch=1_100) == []
+    remove_reservation()
+    assert _stop_idle_cloud_routers(now_epoch=1_200) == []  # first idle observation
+    assert _stop_idle_cloud_routers(now_epoch=2_999) == []
+    assert router_backend.router_running is True
+    assert _stop_idle_cloud_routers(now_epoch=3_000) == ["aws"]
+
+
+def test_unexpired_admission_reservation_blocks_stop_without_any_record(app, router_backend):
+    # Catches a stop between a launch's router start and its VMRecord commit (C4).
+    observe_idle_at(0)
+    add_node_reservation(node="aws", expires_at=10_060)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    assert router_backend.router_running is True
+
+
+def test_expired_reservation_does_not_block_stop(app, router_backend):
+    # Catches a leaked lease keeping the router billing forever (M13).
+    observe_idle_at(0)
+    add_node_reservation(node="aws", expires_at=9_999)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_other_backends_workload_does_not_keep_router_running(app, router_backend):
+    # Catches counting a Proxmox record or another cloud's lease as AWS work.
+    observe_idle_at(0)
+    add_live_record(backend="proxmox")
+    add_node_reservation(node="gcp", expires_at=10_060)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_destroyed_koth_record_does_not_keep_router_running(app, router_backend):
+    # Catches a retained-as-destroyed KOTH row counting as a live guest.
+    record = add_live_record(backend="aws")
+    record.destroyed = True
+    db.session.commit()
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
+
+
+def test_router_lock_rechecks_workload_before_stop(app, router_backend):
+    # Catches launch admission landing while the idle worker waits for the router lock.
+    observe_idle_at(0)
+    owner = arrange_lock_owner_to_insert_reservation_before_yield(
+        app, backend="aws", expires_at=10_060)
+    try:
+        assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    finally:
+        owner.join(timeout=5)
+    assert router_backend.router_running is True
+
+
+def test_worker_restart_waits_a_fresh_idle_interval(app, router_backend):
+    # Catches a restart stopping at once because no in-memory history says otherwise.
+    observe_idle_at(0)
+    _reset_router_idle_state_for_tests()
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    assert router_backend.router_running is True
+    assert _stop_idle_cloud_routers(now_epoch=11_800) == ["aws"]
+
+
+def test_stopped_router_is_not_stopped_again_every_pass(app, router_backend):
+    # Catches calling the provider every minute once the router is already stopped.
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == ["aws"]
+    router_backend.router_running = True  # only a fresh stop could clear this
+    assert _stop_idle_cloud_routers(now_epoch=1_860) == []
+    assert router_backend.router_running is True
+
+
+def test_failed_router_stop_keeps_its_idle_timestamp_for_retry(app, router_backend):
+    # Catches a failed stop being reported as stopped, or restarting the idle window.
+    def refuse_stop():
+        raise BackendError("router stop wait failed")
+
+    observe_idle_at(0)
+    router_backend.stop_router = refuse_stop
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == []
+    assert router_backend.router_running is True
+    del router_backend.stop_router
+    assert _stop_idle_cloud_routers(now_epoch=1_860) == ["aws"]
+    assert router_backend.router_running is False
+
+
+def test_one_backends_stop_failure_does_not_block_the_other(
+        app, router_backend, monkeypatch):
+    # Catches one cloud's provider error ending the router step for every cloud.
+    gcp = FakeBackend('gcp')
+    gcp.router_running = True
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws', 'gcp'))
+    monkeypatch.setattr(config, 'GCP_ROUTER_IDLE_MINUTES', 30)
+    register_backend_factory('gcp', lambda: gcp)
+
+    def refuse_stop():
+        raise BackendError("router stop wait failed")
+
+    router_backend.stop_router = refuse_stop
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=1_800) == ["gcp"]
+    assert (router_backend.router_running, gcp.router_running) == (True, False)
+
+
+def test_router_idle_uses_each_backends_configured_minutes(
+        app, router_backend, monkeypatch):
+    # Catches one hard-coded interval for every cloud.
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 5)
+    observe_idle_at(0)
+    assert _stop_idle_cloud_routers(now_epoch=299) == []
+    assert _stop_idle_cloud_routers(now_epoch=300) == ["aws"]
+
+
+@pytest.fixture
+def expiry_events(router_backend, monkeypatch):
+    events = []
+
+    def recorder(name, result=None):
+        def record(*args, **kwargs):
+            events.append(name)
+            return result
+        return record
+
+    monkeypatch.setattr(vm_tasks, "reconcile_missing_vm_records",
+                        recorder("reconcile", []))
+    monkeypatch.setattr(vm_tasks, "dispatch_pending_alerts", recorder("alerts"))
+    monkeypatch.setattr(vm_tasks, "maybe_reap_orphaned_vms",
+                        recorder("orphans", []))
+    monkeypatch.setattr(vm_tasks, "_stop_idle_cloud_routers",
+                        recorder("routers", []))
+
+    # One expired AWS record whose guest is still there to destroy.
+    vmid = 4200
+    router_backend.instances[vmid] = LaunchedVM(
+        vmid=vmid, vm_type="aws", location="memory-zone", network_slot=None,
+        provider_id=f"provider-{vmid}")
+    router_backend._instance_tags[vmid] = {
+        "vm_name": _IDLE_VM_NAME, "deployment_id": None}
+    add_live_record(backend="aws", vmid=vmid,
+                    expires_at=datetime.now() - timedelta(minutes=5))
+    destroy = router_backend.destroy
+
+    def recording_destroy(ref, policy):
+        events.append("destroy")
+        return destroy(ref, policy)
+
+    router_backend.destroy = recording_destroy
+    return events
+
+
+def test_router_idle_step_runs_after_reconcile_alerts_and_orphan_sweep(
+        app, router_backend, expiry_events):
+    # Catches shared-cost cleanup moving ahead of the safety-critical expiry phases.
+    _run_one_expiry_pass(app)
+    assert expiry_events == ["destroy", "reconcile", "alerts", "orphans", "routers"]

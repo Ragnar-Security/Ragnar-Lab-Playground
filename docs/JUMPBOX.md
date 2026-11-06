@@ -27,7 +27,7 @@ dry run unless you pass `--apply`:
 | Script | Runs on | Does |
 |--------|---------|------|
 | `scripts/jumpbox_provision.sh` | the Proxmox node | creates the VM: cloud image, full disk, two NICs, cloud-init login |
-| `scripts/jumpbox_configure.sh` | the jumpbox | netplan VLAN gateways, dnsmasq, forwarding sysctls, root disk growth; optionally Tailscale, key-only SSH, Zeek/RITA |
+| `scripts/jumpbox_configure.sh` | the jumpbox | netplan VLAN gateways, dnsmasq, forwarding sysctls, root disk growth; optionally Tailscale, key-only SSH, staff-only SSH, inter-VLAN isolation, Zeek/RITA |
 | `scripts/jumpbox_accounts.sh` | the jumpbox | optional student SSH accounts: `create`, `lock-stale`, `unlock` |
 
 `scripts/jumpbox_netgen.py` renders the netplan and dnsmasq files for
@@ -205,13 +205,18 @@ jumpbox is approved without a manual step:
 
 ## Recommended security settings
 
-### Headscale ACL: members reach the labs, not the jumpbox
+### Headscale ACL: each student reaches only their own labs
 
-`config/headscale-acl.example.json` lets every member reach `tag:jumpbox:*`,
-which covers SSH and every other service on the jumpbox. Students need only
-the advertised routes. Routed traffic is matched against its destination
-(`10.x.x.x`), not against the router's tag, so this member rule keeps lab
-access and closes the jumpbox itself:
+`config/headscale-acl.example.json` gives every member (`autogroup:member`)
+`autogroup:self`, `tag:jumpbox:*` and the hosts and ranges it lists. Routed
+traffic is matched against its destination (`10.x.x.x`), not against the
+router's tag, so the policy is
+where per-student access is decided. `scripts/apply_headscale_policy.sh`
+renders it from the portal (dry run by default, `--apply` to install): each
+roster login reaches only its own entry network, its groups' networks and the
+running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
+rule of your base policy except the blanket rule whose `src` is exactly
+`["autogroup:member"]`, so a rule like this one is replaced:
 
 ```json
 {
@@ -221,8 +226,10 @@ access and closes the jumpbox itself:
 }
 ```
 
-Keep the staff rule as it is. Test the change with one student before applying
-it to everyone.
+Keep the staff rule, and any infrastructure access, as explicit rules in the
+base file. `docs/CLOUD_BACKENDS.md` ("Apply the Headscale policy") has the
+procedure, when to re-run it, and the rollback. Test with one student before
+applying it to everyone.
 
 ### Key-only SSH
 
@@ -314,6 +321,59 @@ sudo systemctl disable --now jumpbox-ssh-filter.service   # ExecStop deletes the
 This does not enable key-only SSH; that stays a separate choice
 (`--ssh-keys-only`), which you cannot take while a staff account signs in with
 a password.
+
+### VLAN isolation
+
+The jumpbox is every lab VLAN's gateway, so without this step a lab VM can
+reach another student's lab VM on another VLAN by routing through it. The
+Headscale policy cannot stop that: the traffic never leaves the jumpbox.
+
+```bash
+sudo jumpbox/jumpbox_configure.sh --isolate-vlans                         # dry run: shows the diff
+sudo jumpbox/jumpbox_configure.sh --apply --no-try --isolate-vlans
+sudo jumpbox/jumpbox_configure.sh --apply --no-try --isolate-vlans --allow-vlans 300-305
+```
+
+This writes `/etc/nftables.d/jumpbox-vlan-isolation.nft` and
+`/etc/systemd/system/jumpbox-vlan-isolation.service` (a oneshot that loads the
+file before the network) and enables the unit. The file is its own table,
+`inet jumpbox_vlan_isolation`, with a forward hook at priority -10 and policy
+accept, holding one rule: count and drop what enters **and** leaves through a
+`vlan*` interface. Traffic between `tailscale0` and a VLAN (students, staff),
+management traffic and the jumpbox's own traffic are untouched, and so is
+traffic inside one VLAN, which never crosses the jumpbox. A group's entry and
+internal networks are joined by the entry machine's second NIC, not by
+jumpbox routing, so group labs keep working. The ruleset is checked with
+`nft -c -f` first, and the script refuses when `nft` is missing. Have console
+or recovery access before the first `--apply`; `--no-try` applies a pending
+netplan change without the interactive `netplan try`.
+
+**`--allow-vlans LIST`** (comma-separated tags and `first-last` ranges, tags
+2-4094; only with `--isolate-vlans`) exempts those VLANs from the drop in
+both directions: an exempt VLAN may exchange traffic with every lab VLAN.
+KOTH players arrive over the tailnet, which the table never touches, so set
+it to the KOTH VLAN range only if KOTH boxes must reach each other across
+VLANs, or team VLANs must reach the KOTH VLANs. Re-run with the new list
+whenever the KOTH tags change; a run without `--allow-vlans` removes every
+exemption.
+
+**Verify:** from a student device, your own lab VM still answers; from a lab
+VM, a VM on another VLAN does not, and the drop counter in
+`sudo nft list table inet jumpbox_vlan_isolation` rises.
+
+**Reload, never restart.** The script swaps a changed table with
+`reload-or-restart` on the active unit (ExecReload loads the new table in one
+transaction). **Never `systemctl restart` the unit**: stop deletes the table,
+so the VLANs are unisolated until start loads it again.
+
+**Roll back:**
+
+```bash
+sudo systemctl disable --now jumpbox-vlan-isolation.service   # ExecStop deletes the table
+sudo rm /etc/nftables.d/jumpbox-vlan-isolation.nft /etc/systemd/system/jumpbox-vlan-isolation.service
+sudo systemctl daemon-reload
+sudo nft list table inet jumpbox_vlan_isolation               # must fail: no such table
+```
 
 ## Optional: Zeek and RITA
 

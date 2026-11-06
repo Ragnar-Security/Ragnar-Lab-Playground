@@ -3,6 +3,8 @@ Unit tests for template_manager module
 Tests YAML template loading and management functions
 """
 
+import importlib
+import pytest
 import unittest
 import os
 import yaml
@@ -17,6 +19,10 @@ from app.template_manager import (
     get_template_for_vm,
     TemplateConfigError,
 )
+from app.template_manager import validate_template_config
+
+# The module, not `from app import config`: that name is the config-class mapping.
+config = importlib.import_module('app.config')
 
 
 class TestTemplateManager(unittest.TestCase):
@@ -305,6 +311,69 @@ class GetTemplateForVMTestCase(unittest.TestCase):
     def test_returns_none_when_group_has_no_templates(self):
         config = {'deployment_groups': [{'display_name': 'empty'}]}
         self.assertIsNone(get_template_for_vm(config, 'empty/anything'))
+
+
+# Catches a Proxmox node named like a cloud backend sharing its admission reservations (M14).
+@pytest.mark.parametrize('group', [
+    {'display_name': 'LB Lab', 'load_balancing': {'enabled': False, 'fixed_node': 'AWS'},
+     'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001}}]},
+    {'display_name': 'LB Lab', 'templates': [
+        {'name': 'vm', 'template_locations': {'gcp': 7001}}]},
+    {'display_name': 'LB Lab', 'templates': [
+        {'name': 'vm', 'proxmox': {'storage_locations': {'aws': 'local-lvm'}}}]},
+])
+def test_proxmox_node_named_like_a_backend_is_rejected(group, monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    assert any("'LB Lab'" in e and 'reserved for the' in e for e in errors)
+
+
+# Catches the reserved-name error losing the operator's spelling or naming the wrong backend.
+def test_reserved_node_name_error_keeps_operator_spelling(monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    group = {'display_name': 'LB Lab', 'load_balancing': {'fixed_node': 'AWS'},
+             'templates': [{'name': 'vm', 'template_locations': {'Gcp': 7001},
+                            'storage_locations': {'Gcp': 'local-lvm'}}]}
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    reserved = [e for e in errors if 'reserved for the' in e]
+    assert reserved == [
+        "deployment_group 'LB Lab': Proxmox node name 'AWS' is reserved for the aws backend",
+        "deployment_group 'LB Lab': Proxmox node name 'Gcp' is reserved for the gcp backend",
+    ]
+
+
+def test_ordinary_proxmox_node_names_are_not_flagged(monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    group = {'display_name': 'LB Lab', 'load_balancing': {'fixed_node': 'node-a'},
+             'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001},
+                            'storage_locations': {'node-a': 'local-lvm'}}]}
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    assert not [e for e in errors if 'reserved for the' in e]
+
+
+# Catches backend errors never reaching validate_template_config, the admin's error list.
+def test_validate_template_config_includes_backend_errors(monkeypatch):
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    group = {'display_name': 'Cloud Lab', 'backend': 'aws', 'koth_mode': True,
+             'templates': [{'name': 'vm'}]}
+    errors, warnings = validate_template_config({'deployment_groups': [group]})
+    assert any("'Cloud Lab'" in e and 'not enabled' in e for e in errors)
+    assert any("'Cloud Lab'" in e and "'aws' block" in e for e in errors)
+    assert any("'Cloud Lab'" in e and 'koth_mode' in e for e in errors)
+    # backend and koth_mode are schema keys, not typos.
+    assert warnings == []
+
+
+# Catches the enabled set being read once at import instead of at validation time.
+def test_validate_template_config_reads_enabled_backends_at_call_time(monkeypatch):
+    group = {'display_name': 'Cloud Lab', 'backend': 'gcp', 'templates': [
+        {'name': 'vm', 'gcp': {'image': 'projects/example/global/images/test',
+                               'machine_type': 'small'}}]}
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox', 'gcp'))
+    assert validate_template_config({'deployment_groups': [group]}) == ([], [])
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('proxmox',))
+    errors, _warnings = validate_template_config({'deployment_groups': [group]})
+    assert any('not enabled' in e for e in errors)
 
 
 if __name__ == '__main__':
