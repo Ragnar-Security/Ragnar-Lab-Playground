@@ -931,9 +931,16 @@ def _isolate_env(tmp_path: Path):
     _tool(bin_dir, "nft", LOG_CALL)
     _tool(bin_dir, "systemctl", LOG_CALL + (
         'case "$*" in\n'
-        '  "is-active --quiet jumpbox-vlan-isolation.service") [ -n "$UNIT_ACTIVE" ] || exit 1 ;;\n'
+        '  "is-active --quiet jumpbox-vlan-isolation.service") [ -n "$UNIT_ACTIVE" ] || [ -f "$UNIT_STATE_DIR/active" ] || exit 1 ;;\n'
+        '  "is-enabled jumpbox-vlan-isolation.service")\n'
+        '    if [ -f "$UNIT_STATE_DIR/enabled" ]; then echo enabled\n'
+        '    elif [ -f "$UNIT_STATE_DIR/runtime" ]; then echo enabled-runtime\n'
+        '    else echo disabled; exit 1; fi ;;\n'
+        '  "enable jumpbox-vlan-isolation.service") rm -f "$UNIT_STATE_DIR/runtime"; touch "$UNIT_STATE_DIR/enabled" ;;\n'
+        '  "start jumpbox-vlan-isolation.service") touch "$UNIT_STATE_DIR/active" ;;\n'
         'esac\nexit 0\n'))
     env["UNIT_ACTIVE"] = ""
+    env["UNIT_STATE_DIR"] = str(tmp_path)
     return env, sysroot
 
 
@@ -968,6 +975,25 @@ def test_isolate_vlans_apply_validates_installs_enables_and_converges(tmp_path):
     assert second.returncode == 0, second.stdout + second.stderr
     assert _tree(sysroot) == converged
     assert _mutations(_calls(tmp_path)) == []
+
+    (tmp_path / "enabled").unlink()
+    (tmp_path / "active").unlink()
+    (tmp_path / "calls.log").unlink()
+    third = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans"], env)
+    assert third.returncode == 0, third.stdout + third.stderr
+    assert _tree(sysroot) == converged
+    assert _mutations(_calls(tmp_path)) == [
+        f"systemctl enable {VLAN_UNIT_NAME}",
+        f"systemctl start {VLAN_UNIT_NAME}",
+    ]
+
+    (tmp_path / "enabled").unlink()
+    (tmp_path / "runtime").touch()
+    (tmp_path / "calls.log").unlink()
+    fourth = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans"], env)
+    assert fourth.returncode == 0, fourth.stdout + fourth.stderr
+    assert _mutations(_calls(tmp_path)) == [f"systemctl enable {VLAN_UNIT_NAME}"]
+    assert (tmp_path / "enabled").exists()
 
 
 def test_isolate_vlans_with_allow_vlans_installs_the_exemption_rules(tmp_path):
