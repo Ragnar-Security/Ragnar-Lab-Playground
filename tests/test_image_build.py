@@ -4,6 +4,7 @@ payload, no usable build key, and no identity shared with the build VM."""
 
 import os
 import re
+import shlex
 import signal
 import subprocess
 import tarfile
@@ -168,6 +169,8 @@ BASE_RECIPE = {
 }
 
 FAKE_SSH = LOG_CALL + (
+    # Keep the remote command line (the last argument) intact, NUL-separated.
+    'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
     'case "$*" in *"${FAKE_SSH_FAIL_ON:-@none@}"*) exit "${FAKE_SSH_FAIL_RC:-1}" ;; esac\n'
     'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) exec sleep 30 ;; esac\n'
     "exit 0\n"
@@ -196,6 +199,10 @@ FAKE_CLOUD = LOG_CALL + (
     'case "$1" in\n'
     "  resolve) echo base-1234 ;;\n"
     '  leftovers) for id in ${FAKE_LEFTOVERS:-}; do echo "$id"; done ;;\n'
+    # The tag a reaper re-reads: anything in FAKE_UNTAGGED is not a build VM.
+    '  tag) case " ${FAKE_UNTAGGED:-} " in *" $2 "*) echo "owner=someone-else" ;;\n'
+    '       *) echo "image-build=ib-202601010000-abcd" ;; esac ;;\n'
+    "  fail) exit 1 ;;\n"
     "esac\n"
 )
 
@@ -222,7 +229,7 @@ def _build_env(tmp_path: Path, os_family: str = "linux", drop=(), **overrides):
     for name in (f"setup.{ext}", f"verify.{ext}"):
         (payload / name).write_text("echo step\n")
     recipe_path = lab / "recipe.env"
-    recipe_path.write_text("".join(f"{k}='{v}'\n" for k, v in recipe.items()))
+    recipe_path.write_text("".join(f"{k}={shlex.quote(v)}\n" for k, v in recipe.items()))
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -444,7 +451,9 @@ def test_recipe_missing_key_refused(tmp_path):
 def test_recipe_bad_values_refused(tmp_path):
     for i, (key, value) in enumerate((("OS_FAMILY", "bsd"), ("KEEP_SSH", "maybe"),
                                       ("SETUP_PASSES", "0"), ("DISK_GB", "big"),
-                                      ("SETUP", "missing.sh"), ("PAYLOAD_DIR", "nowhere"))):
+                                      ("SETUP", "missing.sh"), ("PAYLOAD_DIR", "nowhere"),
+                                      ("PAYLOAD_DIR", "/etc"), ("SETUP", "../setup.sh"),
+                                      ("SETUP", "it's.sh"), ("VERIFY", "/tmp/verify.sh"))):
         env, recipe = _build_env(tmp_path / str(i), **{key: value})
         result = _build(env, "--dry-run", recipe, "fake")
         assert result.returncode == 2, (key, result.stderr)
@@ -506,7 +515,7 @@ def test_ttl_changes_expiry(tmp_path):
         return (ends - began).total_seconds() / 60
     assert run_and_minutes("default", None) == 240
     assert run_and_minutes("short", "60") == 60
-    for i, bad in enumerate(("0", "abc", "-5")):
+    for i, bad in enumerate(("0", "abc", "-5", "08", "0060")):
         env, recipe = _build_env(tmp_path / f"bad{i}")
         env["IMAGE_BUILD_TTL_MINUTES"] = bad
         assert _build(env, "--dry-run", recipe, "fake").returncode == 2, bad
@@ -518,9 +527,9 @@ def test_windows_remote_commands(tmp_path):
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
     ssh = _remote_commands(calls, "ssh")
-    assert any(l.endswith(" powershell -NoProfile -ExecutionPolicy Bypass -File C:\\image-build\\setup.ps1")
+    assert any(l.endswith(' powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\image-build\\setup.ps1"')
                for l in ssh), ssh
-    assert any(l.endswith(" powershell -NoProfile -ExecutionPolicy Bypass -File C:\\image-build\\verify.ps1")
+    assert any(l.endswith(' powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\image-build\\verify.ps1"')
                for l in ssh), ssh
     assert any(l.endswith(" powershell -NoProfile -ExecutionPolicy Bypass -File C:\\image-build\\seal_windows.ps1")
                for l in ssh), ssh
@@ -542,7 +551,7 @@ def test_linux_remote_commands(tmp_path):
     assert _build(env, recipe, "fake").returncode == 0
     calls = _calls(tmp_path)
     ssh = _remote_commands(calls)
-    assert any(l.endswith(" builder@192.0.2.10 sudo bash -c 'cd /tmp/image-build && bash ./setup.sh'")
+    assert any(l.endswith(" builder@192.0.2.10 sudo bash -c 'cd /tmp/image-build && bash '\\''./setup.sh'\\'''")
                for l in ssh), ssh
     assert any(l.endswith(" builder@192.0.2.10 sudo bash /tmp/image-build/seal_linux.sh no") for l in ssh), ssh
     scp = _remote_commands(calls, "scp")
@@ -630,3 +639,103 @@ def test_payload_uploaded_again_when_reboot_cleared_tmp(tmp_path):
     result = _build(env2, recipe2, "fake")
     assert result.returncode == 1
     assert "save" not in _events(_calls(tmp_path / "down"), "setup.sh", "verify.sh", "seal_linux.sh")
+
+
+def _remote_lines(tmp_path: Path) -> list:
+    """Each remote command line exactly as ssh received it."""
+    log = tmp_path / "calls.log.remote"
+    return log.read_text().split("\0")[:-1] if log.exists() else []
+
+
+def test_script_paths_with_spaces_linux(tmp_path):
+    env, recipe = _build_env(tmp_path, SETUP="my steps/set up.sh", VERIFY="check it.sh")
+    payload = recipe.parent / "payload"
+    (payload / "my steps").mkdir()
+    (payload / "my steps" / "set up.sh").write_text('echo setup > "$MARKER_DIR/setup ran"\n')
+    (payload / "check it.sh").write_text('echo verify > "$MARKER_DIR/verify ran"\n')
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    remote = _remote_lines(tmp_path)
+    commands = [c for c in remote if "set up.sh" in c] + [c for c in remote if "check it.sh" in c]
+    assert len(commands) == 2, remote
+    # Run each line as the VM's login shell would, against the local payload.
+    markers = tmp_path / "markers"
+    markers.mkdir()
+    for command in commands:
+        assert command.startswith("sudo bash -c "), command
+        local = command.removeprefix("sudo ").replace("/tmp/image-build", str(payload))
+        ran = subprocess.run(["sh", "-c", local], env={**os.environ, "MARKER_DIR": str(markers)},
+                             capture_output=True, text=True, timeout=30)
+        assert ran.returncode == 0, (command, ran.stderr)
+    assert (markers / "setup ran").read_text() == "setup\n"
+    assert (markers / "verify ran").read_text() == "verify\n"
+
+
+def test_script_paths_with_spaces_windows(tmp_path):
+    env, recipe = _build_env(tmp_path, "windows", SETUP="my steps/set up.ps1", VERIFY="check it.ps1")
+    payload = recipe.parent / "payload"
+    (payload / "my steps").mkdir()
+    (payload / "my steps" / "set up.ps1").write_text("Write-Output setup\n")
+    (payload / "check it.ps1").write_text("Write-Output verify\n")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    remote = _remote_lines(tmp_path)
+    assert ('powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\image-build\\my steps\\set up.ps1"'
+            in remote), remote
+    assert ('powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\image-build\\check it.ps1"'
+            in remote), remote
+
+
+def test_reap_refuses_mismatched_tag(tmp_path):
+    env, _recipe = _build_env(tmp_path)
+    env.update(FAKE_LEFTOVERS="vm-old-1 vm-stranger", FAKE_UNTAGGED="vm-stranger")
+    result = _build(env, "--reap", "fake")
+    assert result.returncode == 1
+    calls = _calls(tmp_path)
+    assert "fake-cloud tag vm-stranger" in calls
+    assert "fake-cloud destroy vm-stranger" not in calls
+    assert "fake-cloud destroy vm-old-1" in calls
+    assert "vm-stranger" in result.stderr
+    result = _build(env, "--reap", "fake", "--dry-run")
+    assert result.returncode == 1
+    assert "DRY-RUN: fake-cloud destroy vm-old-1" in result.stderr
+    assert "DRY-RUN: fake-cloud destroy vm-stranger" not in result.stderr
+
+
+def test_backend_midway_failure_not_masked(tmp_path):
+    # A backend step that fails, followed by steps that succeed, must still fail
+    # the call: the core never runs a backend function where set -e is ignored.
+    def run(sub, fn, *args):
+        env, recipe = _build_env(tmp_path / sub)
+        env.update(FAKE_MIDFAIL=fn, FAKE_LEFTOVERS="vm-old-1")
+        result = _build(env, *[recipe if a == "RECIPE" else a for a in args])
+        return result, _calls(tmp_path / sub)
+
+    result, calls = run("check", "backend_check_config", "--dry-run", "RECIPE", "fake")
+    assert result.returncode == 2
+    assert "backend_resolve_base" not in calls
+
+    result, calls = run("resolve", "backend_resolve_base", "RECIPE", "fake")
+    assert result.returncode == 1
+    assert "backend_start" not in calls
+
+    result, calls = run("start", "backend_start", "RECIPE", "fake")
+    assert result.returncode == 1
+    steps = _events(calls, "setup.sh", "verify.sh", "seal_linux.sh")
+    assert "upload" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+    result, calls = run("save", "backend_save", "RECIPE", "fake")
+    assert result.returncode == 1
+    assert "fake-cloud save" not in calls
+    assert _events(calls, "setup.sh", "verify.sh", "seal_linux.sh")[-1] == "destroy"
+    assert not _build_log(tmp_path / "save").exists()
+    assert result.stdout == ""
+
+    result, calls = run("leftovers", "backend_leftovers", "--reap", "fake")
+    assert result.returncode == 1
+    assert "backend_destroy_id" not in calls
+
+    result, calls = run("destroy_id", "backend_destroy_id", "--reap", "fake")
+    assert result.returncode == 1
+    assert "fake-cloud destroy" not in calls

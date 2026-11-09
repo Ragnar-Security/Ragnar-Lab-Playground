@@ -36,9 +36,12 @@
 #   IMAGE_BUILD_TTL_MINUTES   expiry tagged on build resources (default 240).
 #   IMAGE_BUILD_BACKENDS_DIR  where <backend>.sh lives (default: ./backends).
 #
-# Backend contract (<backend>.sh is sourced into this shell):
+# Backend contract (<backend>.sh is sourced into this shell). Every function
+# runs with errexit in force (never under if/||/&&), so any failing step fails
+# the call; a step that may fail must be guarded inside the backend.
 #   backend_check_config        non-zero, naming the missing variable, if the
-#                               config lacks what this backend needs.
+#                               config lacks what this backend needs. Runs in
+#                               a subshell: it must not set variables.
 #   backend_resolve_base <pat>  prints exactly one base ID.
 #   backend_start <run_id> <base_id> <pubkey_file>
 #                               sets BUILD_VM_ID (as soon as anything exists),
@@ -140,7 +143,22 @@ sq() {
   printf "'%s'" "$s"
 }
 
-is_posint() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+# Decimal, no leading zero (so "08" is not read as octal), at most 9 digits.
+is_posint() { [[ "$1" =~ ^[1-9][0-9]{0,8}$ ]]; }
+
+# Run a backend function in a subshell with errexit in force and leave its
+# exit status in CHECKED_RC. Call it as a plain statement, never under
+# if/||/&&/!: there bash ignores set -e for the whole function body (even a
+# subshell's own set -e), so a failing step followed by a succeeding one would
+# be masked. For a function whose output is needed, use the same pattern inline:
+#   set +e; out="$(set -e; fn)"; rc=$?; set -e
+CHECKED_RC=0
+checked() {
+  set +e
+  ( set -e; "$@" )
+  CHECKED_RC=$?
+  set -e
+}
 
 # Format a Unix time as UTC yyyymmddhhmm (GNU date, then BSD date).
 utc_stamp() {
@@ -174,7 +192,9 @@ load_config() {
   fi
   PVE_NODE="${PVE_NODE:-pve}"
   PVE_REPLICA_NODE="${PVE_REPLICA_NODE:-pve2}"
-  if ! backend_check_config; then
+  # In a subshell: backend_check_config only checks and must not set variables.
+  checked backend_check_config
+  if [ "$CHECKED_RC" -ne 0 ]; then
     config_error "config for backend '$BACKEND' is incomplete (see above; config: $config)"
   fi
 }
@@ -212,11 +232,12 @@ remote_run() {
 }
 
 # Run a payload script (path relative to PAYLOAD_DIR) as root / Administrator.
+# The path is quoted: the recipe check admits spaces, never a quote character.
 remote_script() {
   if [ "$OS_FAMILY" = linux ]; then
-    remote_run "cd /tmp/image-build && bash ./$1"
+    remote_run "cd /tmp/image-build && bash $(sq "./$1")"
   else
-    rssh "powershell -NoProfile -ExecutionPolicy Bypass -File C:\\image-build\\${1//\//\\}"
+    rssh "powershell -NoProfile -ExecutionPolicy Bypass -File \"C:\\image-build\\${1//\//\\}\""
   fi
 }
 
@@ -328,7 +349,12 @@ reap() {
   load_backend "$1"
   load_config
   QUERY_LIVE=1
-  ids="$(backend_leftovers)" || die "backend_leftovers failed"
+  # backend_leftovers is not called under `||` (see checked()).
+  set +e
+  ids="$(set -e; backend_leftovers)"
+  drc=$?
+  set -e
+  [ "$drc" -eq 0 ] || die "backend_leftovers failed (exit $drc); nothing was reaped"
   if [ -z "$ids" ]; then
     log "nothing to reap on $BACKEND"
     return 0
@@ -338,12 +364,8 @@ reap() {
     if [ "$DRY_RUN" = 1 ]; then
       printf 'would destroy %s\n' "$id"
     fi
-    # Plain statement with errexit off: in an `if`, bash would ignore the
-    # subshell's own set -e.
-    set +e
-    ( set -e; backend_destroy_id "$id" ) </dev/null
-    drc=$?
-    set -e
+    checked backend_destroy_id "$id" </dev/null
+    drc=$CHECKED_RC
     if [ "$drc" -eq 0 ]; then
       [ "$DRY_RUN" = 1 ] || printf 'destroyed %s\n' "$id"
     else
@@ -416,12 +438,17 @@ case "$KEEP_SSH" in yes|no) ;; *) config_error "KEEP_SSH must be yes or no (got 
 for key in SETUP_PASSES DISK_GB PVE_MEMORY_MB PVE_CORES; do
   is_posint "${!key}" || config_error "$key must be a positive integer (got '${!key}')"
 done
+case "$PAYLOAD_DIR" in
+  /*|'~'*) config_error "PAYLOAD_DIR must be relative to the recipe file (got '$PAYLOAD_DIR')" ;;
+esac
 PAYLOAD_PATH="$(cd "$RECIPE_DIR" && cd "$PAYLOAD_DIR" 2>/dev/null && pwd)" \
   || config_error "PAYLOAD_DIR $PAYLOAD_DIR does not exist next to $RECIPE_ARG"
 for key in SETUP VERIFY; do
   value="${!key}"
-  if ! [[ "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ ]] || [[ "/$value/" == */../* ]]; then
-    config_error "$key must be a plain relative path inside PAYLOAD_DIR (got '$value')"
+  # Letters, digits, space and ._+-/ only: safe to quote for bash and for
+  # cmd.exe/PowerShell alike. Relative, with no '..' component.
+  if ! [[ "$value" =~ ^[A-Za-z0-9_][A-Za-z0-9._\ +/-]*$ ]] || [[ "/$value/" == */../* ]]; then
+    config_error "$key must be a relative path inside PAYLOAD_DIR using only letters, digits, space and ._+-/ (got '$value')"
   fi
   [ -f "$PAYLOAD_PATH/$value" ] || config_error "$key: $PAYLOAD_DIR/$value does not exist"
 done

@@ -1,10 +1,15 @@
 # Test backend for build_image.sh. Selected with IMAGE_BUILD_BACKENDS_DIR
 # pointing here and backend name "fake".
 #
-# Every contract function appends "<function> <args>" to $CALL_LOG. Setting
-# FAKE_FAIL=<function name> makes that function fail. Its "cloud" is the
-# fake-cloud command the tests put on PATH, reached only through the core's
-# mutate/query helpers, so a dry run must leave no fake-cloud line in CALL_LOG.
+# Every contract function appends "<function> <args>" to $CALL_LOG.
+#   FAKE_FAIL=<function>     that function returns 1 at once.
+#   FAKE_MIDFAIL=<function>  a step in the middle of that function fails and
+#                            the function carries on; only errexit stops it.
+#                            Proves the core never calls a backend function
+#                            where bash ignores set -e (if/||/&&).
+# Its "cloud" is the fake-cloud command the tests put on PATH, reached only
+# through the core's mutate/query helpers, so a dry run must leave no
+# fake-cloud line in CALL_LOG (FAKE_MIDFAIL's step is the one exception).
 
 _fake() {
   local fn="$1"
@@ -16,8 +21,17 @@ _fake() {
   fi
 }
 
+# Call as a plain statement: with errexit in force, a failure here ends the
+# function; without it, the function goes on and reports success.
+_midfail() {
+  if [ "${FAKE_MIDFAIL:-}" = "$1" ]; then
+    fake-cloud fail "$1"
+  fi
+}
+
 backend_check_config() {
   _fake backend_check_config || return 1
+  _midfail backend_check_config
   if [ -z "${FAKE_REGION:-}" ]; then
     echo "fake: FAKE_REGION is not set" >&2
     return 1
@@ -26,6 +40,7 @@ backend_check_config() {
 
 backend_resolve_base() {
   _fake backend_resolve_base "$@" || return 1
+  _midfail backend_resolve_base
   query fake-base-id fake-cloud resolve "$1"
 }
 
@@ -34,6 +49,7 @@ backend_start() {
   [ -s "$3" ] || die "fake: public key file $3 is missing"
   BUILD_VM_ID="vm-$1"
   mutate fake-cloud start "$1" "$2" "image-build=$RUN_ID" "image-build-expires=$BUILD_EXPIRES_UTC"
+  _midfail backend_start
   BUILD_SSH_HOST=192.0.2.10
   if [ "$OS_FAMILY" = windows ]; then
     BUILD_SSH_USER=Administrator
@@ -45,6 +61,7 @@ backend_start() {
 
 backend_save() {
   _fake backend_save "$@" || return 1
+  _midfail backend_save
   mutate fake-cloud save "$BUILD_VM_ID" "$1"
   IMAGE_ID="img-$1"
   if [ "${FAKE_SAVE_CONSUMES_VM:-}" = 1 ]; then
@@ -61,11 +78,21 @@ backend_destroy() {
 
 backend_leftovers() {
   _fake backend_leftovers || return 1
+  _midfail backend_leftovers
   query "" fake-cloud leftovers
 }
 
+# Re-reads the tag and destroys only a build VM; anything else is refused.
 backend_destroy_id() {
+  local tag
   _fake backend_destroy_id "$@" || return 1
+  _midfail backend_destroy_id
+  tag="$(query image-build=ib-dry-run fake-cloud tag "$1")"
+  case "$tag" in
+    image-build=ib-*) ;;
+    *) echo "fake: $1 is not a build VM (tag '$tag'); not destroyed" >&2
+       return 1 ;;
+  esac
   mutate fake-cloud destroy "$1"
 }
 
