@@ -47,8 +47,8 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 | Exit | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | Build or reap failure |
-| 2 | Usage or config error (bad recipe, bad config, unknown backend, dirty repo) |
+| 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS` or `BASE_GCP`, no image matching the base, a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH within 900 s, a destroy that was refused. |
+| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES`, an invalid image name, or a config the backend's `backend_check_config` rejects. |
 | 130, 143 | Interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
@@ -211,24 +211,50 @@ Every build resource carries two tags (labels on GCP):
 | `image-build` | The run ID, `ib-<yyyymmddhhmm>-<4 hex>` |
 | `image-build-expires` | UTC `yyyymmddhhmm`, `IMAGE_BUILD_TTL_MINUTES` after the build started (default 4 hours) |
 
-On Proxmox both go in the VM description. The saved image carries
-`image-build-recipe` and `image-build-commit` instead of an expiry (on Proxmox
-the description becomes `image=<image-name>`), because the product does not
-expire.
+On Proxmox both go in the VM description, as two space-separated words. What
+the saved image carries depends on the backend:
 
-**Build resources never carry `lab-playground-site`.** That is the portal's
-tag. The portal's orphan sweeper and the image builder must never see each
-other's resources: build resources carry only the `image-build*` tags, so
-`--reap` matches nothing the portal owns, and portal cleanup matches nothing a
-build owns. On Proxmox the sweeper (`app/orphan_reaper.py`) reaps untracked
-guests whose description has an `Expires:` line past its grace period; a build
-description holds `image-build=` and `image-build-expires=` words and no
-`Expires:` line, so the sweeper keeps it.
+| Backend | The saved image carries |
+|---|---|
+| Proxmox | The description is replaced by `image=<image-name>` and nothing else: no build tags, no recipe or commit tag. The replica copy has the same description. |
+| AWS | The AMI and its snapshots carry `image-build-recipe` and `image-build-commit` tags. |
+| GCP | The image carries `image-build-recipe` and `image-build-commit` labels, and a description naming the recipe, commit and run ID. |
 
-Destroy and reap re-check the `image-build` tag immediately before deleting, on
-every backend. `--reap` removes only a resource whose tag is a build run ID and
-whose `image-build-expires` is in the past. A build resource with no readable
-expiry is reported and left alone (AWS) or skipped (GCP, Proxmox).
+The image has no expiry tag, because the product does not expire.
+
+**Build resources never carry `lab-playground-site`.** The multi-backend
+portal's AWS and GCP backends (branch `feature/multi-backend-vms`, PR #80, not
+yet merged; see "Safety model and ownership" in its `docs/CLOUD_BACKENDS.md`)
+tag every lab resource `lab-playground-site=<LAB_SITE_ID>` and filter
+inventory, reuse and orphan sweeping by it. A build resource never carries it,
+so the portal never lists or deletes a build resource, and the builder only
+touches resources tagged `image-build`. On Proxmox the existing sweeper
+(`app/orphan_reaper.py`) reaps untracked guests whose description has an
+`Expires:` line past its grace period; a build description holds
+`image-build=` and `image-build-expires=` words and no `Expires:` line, so the
+sweeper keeps it.
+
+### What a destroy or a reap will delete
+
+A resource is deleted only after the backend re-reads its tag immediately
+before the delete.
+
+- **Cleanup of the current build** (the trap, and `backend_destroy`) requires
+  the `image-build` value to equal this run's `RUN_ID`. Otherwise it refuses.
+- **`--reap`** requires all of these:
+  - the `image-build` value matches `ib-<12 digits>-<4 hex>` exactly;
+  - the resource has one `image-build` tag (AWS tags and GCP labels hold one
+    value per key; on Proxmox the description may hold only one
+    `image-build=` word);
+  - `image-build-expires` is 12 digits and earlier than now (UTC);
+  - on GCP, the label also equals the instance's own name;
+  - on Proxmox, also: the VM is on `PVE_NODE`, its VMID is in `8000`-`8999`,
+    and it is not a template.
+
+A resource that has the tag but fails these checks is never deleted. On AWS,
+one whose `image-build-expires` is missing or malformed is reported and left
+out of the list. One that is listed but whose tag is not a run ID is refused
+at the delete, and `--reap` reports it and exits 1.
 
 ## Backends
 
@@ -258,8 +284,10 @@ allocated above it, deleting the guest does not undo that. The backend refuses a
 VMID outside its block, and `sync_template.sh`'s optional fifth argument
 (`target_vmid`) accepts only `8500`-`8999`.
 
-`--reap proxmox` looks at non-template VMs on `PVE_NODE` in `8000`-`8999`. It
-never destroys a template.
+`--reap proxmox` lists only non-template VMs on `PVE_NODE` in `8000`-`8999`
+that meet the criteria in "What a destroy or a reap will delete". The
+node-side destroy repeats the tag check before `qm stop` and again before
+`qm destroy`, and refuses a template.
 
 **A template left by a failed save must be removed by hand.** If the build VM
 became a template but the conversion call reported failure, or the copy to the
@@ -277,9 +305,11 @@ with the `sync_template.sh` command the error prints.
   `/home/builder/.ssh/authorized_keys` through the guest agent, and the seal
   empties that file.
 
-For a Windows base, the user is `Administrator`, OpenSSH Server must already be
-installed, and the guest agent must run. The build only writes the key to
-`C:\ProgramData\ssh\administrators_authorized_keys`.
+For a Windows base, the user is `Administrator` and the guest agent must run.
+OpenSSH Server must be installed, and the `sshd` service must be running and
+set to start automatically. The backend only injects the key, through the
+guest agent, into `C:\ProgramData\ssh\administrators_authorized_keys`; it
+never installs or starts `sshd`.
 
 ### AWS
 
@@ -310,9 +340,9 @@ made from its boot disk and joins the `GCP_IMAGE_FAMILY` family. The build
 labels are on the instance; the image carries `image-build-recipe` and
 `image-build-commit` labels.
 
-**`--reap gcp` scans all zones of the project**, not only `GCP_BUILD_ZONE`. It
-reaps an instance whose `image-build` label equals its own name and whose
-`image-build-expires` is in the past. IDs are printed as `<zone>/<instance>`.
+**`--reap gcp` scans all zones of the project**, not only `GCP_BUILD_ZONE`. See
+"What a destroy or a reap will delete" for the criteria. IDs are printed as
+`<zone>/<instance>`.
 `templates.yaml` gets `gcp: {image, machine_type, disk_gb}`.
 
 ## Dry run and reaping
@@ -330,7 +360,8 @@ scripts/image_build/build_image.sh path/to/recipe.env aws
 
 **`--reap <backend>`** removes build VMs that a killed build left behind
 (`kill -9`, a lost laptop, a power cut). It lists the backend's leftovers:
-tagged, expired build VMs only. For each one the backend re-checks the tag, then
+expired build VMs that meet the criteria in "What a destroy or a reap will
+delete". For each one the backend re-checks the tag, then
 destroys it. It prints `destroyed <id>` for each, and exits 1 if any could not
 be destroyed. With `--dry-run`, `--reap` still runs the read-only queries for
 real, because the plan needs the real list, and prints `would destroy <id>` and
