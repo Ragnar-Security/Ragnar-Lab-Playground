@@ -5,12 +5,14 @@
 #   build_image.sh [--dry-run] [--allow-dirty] <recipe.env> <backend>
 #   build_image.sh --reap <backend> [--dry-run]
 #
-# Exit codes: 0 success, 2 usage or config error, 1 build failure.
+# Exit codes: 0 success, 2 usage or config error (only before the build
+# started: past that, any failure is 1), 1 build failure.
 #
 # A build: start a build VM from the backend's base, upload the recipe's payload
-# over SSH, run setup (SETUP_PASSES times, waiting for SSH after each because a
-# setup may reboot), run verify, seal (the matching seal script from this
-# directory), save the image, destroy the build VM. A trap destroys the build VM
+# over SSH, run setup (SETUP_PASSES times; a setup that needs a reboot exits
+# 100 and the core reboots the VM and waits for a new boot ID), run verify,
+# seal (the matching seal script from this directory), save the image,
+# destroy the build VM. A trap destroys the build VM
 # on every exit, so a failed or interrupted build leaves nothing running. Only a
 # verified, sealed build is saved, logged and printed.
 #
@@ -25,8 +27,12 @@
 #
 # Inputs:
 #   config.env  next to this script, or $IMAGE_BUILD_CONFIG. Untracked: it
-#               holds hosts and cloud IDs. See config.env.example.
-#   recipe.env  sourced. Required: IMAGE_PREFIX OS_FAMILY PAYLOAD_DIR SETUP
+#               holds hosts and cloud IDs. See config.env.example. Sourced in
+#               a subshell; only names starting with the backend's
+#               BACKEND_CONFIG_PREFIX come back, and one that sets a recipe
+#               key is refused.
+#   recipe.env  sourced in a subshell; only the recipe keys come back.
+#               Required: IMAGE_PREFIX OS_FAMILY PAYLOAD_DIR SETUP
 #               VERIFY BASE_PROXMOX BASE_AWS BASE_GCP DISK_GB AWS_INSTANCE_TYPE
 #               GCP_MACHINE_TYPE PVE_MEMORY_MB PVE_CORES. Optional: SETUP_PASSES
 #               (1), KEEP_SSH (no), GCP_IMAGE_FAMILY (IMAGE_PREFIX),
@@ -34,9 +40,17 @@
 #               PAYLOAD_DIR is relative to the recipe; SETUP and VERIFY are
 #               relative to PAYLOAD_DIR.
 #   IMAGE_BUILD_TTL_MINUTES   expiry tagged on build resources (default 240).
+#   IMAGE_BUILD_SSH_WAIT_SECONDS  how long to wait for SSH after start and
+#                             after each setup pass or reboot (default 900).
 #   IMAGE_BUILD_BACKENDS_DIR  where <backend>.sh lives (default: ./backends).
 #
-# Backend contract (<backend>.sh is sourced into this shell). Every function
+# Setup contract: exit 0 when done; exit 100 when done but the VM needs a
+# reboot (never reboot from the script). Any other code fails the build. An
+# SSH exit 255 (session dropped) passes only if the VM's boot ID changed.
+#
+# Backend contract (<backend>.sh is sourced into this shell). It sets
+# BACKEND_CONFIG_PREFIX (e.g. AWS_): the prefix of every config key it reads.
+# Every function
 # runs with errexit in force (never under if/||/&&), so any failing step fails
 # the call; a step that may fail must be guarded inside the backend.
 #   backend_check_config        non-zero, naming the missing variable, if the
@@ -49,7 +63,10 @@
 #   backend_save <image_name>   sets IMAGE_ID (a placeholder in a dry run);
 #                               clears BUILD_VM_ID when the build VM itself
 #                               became the image.
-#   backend_destroy             idempotent; destroys only BUILD_VM_ID.
+#   backend_destroy             idempotent; destroys only this run's build VM
+#                               (BUILD_VM_ID, or, if a create call failed
+#                               before it was recorded, what carries this
+#                               run's tag).
 #   backend_leftovers           one ID per line, tagged and expired build VMs
 #                               only. Must read through `query`.
 #   backend_destroy_id <id>     re-checks the tag (through `query`), then
@@ -76,6 +93,13 @@ RECIPE_REQUIRED=(IMAGE_PREFIX OS_FAMILY PAYLOAD_DIR SETUP VERIFY BASE_PROXMOX BA
 RECIPE_OPTIONAL=(SETUP_PASSES KEEP_SSH GCP_IMAGE_FAMILY PAYLOAD_EXCLUDE)
 BACKEND_FUNCTIONS=(backend_check_config backend_resolve_base backend_start backend_save
                    backend_destroy backend_leftovers backend_destroy_id backend_templates_yaml)
+# The build log, relative to the recipe repo's root. It is excluded from the
+# dirty check, so one recipe can be built on several backends before the
+# log is committed.
+BUILD_LOG_REL="coursework/deploy/image-build/BUILD-LOG.tsv"
+SSH_POLL_SECONDS=10
+# A setup's exit code asking the core to reboot the VM.
+SETUP_REBOOT_RC=100
 
 DRY_RUN=0
 QUERY_LIVE=0
@@ -174,19 +198,80 @@ load_backend() {
     fi
     config_error "unknown backend '$name' (available in $dir: ${available:-none})"
   fi
+  unset BACKEND_CONFIG_PREFIX
   # shellcheck source=/dev/null
   source "$dir/$name.sh"
   for fn in "${BACKEND_FUNCTIONS[@]}"; do
     declare -F "$fn" >/dev/null || config_error "backend '$name' does not define $fn"
   done
+  [[ "${BACKEND_CONFIG_PREFIX:-}" =~ ^[A-Z][A-Z0-9]*_$ ]] \
+    || config_error "backend '$name' does not set BACKEND_CONFIG_PREFIX (e.g. AWS_)"
   BACKEND="$name"
 }
 
+# Print one variable as a shell assignment, quoted to survive eval exactly.
+print_assignment() {
+  local decl
+  decl="$(declare -p "$1")"
+  decl="${decl#declare -}"
+  case "${decl%% *}" in
+    *[aA]*) config_error "$2 sets $1 as an array; it must be a plain value" ;;
+    *x*) printf 'export %s=%q\n' "$1" "${!1}" ;;
+    *) printf '%s=%q\n' "$1" "${!1}" ;;
+  esac
+}
+
+# The recipe and the config are data, but sourcing runs them. Each is sourced
+# in a subshell (call these only inside $(...)) that prints, as assignments,
+# the names this shell may take from it; nothing else it sets or defines
+# (DRY_RUN, STARTED, BUILD_VM_ID, a helper function, a trap) gets back. As
+# before, errexit is off while the file runs; its stdout goes to stderr.
+read_recipe() {
+  local name names=("${RECIPE_REQUIRED[@]}" "${RECIPE_OPTIONAL[@]}")
+  if [[ "$BASE_VAR" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+    names+=("$BASE_VAR")
+  fi
+  unset "${names[@]}"
+  # shellcheck source=/dev/null
+  source "$RECIPE_DIR/$RECIPE_FILE" >&2 || config_error "cannot read recipe $RECIPE_ARG"
+  for name in "${names[@]}"; do
+    if [ -n "${!name+x}" ]; then
+      print_assignment "$name" "recipe $RECIPE_ARG"
+    fi
+  done
+}
+
+# Only names that start with the backend's BACKEND_CONFIG_PREFIX come back.
+# A config that sets a recipe key (DISK_GB, AWS_INSTANCE_TYPE, BASE_AWS, ...)
+# is refused: only the recipe sets those.
+read_config() {
+  local config="$1" name
+  # shellcheck disable=SC2046  # variable names: no spaces, no globs
+  unset "${RECIPE_REQUIRED[@]}" "${RECIPE_OPTIONAL[@]}" $(compgen -v BASE_)
+  # shellcheck source=/dev/null
+  source "$config" >&2 || config_error "cannot read config $config"
+  # shellcheck disable=SC2046
+  for name in "${RECIPE_REQUIRED[@]}" "${RECIPE_OPTIONAL[@]}" $(compgen -v BASE_); do
+    if [ -n "${!name+x}" ]; then
+      config_error "config $config sets $name, a recipe key; only the recipe may set it"
+    fi
+  done
+  for name in $(compgen -v "$BACKEND_CONFIG_PREFIX"); do
+    if [ -n "${!name+x}" ]; then
+      print_assignment "$name" "config $config"
+    fi
+  done
+}
+
 load_config() {
-  local config="${IMAGE_BUILD_CONFIG:-$SCRIPT_DIR/config.env}"
+  local config="${IMAGE_BUILD_CONFIG:-$SCRIPT_DIR/config.env}" assignments rc
   if [ -f "$config" ]; then
-    # shellcheck source=/dev/null
-    source "$config" || config_error "cannot read config $config"
+    set +e
+    assignments="$(read_config "$config")"
+    rc=$?
+    set -e
+    [ "$rc" -eq 0 ] || config_error "config $config could not be loaded (exit $rc)"
+    eval "$assignments"
   elif [ -n "${IMAGE_BUILD_CONFIG:-}" ]; then
     config_error "IMAGE_BUILD_CONFIG=$config does not exist"
   fi
@@ -275,7 +360,67 @@ wait_ssh() {
     if [ "$SECONDS" -ge "$deadline" ]; then
       die "no SSH to $SSH_TARGET after ${timeout}s"
     fi
-    run_bg sleep 10
+    run_bg sleep "$SSH_POLL_SECONDS"
+  done
+}
+
+# The command that prints the build VM's boot identity, which changes on
+# every boot and only then: Linux's boot_id, Windows' last boot time (UTC, to
+# the second, so it reads the same on every call within one boot).
+boot_id_command() {
+  if [ "$OS_FAMILY" = linux ]; then
+    printf '%s' 'cat /proc/sys/kernel/random/boot_id'
+  else
+    printf '%s' "powershell -NoProfile -ExecutionPolicy Bypass -Command \"(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('yyyyMMddHHmmss')\""
+  fi
+}
+
+# Print the boot ID; non-zero if SSH fails or the answer is not one word.
+read_boot_id() {
+  local out
+  out="$(query boot-id-dry-run ssh -n "${SSH_OPTS[@]}" "$SSH_TARGET" "$(boot_id_command)")" || return
+  out="${out//$'\r'/}"
+  [[ "$out" =~ ^[A-Za-z0-9.:-]+$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+# The reboot a setup asks for with exit 100. Started in the background, so
+# the SSH call returns before the VM goes down.
+reboot_command() {
+  if [ "$OS_FAMILY" = linux ]; then
+    printf '%s' 'nohup sudo systemctl reboot >/dev/null 2>&1 </dev/null &'
+  else
+    printf '%s' 'powershell -NoProfile -ExecutionPolicy Bypass -Command "Restart-Computer -Force"'
+  fi
+}
+
+reboot_vm() {
+  local rc=0
+  rssh "$(reboot_command)" || rc=$?
+  # 255: the session was cut as the VM went down.
+  case "$rc" in
+    0|255) ;;
+    *) die "the reboot command failed on $SSH_TARGET (ssh exit $rc)" ;;
+  esac
+}
+
+# Wait until SSH answers with a boot ID other than $1: the VM went down and
+# came back. A VM still on its way down answers, with its old boot ID, so an
+# answer alone proves nothing. $2 is the error if no new boot shows up.
+wait_new_boot() {
+  local before="$1" why="$2" deadline now
+  deadline=$((SECONDS + SSH_WAIT_SECONDS))
+  log "waiting up to ${SSH_WAIT_SECONDS}s for $SSH_TARGET to answer with a new boot ID"
+  while :; do
+    now="$(read_boot_id 2>/dev/null)" || now=""
+    if [ -n "$now" ] && [ "$now" != "$before" ]; then
+      log "the VM rebooted (boot ID $before -> $now)"
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      die "$why (boot ID still '${now:-unreadable}', was '$before', after ${SSH_WAIT_SECONDS}s)"
+    fi
+    run_bg sleep "$SSH_POLL_SECONDS"
   done
 }
 
@@ -332,6 +477,11 @@ cleanup() {
     0|1|2|130|143) ;;
     *) rc=1 ;;
   esac
+  # 2 means the core rejected the input before the build began. Past that, a
+  # 2 (from a backend, or a tool it ran) is a build failure.
+  if [ "$rc" -eq 2 ] && [ "$STEP" != startup ]; then
+    rc=1
+  fi
   if [ "$rc" -ne 0 ] && [ "$STEP" != startup ]; then
     if [ "$LOGGED" = 1 ]; then
       log "FAILED during $STEP (exit $rc), after image $IMAGE_ID was saved and logged"
@@ -414,6 +564,9 @@ BASE_VAR="BASE_$(printf '%s' "$BACKEND_ARG" | tr 'a-z-' 'A-Z_')"
 
 TTL_MINUTES="${IMAGE_BUILD_TTL_MINUTES:-240}"
 is_posint "$TTL_MINUTES" || config_error "IMAGE_BUILD_TTL_MINUTES must be a positive integer (got '$TTL_MINUTES')"
+SSH_WAIT_SECONDS="${IMAGE_BUILD_SSH_WAIT_SECONDS:-900}"
+is_posint "$SSH_WAIT_SECONDS" \
+  || config_error "IMAGE_BUILD_SSH_WAIT_SECONDS must be a positive integer (got '$SSH_WAIT_SECONDS')"
 
 # --- recipe --------------------------------------------------------------------
 
@@ -423,8 +576,12 @@ RECIPE_FILE="$(basename "$RECIPE_ARG")"
 # Only the recipe may set its keys; a value inherited from the caller's
 # environment must not stand in for a missing one.
 unset "${RECIPE_REQUIRED[@]}" "${RECIPE_OPTIONAL[@]}" "$BASE_VAR" 2>/dev/null || true
-# shellcheck source=/dev/null
-source "$RECIPE_DIR/$RECIPE_FILE" || config_error "cannot read recipe $RECIPE_ARG"
+set +e
+RECIPE_ASSIGNMENTS="$(read_recipe)"
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || config_error "recipe $RECIPE_ARG could not be loaded (exit $rc)"
+eval "$RECIPE_ASSIGNMENTS"
 
 for key in "${RECIPE_REQUIRED[@]}"; do
   [ -n "${!key:-}" ] || config_error "recipe $RECIPE_ARG does not set $key"
@@ -463,7 +620,11 @@ FULL_SHA="$(git -C "$RECIPE_DIR" rev-parse HEAD)"
 SHA7="${FULL_SHA:0:7}"
 [[ "$SHA7" =~ ^[0-9a-f]{7}$ ]] || config_error "cannot read the recipe repo's commit (got '$FULL_SHA')"
 IMAGE_BUILD_COMMIT="$SHA7"
-if [ -n "$(git -C "$RECIPE_DIR" status --porcelain)" ]; then
+# The build log is left out: building one recipe on several backends appends
+# to it before it is committed. Any other change refuses the build.
+REPO_STATUS="$(git -C "$REPO_ROOT" status --porcelain --untracked-files=all -- ":(exclude)$BUILD_LOG_REL")" \
+  || config_error "cannot read the git status of $REPO_ROOT"
+if [ -n "$REPO_STATUS" ]; then
   if [ "$ALLOW_DIRTY" = 1 ]; then
     log "WARNING: the recipe repo is dirty; building anyway (--allow-dirty)"
     IMAGE_BUILD_COMMIT="$SHA7-dirty"
@@ -480,7 +641,7 @@ IMAGE_NAME="$IMAGE_PREFIX-$SHA7-$STAMP"
 if ! [[ "$IMAGE_NAME" =~ ^[a-z]([-a-z0-9]*[a-z0-9])?$ ]] || [ "${#IMAGE_NAME}" -gt 63 ]; then
   config_error "image name $IMAGE_NAME must be [a-z0-9-], start with a letter and be at most 63 characters (IMAGE_PREFIX at most 42)"
 fi
-BUILD_LOG="$REPO_ROOT/coursework/deploy/image-build/BUILD-LOG.tsv"
+BUILD_LOG="$REPO_ROOT/$BUILD_LOG_REL"
 
 # --- backend and config ------------------------------------------------------------
 
@@ -509,7 +670,7 @@ STARTED=1
 backend_start "$RUN_ID" "$BASE_ID" "$TMP_DIR/key.pub"
 ssh_setup
 log "build VM ${BUILD_VM_ID:-?} at $SSH_TARGET${BUILD_SSH_JUMP:+ via $BUILD_SSH_JUMP}"
-wait_ssh 900
+wait_ssh "$SSH_WAIT_SECONDS"
 
 STEP="upload payload"
 remote_upload "$PAYLOAD_PATH"
@@ -520,14 +681,25 @@ for ((pass = 1; pass <= SETUP_PASSES; pass++)); do
   if [ "$pass" -gt 1 ]; then
     ensure_payload
   fi
+  # Recorded before setup runs: after a reboot, only a different boot ID
+  # proves the VM went down and came back.
+  BOOT_BEFORE="$(read_boot_id)" || die "cannot read the boot ID of $SSH_TARGET"
+  if [ "$DRY_RUN" = 1 ]; then
+    log "DRY RUN: if setup exits $SETUP_REBOOT_RC, the core runs on the VM: $(reboot_command)"
+  fi
   rc=0
   remote_script "$SETUP" || rc=$?
   case "$rc" in
-    0) ;;
-    255) log "SSH session dropped during setup (a reboot?); waiting for the VM" ;;
+    0) wait_ssh "$SSH_WAIT_SECONDS" ;;
+    "$SETUP_REBOOT_RC")
+      log "setup asked for a reboot (exit $rc); rebooting the VM"
+      reboot_vm
+      wait_new_boot "$BOOT_BEFORE" "the VM did not come back from the reboot" ;;
+    255)
+      log "SSH session dropped during setup; waiting for the VM to come back from a reboot"
+      wait_new_boot "$BOOT_BEFORE" "SSH dropped during setup but the VM did not reboot" ;;
     *) die "setup pass $pass exited $rc" ;;
   esac
-  wait_ssh 900
 done
 
 STEP="verify"

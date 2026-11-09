@@ -222,9 +222,27 @@ BASE_RECIPE = {
     "PVE_CORES": "2",
 }
 
+# The build VM. Every remote command line is kept intact (NUL-separated) and,
+# with the boot it ran in, in $CALL_LOG.timeline. A boot-ID read prints
+# boot-<n>. A reboot command (or one matching FAKE_SSH_REBOOT_ON) makes the
+# boot ID change, but only after FAKE_BOOT_FLIP_AFTER more reads (default 0):
+# a VM still going down answers with its old boot.
 FAKE_SSH = LOG_CALL + (
-    # Keep the remote command line (the last argument) intact, NUL-separated.
     'for a in "$@"; do last="$a"; done; printf "%s\\0" "$last" >> "$CALL_LOG.remote"\n'
+    'boot="$CALL_LOG.boot"; pending="$CALL_LOG.reboot-pending"\n'
+    '[ -f "$boot" ] || echo 1 > "$boot"\n'
+    'case "$last" in *boot_id*|*LastBootUpTime*)\n'
+    '  if [ -f "$pending" ]; then\n'
+    '    n=$(cat "$pending")\n'
+    '    if [ "$n" -le 0 ]; then echo $(( $(cat "$boot") + 1 )) > "$boot"; rm -f "$pending"\n'
+    '    else echo $((n - 1)) > "$pending"; fi\n'
+    '  fi ;;\n'
+    'esac\n'
+    'printf "boot-%s\\t%s\\n" "$(cat "$boot")" "$last" >> "$CALL_LOG.timeline"\n'
+    'case "$last" in *"systemctl reboot"*|*Restart-Computer*|*"${FAKE_SSH_REBOOT_ON:-@none@}"*)\n'
+    '  echo "${FAKE_BOOT_FLIP_AFTER:-0}" > "$pending" ;;\n'
+    'esac\n'
+    'case "$last" in *boot_id*|*LastBootUpTime*) echo "boot-$(cat "$boot")"; exit 0 ;; esac\n'
     'case "$*" in *"${FAKE_SSH_FAIL_ON:-@none@}"*) exit "${FAKE_SSH_FAIL_RC:-1}" ;; esac\n'
     'case "$*" in *"${FAKE_SSH_SLEEP_ON:-@none@}"*) exec sleep 30 ;; esac\n'
     "exit 0\n"
@@ -245,7 +263,7 @@ FAKE_GIT = LOG_CALL + (
     '  "rev-parse --show-toplevel") echo "$FAKE_GIT_TOPLEVEL" ;;\n'
     '  "rev-parse --show-prefix") echo "$FAKE_GIT_PREFIX" ;;\n'
     f'  "rev-parse HEAD") echo {FULL_SHA} ;;\n'
-    '  "status --porcelain") [ -n "${FAKE_GIT_STATUS:-}" ] && printf "%s\\n" "$FAKE_GIT_STATUS"; exit 0 ;;\n'
+    '  "status --porcelain"*) [ -n "${FAKE_GIT_STATUS:-}" ] && printf "%s\\n" "$FAKE_GIT_STATUS"; exit 0 ;;\n'
     '  *) echo "fake git: unexpected: $*" >&2; exit 1 ;;\n'
     "esac\n"
 )
@@ -358,6 +376,9 @@ def test_dry_run_runs_no_mutation(tmp_path):
     assert _events(calls, "setup.sh", "verify.sh", "seal_linux.sh") == [
         "check_config", "resolve_base", "start", "save", "destroy"]
     assert "sudo bash /tmp/image-build/seal_linux.sh no" in result.stderr
+    # The boot-ID read and the reboot a setup exit 100 would trigger are shown.
+    assert "DRY-RUN: ssh " in result.stderr and "cat /proc/sys/kernel/random/boot_id" in result.stderr
+    assert "nohup sudo systemctl reboot" in result.stderr
     assert not _build_log(tmp_path).exists()
     assert result.stdout.rstrip("\n").splitlines()[-1].startswith("fake: {image: ")
 
@@ -370,6 +391,8 @@ def test_order_of_operations(tmp_path):
     assert _events(calls, "setup.sh", "verify.sh", "seal_linux.sh") == [
         "check_config", "resolve_base", "start", "upload", "setup", "setup",
         "verify", "seal", "save", "destroy"]
+    # Setup exited 0: no reboot.
+    assert "reboot" not in "".join(_remote_lines(tmp_path))
     lines = _build_log(tmp_path).read_text().splitlines()
     assert lines[0] == "date\tbackend\timage_id\timage_name\tbase_id\trecipe\tcommit\tverify"
     assert len(lines) == 2
@@ -439,12 +462,73 @@ def test_failed_save_destroys(tmp_path):
     assert not _build_log(tmp_path).exists()
 
 
-def test_setup_session_drop_tolerated_other_failure_not(tmp_path):
-    # A setup that reboots the VM drops the SSH session (exit 255); verify decides.
-    env, recipe = _build_env(tmp_path)
-    env.update(FAKE_SSH_FAIL_ON="setup.sh", FAKE_SSH_FAIL_RC="255")
+def _fast_sleep(tmp_path: Path) -> None:
+    """The core's 10 s poll sleep, shortened for the reboot-wait tests."""
+    _tool(tmp_path / "bin", "sleep", LOG_CALL + "PATH=/usr/bin:/bin exec sleep 0.1\n")
+
+
+def _timeline(tmp_path: Path) -> list:
+    """(boot, remote command line) for every SSH command, in order."""
+    log = tmp_path / "calls.log.timeline"
+    return [tuple(l.split("\t", 1)) for l in log.read_text().splitlines()] if log.exists() else []
+
+
+def _is_boot_read(command: str) -> bool:
+    return "boot_id" in command or "LastBootUpTime" in command
+
+
+def test_setup_exit_100_core_reboots_and_waits_for_new_boot(tmp_path):
+    for os_family, setup, verify, reboot in (
+            ("linux", "setup.sh", "verify.sh", "nohup sudo systemctl reboot"),
+            ("windows", "setup.ps1", "verify.ps1", "Restart-Computer -Force")):
+        sub = tmp_path / os_family
+        env, recipe = _build_env(sub, os_family)
+        _fast_sleep(sub)
+        # The VM keeps answering with its old boot ID for three polls.
+        env.update(FAKE_SSH_FAIL_ON=setup, FAKE_SSH_FAIL_RC="100", FAKE_BOOT_FLIP_AFTER="3")
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 0, result.stderr
+        timeline = _timeline(sub)
+        commands = [c for _b, c in timeline]
+        i_setup = next(i for i, c in enumerate(commands) if setup in c)
+        i_reboot = next(i for i, c in enumerate(commands) if reboot in c)
+        i_verify = next(i for i, c in enumerate(commands) if verify in c)
+        assert i_setup < i_reboot < i_verify, commands
+        # The setup did not reboot; the core did, once.
+        assert sum(reboot in c for c in commands) == 1, commands
+        # Verify ran only in the new boot, after the polls that still saw the old one.
+        assert timeline[i_verify][0] == "boot-2", timeline
+        polls = [b for b, c in timeline[i_reboot + 1:i_verify] if _is_boot_read(c)]
+        assert polls[:3] == ["boot-1"] * 3 and "boot-2" in polls, timeline
+        assert all(b == "boot-1" for b, _c in timeline[:i_reboot + 1]), timeline
+
+
+def test_setup_session_drop_requires_a_new_boot(tmp_path):
+    # Exit 255 (session dropped) and the VM rebooted: the build goes on.
+    env, recipe = _build_env(tmp_path / "rebooted")
+    _fast_sleep(tmp_path / "rebooted")
+    env.update(FAKE_SSH_FAIL_ON="setup.sh", FAKE_SSH_FAIL_RC="255", FAKE_SSH_REBOOT_ON="setup.sh",
+               FAKE_BOOT_FLIP_AFTER="2")
     result = _build(env, recipe, "fake")
     assert result.returncode == 0, result.stderr
+    timeline = _timeline(tmp_path / "rebooted")
+    verify = [b for b, c in timeline if "verify.sh" in c]
+    assert verify == ["boot-2"], timeline
+    assert not any("systemctl reboot" in c for _b, c in timeline)
+
+    # Exit 255 but the boot ID never changes: the session dropped without a
+    # reboot, so the build stops when the wait runs out.
+    env, recipe = _build_env(tmp_path / "same")
+    _fast_sleep(tmp_path / "same")
+    env.update(FAKE_SSH_FAIL_ON="setup.sh", FAKE_SSH_FAIL_RC="255", IMAGE_BUILD_SSH_WAIT_SECONDS="2")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 1, result.stderr
+    assert "SSH dropped during setup but the VM did not reboot" in result.stderr
+    steps = _events(_calls(tmp_path / "same"), "setup.sh", "verify.sh", "seal_linux.sh")
+    assert "verify" not in steps and "save" not in steps
+    assert steps[-1] == "destroy"
+
+    # Any other exit code fails the build at once.
     env2, recipe2 = _build_env(tmp_path / "fail")
     env2.update(FAKE_SSH_FAIL_ON="setup.sh", FAKE_SSH_FAIL_RC="3")
     result = _build(env2, recipe2, "fake")
@@ -452,6 +536,112 @@ def test_setup_session_drop_tolerated_other_failure_not(tmp_path):
     steps = _events(_calls(tmp_path / "fail"), "setup.sh", "verify.sh", "seal_linux.sh")
     assert "verify" not in steps and "save" not in steps
     assert steps[-1] == "destroy"
+
+
+def test_ssh_wait_seconds_checked(tmp_path):
+    for i, bad in enumerate(("0", "abc", "-5", "08")):
+        env, recipe = _build_env(tmp_path / str(i))
+        env["IMAGE_BUILD_SSH_WAIT_SECONDS"] = bad
+        result = _build(env, "--dry-run", recipe, "fake")
+        assert result.returncode == 2, bad
+        assert "IMAGE_BUILD_SSH_WAIT_SECONDS" in result.stderr
+
+
+def test_exit_2_only_before_any_vm_started(tmp_path):
+    # A backend step that exits 2 once the build is under way is a build
+    # failure (1), not a rejected input.
+    for fn in ("backend_resolve_base", "backend_start", "backend_save"):
+        env, recipe = _build_env(tmp_path / fn)
+        env.update(FAKE_FAIL=fn, FAKE_FAIL_RC="2")
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 1, (fn, result.stderr)
+    # A config the backend rejects is still 2.
+    env, recipe = _build_env(tmp_path / "check")
+    env.update(FAKE_FAIL="backend_check_config", FAKE_FAIL_RC="2")
+    assert _build(env, recipe, "fake").returncode == 2
+
+
+def _append(path: Path, text: str) -> None:
+    path.write_text(path.read_text() + text)
+
+
+def test_recipe_cannot_touch_core_state(tmp_path):
+    # DRY_RUN=0 in a recipe does not turn a dry run live.
+    env, recipe = _build_env(tmp_path / "dry")
+    _append(recipe, "DRY_RUN=0\nQUERY_LIVE=1\n")
+    result = _build(env, "--dry-run", recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path / "dry")
+    assert _remote_commands(calls, "fake-cloud") == []
+    assert _remote_commands(calls, "ssh") == [] and _remote_commands(calls, "scp") == []
+    assert "DRY-RUN: fake-cloud start" in result.stderr
+
+    # STARTED/BUILD_VM_ID from a recipe do not make the trap destroy anything.
+    env, recipe = _build_env(tmp_path / "started")
+    _append(recipe, "STARTED=1\nBUILD_VM_ID=vm-victim\n")
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text("# nothing configured\n")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 2, result.stderr
+    calls = _calls(tmp_path / "started")
+    assert "backend_destroy" not in calls and "vm-victim" not in calls
+
+    # A recipe cannot replace the core's helpers.
+    env, recipe = _build_env(tmp_path / "func")
+    _append(recipe, "log() { echo HIJACKED >&2; }\nmutate() { echo HIJACKED >&2; }\n")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    assert "HIJACKED" not in result.stderr
+    assert "[image-build] run ib-" in result.stderr
+    assert "fake-cloud start" in _calls(tmp_path / "func")
+
+
+def test_recipe_values_round_trip(tmp_path):
+    # Spaces, quotes, $ and a glob survive exactly; nothing is split or expanded.
+    value = """fake base-* 'q' "dq" $HOME \\ *"""
+    env, recipe = _build_env(tmp_path, BASE_FAKE=value, PAYLOAD_EXCLUDE="packer *.iso")
+    result = _build(env, "--dry-run", recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    assert f"backend_resolve_base {value}\n" in _calls(tmp_path)
+    assert f"DRY-RUN: fake-cloud resolve {value}\n" in result.stderr
+    tar_line = [l for l in result.stderr.splitlines() if l.startswith("DRY-RUN: tar ")][0]
+    assert "--exclude=packer" in tar_line.split() and "--exclude=*.iso" in tar_line.split()
+
+
+def test_config_cannot_touch_core_state_or_recipe_keys(tmp_path):
+    config_ok = "FAKE_REGION='test-1'\n"
+    # DRY_RUN=0 in the config does not turn a dry run live.
+    env, recipe = _build_env(tmp_path / "dry")
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text(config_ok + "DRY_RUN=0\nQUERY_LIVE=1\n")
+    result = _build(env, "--dry-run", recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path / "dry")
+    assert _remote_commands(calls, "fake-cloud") == []
+    assert _remote_commands(calls, "ssh") == [] and _remote_commands(calls, "scp") == []
+
+    # STARTED/BUILD_VM_ID from the config do not make the trap destroy anything.
+    env, recipe = _build_env(tmp_path / "started")
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text("STARTED=1\nBUILD_VM_ID=vm-victim\n")
+    result = _build(env, recipe, "fake")
+    assert result.returncode == 2, result.stderr
+    calls = _calls(tmp_path / "started")
+    assert "backend_destroy" not in calls and "vm-victim" not in calls
+
+    # Only the recipe sets recipe keys: a config that sets one is refused.
+    for key, value in (("DISK_GB", "999"), ("KEEP_SSH", "yes"), ("BASE_FAKE", "other-*"),
+                       ("AWS_INSTANCE_TYPE", "t3.large")):
+        env, recipe = _build_env(tmp_path / key)
+        Path(env["IMAGE_BUILD_CONFIG"]).write_text(config_ok + f"{key}={value}\n")
+        result = _build(env, "--dry-run", recipe, "fake")
+        assert result.returncode == 2, (key, result.stderr)
+        assert key in result.stderr, (key, result.stderr)
+        assert "backend_start" not in _calls(tmp_path / key)
+
+    # The backend's own keys still arrive, exactly.
+    env, recipe = _build_env(tmp_path / "value")
+    Path(env["IMAGE_BUILD_CONFIG"]).write_text("FAKE_REGION='a b * \"c\"'\n")
+    result = _build(env, "--dry-run", recipe, "fake")
+    assert result.returncode == 0, result.stderr
+    assert 'backend_check_config region=a b * "c"' in _calls(tmp_path / "value")
 
 
 def test_sigterm_destroys(tmp_path):
@@ -491,6 +681,54 @@ def test_dirty_tree_refused(tmp_path):
     result = _build(env, "--allow-dirty", recipe, "fake")
     assert result.returncode == 0, result.stderr
     assert _build_log(tmp_path).read_text().splitlines()[1].split("\t")[6] == "abc1234-dirty"
+
+
+def _git(repo: Path, *args) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+         "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", *args],
+        check=True, capture_output=True, text=True).stdout
+
+
+def test_build_log_alone_does_not_dirty_the_repo(tmp_path):
+    # One recipe is built on several backends before the log is committed: the
+    # log a build appends must not make the next build's repo "dirty". Real
+    # git, so the pathspec is proven against git itself (and from a recipe in
+    # a subdirectory, where a cwd-relative pathspec would miss).
+    env, recipe = _build_env(tmp_path)
+    (tmp_path / "bin" / "git").unlink()
+    repo = tmp_path / "course"
+    _git(repo, "init", "-q")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "recipe")
+    sha7 = _git(repo, "rev-parse", "HEAD")[:7]
+    log = _build_log(tmp_path)
+
+    def build_ok():
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 0, result.stderr
+        assert log.read_text().splitlines()[-1].split("\t")[6] == sha7
+
+    build_ok()                       # creates the log (untracked)
+    build_ok()                       # an untracked log alone is clean
+    _git(repo, "add", "coursework")
+    _git(repo, "commit", "-q", "-m", "log")
+    sha7 = _git(repo, "rev-parse", "HEAD")[:7]
+    build_ok()                       # appends: the log is now modified
+    build_ok()                       # a modified log alone is clean
+
+    # Anything else still refuses, even next to the log.
+    for other in ("labs/demo/payload/setup.sh", "coursework/deploy/image-build/notes.txt"):
+        path = repo / other
+        before = path.read_text() if path.exists() else None
+        path.write_text("changed\n")
+        result = _build(env, recipe, "fake")
+        assert result.returncode == 2, (other, result.stderr)
+        assert "dirty" in result.stderr
+        if before is None:
+            path.unlink()
+        else:
+            path.write_text(before)
 
 
 def test_recipe_missing_key_refused(tmp_path):
