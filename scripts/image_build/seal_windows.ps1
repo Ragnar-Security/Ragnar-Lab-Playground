@@ -9,8 +9,14 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-Remove-Item -Recurse -Force 'C:\image-build' -ErrorAction SilentlyContinue
-Remove-Item -Force 'C:\ProgramData\ssh\administrators_authorized_keys' -ErrorAction SilentlyContinue
+# Fail closed: an absent path is fine, a present path that cannot be deleted
+# stops the script (non-zero exit) so the image is never saved with it.
+$sealPaths = @('C:\image-build', 'C:\ProgramData\ssh\administrators_authorized_keys')
+foreach ($p in $sealPaths) {
+    if (Test-Path -LiteralPath $p) {
+        Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction Stop
+    }
+}
 
 # 32 characters from an alphabet with every character class, drawn from the
 # cryptographic RNG. The value is held in a SecureString and never output.
@@ -33,7 +39,9 @@ if (-not $KeepSsh) {
     Set-Service sshd -StartupType Disabled
 }
 
-if (Test-Path 'C:\image-build') {
-    [Console]::Error.WriteLine('seal_windows.ps1: C:\image-build still exists after removal')
-    exit 1
+foreach ($p in $sealPaths) {
+    if (Test-Path -LiteralPath $p) {
+        [Console]::Error.WriteLine("seal_windows.ps1: $p still exists after removal")
+        exit 1
+    }
 }
