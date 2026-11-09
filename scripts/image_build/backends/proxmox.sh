@@ -13,21 +13,27 @@
 #
 # Tags live in the description: "image-build=<run-id>
 # image-build-expires=<yyyymmddhhmm UTC>" from the clone onwards (qm clone
-# sets it, so the guest is never untagged), and "image=<image-name>" once it
-# is a template. A destroy re-checks the tag on the node, in the same remote
-# command, immediately before `qm stop` and again before `qm destroy`, and
-# never destroys a template.
+# sets it; while the clone is still running the new guest may not carry it
+# yet, being held as `lock: clone`, and a destroy that finds no tag refuses
+# it), and "image=<image-name>" once it is a template. A destroy re-checks the
+# tag on the node, in the same remote command, immediately before `qm stop`
+# and again before `qm destroy`, and never destroys a template.
 #
 # Config: PVE_HOST and PVE_REPLICA_HOST are SSH addresses (root, key auth);
 # PVE_NODE and PVE_REPLICA_NODE are the cluster's node names, as in
-# templates.yaml. Every value that reaches a remote shell is checked against a
-# strict pattern by backend_check_config, and every remote argument is quoted
-# by pve(). Needs python3 locally to read pvesh/qm JSON.
+# templates.yaml ([a-z0-9-]). Every value that reaches a remote shell is
+# checked against a strict pattern by backend_check_config, and every remote
+# argument is quoted by pve(). Needs python3 locally to read pvesh/qm JSON.
+
+# The config keys this backend reads (the core imports only these).
+BACKEND_CONFIG_PREFIX=PVE_
 
 _PVE_BLOCK_MIN=8000
 _PVE_BLOCK_MAX=8499
 _PVE_LEFTOVER_MAX=8999
 _PVE_REPLICA_OFFSET=500
+# A node name as templates.yaml takes it; the config check uses the same.
+_PVE_NODE_CHARS='[a-z0-9-]+'
 _PVE_SYNC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/sync_template.sh"
 
 # JSON from pvesh and qm, read locally. Exit 0/1 is the answer for a check,
@@ -248,14 +254,28 @@ EOF
 # the node itself immediately before `qm stop` and again before `qm destroy`,
 # with no round trip in which the VMID could be freed and reused. $2 is a
 # shell condition on $w (the description's words, one per line); $3 says why
-# a VM failing it is refused. A VM that is absent is fine (exit 0); one that
-# fails $2, is a template, or is not a VM on this node is refused (exit 3).
+# a VM failing it is refused. A VM that does not exist is fine (exit 0): qm
+# must report exactly that, /etc/pve/nodes must be readable, and no node may
+# hold the VMID. One that fails $2, is a template, or is not a VM on this node
+# is refused (exit 3). A config that cannot be read for any other reason (the
+# cluster filesystem down, say) fails the destroy (exit 4).
 _pve_destroy_script() {
   cat <<EOF
 set -e
 v=$1
 check() {
   if ! c=\$(qm config \$v 2>/dev/null); then
+    e=\$(qm config \$v 2>&1 >/dev/null) || true
+    case "\$e" in
+      *"/\$v.conf' does not exist"*) ;;
+      *)
+        echo "proxmox: cannot read the config of VM \$v (\${e:-qm config failed}); not destroyed" >&2
+        exit 4 ;;
+    esac
+    if ! ls -d /etc/pve/nodes >/dev/null 2>&1; then
+      echo "proxmox: /etc/pve/nodes is not readable (cluster filesystem down?); VM \$v not destroyed" >&2
+      exit 4
+    fi
     if [ -n "\$(ls /etc/pve/nodes/*/qemu-server/\$v.conf /etc/pve/nodes/*/lxc/\$v.conf 2>/dev/null)" ]; then
       echo "proxmox: VMID \$v is not a VM on this node; not destroyed" >&2
       exit 3
@@ -299,6 +319,14 @@ backend_check_config() {
       bad=1
     fi
   done
+  # templates.yaml names the nodes: a name it cannot take fails here, not
+  # after the image is saved and logged.
+  for key in PVE_NODE PVE_REPLICA_NODE; do
+    if [ -n "${!key:-}" ] && ! [[ "${!key}" =~ ^${_PVE_NODE_CHARS}$ ]]; then
+      echo "proxmox: $key must match $_PVE_NODE_CHARS, as in templates.yaml (got '${!key}')" >&2
+      bad=1
+    fi
+  done
   if [ -n "${PVE_BUILD_VLAN:-}" ] && { ! [[ "$PVE_BUILD_VLAN" =~ ^[1-9][0-9]{0,3}$ ]] \
        || [ "$PVE_BUILD_VLAN" -gt 4094 ]; }; then
     echo "proxmox: PVE_BUILD_VLAN must be a VLAN number 1-4094 (got '$PVE_BUILD_VLAN')" >&2
@@ -336,9 +364,12 @@ backend_start() {
 
   vmid="$(query "$_PVE_BLOCK_MIN" _pve_free_vmid)"
   _pve_guard_vmid "$vmid" "$_PVE_BLOCK_MAX"
-  # Set before the clone: a clone that fails half-way is still destroyed.
+  # Set before the clone: a clone that fails half-way, leaving a tagged guest,
+  # is still destroyed.
   BUILD_VM_ID="$vmid"
-  # Tagged by the clone itself, so no step can leave an untagged guest.
+  # Tagged by the clone command itself. While the clone runs, the guest may
+  # not carry the description yet (`lock: clone`); a destroy that finds no
+  # tag refuses it (fails closed, so --reap or a hand cleanup is needed).
   mutate pve qm clone "$base" "$vmid" --name "$run_id" --full 1 --storage "$PVE_STORAGE" \
     --description "image-build=$RUN_ID image-build-expires=$BUILD_EXPIRES_UTC" >&2
   mutate pve qm set "$vmid" --memory "$PVE_MEMORY_MB" --cores "$PVE_CORES" \
@@ -388,7 +419,11 @@ backend_save() {
   # The build VM is the template now: the core must not destroy it.
   BUILD_VM_ID=""
   # Before the copy, so the replica carries the same description.
-  mutate pve qm set "$vmid" --description "image=$name" >&2
+  rc=0
+  mutate pve qm set "$vmid" --description "image=$name" >&2 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    die "proxmox: setting the description of template $vmid on $PVE_NODE to image=$name failed (exit $rc); the template still carries its build tags (image-build=$RUN_ID) and is neither replicated nor logged: set it by hand (qm set $vmid --description image=$name) and copy it with scripts/sync_template.sh, or delete it (qm destroy $vmid --purge)"
+  fi
 
   rc=0
   mutate bash "$_PVE_SYNC" "$PVE_HOST" "$vmid" "$PVE_REPLICA_HOST" "$PVE_REPLICA_STORAGE" \
@@ -433,7 +468,7 @@ backend_destroy_id() {
 }
 
 backend_templates_yaml() {
-  if ! [[ "$1" =~ ^([a-z0-9-]+):([0-9]+),([a-z0-9-]+):([0-9]+)$ ]]; then
+  if ! [[ "$1" =~ ^(${_PVE_NODE_CHARS}):([0-9]+),(${_PVE_NODE_CHARS}):([0-9]+)$ ]]; then
     die "proxmox: image ID '$1' is not <node>:<vmid>,<node>:<vmid>"
   fi
   printf 'template_locations: {%s: %s, %s: %s}\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" \

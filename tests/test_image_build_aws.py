@@ -145,6 +145,9 @@ elif op == ["run-instances"]:
     save()
     if query != "Instances[0].InstanceId":
         fail("unknown run-instances query %r" % query)
+    if os.environ.get("FAKE_AWS_RUN_FAIL"):
+        # The instance exists, but the client never learns its ID.
+        fail("Read timeout on endpoint URL", 255)
     print(iid)
 elif op == ["describe-instances"] and "--instance-ids" in opts:
     inst = instance(one("--instance-ids"))
@@ -159,8 +162,9 @@ elif op == ["describe-instances"] and "--instance-ids" in opts:
     else:
         fail("unknown describe-instances query %r" % query)
 elif op == ["describe-instances"] and "--filters" in opts:
-    if query != ("Reservations[].Instances[].[InstanceId, "
-                 "Tags[?Key=='image-build-expires'].Value | [0]]"):
+    leftovers = ("Reservations[].Instances[].[InstanceId, "
+                 "Tags[?Key=='image-build-expires'].Value | [0]]")
+    if query not in (leftovers, "Reservations[].Instances[].[InstanceId]"):
         fail("unknown describe-instances query %r" % query)
     rows = list(world["instances"].items())
     for flt in opts["--filters"]:
@@ -168,12 +172,17 @@ elif op == ["describe-instances"] and "--filters" in opts:
         values = values.split(",")
         if name == "Name=tag-key":
             rows = [r for r in rows if any(k in r[1]["tags"] for k in values)]
+        elif name == "Name=tag:image-build":
+            rows = [r for r in rows if r[1]["tags"].get("image-build") in values]
         elif name == "Name=instance-state-name":
             rows = [r for r in rows if r[1]["state"] in values]
         else:
             fail("unknown filter %r" % flt)
     for iid, inst in rows:
-        print("%s\t%s" % (iid, text(inst["tags"].get("image-build-expires"))))
+        if query == leftovers:
+            print("%s\t%s" % (iid, text(inst["tags"].get("image-build-expires"))))
+        else:
+            print(iid)
 elif op == ["create-image"]:
     instance(one("--instance-id"))
     if query != "ImageId":
@@ -425,6 +434,49 @@ def test_aws_destroy_failure_after_start_still_terminates(tmp_path):
     assert ops[-3:] == ["describe-instances", "terminate-instances", "wait instance-terminated"]
 
 
+FOREIGN = "i-0000000000000f00f"
+
+
+def test_aws_unrecorded_instance_found_by_run_tag(tmp_path):
+    # run-instances made the instance but failed before printing its ID: the
+    # cleanup finds it by this run's tag and terminates it through the same
+    # ownership re-check. Another run's instance is never touched.
+    env, recipe = _aws_env(tmp_path)
+    _seed(env, {FOREIGN: {"state": "running", "ip": None,
+                          "tags": {"image-build": "ib-202601010000-ffff",
+                                   "image-build-expires": "209912312359"}}})
+    env["FAKE_AWS_RUN_FAIL"] = "1"
+    result = _build(env, recipe, "aws")
+    assert result.returncode == 1, result.stderr
+    run_id = _run_id(result.stderr)
+    world = json.loads(Path(env["FAKE_AWS_STATE"]).read_text())["instances"]
+    assert world[INSTANCE]["state"] == "terminated"
+    assert world[FOREIGN]["state"] == "running"
+    assert _ops(tmp_path) == ["describe-images", "describe-images", "run-instances",
+                              "describe-instances",          # lookup by run tag
+                              "describe-instances",          # ownership re-check
+                              "terminate-instances", "wait instance-terminated"]
+    lookup = [c for c in _aws_calls(tmp_path)
+              if c["words"][1:] == ["describe-instances"] and "--filters" in c["opts"]]
+    assert len(lookup) == 1
+    assert f"Name=tag:image-build,Values={run_id}" in lookup[0]["opts"]["--filters"]
+    assert [c["opts"]["--instance-ids"] for c in _aws_calls(tmp_path)
+            if c["words"][1:] == ["terminate-instances"]] == [[INSTANCE]]
+    assert "could not destroy" not in result.stderr.lower()
+
+    # The lookup finds nothing of this run: nothing is terminated.
+    env, recipe = _aws_env(tmp_path / "none")
+    _seed(env, {FOREIGN: {"state": "running", "ip": None,
+                          "tags": {"image-build": "ib-202601010000-ffff",
+                                   "image-build-expires": "202601010400"}}})
+    recipe.write_text(recipe.read_text().replace("AWS_INSTANCE_TYPE=t3.small", "AWS_INSTANCE_TYPE='t3 small'"))
+    result = _build(env, recipe, "aws")
+    assert result.returncode == 1
+    assert "terminate-instances" not in _ops(tmp_path / "none")
+    world = json.loads(Path(env["FAKE_AWS_STATE"]).read_text())["instances"]
+    assert world[FOREIGN]["state"] == "running"
+
+
 def test_aws_image_wait_retries_while_pending(tmp_path):
     env, recipe = _aws_env(tmp_path)
     # The waiter gives up twice while the AMI is still pending, then succeeds.
@@ -653,13 +705,16 @@ class _Ec2Stub:
         iid = f"i-0000000000000{len(self.instances) + 1:04x}"
         self.instances[iid] = {"state": "running", "tags": tags, "ip": "192.0.2.20",
                                "image": p["ImageId"]}
+        if getattr(self, "fail_run_after_create", False):
+            # Created, but the caller never sees the reply's instance ID.
+            return 500, _error("InternalError", "An internal error has occurred")
         return 200, _resp("RunInstances",
                           f"<reservationId>r-0000000000000001</reservationId><ownerId>000000000000</ownerId>"
                           f"<instancesSet>{self._instance_xml(iid)}</instancesSet>")
 
     def _DescribeInstances(self, p):
         ids, flt = self._list(p, "InstanceId"), self._filters(p)
-        unknown = set(flt) - {"tag-key", "instance-state-name"}
+        unknown = set(flt) - {"tag-key", "tag:image-build", "instance-state-name"}
         if unknown:
             return 400, _error("InvalidParameterValue", f"stub filter {unknown}")
         missing = [i for i in ids if i not in self.instances]
@@ -670,6 +725,8 @@ class _Ec2Stub:
             if ids and iid not in ids:
                 continue
             if "tag-key" in flt and not any(k in inst["tags"] for k in flt["tag-key"]):
+                continue
+            if "tag:image-build" in flt and inst["tags"].get("image-build") not in flt["tag:image-build"]:
                 continue
             if "instance-state-name" in flt and inst["state"] not in flt["instance-state-name"]:
                 continue
@@ -854,3 +911,21 @@ def test_real_cli_reap(tmp_path, ec2_stub):
     result = _build(env, "--reap", "aws")
     assert result.returncode == 1
     assert ec2_stub.instances["i-00000000000000003"]["state"] == "running"
+
+
+@real_cli
+def test_real_cli_unrecorded_instance_found_by_run_tag(tmp_path, ec2_stub):
+    # The real CLI's filter and --output text shapes for the run-tag lookup.
+    ec2_stub.instances[FOREIGN] = {"state": "running", "ip": None, "image": "ami-00000000000000a01",
+                                   "tags": {"image-build": "ib-202601010000-ffff",
+                                            "image-build-expires": "202601010400"}}
+    ec2_stub.fail_run_after_create = True
+    env, recipe = _real_env(tmp_path, ec2_stub)
+    result = _build(env, recipe, "aws")
+    assert result.returncode == 1, result.stderr
+    run_id = _run_id(result.stderr)
+    ours = [i for i, inst in ec2_stub.instances.items() if inst["tags"].get("image-build") == run_id]
+    assert len(ours) == 1
+    assert ec2_stub.instances[ours[0]]["state"] == "terminated"
+    assert ec2_stub.instances[FOREIGN]["state"] == "running"
+    assert [p["InstanceId.1"] for p in _actions(ec2_stub, "TerminateInstances")] == ours

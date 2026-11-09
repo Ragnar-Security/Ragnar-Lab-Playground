@@ -61,6 +61,9 @@ if prog == "ssh":
     user, _, host = target.rpartition("@")
     nodes = json.loads(os.environ["FAKE_PVE_HOSTS"])
     if user != "root" or host not in nodes:
+        # A build VM: it never reboots here, so its boot ID is constant.
+        if "boot_id" in cmd or "LastBootUpTime" in cmd:
+            print("boot-1")
         sys.exit(0)
     with open(os.environ["PVE_LOG"] + ".remote", "a") as f:
         f.write(nodes[host] + "\t" + cmd + "\0")
@@ -110,19 +113,25 @@ def description(vmid):
 
 def local_vm(vmid):
     g = guests.get(vmid)
-    if not g or g["node"] != node or g["type"] != "qemu":
+    if not g or g["node"] != node or g["type"] != "qemu" or vmid == vanished:
         refuse("Configuration file 'nodes/%s/qemu-server/%s.conf' does not exist" % (node, vmid))
     return g
 
 
+# FAKE_PVE_VANISHED=<vmid>: listed by pvesh, but gone for qm and the
+# /etc/pve probe (it was destroyed in between).
+vanished = os.environ.get("FAKE_PVE_VANISHED", "")
 if prog == "ls":
     shown = []
     if w[1] == "-t":
         shown = [d for d in dumps if fnmatch.fnmatch(d, w[2])][-1:]
+    elif w[1:] == ["-d", "/etc/pve/nodes"]:
+        # FAKE_PVE_CLUSTERFS_DOWN: pmxcfs is not mounted.
+        shown = [] if os.environ.get("FAKE_PVE_CLUSTERFS_DOWN") else ["/etc/pve/nodes"]
     else:
         for word in w[1:]:
             m = word.rsplit("/", 1)[-1].split(".")[0]
-            if m in guests and ("/lxc/" in word) == (guests[m]["type"] == "lxc"):
+            if m in guests and m != vanished and ("/lxc/" in word) == (guests[m]["type"] == "lxc"):
                 shown.append(word.replace("*", guests[m]["node"]))
     for s in shown:
         print(s)
@@ -183,6 +192,10 @@ elif prog == "qm":
             refuse("unexpected: " + shlex.join(w))
         done()
     vmid = w[2]
+    if sub == "config" and os.environ.get("FAKE_PVE_QM_CONFIG_ERROR"):
+        # Any failure other than "does not exist", e.g. pmxcfs unreachable.
+        print(os.environ["FAKE_PVE_QM_CONFIG_ERROR"], file=sys.stderr)
+        done(255)
     g = local_vm(vmid)
     if sub == "clone":
         new = w[3]
@@ -199,6 +212,8 @@ elif prog == "qm":
     elif sub == "set":
         o = opts(w[3:])
         if "memory" in o and os.environ.get("FAKE_PVE_SET_FAIL"):
+            refuse("set failed")
+        if o.get("description", "").startswith("image=") and os.environ.get("FAKE_PVE_DESC_FAIL"):
             refuse("set failed")
         for key in ("name", "description"):
             if key in o:
@@ -672,6 +687,63 @@ def test_proxmox_config_unsafe_values_refused(tmp_path):
         assert result.returncode == 2, (key, value, result.stderr)
         assert key in result.stderr, (key, result.stderr)
         assert _ssh_calls(sub) == [], key
+
+
+def test_proxmox_node_names_checked_at_config_time(tmp_path):
+    # templates.yaml takes [a-z0-9-] node names: anything else is refused
+    # before the build, not after the image is saved and logged.
+    for i, (key, value) in enumerate((("PVE_NODE", "Pve"), ("PVE_NODE", "pve.lan"),
+                                      ("PVE_REPLICA_NODE", "pve_2"))):
+        sub = tmp_path / str(i)
+        env, recipe = _pve_env(sub, _cluster())
+        config = re.sub(rf"^{key}=.*$", f"{key}={value}", PVE_CONFIG, flags=re.M)
+        Path(env["IMAGE_BUILD_CONFIG"]).write_text(config)
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 2, (key, value, result.stderr)
+        assert key in result.stderr, (key, result.stderr)
+        assert _ssh_calls(sub) == [], key
+
+
+def test_proxmox_failed_description_rewrite_names_the_template(tmp_path):
+    env, recipe = _pve_env(tmp_path, _cluster())
+    env["FAKE_PVE_DESC_FAIL"] = "1"
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert "template 8000" in result.stderr, result.stderr
+    assert "build tags" in result.stderr, result.stderr
+    state = _state(tmp_path)["8000"]
+    assert state["template"] == 1 and state["description"].startswith("image-build=ib-")
+    assert _destroys(tmp_path) == []
+    assert not any(c.startswith(("vzdump", "qmrestore")) for c in _pve_cmds(tmp_path))
+    assert not _build_log(tmp_path).exists()
+
+
+def test_proxmox_node_destroy_absent_means_does_not_exist(tmp_path):
+    def reap(sub, **extra):
+        env, _recipe = _pve_env(tmp_path / sub, _cluster(**{"8003": _guest("pve", "x", description=EXPIRED)}))
+        env.update(FAKE_PVE_VANISHED="8003", **extra)
+        return _build(env, "--reap", "proxmox")
+
+    # Really gone between the listing and the node-side destroy: nothing to do.
+    result = reap("gone")
+    assert result.returncode == 0, result.stderr
+    assert "VM 8003 does not exist" in result.stderr
+    assert _destroys(tmp_path / "gone") == []
+
+    # qm config failed for another reason: not "absent", the destroy fails.
+    result = reap("qmerror", FAKE_PVE_QM_CONFIG_ERROR="ipcc_send_rec[1] failed: Connection refused")
+    assert result.returncode == 1, result.stderr
+    assert "could not destroy 8003" in result.stderr
+    assert "does not exist" not in result.stderr
+    assert "Connection refused" in result.stderr
+    assert _destroys(tmp_path / "qmerror") == []
+
+    # "does not exist", but /etc/pve is not there to confirm it (pmxcfs down).
+    result = reap("pmxcfs", FAKE_PVE_CLUSTERFS_DOWN="1")
+    assert result.returncode == 1, result.stderr
+    assert "could not destroy 8003" in result.stderr
+    assert "/etc/pve" in result.stderr
+    assert _destroys(tmp_path / "pmxcfs") == []
 
 
 # --- sync_template.sh -------------------------------------------------------------

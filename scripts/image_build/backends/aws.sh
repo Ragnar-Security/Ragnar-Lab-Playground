@@ -17,6 +17,9 @@
 # and image-build-expires=<yyyymmddhhmm UTC>. The image and its snapshots carry
 # image-build-recipe and image-build-commit instead: the product never expires.
 
+# The config keys this backend reads (the core imports only these).
+BACKEND_CONFIG_PREFIX=AWS_
+
 # One `aws ec2 wait image-available` gives up after 10 minutes (40 x 15 s);
 # a Windows AMI can take longer, so it is re-run while the AMI is pending.
 _AWS_IMAGE_WAIT_ROUNDS=6
@@ -199,7 +202,7 @@ backend_start() {
     iid=i-dryrun
   fi
   [[ "$iid" =~ ^i-[0-9a-z]+$ ]] \
-    || die "aws: run-instances returned '$iid', not an instance ID; run: build_image.sh --reap aws"
+    || die "aws: run-instances returned '$iid', not an instance ID; the cleanup looks the instance up by this run's tag"
   BUILD_VM_ID="$iid"
 
   mutate aws ec2 wait instance-running --region "$AWS_BUILD_REGION" --instance-ids "$iid" \
@@ -245,12 +248,28 @@ backend_save() {
   IMAGE_ID="$ami"
 }
 
+# The build instance, re-checked and terminated. With no instance ID recorded
+# (run-instances failed, or was interrupted, after AWS may already have made
+# the instance), whatever carries this run's image-build tag is looked up and
+# terminated through the same re-check.
 backend_destroy() {
-  if [ -z "$BUILD_VM_ID" ]; then
+  local rows id ids=()
+  if [ -n "$BUILD_VM_ID" ]; then
+    _aws_terminate "$BUILD_VM_ID" own
+    BUILD_VM_ID=""
     return 0
   fi
-  _aws_terminate "$BUILD_VM_ID" own
-  BUILD_VM_ID=""
+  [ -n "${RUN_ID:-}" ] || return 0
+  rows="$(query "" aws ec2 describe-instances --region "$AWS_BUILD_REGION" \
+    --filters "Name=tag:image-build,Values=$RUN_ID" \
+    Name=instance-state-name,Values=pending,running,stopping,stopped \
+    --query 'Reservations[].Instances[].[InstanceId]' --output text)"
+  read -r -d '' -a ids <<< "$rows" || true
+  for id in ${ids[@]+"${ids[@]}"}; do
+    [[ "$id" =~ ^i-[0-9a-f]+$ ]] || die "aws: looking up run $RUN_ID returned '$id', not an instance ID"
+    echo "aws: $id was launched by this run but its ID was never recorded; terminating it" >&2
+    _aws_terminate "$id" own
+  done
 }
 
 # Build instances (tag key image-build) not yet terminated whose

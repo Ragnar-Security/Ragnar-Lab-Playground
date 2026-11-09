@@ -21,6 +21,9 @@
 # the project. A build VM is an instance whose image-build label equals its own
 # name (ib-<yyyymmddhhmm>-<4 hex>) and carries image-build-expires.
 
+# The config keys this backend reads (the core imports only these).
+BACKEND_CONFIG_PREFIX=GCP_
+
 _GCP_RUN_ID_RE='^ib-[0-9]{12}-[0-9a-f]{4}$'
 _GCP_NAME_RE='^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$'
 _GCP_ZONE_RE='^[a-z]+-[a-z]+[0-9]+-[a-z]$'
@@ -53,6 +56,10 @@ backend_check_config() {
   # an hour of build, not at the save.
   if [ -n "${GCP_IMAGE_FAMILY:-}" ] && ! [[ "$GCP_IMAGE_FAMILY" =~ $_GCP_NAME_RE ]]; then
     echo "gcp: GCP_IMAGE_FAMILY '$GCP_IMAGE_FAMILY' must match $_GCP_NAME_RE" >&2
+    return 1
+  fi
+  if [ "$DRY_RUN" != 1 ] && ! command -v gcloud >/dev/null 2>&1; then
+    echo "gcp: the Google Cloud CLI (gcloud) is not on PATH" >&2
     return 1
   fi
 }

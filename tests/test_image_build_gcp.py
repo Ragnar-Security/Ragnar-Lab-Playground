@@ -4,10 +4,16 @@ instance state, so ordering (stop before image) and the label re-checks are
 enforced by the fake and not only asserted on its log."""
 
 import json
+import os
 import re
+import shlex
+import shutil
+import subprocess
 from pathlib import Path
 
-from tests.test_image_build import KEY_MATERIAL, _build, _build_env, _build_log, _calls
+from tests.test_image_build import IMAGE_BUILD, KEY_MATERIAL, _build, _build_env, _build_log, _calls
+
+GCP_BACKEND = IMAGE_BUILD / "backends" / "gcp.sh"
 
 PROJECT = "fake-build-project"
 ZONE = "us-east1-b"
@@ -439,3 +445,27 @@ def test_gcp_config_checked(tmp_path):
     result = _build(env, "--dry-run", recipe, "gcp")
     assert result.returncode == 2
     assert "GCP_IMAGE_FAMILY" in result.stderr
+
+
+def test_gcp_check_config_requires_gcloud_outside_dry_run(tmp_path):
+    # The check itself, with a PATH that holds no gcloud (as AWS and Proxmox
+    # check their tools): only a dry run may go on without the CLI.
+    bash = shutil.which("bash")
+    (tmp_path / "with").mkdir()
+    (tmp_path / "with" / "gcloud").write_text("#!/bin/sh\nexit 0\n")
+    (tmp_path / "with" / "gcloud").chmod(0o755)
+    (tmp_path / "without").mkdir()
+
+    def check(dry_run, path_dir):
+        script = (f"set -euo pipefail\nsource {shlex.quote(str(GCP_BACKEND))}\n"
+                  f"GCP_BUILD_PROJECT={PROJECT} GCP_BUILD_ZONE={ZONE} GCP_BUILD_SUBNET={SUBNET}\n"
+                  f"DRY_RUN={dry_run}\nPATH={shlex.quote(str(path_dir))}\nbackend_check_config\n")
+        return subprocess.run([bash, "-c", script], capture_output=True, text=True, timeout=30,
+                              env={"PATH": os.environ["PATH"]})
+
+    result = check(0, tmp_path / "without")
+    assert result.returncode != 0
+    assert "gcloud" in result.stderr
+    assert check(1, tmp_path / "without").returncode == 0
+    result = check(0, tmp_path / "with")
+    assert result.returncode == 0, result.stderr
