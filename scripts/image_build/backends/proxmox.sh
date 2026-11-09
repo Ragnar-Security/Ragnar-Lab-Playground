@@ -33,7 +33,7 @@ _PVE_SYNC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/sync_template.sh"
 # JSON from pvesh and qm, read locally. Exit 0/1 is the answer for a check,
 # 2 a malformed reply.
 _PVE_PY="$(cat <<'PY'
-import base64, fnmatch, json, sys
+import base64, fnmatch, json, re, sys
 
 
 def fail(msg, code=2):
@@ -101,8 +101,11 @@ elif mode == "inrange":
 elif mode == "istemplate":
     print(1 if int(load().get("template") or 0) == 1 else 0)
 elif mode == "expired":
+    # A reapable VM carries exactly one image-build tag in the core's RUN_ID
+    # format (ib-<yyyymmddhhmm>-<4 hex>), and one expiry in the past.
     now, t = int(args[0]), tags(load())
-    tagged = any(x.startswith("image-build=") and len(x) > len("image-build=") for x in t)
+    runs = [x[len("image-build="):] for x in t if x.startswith("image-build=")]
+    tagged = len(runs) == 1 and re.fullmatch(r"ib-[0-9]{12}-[0-9a-f]{4}", runs[0]) is not None
     exp = [x[len("image-build-expires="):] for x in t if x.startswith("image-build-expires=")]
     ok = tagged and len(exp) == 1 and len(exp[0]) == 12 and exp[0].isdigit() and int(exp[0]) < now
     sys.exit(0 if ok else 1)
@@ -416,15 +419,16 @@ backend_destroy_id() {
   local now cfg rc=0 expired
   _pve_guard_vmid "$1" "$_PVE_LEFTOVER_MAX"
   now="$(_pve_now)"
-  cfg="$(query '{"description": "image-build=ib-dry-run image-build-expires=000000000000"}' \
+  cfg="$(query '{"description": "image-build=ib-000000000000-0000 image-build-expires=000000000000"}' \
     _pve_config "$1")"
   printf '%s' "$cfg" | _pve_py expired "$now" || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "proxmox: VM $1 is not a tagged, expired build VM on $PVE_NODE; not destroyed" >&2
     return 1
   fi
-  # Re-checked on the node, in the destroy command itself.
-  expired='printf "%s\n" "$w" | grep -qx "image-build=..*" && e=$(printf "%s\n" "$w" | sed -n "s/^image-build-expires=//p") && [ "$(printf "%s\n" "$e" | grep -cx "[0-9]\{12\}")" = 1 ] && [ "$e" -lt '"$now"' ]'
+  # Re-checked on the node, in the destroy command itself: one image-build tag
+  # in RUN_ID format, and one 12-digit expiry in the past.
+  expired='[ "$(printf "%s\n" "$w" | grep -c "^image-build=")" = 1 ] && printf "%s\n" "$w" | grep -qx "image-build=ib-[0-9]\{12\}-[0-9a-f]\{4\}" && e=$(printf "%s\n" "$w" | sed -n "s/^image-build-expires=//p") && [ "$(printf "%s\n" "$e" | grep -cx "[0-9]\{12\}")" = 1 ] && [ "$e" -lt '"$now"' ]'
   mutate pve sh -c "$(_pve_destroy_script "$1" "$expired" "is not a tagged, expired build VM")" >&2
 }
 

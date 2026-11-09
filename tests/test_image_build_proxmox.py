@@ -532,6 +532,37 @@ def test_proxmox_destroy_rechecks_tag(tmp_path):
     assert "8003" in _state(tmp_path / "reap")
 
 
+# Expired, but the image-build value is not a RUN_ID the core could have made.
+HAND_TAGGED = {
+    "8007": "image-build=x image-build-expires=202601010400",
+    "8008": "image-build=ib-202601010000-ABCD image-build-expires=202601010400",
+    "8009": "image-build=ib-2026010100-abcd image-build-expires=202601010400",
+    "8010": EXPIRED + " image-build=ib-202601010000-ffff",
+}
+
+
+def test_proxmox_reap_requires_run_id_format(tmp_path):
+    guests = _cluster(**{v: _guest("pve", "hand", status="running", description=d)
+                         for v, d in HAND_TAGGED.items()})
+    guests["8003"] = _guest("pve", "expired", status="running", description=EXPIRED)
+    env, _recipe = _pve_env(tmp_path, guests)
+    result = _build(env, "--reap", "proxmox")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == ["destroyed 8003"], result.stdout
+    assert _destroys(tmp_path) == ["qm stop 8003", "qm destroy 8003 --purge 1"]
+    assert set(HAND_TAGGED) <= set(_state(tmp_path))
+
+    # The node-side check alone: the tag turns into a hand-made one between
+    # `qm stop` and `qm destroy`.
+    env, _recipe = _pve_env(tmp_path / "node", _cluster(**{"8003": _guest("pve", "x", status="running",
+                                                                         description=EXPIRED)}))
+    env["FAKE_PVE_RETAG_ON_STOP"] = HAND_TAGGED["8007"]
+    result = _build(env, "--reap", "proxmox")
+    assert result.returncode == 1
+    assert _destroys(tmp_path / "node") == ["qm stop 8003"]
+    assert "8003" in _state(tmp_path / "node")
+
+
 def test_proxmox_clone_tagged_so_failed_set_is_destroyed(tmp_path):
     env, recipe = _pve_env(tmp_path, _cluster())
     env["FAKE_PVE_SET_FAIL"] = "1"
