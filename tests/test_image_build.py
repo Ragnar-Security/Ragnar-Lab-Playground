@@ -19,6 +19,19 @@ SEAL_LINUX = IMAGE_BUILD / "seal_linux.sh"
 LOG_CALL = 'printf "%s %s\\n" "$(basename "$0")" "$*" >> "$CALL_LOG"\n'
 
 
+# systemctl <verb> <unit>: logged. A unit in FAKE_SYSTEMCTL_MISSING does not
+# exist (disable fails as systemd 255 does); one in FAKE_SYSTEMCTL_FAIL fails
+# for another reason.
+FAKE_SYSTEMCTL = LOG_CALL + (
+    'case " ${FAKE_SYSTEMCTL_MISSING:-} " in *" $2 "*)\n'
+    '  [ "$1" = disable ] && { echo "Failed to disable unit: Unit file $2 does not exist." >&2; exit 1; } ;;\n'
+    'esac\n'
+    'case " ${FAKE_SYSTEMCTL_FAIL:-} " in *" $2 "*)\n'
+    '  echo "Failed to $1 unit: Access denied" >&2; exit 1 ;;\n'
+    'esac\n'
+)
+
+
 def _tool(bin_dir: Path, name: str, body: str) -> None:
     path = bin_dir / name
     path.write_text("#!/bin/sh\n" + body)
@@ -43,8 +56,9 @@ def _seal_env(tmp_path: Path) -> dict:
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    for name in ("systemctl", "passwd", "cloud-init"):
+    for name in ("passwd", "cloud-init"):
         _tool(bin_dir, name, LOG_CALL)
+    _tool(bin_dir, "systemctl", FAKE_SYSTEMCTL)
     env = dict(os.environ)
     env.update(
         PATH=f"{bin_dir}:{os.environ['PATH']}",
@@ -81,9 +95,43 @@ def test_seal_linux_removes_payload_and_key(tmp_path):
     assert (root / "root/.bash_history").read_text() == ""
     assert (root / "home/other/.bash_history").read_text() == ""
     calls = _calls(tmp_path)
-    assert "systemctl disable ssh" in calls
     assert "passwd -l builder" in calls
     assert "cloud-init clean --logs" in calls
+
+
+def test_seal_linux_ssh_off_includes_socket(tmp_path):
+    # Ubuntu >= 22.10: ssh.socket owns port 22, so disabling ssh.service alone
+    # leaves sshd reachable. Both units are disabled and masked, and the
+    # marker both Debian/Ubuntu units honour is written.
+    env = _seal_env(tmp_path)
+    root = Path(env["SEAL_ROOT"])
+    result = _seal(tmp_path, env, "no")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path).splitlines()
+    for unit in ("ssh.service", "ssh.socket"):
+        assert f"systemctl disable {unit}" in calls, calls
+        assert f"systemctl mask {unit}" in calls, calls
+    assert (root / "etc/ssh/sshd_not_to_be_run").is_file()
+
+
+def test_seal_linux_ssh_off_tolerates_missing_unit_only(tmp_path):
+    # A base without ssh.socket (pre-22.10) still seals.
+    env = _seal_env(tmp_path)
+    root = Path(env["SEAL_ROOT"])
+    env["FAKE_SYSTEMCTL_MISSING"] = "ssh.socket"
+    result = _seal(tmp_path, env, "no")
+    assert result.returncode == 0, result.stderr
+    calls = _calls(tmp_path).splitlines()
+    assert "systemctl mask ssh.service" in calls, calls
+    assert "systemctl mask ssh.socket" not in calls, calls
+    assert (root / "etc/ssh/sshd_not_to_be_run").is_file()
+    # Any other failure fails the seal, so the image is not saved.
+    for unit in ("ssh.socket", "ssh.service"):
+        env = _seal_env(tmp_path / unit)
+        env["FAKE_SYSTEMCTL_FAIL"] = unit
+        result = _seal(tmp_path / unit, env, "no")
+        assert result.returncode != 0, unit
+        assert unit in result.stderr, (unit, result.stderr)
 
 
 def test_seal_linux_keep_ssh(tmp_path):
@@ -92,9 +140,10 @@ def test_seal_linux_keep_ssh(tmp_path):
     result = _seal(tmp_path, env, "yes")
     assert result.returncode == 0, result.stderr
     calls = _calls(tmp_path)
-    assert "systemctl disable ssh" not in calls
-    # A build base is logged into as builder by the next build.
-    assert "passwd -l builder" not in calls
+    assert "systemctl" not in calls
+    assert not (root / "etc/ssh/sshd_not_to_be_run").exists()
+    # The account is locked either way: key login still works under UsePAM.
+    assert "passwd -l builder" in calls
     assert (root / "home/builder/.ssh/authorized_keys").read_text() == ""
     assert not (root / "tmp/image-build").exists()
     assert (root / "etc/machine-id").read_text() == ""
@@ -108,9 +157,14 @@ def test_seal_linux_installs_hostkey_regen_dropin(tmp_path):
     assert result.returncode == 0, result.stderr
     dropin = root / "etc/systemd/system/ssh.service.d/10-regen-hostkeys.conf"
     assert dropin.is_file()
-    text = dropin.read_text()
-    assert "[Service]" in text
-    assert "ExecStartPre=/usr/bin/ssh-keygen -A" in text.splitlines()
+    # The unit's own `ExecStartPre=/usr/sbin/sshd -t` fails without host keys,
+    # so the list is reset and the keys are made before sshd checks them.
+    assert dropin.read_text().splitlines() == [
+        "[Service]",
+        "ExecStartPre=",
+        "ExecStartPre=/usr/bin/ssh-keygen -A",
+        "ExecStartPre=/usr/sbin/sshd -t",
+    ]
 
 
 def test_seal_linux_fails_if_payload_survives(tmp_path):

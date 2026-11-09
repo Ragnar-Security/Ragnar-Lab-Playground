@@ -18,18 +18,43 @@ esac
 R="${SEAL_ROOT:-}"
 shopt -s nullglob
 
+# Disable and mask one systemd unit. A unit that does not exist (ssh.socket on
+# a base older than Ubuntu 22.10) is skipped; any other failure fails the seal.
+ssh_unit_off() {
+  local unit="$1" err
+  if ! err="$(systemctl disable "$unit" 2>&1)"; then
+    case "$err" in
+      *"does not exist"*)
+        echo "seal_linux.sh: $unit does not exist; skipped" >&2
+        return 0 ;;
+      *)
+        echo "seal_linux.sh: systemctl disable $unit failed: $err" >&2
+        return 1 ;;
+    esac
+  fi
+  systemctl mask "$unit"
+}
+
 # 1. The payload: setup, verify (solve steps), tarballs.
 rm -rf "$R/tmp/image-build"
 
-# 2. The build key. A base image (keep_ssh=yes) stays reachable: the next build
-#    logs in as builder, so the account is not locked there.
+# 2. The build key, and the account's password. Locked even on a base
+#    (keep_ssh=yes): with UsePAM (Ubuntu's default) sshd still admits a
+#    public key to a password-locked account, so the next build logs in.
 if [ -f "$R/home/builder/.ssh/authorized_keys" ]; then
   truncate -s 0 "$R/home/builder/.ssh/authorized_keys"
 fi
+passwd -l builder
+
+# 3. Host SSH ships off (this session survives until the VM is stopped).
+#    Since Ubuntu 22.10 ssh.socket owns port 22 and starts ssh.service on
+#    demand, so both units are disabled and masked; both Debian/Ubuntu units
+#    also refuse to start while sshd_not_to_be_run exists. RHEL's unit is
+#    `sshd` and is not handled here.
 if [ "$keep_ssh" = no ]; then
-  passwd -l builder
-  # 3. Host SSH ships off (this session survives until the VM is stopped).
-  systemctl disable ssh
+  ssh_unit_off ssh.service
+  ssh_unit_off ssh.socket
+  touch "$R/etc/ssh/sshd_not_to_be_run"
 fi
 
 # 4. cloud-init state, so the clone runs first-boot again.
@@ -41,10 +66,12 @@ fi
 truncate -s 0 "$R/etc/machine-id"
 
 # 6. Host keys, plus a drop-in that regenerates them at boot on a base without
-#    cloud-init.
+#    cloud-init. ssh.service's own `ExecStartPre=/usr/sbin/sshd -t` fails with
+#    no host keys, and a drop-in's ExecStartPre= lines run after the unit's, so
+#    the list is reset and the check re-added after ssh-keygen.
 rm -f "$R"/etc/ssh/ssh_host_*
 mkdir -p "$R/etc/systemd/system/ssh.service.d"
-printf '[Service]\nExecStartPre=/usr/bin/ssh-keygen -A\n' \
+printf '[Service]\nExecStartPre=\nExecStartPre=/usr/bin/ssh-keygen -A\nExecStartPre=/usr/sbin/sshd -t\n' \
   > "$R/etc/systemd/system/ssh.service.d/10-regen-hostkeys.conf"
 
 # 7. Shell history.
