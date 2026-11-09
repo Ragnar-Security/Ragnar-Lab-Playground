@@ -18,8 +18,10 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   from a recipe on Proxmox, AWS or GCP: it starts a build VM from the
   backend's base, uploads the recipe's payload, runs setup and verify, seals
   the VM, saves the image, destroys the build VM and prints the
-  `templates.yaml` lines. `--dry-run` prints every command without running
-  it; `--reap <backend>` removes expired build VMs a killed build left behind.
+  `templates.yaml` lines. `--dry-run` prints the commands a build would run
+  without running them (with `--reap` it still runs the read-only queries
+  and prints the deletes); `--reap <backend>` removes expired build VMs a
+  killed build left behind.
   Build resources are tagged `image-build` and `image-build-expires`. Operator values go in the
   untracked `scripts/image_build/config.env`, created from
   `config.env.example`. See `scripts/image_build/README.md`.

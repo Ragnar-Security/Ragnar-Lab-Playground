@@ -225,10 +225,13 @@ The image has no expiry tag, because the product does not expire.
 **Build resources never carry `lab-playground-site`.** The multi-backend
 portal's AWS and GCP backends (branch `feature/multi-backend-vms`, PR #80, not
 yet merged; see "Safety model and ownership" in its `docs/CLOUD_BACKENDS.md`)
-tag every lab resource `lab-playground-site=<LAB_SITE_ID>` and filter
-inventory, reuse and orphan sweeping by it. A build resource never carries it,
-so the portal never lists or deletes a build resource, and the builder only
-touches resources tagged `image-build`. On Proxmox the existing sweeper
+tag the instances and other taggable resources they create with
+`lab-playground-site=<LAB_SITE_ID>`, and filter inventory, reuse and deletes
+by it. Its GCP networks carry no labels; they are identified by their
+`lp-<site-id>-...` names instead. A build resource never carries the tag, so
+the portal never lists or deletes a build instance. The builder, for its part,
+selects only `image-build`-tagged build VMs when it cleans up or reaps; it
+never deletes a saved image. On Proxmox the existing sweeper
 (`app/orphan_reaper.py`) reaps untracked guests whose description has an
 `Expires:` line past its grace period; a build description holds
 `image-build=` and `image-build-expires=` words and no `Expires:` line, so the
