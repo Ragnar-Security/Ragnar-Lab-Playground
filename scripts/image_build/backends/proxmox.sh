@@ -12,12 +12,17 @@
 # (app/proxmox_service.py).
 #
 # Tags live in the description: "image-build=<run-id>
-# image-build-expires=<yyyymmddhhmm UTC>" while a VM is a build VM, and
-# "image=<image-name>" once it is a template.
+# image-build-expires=<yyyymmddhhmm UTC>" from the clone onwards (qm clone
+# sets it, so the guest is never untagged), and "image=<image-name>" once it
+# is a template. A destroy re-checks the tag on the node, in the same remote
+# command, immediately before `qm stop` and again before `qm destroy`, and
+# never destroys a template.
 #
 # Config: PVE_HOST and PVE_REPLICA_HOST are SSH addresses (root, key auth);
 # PVE_NODE and PVE_REPLICA_NODE are the cluster's node names, as in
-# templates.yaml. Needs python3 locally to read pvesh/qm JSON.
+# templates.yaml. Every value that reaches a remote shell is checked against a
+# strict pattern by backend_check_config, and every remote argument is quoted
+# by pve(). Needs python3 locally to read pvesh/qm JSON.
 
 _PVE_BLOCK_MIN=8000
 _PVE_BLOCK_MAX=8499
@@ -86,22 +91,15 @@ elif mode == "ip":
                 print(ip)
                 sys.exit(0)
     sys.exit(1)
-elif mode == "state":
-    node, want = args[0], int(args[1])
-    match = [r for r in load() if vmid(r) == want]
-    if not match:
-        print("absent")
-    elif match[0].get("type") != "qemu" or match[0].get("node") != node:
-        print("foreign")
-    else:
-        print("stopped" if match[0].get("status") == "stopped" else "running")
 elif mode == "inrange":
+    # Build VMs only: a template is never a leftover (destroy refuses one).
     node, lo, hi = args[0], int(args[1]), int(args[2])
     for v in sorted(vmid(r) for r in load()
-                    if r.get("type") == "qemu" and r.get("node") == node and lo <= vmid(r) <= hi):
+                    if r.get("type") == "qemu" and r.get("node") == node
+                    and int(r.get("template") or 0) == 0 and lo <= vmid(r) <= hi):
         print(v)
-elif mode == "owned":
-    sys.exit(0 if "image-build=" + args[0] in tags(load()) else 1)
+elif mode == "istemplate":
+    print(1 if int(load().get("template") or 0) == 1 else 0)
 elif mode == "expired":
     now, t = int(args[0]), tags(load())
     tagged = any(x.startswith("image-build=") and len(x) > len("image-build=") for x in t)
@@ -124,8 +122,24 @@ PY
 
 _pve_py() { python3 -c "$_PVE_PY" "$@"; }
 
-# Every Proxmox command runs on the build node as root.
-pve() { ssh -n -o BatchMode=yes root@"$PVE_HOST" "$@"; }
+# One argument for the node's root shell: bare when it holds only characters
+# no shell reads, single-quoted otherwise.
+_pve_q() {
+  if [[ "$1" =~ ^[A-Za-z0-9._/:=,@+%-]+$ ]]; then
+    printf '%s' "$1"
+  else
+    sq "$1"
+  fi
+}
+
+# Every Proxmox command runs on the build node as root, each argument quoted.
+pve() {
+  local arg line=""
+  for arg in "$@"; do
+    line+="${line:+ }$(_pve_q "$arg")"
+  done
+  ssh -n -o BatchMode=yes root@"$PVE_HOST" "$line"
+}
 
 _pve_now() { date -u +%Y%m%d%H%M; }
 
@@ -148,6 +162,10 @@ _pve_newest_template() {
 
 _pve_free_vmid() {
   _pve_resources | _pve_py free "$_PVE_BLOCK_MIN" "$_PVE_BLOCK_MAX" "$_PVE_REPLICA_OFFSET"
+}
+
+_pve_is_template() {
+  _pve_config "$1" | _pve_py istemplate
 }
 
 _pve_wait_agent() {
@@ -181,24 +199,6 @@ _pve_guest_ip() {
   done
 }
 
-# Prints absent, foreign, stopped or running for VMID $1. A QEMU VM on
-# $PVE_NODE whose description fails `_pve_py $2 $3` (owned <run-id> or
-# expired <now>) is foreign, as is any guest elsewhere or of another type.
-_pve_verdict() {
-  local state cfg rc=0
-  state="$(_pve_resources | _pve_py state "$PVE_NODE" "$1")"
-  case "$state" in
-    absent|foreign) printf '%s\n' "$state"; return 0 ;;
-  esac
-  cfg="$(_pve_config "$1")"
-  printf '%s' "$cfg" | _pve_py "$2" "$3" || rc=$?
-  case "$rc" in
-    0) printf '%s\n' "$state" ;;
-    1) echo foreign ;;
-    *) return "$rc" ;;
-  esac
-}
-
 _pve_leftovers() {
   local now ids vmid cfg rc
   now="$(_pve_now)"
@@ -218,7 +218,6 @@ _pve_leftovers() {
 # --- mutations ----------------------------------------------------------------
 
 # Run a command in the guest as root/SYSTEM and fail unless it exited 0.
-# The arguments after the VMID reach the node's shell, so quote them for it.
 _pve_guest_exec() {
   local vmid="$1" out
   shift
@@ -242,44 +241,75 @@ if (\$LASTEXITCODE -ne 0) { exit \$LASTEXITCODE }
 EOF
 }
 
-# <vmid> <verdict> <why>: stop and destroy an owned VM; refuse a foreign one.
-_pve_teardown() {
-  case "$2" in
-    absent) echo "proxmox: VM $1 does not exist; nothing to destroy" >&2 ;;
-    running)
-      mutate pve qm stop "$1" >&2
-      mutate pve qm destroy "$1" --purge 1 >&2 ;;
-    stopped) mutate pve qm destroy "$1" --purge 1 >&2 ;;
-    *)
-      echo "proxmox: VM $1 $3; not destroyed" >&2
-      return 1 ;;
-  esac
+# The node-side destroy of VMID $1: one sh script, so the tag is checked by
+# the node itself immediately before `qm stop` and again before `qm destroy`,
+# with no round trip in which the VMID could be freed and reused. $2 is a
+# shell condition on $w (the description's words, one per line); $3 says why
+# a VM failing it is refused. A VM that is absent is fine (exit 0); one that
+# fails $2, is a template, or is not a VM on this node is refused (exit 3).
+_pve_destroy_script() {
+  cat <<EOF
+set -e
+v=$1
+check() {
+  if ! c=\$(qm config \$v 2>/dev/null); then
+    if [ -n "\$(ls /etc/pve/nodes/*/qemu-server/\$v.conf /etc/pve/nodes/*/lxc/\$v.conf 2>/dev/null)" ]; then
+      echo "proxmox: VMID \$v is not a VM on this node; not destroyed" >&2
+      exit 3
+    fi
+    echo "proxmox: VM \$v does not exist; nothing to destroy" >&2
+    exit 0
+  fi
+  if printf '%s\n' "\$c" | grep -qx 'template: 1'; then
+    echo "proxmox: VM \$v is a template; not destroyed" >&2
+    exit 3
+  fi
+  w=\$(printf '%s\n' "\$c" | sed -n 's/^description: //p' | tr ' ' '\n')
+  if ! { $2; }; then
+    echo "proxmox: VM \$v $3; not destroyed" >&2
+    exit 3
+  fi
+}
+check
+qm stop \$v
+check
+qm destroy \$v --purge 1
+EOF
 }
 
 # --- contract -------------------------------------------------------------------
 
 backend_check_config() {
-  local key missing=0
+  local key bad=0
   for key in PVE_HOST PVE_NODE PVE_REPLICA_NODE PVE_REPLICA_HOST PVE_STORAGE \
              PVE_REPLICA_STORAGE PVE_BUILD_BRIDGE PVE_BUILD_VLAN; do
     if [ -z "${!key:-}" ]; then
       echo "proxmox: $key is not set" >&2
-      missing=1
+      bad=1
     fi
   done
-  if [ -n "${PVE_BUILD_VLAN:-}" ] && ! [[ "$PVE_BUILD_VLAN" =~ ^[1-9][0-9]{0,3}$ ]]; then
-    echo "proxmox: PVE_BUILD_VLAN must be a VLAN number (got '$PVE_BUILD_VLAN')" >&2
-    missing=1
+  # Each of these reaches a root shell on a node.
+  for key in PVE_HOST PVE_NODE PVE_REPLICA_NODE PVE_REPLICA_HOST PVE_STORAGE \
+             PVE_REPLICA_STORAGE PVE_BUILD_BRIDGE; do
+    if [ -n "${!key:-}" ] && ! [[ "${!key}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      echo "proxmox: $key must match [A-Za-z0-9][A-Za-z0-9._-]* (got '${!key}')" >&2
+      bad=1
+    fi
+  done
+  if [ -n "${PVE_BUILD_VLAN:-}" ] && { ! [[ "$PVE_BUILD_VLAN" =~ ^[1-9][0-9]{0,3}$ ]] \
+       || [ "$PVE_BUILD_VLAN" -gt 4094 ]; }; then
+    echo "proxmox: PVE_BUILD_VLAN must be a VLAN number 1-4094 (got '$PVE_BUILD_VLAN')" >&2
+    bad=1
   fi
   if ! command -v python3 >/dev/null 2>&1; then
     echo "proxmox: python3 is required" >&2
-    missing=1
+    bad=1
   fi
   if [ ! -f "$_PVE_SYNC" ]; then
     echo "proxmox: $_PVE_SYNC is missing" >&2
-    missing=1
+    bad=1
   fi
-  return "$missing"
+  return "$bad"
 }
 
 backend_resolve_base() {
@@ -293,6 +323,10 @@ backend_start() {
   # shell would read.
   [[ "$key" =~ ^[A-Za-z0-9@.+/=_:-]+(\ [A-Za-z0-9@.+/=_:-]+)*$ ]] \
     || die "proxmox: public key $3 has an unexpected format"
+  [[ "$run_id" =~ ^ib-[0-9]{12}-[0-9a-f]{4}$ ]] || die "proxmox: unexpected run ID '$run_id'"
+  # Recipe values (absent in a reap, so not checked with the config).
+  [[ "$PVE_MEMORY_MB" =~ ^[1-9][0-9]{0,8}$ && "$PVE_CORES" =~ ^[1-9][0-9]{0,8}$ ]] \
+    || die "proxmox: PVE_MEMORY_MB and PVE_CORES must be positive integers"
   if ! [[ "$base" =~ ^[1-9][0-9]*$ && "$base" -lt 9000 ]] && [ "$DRY_RUN" != 1 ]; then
     die "proxmox: base '$base' is not a VMID below 9000"
   fi
@@ -301,10 +335,11 @@ backend_start() {
   _pve_guard_vmid "$vmid" "$_PVE_BLOCK_MAX"
   # Set before the clone: a clone that fails half-way is still destroyed.
   BUILD_VM_ID="$vmid"
-  mutate pve qm clone "$base" "$vmid" --name "$run_id" --full 1 --storage "$PVE_STORAGE" >&2
+  # Tagged by the clone itself, so no step can leave an untagged guest.
+  mutate pve qm clone "$base" "$vmid" --name "$run_id" --full 1 --storage "$PVE_STORAGE" \
+    --description "image-build=$RUN_ID image-build-expires=$BUILD_EXPIRES_UTC" >&2
   mutate pve qm set "$vmid" --memory "$PVE_MEMORY_MB" --cores "$PVE_CORES" \
-    --net0 "virtio,bridge=$PVE_BUILD_BRIDGE,tag=$PVE_BUILD_VLAN" \
-    --description "$(sq "image-build=$RUN_ID image-build-expires=$BUILD_EXPIRES_UTC")" >&2
+    --net0 "virtio,bridge=$PVE_BUILD_BRIDGE,tag=$PVE_BUILD_VLAN" >&2
   mutate pve qm start "$vmid" >&2
   query "" _pve_wait_agent "$vmid" >/dev/null
 
@@ -313,10 +348,10 @@ backend_start() {
       -EncodedCommand "$(_pve_windows_key_script "$key" | _pve_py encps)"
     BUILD_SSH_USER=Administrator
   else
-    _pve_guest_exec "$vmid" /bin/sh -c "$(sq "mkdir -p /home/builder/.ssh \
+    _pve_guest_exec "$vmid" /bin/sh -c "mkdir -p /home/builder/.ssh \
 && printf '%s\n' '$key' >> /home/builder/.ssh/authorized_keys \
 && chown -R builder: /home/builder/.ssh && chmod 700 /home/builder/.ssh \
-&& chmod 600 /home/builder/.ssh/authorized_keys")"
+&& chmod 600 /home/builder/.ssh/authorized_keys"
     BUILD_SSH_USER=builder
   fi
 
@@ -337,11 +372,20 @@ backend_save() {
   # The build tag stays until the VM is a template, so a VM whose save fails
   # before that is still destroyed (by the core) or reaped.
   mutate pve qm set "$vmid" --name "$name" >&2
-  mutate pve qm template "$vmid" >&2
+  rc=0
+  mutate pve qm template "$vmid" >&2 || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # The conversion may have happened even though the call failed.
+    if [ "$(query 0 _pve_is_template "$vmid")" = 1 ]; then
+      BUILD_VM_ID=""
+      die "proxmox: 'qm template $vmid' reported failure (exit $rc), but VM $vmid is now a template; it is neither replicated nor logged: delete it on $PVE_NODE (qm destroy $vmid) or finish the save by hand"
+    fi
+    die "proxmox: 'qm template $vmid' failed (exit $rc); VM $vmid is not a template"
+  fi
   # The build VM is the template now: the core must not destroy it.
   BUILD_VM_ID=""
   # Before the copy, so the replica carries the same description.
-  mutate pve qm set "$vmid" --description "$(sq "image=$name")" >&2
+  mutate pve qm set "$vmid" --description "image=$name" >&2
 
   rc=0
   mutate bash "$_PVE_SYNC" "$PVE_HOST" "$vmid" "$PVE_REPLICA_HOST" "$PVE_REPLICA_STORAGE" \
@@ -353,13 +397,14 @@ backend_save() {
 }
 
 backend_destroy() {
-  local vmid="$BUILD_VM_ID" verdict
+  local vmid="$BUILD_VM_ID" owned
   if [ -z "$vmid" ]; then
     return 0
   fi
   _pve_guard_vmid "$vmid" "$_PVE_BLOCK_MAX"
-  verdict="$(query running _pve_verdict "$vmid" owned "$RUN_ID")"
-  _pve_teardown "$vmid" "$verdict" "is no longer tagged image-build=$RUN_ID"
+  [[ "$RUN_ID" =~ ^ib-[0-9]{12}-[0-9a-f]{4}$ ]] || die "proxmox: unexpected run ID '$RUN_ID'"
+  owned='printf "%s\n" "$w" | grep -qxF image-build='"$RUN_ID"
+  mutate pve sh -c "$(_pve_destroy_script "$vmid" "$owned" "is not tagged image-build=$RUN_ID")" >&2
   BUILD_VM_ID=""
 }
 
@@ -368,10 +413,19 @@ backend_leftovers() {
 }
 
 backend_destroy_id() {
-  local verdict
+  local now cfg rc=0 expired
   _pve_guard_vmid "$1" "$_PVE_LEFTOVER_MAX"
-  verdict="$(query running _pve_verdict "$1" expired "$(_pve_now)")"
-  _pve_teardown "$1" "$verdict" "is not a tagged, expired build VM on $PVE_NODE"
+  now="$(_pve_now)"
+  cfg="$(query '{"description": "image-build=ib-dry-run image-build-expires=000000000000"}' \
+    _pve_config "$1")"
+  printf '%s' "$cfg" | _pve_py expired "$now" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "proxmox: VM $1 is not a tagged, expired build VM on $PVE_NODE; not destroyed" >&2
+    return 1
+  fi
+  # Re-checked on the node, in the destroy command itself.
+  expired='printf "%s\n" "$w" | grep -qx "image-build=..*" && e=$(printf "%s\n" "$w" | sed -n "s/^image-build-expires=//p") && [ "$(printf "%s\n" "$e" | grep -cx "[0-9]\{12\}")" = 1 ] && [ "$e" -lt '"$now"' ]'
+  mutate pve sh -c "$(_pve_destroy_script "$1" "$expired" "is not a tagged, expired build VM")" >&2
 }
 
 backend_templates_yaml() {

@@ -1,7 +1,8 @@
 """The Proxmox backend of the image builder, and sync_template.sh's fixed
-target VMID. A fake `ssh` plays the Proxmox cluster from a JSON state file, so
-every pvesh/qm/vzdump command the backend (and sync_template.sh) sends is
-logged and acted on.
+target VMID. A fake `ssh` plays the Proxmox cluster: a command sent to a node
+runs in a real `sh` whose PATH holds fake node tools (qm, pvesh, vzdump, ...)
+acting on a JSON state file, so a remote script behaves as it would on the
+node and every tool invocation is logged.
 
 The VMID block is the point of most of these tests: build VMs only in
 8000-8499 with the replica at +500, and no command ever names a VMID >= 9000
@@ -11,6 +12,7 @@ import base64
 import json
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -32,32 +34,44 @@ PVE_CONFIG = (
 BASE_VMID = 8100
 EXPIRED = "image-build=ib-202601010000-abcd image-build-expires=202601010400"
 UNEXPIRED = "image-build=ib-209912310000-abcd image-build-expires=209912312359"
+NODE_TOOLS = ("qm", "pvesh", "pvesm", "vzdump", "qmrestore", "pct", "scp", "ls", "du", "rm")
 
-# A Proxmox cluster in a JSON file. root@<host in FAKE_PVE_HOSTS> is a node:
-# each command is logged to $PVE_LOG as "<node>\t<command>" and acted on.
-# Any other target is a build VM, where every command succeeds (and
-# FAKE_SSH_FAIL_ON fails one, as in the core's fake).
-FAKE_PVE_SSH = r'''#!/usr/bin/env python3
-import fnmatch, json, os, shlex, sys
+# One program, three roles by the name it runs as:
+#   ssh   root@<host in FAKE_PVE_HOSTS> runs the command line in sh, as a node
+#         would, with the node tools first on PATH (raw line logged to
+#         $PVE_LOG.remote). Any other target is a build VM: every command
+#         succeeds, and FAKE_SSH_FAIL_ON fails one, as in the core's fake.
+#   <tool> a node tool on node $FAKE_PVE_NODE: logged to $PVE_LOG as
+#         "<node>\t<command>" and acted on in $PVE_STATE.
+FAKE_PVE = r'''#!/usr/bin/env python3
+import fnmatch, json, os, shlex, subprocess, sys
 
-argv = sys.argv[1:]
-with open(os.environ["CALL_LOG"], "a") as f:
-    f.write("ssh " + " ".join(argv) + "\n")
-with_arg = {"-o", "-i", "-J", "-p", "-l", "-F"}
-i = 0
-while i < len(argv) and argv[i].startswith("-"):
-    i += 2 if argv[i] in with_arg else 1
-target, cmd = argv[i], " ".join(argv[i + 1:])
-fail_on = os.environ.get("FAKE_SSH_FAIL_ON")
-if fail_on and fail_on in " ".join(argv):
-    sys.exit(1)
-user, _, host = target.rpartition("@")
-nodes = json.loads(os.environ["FAKE_PVE_HOSTS"])
-if user != "root" or host not in nodes:
-    sys.exit(0)
-node = nodes[host]
+prog, argv = os.path.basename(sys.argv[0]), sys.argv[1:]
+if prog == "ssh":
+    with open(os.environ["CALL_LOG"], "a") as f:
+        f.write("ssh " + " ".join(argv) + "\n")
+    with_arg = {"-o", "-i", "-J", "-p", "-l", "-F"}
+    i = 0
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in with_arg else 1
+    target, cmd = argv[i], " ".join(argv[i + 1:])
+    fail_on = os.environ.get("FAKE_SSH_FAIL_ON")
+    if fail_on and fail_on in " ".join(argv):
+        sys.exit(1)
+    user, _, host = target.rpartition("@")
+    nodes = json.loads(os.environ["FAKE_PVE_HOSTS"])
+    if user != "root" or host not in nodes:
+        sys.exit(0)
+    with open(os.environ["PVE_LOG"] + ".remote", "a") as f:
+        f.write(nodes[host] + "\t" + cmd + "\0")
+    env = dict(os.environ, FAKE_PVE_NODE=nodes[host],
+               PATH=os.environ["FAKE_PVE_NODEBIN"] + ":" + os.environ["PATH"])
+    sys.exit(subprocess.run(["sh", "-c", cmd], env=env, stdin=subprocess.DEVNULL).returncode)
+
+node, w = os.environ["FAKE_PVE_NODE"], [prog] + argv
 with open(os.environ["PVE_LOG"], "a") as f:
-    f.write(node + "\t" + cmd + "\n")
+    f.write(node + "\t" + shlex.join(w) + "\n")
+nodes = json.loads(os.environ["FAKE_PVE_HOSTS"])
 path = os.environ["PVE_STATE"]
 with open(path) as f:
     state = json.load(f)
@@ -73,7 +87,7 @@ def done(code=0):
 
 def refuse(msg):
     print("fake pve: " + msg, file=sys.stderr)
-    done(2)
+    done(255)
 
 
 def opts(words):
@@ -94,23 +108,32 @@ def description(vmid):
     return guests[vmid]["description"]
 
 
-w = shlex.split(cmd)
-if w == ["echo", "OK"] or w == ["true"]:
-    print("OK")
-elif cmd.startswith("ls -t "):
-    hits = [d for d in dumps if fnmatch.fnmatch(d, w[2])]
-    if hits:
-        print(hits[-1])
-elif cmd.startswith("ls /etc/pve/nodes/"):
-    for word in w[1:]:
-        vmid = word.rsplit("/", 1)[-1].split(".")[0]
-        if vmid.isdigit() and vmid in guests and ("/lxc/" in word) == (guests[vmid]["type"] == "lxc"):
-            print(word.replace("*", guests[vmid]["node"]))
-elif cmd.startswith("du -h "):
-    print("1.0G")
-elif cmd.startswith("qm config "):
-    print(1 if guests[w[2]]["template"] else 0)
-elif w[:2] == ["pvesh", "get"]:
+def local_vm(vmid):
+    g = guests.get(vmid)
+    if not g or g["node"] != node or g["type"] != "qemu":
+        refuse("Configuration file 'nodes/%s/qemu-server/%s.conf' does not exist" % (node, vmid))
+    return g
+
+
+if prog == "ls":
+    shown = []
+    if w[1] == "-t":
+        shown = [d for d in dumps if fnmatch.fnmatch(d, w[2])][-1:]
+    else:
+        for word in w[1:]:
+            m = word.rsplit("/", 1)[-1].split(".")[0]
+            if m in guests and ("/lxc/" in word) == (guests[m]["type"] == "lxc"):
+                shown.append(word.replace("*", guests[m]["node"]))
+    for s in shown:
+        print(s)
+    done(0 if shown else 2)
+elif prog == "du":
+    print("1.0G\t" + w[-1])
+elif prog in ("rm", "pvesm"):
+    pass
+elif prog == "pct":
+    refuse("no container " + w[2])
+elif prog == "pvesh":
     if w[2] == "/cluster/resources":
         print(json.dumps([{"id": g["type"] + "/" + v, "vmid": int(v), "node": g["node"],
                            "type": g["type"], "name": g["name"], "template": g["template"],
@@ -126,17 +149,14 @@ elif w[:2] == ["pvesh", "get"]:
             cfg["template"] = 1
         print(json.dumps(cfg))
     else:
-        refuse("unexpected: " + cmd)
-elif w[0] == "pvesm":
-    pass
-elif w[0] == "vzdump":
-    if w[1] not in guests or guests[w[1]]["node"] != node:
-        refuse("vzdump: no VM " + w[1])
+        refuse("unexpected: " + shlex.join(w))
+elif prog == "vzdump":
+    local_vm(w[1])
     dumps.append("/var/lib/vz/dump/vzdump-qemu-" + w[1] + "-2026_11_08-00_00_00.vma.zst")
-elif w[0] == "scp":
+elif prog == "scp":
     dest_host, _, dest_path = w[2].partition(":")
     state["dumps"].setdefault(nodes[dest_host.split("@")[1]], []).append(dest_path)
-elif w[0] == "qmrestore":
+elif prog == "qmrestore":
     if w[1] not in dumps:
         refuse("qmrestore: no dump " + w[1])
     if w[2] in guests:
@@ -144,12 +164,11 @@ elif w[0] == "qmrestore":
     source = w[1].split("-")[2]
     guests[w[2]] = dict(guests[source], node=node, status="stopped",
                         storage=opts(w[3:]).get("storage"))
-elif w[0] == "rm":
-    pass
-elif w[0] == "qm":
-    sub, vmid = w[1], (w[2] if len(w) > 2 else "")
+elif prog == "qm":
+    sub = w[1]
     if sub == "guest":
         vmid = w[3]
+        local_vm(vmid)
         if w[2] == "cmd" and w[4] == "ping":
             pass
         elif w[2] == "cmd" and w[4] == "network-get-interfaces":
@@ -161,38 +180,52 @@ elif w[0] == "qm":
             print(json.dumps({"exitcode": int(os.environ.get("FAKE_PVE_EXEC_EXITCODE", "0")),
                               "exited": 1, "out-data": ""}))
         else:
-            refuse("unexpected: " + cmd)
-    elif sub == "clone":
+            refuse("unexpected: " + shlex.join(w))
+        done()
+    vmid = w[2]
+    g = local_vm(vmid)
+    if sub == "clone":
         new = w[3]
         if new in guests:
             refuse("clone: VMID " + new + " exists")
-        guests[new] = dict(guests[vmid], node=node, name=opts(w[4:])["name"], template=0,
-                           status="stopped")
-    elif vmid not in guests:
-        refuse(sub + ": no VM " + vmid)
+        o = opts(w[4:])
+        guests[new] = dict(g, node=node, name=o["name"], template=0, status="stopped",
+                           description=o.get("description", ""))
+    elif sub == "config":
+        print("description: " + description(vmid))
+        print("name: " + g["name"])
+        if g["template"]:
+            print("template: 1")
     elif sub == "set":
         o = opts(w[3:])
+        if "memory" in o and os.environ.get("FAKE_PVE_SET_FAIL"):
+            refuse("set failed")
         for key in ("name", "description"):
             if key in o:
-                guests[vmid][key] = o[key]
+                g[key] = o[key]
     elif sub == "start":
-        guests[vmid]["status"] = "running"
+        g["status"] = "running"
     elif sub == "shutdown":
         if os.environ.get("FAKE_PVE_SHUTDOWN_FAIL"):
             refuse("shutdown timed out")
-        guests[vmid]["status"] = "stopped"
+        g["status"] = "stopped"
     elif sub == "stop":
-        guests[vmid]["status"] = "stopped"
+        g["status"] = "stopped"
+        if os.environ.get("FAKE_PVE_RETAG_ON_STOP"):
+            g["description"] = os.environ["FAKE_PVE_RETAG_ON_STOP"]
     elif sub == "template":
-        guests[vmid]["template"] = 1
+        if os.environ.get("FAKE_PVE_TEMPLATE_FAIL"):
+            refuse("template failed")
+        g["template"] = 1
+        done(int(os.environ.get("FAKE_PVE_TEMPLATE_RC", "0")))
     elif sub == "destroy":
         del guests[vmid]
     elif sub == "status":
-        print("status: " + guests[vmid]["status"])
+        print("status: " + g["status"])
     else:
-        refuse("unexpected: " + cmd)
+        refuse("unexpected: " + shlex.join(w))
 else:
-    refuse("unexpected: " + cmd)
+    refuse("unexpected: " + shlex.join(w))
 done()
 '''
 
@@ -219,10 +252,13 @@ def _cluster(**extra):
 
 def _fake_pve(tmp_path: Path, env: dict, guests: dict) -> dict:
     bin_dir = tmp_path / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    ssh = bin_dir / "ssh"
-    ssh.write_text(FAKE_PVE_SSH)
-    ssh.chmod(0o755)
+    node_bin = bin_dir / "node"
+    node_bin.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "ssh"
+    fake.write_text(FAKE_PVE)
+    fake.chmod(0o755)
+    for tool in NODE_TOOLS:
+        (node_bin / tool).symlink_to(fake)
     (tmp_path / "pve-state.json").write_text(json.dumps({"guests": guests}))
     env.update(
         PATH=f"{bin_dir}:{env['PATH']}",
@@ -230,6 +266,7 @@ def _fake_pve(tmp_path: Path, env: dict, guests: dict) -> dict:
         PVE_STATE=str(tmp_path / "pve-state.json"),
         PVE_LOG=str(tmp_path / "pve.log"),
         FAKE_PVE_HOSTS=json.dumps(HOSTS),
+        FAKE_PVE_NODEBIN=str(node_bin),
     )
     return env
 
@@ -243,11 +280,17 @@ def _pve_env(tmp_path: Path, guests: dict, os_family: str = "linux", **recipe):
 
 
 def _pve_cmds(tmp_path: Path, node=None) -> list:
+    """Every node tool invocation, as a shell-quoted command line."""
     log = tmp_path / "pve.log"
     if not log.exists():
         return []
     rows = [line.split("\t", 1) for line in log.read_text().splitlines()]
     return [cmd for n, cmd in rows if node is None or n == node]
+
+
+def _ssh_calls(tmp_path: Path) -> list:
+    log = tmp_path / "calls.log"
+    return [l for l in log.read_text().splitlines() if l.startswith("ssh ")] if log.exists() else []
 
 
 def _state(tmp_path: Path) -> dict:
@@ -262,6 +305,10 @@ def _clones(tmp_path: Path) -> list:
     return [c for c in _pve_cmds(tmp_path) if c.startswith("qm clone ")]
 
 
+def _destroys(tmp_path: Path) -> list:
+    return [c for c in _pve_cmds(tmp_path) if c.startswith(("qm stop", "qm destroy"))]
+
+
 def test_proxmox_vmid_picks_lowest_free_pair(tmp_path):
     # 8000 is taken, and 8001's partner 8501 is taken: the first free pair is 8002/8502.
     guests = _cluster(**{"8000": _guest("pve", "taken"), "8501": _guest("pve2", "taken")})
@@ -270,7 +317,17 @@ def test_proxmox_vmid_picks_lowest_free_pair(tmp_path):
     assert result.returncode == 0, result.stderr
     clones = _clones(tmp_path)
     assert len(clones) == 1 and clones[0].startswith(f"qm clone {BASE_VMID} 8002 --name ib-"), clones
-    assert clones[0].endswith(" --full 1 --storage build-store"), clones
+    assert _yaml(result) == "template_locations: {pve: 8002, pve2: 8502}"
+
+
+def test_proxmox_vmid_skips_lxc_occupants(tmp_path):
+    # Containers hold VMIDs too: an LXC at 8000, and one at 8501 (8001's partner).
+    guests = _cluster(**{"8000": _guest("pve", "ct", kind="lxc"),
+                         "8501": _guest("pve2", "ct2", kind="lxc")})
+    env, recipe = _pve_env(tmp_path, guests)
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    assert _clones(tmp_path)[0].startswith(f"qm clone {BASE_VMID} 8002 "), _clones(tmp_path)
     assert _yaml(result) == "template_locations: {pve: 8002, pve2: 8502}"
 
 
@@ -292,9 +349,9 @@ def test_proxmox_vmid_block_exhausted_refused(tmp_path):
 
 
 def _vmids_named(cmd: str) -> list:
-    """Every VMID a Proxmox command names: numeric arguments of qm/qmrestore/
-    vzdump/pct, and VMIDs in a pvesh or /etc/pve path."""
-    words = cmd.split()
+    """Every VMID a node tool invocation names: numeric arguments of qm/
+    qmrestore/vzdump/pct, and VMIDs in a pvesh, /etc/pve or dump path."""
+    words = shlex.split(cmd)
     found = [int(n) for n in re.findall(r"/(?:qemu|lxc|qemu-server)/(\d+)", cmd)]
     found += [int(n) for n in re.findall(r"vzdump-(?:qemu|lxc)-(\d+)-", cmd)]
     if words[0] in ("qm", "qmrestore", "vzdump", "pct"):
@@ -320,6 +377,7 @@ def test_proxmox_never_touches_9000_plus(tmp_path):
 
     commands = _pve_cmds(tmp_path) + _pve_cmds(tmp_path / "fail") + _pve_cmds(tmp_path / "reap")
     assert any(c.startswith("qm destroy 8003") for c in commands)
+    assert any(c.startswith("qm destroy 8000") for c in commands)
     named = [(c, v) for c in commands for v in _vmids_named(c) if v >= 9000]
     assert named == [], named
     for sub in ("", "fail", "reap"):
@@ -365,11 +423,11 @@ def test_proxmox_save_replicates_to_plus_500(tmp_path):
     assert image_id == "pve:8000,pve2:8500"
     assert _yaml(result) == "template_locations: {pve: 8000, pve2: 8500}"
     pve2 = _pve_cmds(tmp_path, "pve2")
-    assert any(c.startswith("qmrestore '/var/lib/vz/dump/vzdump-qemu-8000-")
-               and c.endswith("' 8500 --storage replica-store") for c in pve2), pve2
+    assert ("qmrestore /var/lib/vz/dump/vzdump-qemu-8000-2026_11_08-00_00_00.vma.zst 8500 "
+            "--storage replica-store") in pve2, pve2
     assert not any("/cluster/nextid" in c for c in _pve_cmds(tmp_path))
     # The build VM became the template: the core destroys nothing.
-    assert not any(c.startswith("qm destroy") for c in _pve_cmds(tmp_path))
+    assert _destroys(tmp_path) == []
     state = _state(tmp_path)
     for vmid, node in (("8000", "pve"), ("8500", "pve2")):
         assert state[vmid]["node"] == node
@@ -382,7 +440,6 @@ def test_proxmox_save_replicates_to_plus_500(tmp_path):
     order = [next(i for i, c in enumerate(pve) if c.startswith(p))
              for p in ("qm shutdown 8000 --timeout 300", "qm template 8000", "vzdump 8000")]
     assert order == sorted(order), pve
-    assert not any(c.startswith("qm stop") for c in pve)
 
 
 def test_proxmox_save_falls_back_to_stop(tmp_path):
@@ -394,26 +451,49 @@ def test_proxmox_save_falls_back_to_stop(tmp_path):
     assert pve.index("qm stop 8000") < pve.index("qm template 8000"), pve
 
 
+def test_proxmox_template_reported_failure_keeps_template(tmp_path):
+    # qm template converted the VM, but the call reported failure: the build
+    # fails, naming V, and the template is neither destroyed nor replicated.
+    env, recipe = _pve_env(tmp_path, _cluster())
+    env["FAKE_PVE_TEMPLATE_RC"] = "255"
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert "VM 8000 is now a template" in result.stderr, result.stderr
+    assert _destroys(tmp_path) == []
+    assert _state(tmp_path)["8000"]["template"] == 1
+    assert not any(c.startswith(("vzdump", "qmrestore")) for c in _pve_cmds(tmp_path))
+    assert not _build_log(tmp_path).exists()
+
+    # A conversion that did not happen leaves a build VM, which is destroyed.
+    env, recipe = _pve_env(tmp_path / "nottemplate", _cluster())
+    env["FAKE_PVE_TEMPLATE_FAIL"] = "1"
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert "8000" in result.stderr
+    assert _destroys(tmp_path / "nottemplate") == ["qm stop 8000", "qm destroy 8000 --purge 1"]
+    assert "8000" not in _state(tmp_path / "nottemplate")
+
+
 def test_proxmox_leftovers_only_tagged_expired(tmp_path):
     guests = _cluster(**{
         "8003": _guest("pve", "expired", status="running", description=EXPIRED),
         "8004": _guest("pve", "unexpired", status="running", description=UNEXPIRED),
         "8005": _guest("pve", "untagged", description="image=enpm634-old-abc1234-202601010000"),
+        "8006": _guest("pve", "template", template=1, description=EXPIRED),
     })
     env, _recipe = _pve_env(tmp_path, guests)
     result = _build(env, "--reap", "proxmox", "--dry-run")
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["would destroy 8003"], result.stdout
-    assert not any(c.startswith(("qm stop", "qm destroy")) for c in _pve_cmds(tmp_path))
+    assert _destroys(tmp_path) == []
 
     result = _build(env, "--reap", "proxmox")
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["destroyed 8003"], result.stdout
-    destroys = [c for c in _pve_cmds(tmp_path) if c.startswith(("qm stop", "qm destroy"))]
-    assert destroys == ["qm stop 8003", "qm destroy 8003 --purge 1"], destroys
+    assert _destroys(tmp_path) == ["qm stop 8003", "qm destroy 8003 --purge 1"]
     state = _state(tmp_path)
     assert "8003" not in state
-    assert {"8004", "8005", "9997"} <= set(state)
+    assert {"8004", "8005", "8006", "9997"} <= set(state)
 
 
 def test_proxmox_destroy_rechecks_tag(tmp_path):
@@ -421,8 +501,7 @@ def test_proxmox_destroy_rechecks_tag(tmp_path):
     env, recipe = _pve_env(tmp_path, _cluster())
     env["FAKE_SSH_FAIL_ON"] = "verify.sh"
     assert _build(env, recipe, "proxmox").returncode == 1
-    destroys = [c for c in _pve_cmds(tmp_path) if c.startswith(("qm stop", "qm destroy"))]
-    assert destroys == ["qm stop 8000", "qm destroy 8000 --purge 1"], destroys
+    assert _destroys(tmp_path) == ["qm stop 8000", "qm destroy 8000 --purge 1"]
     assert "8000" not in _state(tmp_path)
 
     # The description no longer names this run: the VM is left alone.
@@ -430,9 +509,39 @@ def test_proxmox_destroy_rechecks_tag(tmp_path):
     env.update(FAKE_SSH_FAIL_ON="verify.sh", FAKE_PVE_DESC_OVERRIDE="8000=owner=someone-else")
     result = _build(env, recipe, "proxmox")
     assert result.returncode == 1
-    assert not any(c.startswith(("qm stop", "qm destroy")) for c in _pve_cmds(tmp_path / "changed"))
+    assert _destroys(tmp_path / "changed") == []
     assert "8000" in _state(tmp_path / "changed")
     assert "not destroyed" in result.stderr, result.stderr
+
+    # The tag disappears between `qm stop` and `qm destroy` (the VMID was
+    # freed and reused): the node-side re-check stops the destroy.
+    env, recipe = _pve_env(tmp_path / "reused", _cluster())
+    env.update(FAKE_SSH_FAIL_ON="verify.sh", FAKE_PVE_RETAG_ON_STOP="owner=someone-else")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert _destroys(tmp_path / "reused") == ["qm stop 8000"]
+    assert "8000" in _state(tmp_path / "reused")
+    assert "not destroyed" in result.stderr, result.stderr
+
+    # The same for a reap.
+    env, _recipe = _pve_env(tmp_path / "reap", _cluster(**{"8003": _guest("pve", "x", description=EXPIRED)}))
+    env["FAKE_PVE_RETAG_ON_STOP"] = UNEXPIRED
+    result = _build(env, "--reap", "proxmox")
+    assert result.returncode == 1
+    assert _destroys(tmp_path / "reap") == ["qm stop 8003"]
+    assert "8003" in _state(tmp_path / "reap")
+
+
+def test_proxmox_clone_tagged_so_failed_set_is_destroyed(tmp_path):
+    env, recipe = _pve_env(tmp_path, _cluster())
+    env["FAKE_PVE_SET_FAIL"] = "1"
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    clone = shlex.split(_clones(tmp_path)[0])
+    desc = clone[clone.index("--description") + 1]
+    assert re.fullmatch(r"image-build=ib-\d{12}-[0-9a-f]{4} image-build-expires=\d{12}", desc), desc
+    assert _destroys(tmp_path) == ["qm stop 8000", "qm destroy 8000 --purge 1"]
+    assert "8000" not in _state(tmp_path)
 
 
 def test_proxmox_start_tags_and_configures(tmp_path):
@@ -440,21 +549,21 @@ def test_proxmox_start_tags_and_configures(tmp_path):
     env["FAKE_SSH_FAIL_ON"] = "verify.sh"  # stop before save rewrites the description
     _build(env, recipe, "proxmox")
     pve = _pve_cmds(tmp_path, "pve")
-    sets = [c for c in pve if c.startswith("qm set 8000 --memory")]
-    assert len(sets) == 1, pve
-    assert sets[0].startswith("qm set 8000 --memory 2048 --cores 2 --net0 virtio,bridge=vmbr9,tag=999 "
-                              "--description 'image-build=ib-"), sets
-    desc = re.search(r"--description '([^']*)'", sets[0]).group(1)
+    clone = shlex.split(_clones(tmp_path)[0])
+    assert clone[:4] == ["qm", "clone", str(BASE_VMID), "8000"], clone
+    opts = dict(zip(clone[4::2], clone[5::2]))
     run_id, expires = re.fullmatch(r"image-build=(ib-\d{12}-[0-9a-f]{4}) image-build-expires=(\d{12})",
-                                   desc).groups()
+                                   opts["--description"]).groups()
+    assert opts == {"--name": run_id, "--full": "1", "--storage": "build-store",
+                    "--description": f"image-build={run_id} image-build-expires={expires}"}
+    assert "qm set 8000 --memory 2048 --cores 2 --net0 virtio,bridge=vmbr9,tag=999" in pve, pve
     assert "lab-playground-site" not in "".join(pve)
-    assert pve.index("qm start 8000") > pve.index(sets[0])
-    clone = _clones(tmp_path)[0]
-    assert f"--name {run_id} " in clone
+    assert pve.index("qm start 8000") > pve.index("qm set 8000 --memory 2048 --cores 2 "
+                                                  "--net0 virtio,bridge=vmbr9,tag=999")
 
 
 def _guest_exec(tmp_path: Path) -> list:
-    return [c for c in _pve_cmds(tmp_path) if c.startswith("qm guest exec 8000 ")]
+    return [shlex.split(c) for c in _pve_cmds(tmp_path) if c.startswith("qm guest exec 8000 ")]
 
 
 def test_proxmox_linux_key_and_ssh(tmp_path):
@@ -463,9 +572,10 @@ def test_proxmox_linux_key_and_ssh(tmp_path):
     assert result.returncode == 0, result.stderr
     execs = _guest_exec(tmp_path)
     assert len(execs) == 1, execs
-    assert "ssh-ed25519 AAAAC3FAKEPUBLIC image-build" in execs[0]
-    assert ">> /home/builder/.ssh/authorized_keys" in execs[0]
-    vm_ssh = [l for l in (tmp_path / "calls.log").read_text().splitlines() if " builder@192.0.2.10 " in l]
+    assert execs[0][-3:-1] == ["/bin/sh", "-c"], execs
+    script = execs[0][-1]
+    assert "printf '%s\\n' 'ssh-ed25519 AAAAC3FAKEPUBLIC image-build' >> /home/builder/.ssh/authorized_keys" in script
+    vm_ssh = [l for l in _ssh_calls(tmp_path) if " builder@192.0.2.10 " in l]
     assert vm_ssh and all("-J root@pve-host.invalid" in l for l in vm_ssh), vm_ssh
 
 
@@ -475,14 +585,13 @@ def test_proxmox_windows_key_acl_and_ssh(tmp_path):
     assert result.returncode == 0, result.stderr
     execs = _guest_exec(tmp_path)
     assert len(execs) == 1, execs
-    encoded = re.search(r"-EncodedCommand (\S+)$", execs[0]).group(1)
-    script = base64.b64decode(encoded).decode("utf-16-le")
+    assert execs[0][-2] == "-EncodedCommand", execs
+    script = base64.b64decode(execs[0][-1]).decode("utf-16-le")
     assert "Set-Content -Path $file -Value 'ssh-ed25519 AAAAC3FAKEPUBLIC image-build'" in script
     assert "$file = 'C:\\ProgramData\\ssh\\administrators_authorized_keys'" in script
     # Administrators and SYSTEM full control, inheritance removed.
     assert "icacls.exe $file /inheritance:r /grant '*S-1-5-32-544:F' /grant '*S-1-5-18:F'" in script
-    vm_ssh = [l for l in (tmp_path / "calls.log").read_text().splitlines()
-              if " Administrator@192.0.2.10 " in l]
+    vm_ssh = [l for l in _ssh_calls(tmp_path) if " Administrator@192.0.2.10 " in l]
     assert vm_ssh and all("-J root@pve-host.invalid" in l for l in vm_ssh), vm_ssh
 
 
@@ -491,7 +600,7 @@ def test_proxmox_failed_key_injection_fails_build(tmp_path):
     env["FAKE_PVE_EXEC_EXITCODE"] = "1"
     result = _build(env, recipe, "proxmox")
     assert result.returncode == 1
-    assert not any(" builder@192.0.2.10 " in l for l in (tmp_path / "calls.log").read_text().splitlines())
+    assert not any(" builder@192.0.2.10 " in l for l in _ssh_calls(tmp_path))
     assert "8000" not in _state(tmp_path)
 
 
@@ -500,6 +609,7 @@ def test_proxmox_dry_run_touches_nothing(tmp_path):
     result = _build(env, "--dry-run", recipe, "proxmox")
     assert result.returncode == 0, result.stderr
     assert _pve_cmds(tmp_path) == []
+    assert _ssh_calls(tmp_path) == []
     for printed in ("DRY-RUN: pve qm clone ", "DRY-RUN: pve qm template 8000",
                     f"DRY-RUN: bash {ROOT / 'scripts' / 'sync_template.sh'} pve-host.invalid 8000 "
                     "pve2-host.invalid replica-store 8500"):
@@ -513,7 +623,24 @@ def test_proxmox_config_missing_refused(tmp_path):
     result = _build(env, recipe, "proxmox")
     assert result.returncode == 2
     assert "PVE_REPLICA_HOST" in result.stderr
-    assert _pve_cmds(tmp_path) == []
+    assert _ssh_calls(tmp_path) == []
+
+
+def test_proxmox_config_unsafe_values_refused(tmp_path):
+    # Every config value reaches a root shell on a node: shell syntax is refused
+    # before any ssh call.
+    for i, (key, value) in enumerate((("PVE_STORAGE", "local;id"), ("PVE_BUILD_BRIDGE", "vmbr0 x"),
+                                      ("PVE_NODE", "pve$(id)"), ("PVE_REPLICA_STORAGE", "a'b"),
+                                      ("PVE_HOST", "-oProxyCommand=x"),
+                                      ("PVE_BUILD_VLAN", "4095"), ("PVE_BUILD_VLAN", "0"))):
+        sub = tmp_path / str(i)
+        env, recipe = _pve_env(sub, _cluster())
+        config = re.sub(rf"^{key}=.*$", f"{key}={shlex.quote(value)}", PVE_CONFIG, flags=re.M)
+        Path(env["IMAGE_BUILD_CONFIG"]).write_text(config)
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 2, (key, value, result.stderr)
+        assert key in result.stderr, (key, result.stderr)
+        assert _ssh_calls(sub) == [], key
 
 
 # --- sync_template.sh -------------------------------------------------------------
@@ -521,34 +648,44 @@ def test_proxmox_config_missing_refused(tmp_path):
 
 def _sync(tmp_path: Path, *args, **extra_env):
     env = _fake_pve(tmp_path, dict(os.environ), {"8002": _guest("pve", "tmpl", template=1),
-                                                 "8123": _guest("pve2", "other")})
+                                                 "8502": _guest("pve2", "other")})
     env.update(extra_env)
     result = subprocess.run(["bash", str(SYNC), *args], env=env, capture_output=True, text=True,
                             timeout=60, stdin=subprocess.DEVNULL)
     return result, _pve_cmds(tmp_path, "pve2")
 
 
+SYNC_ARGS = ("pve-host.invalid", "8002", "pve2-host.invalid", "replica-store")
+
+
 def test_sync_template_fixed_target_vmid(tmp_path):
-    result, pve2 = _sync(tmp_path / "fixed", "pve-host.invalid", "8002", "pve2-host.invalid",
-                         "replica-store", "8502", FAKE_PVE_NEXTID="8124")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert not any("/cluster/nextid" in c for c in pve2), pve2
-    restores = [c for c in pve2 if c.startswith("qmrestore ")]
-    assert restores == ["qmrestore '/var/lib/vz/dump/vzdump-qemu-8002-2026_11_08-00_00_00.vma.zst' 8502 "
-                        "--storage replica-store"], pve2
-    assert "pve2-host.invalid: 8502" in result.stdout
+    for vmid in ("8500", "8999"):
+        result, pve2 = _sync(tmp_path / vmid, *SYNC_ARGS, vmid, FAKE_PVE_NEXTID="8124")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert not any("/cluster/nextid" in c for c in pve2), pve2
+        restores = [c for c in pve2 if c.startswith("qmrestore ")]
+        assert restores == ["qmrestore /var/lib/vz/dump/vzdump-qemu-8002-2026_11_08-00_00_00.vma.zst "
+                            f"{vmid} --storage replica-store"], pve2
+        assert f"pve2-host.invalid: {vmid}" in result.stdout
+        assert _state(tmp_path / vmid)[vmid]["template"] == 1
 
     # Without the argument, the next free VMID is asked for, as before.
-    result, pve2 = _sync(tmp_path / "next", "pve-host.invalid", "8002", "pve2-host.invalid",
-                         "replica-store", FAKE_PVE_NEXTID="8124")
+    result, pve2 = _sync(tmp_path / "next", *SYNC_ARGS, FAKE_PVE_NEXTID="8124")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "pvesh get /cluster/nextid" in pve2
-    assert [c for c in pve2 if c.startswith("qmrestore ")][0].endswith("' 8124 --storage replica-store")
+    assert [c for c in pve2 if c.startswith("qmrestore ")][0].endswith(" 8124 --storage replica-store")
     assert "Next available VMID: 8124" in result.stdout
 
-    # A target VMID in use, or not a number, is refused before anything is dumped.
-    for sub, vmid in (("used", "8123"), ("bad", "85x2")):
-        result, pve2 = _sync(tmp_path / sub, "pve-host.invalid", "8002", "pve2-host.invalid",
-                             "replica-store", vmid)
+    # Outside 8500-8999, not a number, or a sixth argument: refused before any ssh.
+    for sub, extra in (("v9000", ["9000"]), ("v8499", ["8499"]), ("v99999", ["99999"]),
+                       ("bad", ["85x2"]), ("empty", [""]), ("six", ["8501", "x"])):
+        result, _pve2 = _sync(tmp_path / sub, *SYNC_ARGS, *extra)
         assert result.returncode == 1, (sub, result.stdout)
-        assert not any(c.startswith(("vzdump", "qmrestore")) for c in _pve_cmds(tmp_path / sub)), sub
+        assert _ssh_calls(tmp_path / sub) == [], sub
+    assert "8500-8999" in _sync(tmp_path / "msg", *SYNC_ARGS, "9000")[0].stdout
+
+    # A target VMID already in use is refused before anything is dumped.
+    result, _pve2 = _sync(tmp_path / "used", *SYNC_ARGS, "8502")
+    assert result.returncode == 1, result.stdout
+    assert "already in use" in result.stdout
+    assert not any(c.startswith(("vzdump", "qmrestore")) for c in _pve_cmds(tmp_path / "used"))
