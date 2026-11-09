@@ -22,7 +22,9 @@ build_image.sh --reap <backend> [--dry-run]
 2. Resolve the base image or template for the backend.
 3. Start a build VM from it, with a fresh SSH key made for this run.
 4. Upload the recipe's payload to the VM, over SSH.
-5. Run the setup script, `SETUP_PASSES` times. After each pass, wait for SSH.
+5. Run the setup script, `SETUP_PASSES` times. After each pass, wait for SSH;
+   if the setup asked for a reboot (exit 100), reboot the VM and wait for a
+   new boot. See "Rules for setup scripts".
 6. Run the verify script. A failure stops the build; nothing is saved.
 7. Seal the VM (`seal_linux.sh` or `seal_windows.ps1`). A failure stops the
    build; nothing is saved.
@@ -47,8 +49,8 @@ reaped). Everything else, including every `DRY-RUN:` line, goes to stderr.
 | Exit | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS` or `BASE_GCP`, no image matching the base, a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH within 900 s, a destroy that was refused. |
-| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES`, an invalid image name, or a config the backend's `backend_check_config` rejects. |
+| 1 | A build or reap failed while running. This includes errors a backend raises after the config passed: a malformed `BASE_AWS` or `BASE_GCP`, no image matching the base, a malformed `AWS_INSTANCE_TYPE`, a bad public key, a VMID outside the Proxmox block, a failed setup, verify or seal, no SSH (or no new boot after a reboot) within `IMAGE_BUILD_SSH_WAIT_SECONDS`, a destroy that was refused. Once the build has begun (base resolution onwards), every failure is 1, even one where a backend or a tool it ran exited 2. |
+| 2 | The core rejected the input before any VM started: bad usage or option, unknown backend, unreadable recipe, a missing or invalid recipe key (`OS_FAMILY`, `KEEP_SSH`, the integer keys, `PAYLOAD_DIR`, `SETUP`/`VERIFY`), a missing `BASE_<BACKEND>` key, a recipe outside a git repo, a dirty repo, an invalid `IMAGE_BUILD_TTL_MINUTES` or `IMAGE_BUILD_SSH_WAIT_SECONDS`, an invalid image name, a config that sets a recipe key, or a config the backend's `backend_check_config` rejects. |
 | 130, 143 | Interrupted (INT) or terminated (TERM); the trap still ran |
 
 ### Image names and the build log
@@ -58,9 +60,12 @@ first seven characters of the HEAD commit of the git repo that holds the
 recipe. The name may contain only `a-z`, `0-9` and `-`, must start with a
 letter, and is at most 63 characters, so `IMAGE_PREFIX` is at most 42.
 
-The recipe's repo must be clean, or the build stops with exit 2.
-`--allow-dirty` overrides that for a self-test; the commit is then recorded as
-`<sha7>-dirty`. Do not use it for a real build.
+The recipe's repo must be clean, or the build stops with exit 2. The one
+exception is the build log itself (`coursework/deploy/image-build/BUILD-LOG.tsv`,
+new or modified), so you can build one recipe on several backends and commit
+the log once at the end. Any other change, even next to the log, still
+refuses the build. `--allow-dirty` overrides that for a self-test; the commit
+is then recorded as `<sha7>-dirty`. Do not use it for a real build.
 
 Each saved image adds one tab-separated line to
 `coursework/deploy/image-build/BUILD-LOG.tsv` in the recipe's repo:
@@ -73,11 +78,18 @@ Copy `config.env.example` to `config.env` (untracked) and fill in the section
 for your backend. Set `IMAGE_BUILD_CONFIG=/path/to/file` to use another file.
 The backend checks its own keys and names any that are missing or malformed.
 
+The file is sourced in a subshell, and only the keys of the backend you build
+on come back: names starting `PVE_` (Proxmox), `AWS_` or `GCP_`. Anything
+else it sets is ignored, so it cannot change the builder's own state (for
+example `DRY_RUN`). A config that sets a recipe key (`DISK_GB`,
+`AWS_INSTANCE_TYPE`, `GCP_MACHINE_TYPE`, `PVE_CORES`, a `BASE_*` key, ...)
+stops the build with exit 2: only the recipe sets those.
+
 | Backend | Key | Meaning |
 |---|---|---|
 | Proxmox | `PVE_HOST` | Address of the build node. Reached as root over SSH, key auth. Also the jump host to the build VM. |
-| Proxmox | `PVE_NODE` | Node that runs the build VM (default `pve`). |
-| Proxmox | `PVE_REPLICA_NODE` | Node that receives the template copy (default `pve2`). |
+| Proxmox | `PVE_NODE` | Node that runs the build VM (default `pve`). Lowercase letters, digits and `-` only, as `templates.yaml` takes it; checked before the build. |
+| Proxmox | `PVE_REPLICA_NODE` | Node that receives the template copy (default `pve2`). Same rule as `PVE_NODE`. |
 | Proxmox | `PVE_REPLICA_HOST` | Address of the replica node. |
 | Proxmox | `PVE_STORAGE` | Storage for the build VM's disk on `PVE_NODE`. |
 | Proxmox | `PVE_REPLICA_STORAGE` | Storage for the replica template. |
@@ -91,17 +103,23 @@ The backend checks its own keys and names any that are missing or malformed.
 | GCP | `GCP_BUILD_SUBNET` | Subnet of the build network, separate from the lab network. |
 
 The Proxmox backend needs `python3` on the machine running the build. The AWS
-backend needs the AWS CLI v2 on `PATH` (not checked in a dry run). The GCP
-backend uses `gcloud`.
+backend needs the AWS CLI v2 on `PATH`, and the GCP backend `gcloud` (neither
+is checked in a dry run).
 
 `IMAGE_BUILD_TTL_MINUTES` (environment, default 240) sets how long a build's
-resources live before `--reap` may remove them. `IMAGE_BUILD_BACKENDS_DIR`
-(environment) changes where `<backend>.sh` is read from.
+resources live before `--reap` may remove them.
+`IMAGE_BUILD_SSH_WAIT_SECONDS` (environment, default 900) bounds each wait for
+the build VM: for SSH after it starts and after each setup pass, and for a new
+boot after a reboot. `IMAGE_BUILD_BACKENDS_DIR` (environment) changes where
+`<backend>.sh` is read from.
 
 ## Recipe keys
 
 A recipe is a sourced `.env` file inside a git repo. Only the recipe may set
-these keys; values in your shell environment are ignored.
+these keys; values in your shell environment are ignored. It is sourced in a
+subshell and only these keys are taken from it: anything else it sets or
+defines (a variable such as `DRY_RUN`, a function) has no effect on the build.
+Values arrive exactly as written, spaces, quotes and globs included.
 
 | Key | Required | Meaning |
 |---|---|---|
@@ -136,11 +154,24 @@ Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
 
 ### Rules for setup scripts
 
-- **A setup script that reboots must do so as its final action.** The core
-  treats SSH exit 255 as a dropped session, waits for SSH again (up to 900 s)
-  and carries on. It does not re-resolve the VM's address after the reboot, so
-  the VM must come back at the same address. Anything the script does after
-  `reboot` is not guaranteed to run.
+- **Never reboot from a setup script. Exit 100 instead.** Exit 0 means done.
+  Exit 100 means done, but the VM needs a reboot: the core reboots it
+  (`sudo systemctl reboot` on Linux, `Restart-Computer -Force` on Windows,
+  started in the background so the SSH call returns), then waits until SSH
+  answers with a boot ID other than the one it recorded before the setup ran
+  (Linux `/proc/sys/kernel/random/boot_id`; Windows the last boot time, UTC,
+  to the second). Only then does the next pass or verify run, so nothing runs
+  against a VM that is still on its way down. No new boot within
+  `IMAGE_BUILD_SSH_WAIT_SECONDS` fails the build. Any other exit code fails
+  the build.
+- **A dropped session must have been a reboot.** If the setup's SSH session
+  ends with exit 255, the core waits the same way and goes on only if the boot
+  ID changed; otherwise the build fails ("SSH dropped during setup but the VM
+  did not reboot").
+- **The VM must come back at the same address.** The core does not re-resolve
+  it after a reboot.
+- A dry run prints the boot-ID read and the reboot command an exit 100 would
+  run, and runs neither.
 - **Ubuntu clears `/tmp` at boot.** If `/tmp/image-build` has vanished, the
   core uploads the payload again before the next setup pass and before verify.
   Do not depend on state written under `/tmp` surviving a reboot.
@@ -156,13 +187,25 @@ Windows. Setup and verify run as root (Linux, through `sudo`) or in PowerShell
 | Used as the BASE of a later build (for example a Docker-host image built upon) | `KEEP_SSH=yes` | Host SSH stays on, so the next build can log in. |
 
 On Linux, `seal_linux.sh <yes|no>` always removes the payload, empties
-`/home/builder/.ssh/authorized_keys`, runs `cloud-init clean --logs` when
-cloud-init is present, empties `/etc/machine-id`, deletes the host keys, and
-empties shell history. With `keep_ssh=no` it also runs `passwd -l builder` and
-`systemctl disable ssh`. With `keep_ssh=yes` it skips both. Whenever it deletes
-the host keys it installs a systemd drop-in
-(`ssh.service.d/10-regen-hostkeys.conf`) that runs `ssh-keygen -A` before sshd
-starts, so a clone gets new host keys on a base without cloud-init.
+`/home/builder/.ssh/authorized_keys`, runs `passwd -l builder`, runs
+`cloud-init clean --logs` when cloud-init is present, empties
+`/etc/machine-id`, deletes the host keys, and empties shell history. Locking
+`builder`'s password does not stop the next build on a `KEEP_SSH=yes` base:
+with `UsePAM yes` (Ubuntu's default) sshd still accepts a public key for a
+password-locked account.
+
+With `keep_ssh=no` it also turns host SSH off. Since Ubuntu 22.10 `ssh.socket`
+owns port 22 and starts `ssh.service` on demand, so the seal disables and
+masks both units (a unit that does not exist, such as `ssh.socket` on an older
+base, is skipped; any other `systemctl` failure fails the seal) and writes
+`/etc/ssh/sshd_not_to_be_run`, which both units also honour. RHEL's `sshd`
+unit is not handled.
+
+Whenever it deletes the host keys it installs a systemd drop-in
+(`ssh.service.d/10-regen-hostkeys.conf`) that resets `ExecStartPre=` and runs
+`ssh-keygen -A` and then `sshd -t`. The reset matters: the unit's own
+`ExecStartPre=/usr/sbin/sshd -t` would otherwise run first and fail with no
+host keys. A clone therefore gets new host keys on a base without cloud-init.
 
 On Windows, `seal_windows.ps1` disables the `sshd` service unless `-KeepSsh`
 is passed (which the core does for `KEEP_SSH=yes`).
@@ -183,7 +226,9 @@ is passed (which the core does for `KEEP_SSH=yes`).
 
 ## The backend contract
 
-Each `backends/<name>.sh` is sourced into the core and must define these
+Each `backends/<name>.sh` is sourced into the core. It sets
+`BACKEND_CONFIG_PREFIX` (for example `AWS_`), the prefix of every config key
+it reads (only those come back from `config.env`), and must define these
 functions. The full text is in the header of `build_image.sh`.
 
 | Function | Job |
@@ -192,7 +237,7 @@ functions. The full text is in the header of `build_image.sh`.
 | `backend_resolve_base <pattern>` | Print exactly one base ID, from the recipe's `BASE_<BACKEND>`. |
 | `backend_start <run_id> <base_id> <pubkey_file>` | Start the build VM with the key. Set `BUILD_VM_ID` as soon as anything exists, then `BUILD_SSH_HOST`, `BUILD_SSH_USER`, `BUILD_SSH_JUMP`. |
 | `backend_save <image_name>` | Save the image and set `IMAGE_ID`. Clear `BUILD_VM_ID` if the build VM itself became the image. |
-| `backend_destroy` | Idempotent. Destroys only `BUILD_VM_ID`. |
+| `backend_destroy` | Idempotent. Destroys only this run's build VM: `BUILD_VM_ID`, or (AWS) what carries this run's tag if the create call failed before the ID was recorded. |
 | `backend_leftovers` | Print one ID per line: tagged, expired build VMs only. Reads through `query`. |
 | `backend_destroy_id <id>` | Re-check the tag through `query`, then destroy through `mutate`. |
 | `backend_templates_yaml <image_id>` | Print the `templates.yaml` lines. |
@@ -244,6 +289,11 @@ before the delete.
 
 - **Cleanup of the current build** (the trap, and `backend_destroy`) requires
   the `image-build` value to equal this run's `RUN_ID`. Otherwise it refuses.
+  On AWS, if `run-instances` failed or was interrupted before the instance ID
+  was recorded, the cleanup lists the instances in `AWS_BUILD_REGION` tagged
+  `image-build=<RUN_ID>` (pending, running, stopping or stopped) and
+  terminates each through the same check, so another run's instance is never
+  touched.
 - **`--reap`** requires all of these:
   - the `image-build` value matches `ib-<12 digits>-<4 hex>` exactly;
   - the resource has one `image-build` tag (AWS tags and GCP labels hold one
@@ -290,13 +340,22 @@ VMID outside its block, and `sync_template.sh`'s optional fifth argument
 `--reap proxmox` lists only non-template VMs on `PVE_NODE` in `8000`-`8999`
 that meet the criteria in "What a destroy or a reap will delete". The
 node-side destroy repeats the tag check before `qm stop` and again before
-`qm destroy`, and refuses a template.
+`qm destroy`, and refuses a template. It treats a VM as already gone only
+when `qm config` says exactly that its config file does not exist,
+`/etc/pve/nodes` is readable, and no node holds the VMID. Any other failure
+to read the config (the cluster filesystem down, say) fails the destroy.
+
+The clone command itself writes the build tags. While a clone is still
+running the new guest may not carry them yet (Proxmox holds it locked, as
+`lock: clone`); a destroy that finds no tag refuses, so an interrupted clone
+can need a hand cleanup and is never destroyed blindly.
 
 **A template left by a failed save must be removed by hand.** If the build VM
-became a template but the conversion call reported failure, or the copy to the
-replica failed, the build is not logged. The error message names the VMID:
-delete it with `qm destroy <vmid> --purge` on the node, or finish the copy
-with the `sync_template.sh` command the error prints.
+became a template but the conversion call reported failure, setting its
+`image=<name>` description failed (it then still carries the build tags), or
+the copy to the replica failed, the build is not logged. The error message
+names the VMID: delete it with `qm destroy <vmid> --purge` on the node, or
+finish the save with the commands the error prints.
 
 **Base-template contract.** The template named by `BASE_PROXMOX` must have:
 

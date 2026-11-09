@@ -25,6 +25,26 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   Build resources are tagged `image-build` and `image-build-expires`. Operator values go in the
   untracked `scripts/image_build/config.env`, created from
   `config.env.example`. See `scripts/image_build/README.md`.
+  - A setup script that needs a reboot exits 100; the builder reboots the VM
+    itself and runs the next step only once the VM's boot ID has changed. An
+    SSH session that drops during setup passes only if the boot ID changed.
+    `IMAGE_BUILD_SSH_WAIT_SECONDS` (default 900) bounds every wait for SSH.
+  - The recipe and `config.env` are sourced in a subshell. Only the recipe
+    keys, and only the backend's own config keys (`PVE_`, `AWS_`, `GCP_`),
+    are taken from them, so neither can switch off `--dry-run` or change the
+    builder's state. A `config.env` that sets a recipe key is refused.
+  - `BUILD-LOG.tsv` does not count as a change in the recipe repo's dirty
+    check, so one recipe can be built on several backends before the log is
+    committed.
+  - Exit 2 only means the input was refused before the build began; any
+    later failure exits 1.
+  - The Linux seal disables and masks both `ssh.service` and `ssh.socket`
+    (Ubuntu 22.10+ starts sshd from the socket) and writes
+    `/etc/ssh/sshd_not_to_be_run`. It always locks `builder`'s password, and
+    its host-key drop-in runs `ssh-keygen -A` before `sshd -t`.
+  - On AWS, if `run-instances` fails or is interrupted before the instance ID
+    is recorded, the cleanup finds the instance by this run's `image-build`
+    tag and terminates it.
 - `scripts/sync_template.sh` takes an optional fifth argument, the target
   VMID, restricted to 8500-8999 so a replica can never land at VMID 9000 or
   above.
