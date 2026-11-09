@@ -19,6 +19,8 @@ env/
 # Per-workstation tool permissions and deployment configuration.
 .claude/*
 scripts/site.env
+# Image builder hosts and cloud IDs; only config.env.example is tracked.
+scripts/image_build/config.env
 config/headscale-acl.json
 
 # Isolated worktrees (local working state, never repository content).
