@@ -2,6 +2,10 @@
 
 This guide covers local development setup for the Proxmox VM Automation application.
 
+> **Testing against a real Proxmox cluster that others use?** Follow
+> [LOCAL_TEST_INSTANCE.md](LOCAL_TEST_INSTANCE.md) instead. The plain development stack runs the
+> orphan reaper, which would treat everyone else's VMs as orphans.
+
 ## Table of Contents
 
 1. [Development Setup](#development-setup)

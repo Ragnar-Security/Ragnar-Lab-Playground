@@ -1,0 +1,22 @@
+# Override for a LOCAL TEST INSTANCE that talks to a real Proxmox cluster.
+# Copy to docker-compose.local.yml (untracked) and use with the dev stack:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d --build
+# See docs/LOCAL_TEST_INSTANCE.md before pointing it at a cluster other people use.
+services:
+  vm-automation:
+    environment:
+      # The orphan reaper scans the WHOLE cluster and deletes app-named guests that are past
+      # their Expires: line and have no row in THIS database. A local database is empty, so
+      # with the reaper on it would delete other people's VMs. It must be the literal word
+      # false: an unset or EMPTY value turns the reaper on.
+      - ORPHAN_REAPER_ENABLED=false
+      - ORPHAN_REAPER_DRY_RUN=true
+      - PYTHONUNBUFFERED=1
+    # run.py configures no logging, so the "Orphan reaper disabled" line would never print.
+    # This starts the same entry point with INFO logging so the check in the guide works.
+    command:
+      - sh
+      - -c
+      - >-
+        python scripts/init_db.py &&
+        python -c "import logging,runpy; logging.basicConfig(level=logging.INFO, format='%(asctime)s %(name)s %(levelname)s %(message)s'); runpy.run_path('run.py', run_name='__main__')"
