@@ -58,6 +58,8 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
     interrupted run destroys its half-made VM only when the VM carries the
     run's construction marker. The README explains how to rebuild the base for
     a new point release.
+  - On Proxmox, a build stops before cloning unless the recipe's `DISK_GB`
+    equals the base template's disk size; the backend does not resize.
 - `scripts/sync_template.sh` takes an optional fifth argument, the target
   VMID, restricted to 8500-8999 so a replica can never land at VMID 9000 or
   above.

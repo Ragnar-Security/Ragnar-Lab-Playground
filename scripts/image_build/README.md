@@ -131,7 +131,7 @@ Values arrive exactly as written, spaces, quotes and globs included.
 | `BASE_PROXMOX` | yes | Proxmox: a template name glob. The newest match on `PVE_NODE` is used. |
 | `BASE_AWS` | yes | AWS: `<owner>:<AMI name glob>`. Owner is `self`, `amazon` or an account ID. The newest available AMI wins. |
 | `BASE_GCP` | yes | GCP: `<image project>/<image family>`. |
-| `DISK_GB` | yes | Root disk size in GB. |
+| `DISK_GB` | yes | Root disk size in GB. On Proxmox it must equal the base template's disk size: the build checks it and stops otherwise (see "Proxmox"). |
 | `AWS_INSTANCE_TYPE` | yes | For example `t3.small`. |
 | `GCP_MACHINE_TYPE` | yes | For example `e2-standard-2`. |
 | `PVE_MEMORY_MB` | yes | Build VM memory on Proxmox. |
@@ -320,6 +320,14 @@ the guest agent, and reaches it over SSH through `root@PVE_HOST`. After seal,
 it shuts the VM down, renames it to the image name, turns the build VM itself
 into the template, and copies that to `PVE_REPLICA_NODE` with
 `scripts/sync_template.sh`.
+
+**Disk size.** The backend does not resize, so every Proxmox image has the
+base template's disk size. `DISK_GB` must equal it: before cloning, the build
+reads the base's `scsi0` size and stops (exit 1, nothing cloned) if it
+differs from `DISK_GB`. Set `DISK_GB` to the base's size, or build a base of
+the wanted size: `proxmox_base_ubuntu.sh --disk` sets it. The size may be
+written in K, M, G or T (`20480M` is 20 GiB); it matches `DISK_GB` only when
+it is exactly that many GiB, so `20.5G` never does.
 
 **VMIDs.**
 

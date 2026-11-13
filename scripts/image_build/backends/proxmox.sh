@@ -40,6 +40,7 @@ _PVE_SYNC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/sync_template.sh"
 # 2 a malformed reply.
 _PVE_PY="$(cat <<'PY'
 import base64, fnmatch, json, re, sys
+from fractions import Fraction
 
 
 def fail(msg, code=2):
@@ -106,6 +107,21 @@ elif mode == "inrange":
         print(v)
 elif mode == "istemplate":
     print(1 if int(load().get("template") or 0) == 1 else 0)
+elif mode == "disksize":
+    # scsi0 reads like "store:vm-100-disk-0,discard=on,size=20G"; the size may
+    # be written as 20.5G or 3584M. Prints "<whole GiB, or - if not whole>
+    # <the size as written>".
+    size = ""
+    for opt in str(load().get("scsi0") or "").split(","):
+        k, _, v = opt.partition("=")
+        if k.strip() == "size":
+            size = v.strip()
+    m = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)([KMGT])", size)
+    if not m:
+        fail("cannot read the size of the scsi0 disk of base template %s: "
+             "no size=<number>K, M, G or T in its config" % args[0], 1)
+    gib = Fraction(m.group(1)) * Fraction(1024) ** "KMGT".index(m.group(2)) / 1024 ** 2
+    print("%s\t%s" % (gib.numerator if gib.denominator == 1 else "-", size))
 elif mode == "expired":
     # A reapable VM carries exactly one image-build tag in the core's RUN_ID
     # format (ib-<yyyymmddhhmm>-<4 hex>), and one expiry in the past.
@@ -175,6 +191,11 @@ _pve_free_vmid() {
 
 _pve_is_template() {
   _pve_config "$1" | _pve_py istemplate
+}
+
+# The base's boot disk (scsi0) size in GB, from its config.
+_pve_base_disk_gb() {
+  _pve_config "$1" | _pve_py disksize "$1"
 }
 
 _pve_wait_agent() {
@@ -348,7 +369,7 @@ backend_resolve_base() {
 }
 
 backend_start() {
-  local run_id="$1" base="$2" key vmid
+  local run_id="$1" base="$2" key vmid base_disk base_gb base_written hint
   key="$(cat "$3")"
   # The key reaches three shells (node, guest exec, guest); admit nothing a
   # shell would read.
@@ -360,6 +381,18 @@ backend_start() {
     || die "proxmox: PVE_MEMORY_MB and PVE_CORES must be positive integers"
   if ! [[ "$base" =~ ^[1-9][0-9]*$ && "$base" -lt 9000 ]] && [ "$DRY_RUN" != 1 ]; then
     die "proxmox: base '$base' is not a VMID below 9000"
+  fi
+
+  # Proxmox does not resize: the image gets the base's disk, so DISK_GB must
+  # be that size. Checked before anything is cloned. The dry-run placeholder
+  # is DISK_GB itself, so the check passes there. The query prints the size in
+  # whole GiB ("-" when it is not a whole number) and as Proxmox wrote it.
+  base_disk="$(query "$DISK_GB"$'\t'"${DISK_GB}G" _pve_base_disk_gb "$base")"
+  IFS=$'\t' read -r base_gb base_written <<<"$base_disk"
+  if [ "$base_gb" != "$DISK_GB" ]; then
+    hint="build a base of the wanted size (proxmox_base_ubuntu.sh --disk)"
+    [ "$base_gb" = - ] || hint="set DISK_GB=$base_gb in the recipe, or $hint"
+    die "proxmox: DISK_GB is ${DISK_GB}G but base template $base has a $base_written disk. Proxmox images take the base template's disk size: $hint"
   fi
 
   vmid="$(query "$_PVE_BLOCK_MIN" _pve_free_vmid)"

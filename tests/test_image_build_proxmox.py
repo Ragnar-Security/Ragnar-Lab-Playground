@@ -153,7 +153,10 @@ elif prog == "pvesh":
         _, _, n, kind, vmid, _ = w[2].split("/")
         if vmid not in guests or guests[vmid]["node"] != n:
             refuse("no VM " + vmid + " on " + n)
-        cfg = {"name": guests[vmid]["name"], "description": description(vmid)}
+        # A guest's "scsi0" overrides its boot disk line; the default is 20G,
+        # the recipe's DISK_GB in the shared fixture.
+        cfg = {"name": guests[vmid]["name"], "description": description(vmid),
+               "scsi0": guests[vmid].get("scsi0", "build-store:vm-%s-disk-0,discard=on,size=20G" % vmid)}
         if guests[vmid]["template"]:
             cfg["template"] = 1
         print(json.dumps(cfg))
@@ -430,6 +433,95 @@ def test_proxmox_resolve_base_newest(tmp_path):
     assert _clones(tmp_path / "none") == []
 
 
+def _base_disk(scsi0: str) -> dict:
+    guests = _cluster()
+    guests[str(BASE_VMID)]["scsi0"] = scsi0
+    return guests
+
+
+def test_proxmox_disk_gb_equal_to_base_passes(tmp_path):
+    env, recipe = _pve_env(tmp_path, _base_disk("build-store:vm-8100-disk-0,discard=on,size=20G"))
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    assert len(_clones(tmp_path)) == 1
+
+    # A base measured in T: 1T is 1024G.
+    env, recipe = _pve_env(tmp_path / "t", _base_disk("build-store:vm-8100-disk-0,size=1T"), DISK_GB="1024")
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 0, result.stderr
+    assert len(_clones(tmp_path / "t")) == 1
+
+
+def test_proxmox_disk_gb_differing_from_base_refused(tmp_path):
+    # DISK_GB larger than the base, then smaller: either way the build stops
+    # before any VM exists, and the message names both sizes and the way out.
+    for name, disk_gb in (("larger", "40"), ("smaller", "10")):
+        env, recipe = _pve_env(tmp_path / name, _cluster(), DISK_GB=disk_gb)
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 1, result.stderr
+        assert f"DISK_GB is {disk_gb}G but base template {BASE_VMID} has a 20G disk" in result.stderr, result.stderr
+        assert "take the base template's disk size" in result.stderr, result.stderr
+        assert "DISK_GB=20" in result.stderr, result.stderr
+        assert _clones(tmp_path / name) == []
+        assert _destroys(tmp_path / name) == []
+        assert set(_state(tmp_path / name)) == set(_cluster())
+
+
+def test_proxmox_disk_size_spellings_equal_to_disk_gb(tmp_path):
+    # The same 20 GiB as Proxmox may write it, with options reordered and spaced.
+    for n, scsi0 in enumerate(("build-store:vm-8100-disk-0,discard=on,size=20.0G",
+                               "build-store:vm-8100-disk-0,size=20480M",
+                               "build-store:vm-8100-disk-0,size=20971520K",
+                               "size=20G,build-store:vm-8100-disk-0,discard=on",
+                               "build-store:vm-8100-disk-0 , discard=on , size=20G ,ssd=1",
+                               "build-store:vm-8100-disk-0,discard=on, size = 20G")):
+        env, recipe = _pve_env(tmp_path / str(n), _base_disk(scsi0))
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 0, (scsi0, result.stderr)
+        assert len(_clones(tmp_path / str(n))) == 1, scsi0
+
+
+def test_proxmox_disk_size_not_a_whole_gib_is_a_mismatch(tmp_path):
+    # 20.5G and 3584M are not DISK_GB GiB; the message shows the size as written
+    # and offers no DISK_GB value, since none matches.
+    for n, written in enumerate(("20.5G", "3584M")):
+        env, recipe = _pve_env(tmp_path / str(n),
+                               _base_disk(f"build-store:vm-8100-disk-0,size={written}"))
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 1, result.stderr
+        assert f"DISK_GB is 20G but base template {BASE_VMID} has a {written} disk" in result.stderr, result.stderr
+        assert "take the base template's disk size" in result.stderr, result.stderr
+        assert "set DISK_GB=" not in result.stderr, result.stderr
+        assert _clones(tmp_path / str(n)) == []
+
+    # A whole GiB written in M names the GiB value to set.
+    env, recipe = _pve_env(tmp_path / "m", _base_disk("build-store:vm-8100-disk-0,size=2048M"))
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert "has a 2048M disk" in result.stderr and "set DISK_GB=2 in the recipe" in result.stderr, result.stderr
+    assert _clones(tmp_path / "m") == []
+
+
+def test_proxmox_unreadable_base_disk_size_refused(tmp_path):
+    for n, scsi0 in enumerate(("build-store:vm-8100-disk-0,discard=on",   # no size
+                               "build-store:vm-8100-disk-0,size=20X",     # unknown unit
+                               "build-store:vm-8100-disk-0,size=abcG",
+                               "build-store:vm-8100-disk-0,size=G")):
+        env, recipe = _pve_env(tmp_path / str(n), _base_disk(scsi0))
+        result = _build(env, recipe, "proxmox")
+        assert result.returncode == 1, (scsi0, result.stderr)
+        assert "cannot read the size of the scsi0 disk of base template 8100" in result.stderr, result.stderr
+        assert _clones(tmp_path / str(n)) == []
+
+    # A base with no scsi0 at all.
+    guests = _cluster()
+    guests[str(BASE_VMID)]["scsi0"] = ""
+    env, recipe = _pve_env(tmp_path / "none", guests)
+    result = _build(env, recipe, "proxmox")
+    assert result.returncode == 1
+    assert _clones(tmp_path / "none") == []
+
+
 def test_proxmox_save_replicates_to_plus_500(tmp_path):
     env, recipe = _pve_env(tmp_path, _cluster())
     result = _build(env, recipe, "proxmox")
@@ -656,7 +748,7 @@ def test_proxmox_dry_run_touches_nothing(tmp_path):
     assert result.returncode == 0, result.stderr
     assert _pve_cmds(tmp_path) == []
     assert _ssh_calls(tmp_path) == []
-    for printed in ("DRY-RUN: pve qm clone ", "DRY-RUN: pve qm template 8000",
+    for printed in ("DRY-RUN: _pve_base_disk_gb ", "DRY-RUN: pve qm clone ", "DRY-RUN: pve qm template 8000",
                     f"DRY-RUN: bash {ROOT / 'scripts' / 'sync_template.sh'} pve-host.invalid 8000 "
                     "pve2-host.invalid replica-store 8500"):
         assert printed in result.stderr, printed
