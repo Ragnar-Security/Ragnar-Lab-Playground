@@ -373,6 +373,93 @@ set to start automatically. The backend only injects the key, through the
 guest agent, into `C:\ProgramData\ssh\administrators_authorized_keys`; it
 never installs or starts `sshd`.
 
+#### Building the Linux base: `proxmox_base_ubuntu.sh`
+
+`scripts/image_build/proxmox_base_ubuntu.sh` builds a Linux base that meets
+this contract, `base-ubuntu-2404-<yyyymmdd>`, from the official Ubuntu 24.04
+cloud image. It runs on the build host, reads the same `config.env`
+(`IMAGE_BUILD_CONFIG` overrides the path), and reaches `root@PVE_HOST` over
+SSH as the builder does. It uses five keys: `PVE_HOST`, `PVE_NODE`,
+`PVE_STORAGE` (the template's disk), `PVE_BUILD_BRIDGE` and `PVE_BUILD_VLAN`.
+
+```
+scripts/image_build/proxmox_base_ubuntu.sh [--image PATH] [--snippets STORE]   # dry run
+scripts/image_build/proxmox_base_ubuntu.sh --apply [--image PATH] [--snippets STORE]
+```
+
+**It is a dry run by default.** Without `--apply` it runs only the read-only
+checks and prints every command that would change the cluster, the user-data
+and the in-guest finalize script. Options: `--image` (the cloud image on
+`PVE_NODE`, default
+`/var/lib/vz/template/iso/noble-server-cloudimg-amd64.img`), `--snippets` (a
+storage with the `snippets` content type, default `local`), `--vmid`,
+`--date` (default today, UTC) and `--disk` (default `20G`; the backend does
+not resize, so this is every image's disk size).
+
+**VMID.** The lowest `V` in `8000`-`8499` with both `V` and `V+500` free
+anywhere in the cluster, so the replica can sit at `V+500`. `--vmid` is
+accepted only in `8000`-`8499` and only when both IDs are free. The script
+refuses a VMID in use, a name already taken (one base per day), and a
+`PVE_NODE` with less than 16 GiB of available memory. It never touches an
+existing guest.
+
+**Build network.** The VM's `net0` is on `PVE_BUILD_BRIDGE` tagged
+`PVE_BUILD_VLAN`, the builder's provisioning network (VLAN 20 in the
+reference deployment, never a student lab VLAN). It needs DHCP and internet
+access there: the first boot upgrades the image and installs packages.
+
+**What it does.** It writes a first-boot user-data snippet (no key, no
+password) to the snippets storage, creates the VM, imports the cloud image as
+its disk and boots it with a cloud-init drive pointing at the snippet.
+cloud-init creates `builder` and installs `qemu-guest-agent` and
+`openssh-server`. The rest runs as root through the guest agent: a netplan
+file that gives DHCP to any `en*`/`eth*` interface, matched by name rather
+than MAC (a clone has a new MAC), with cloud-init's own network config
+disabled; no SSH host keys (a drop-in runs `ssh-keygen -A` when `ssh.service`
+starts); every `authorized_keys` file deleted and every password locked;
+`cloud-init clean --logs` and an empty `/etc/machine-id`. It then shuts the
+VM down, **removes the cloud-init drive** (`ide2`, `cicustom`, `ipconfig0`;
+a clone that kept it would replay its config), turns the VM into a template
+and **deletes the snippet**. The template's description records the image
+file name and its SHA-256.
+
+**Failure.** `qm create` writes a construction marker into the VM's
+description (`proxmox-base-build=<time>-<random>`, unique to the run), and
+the marker stays there until the VM is a template. If the run fails, or is
+interrupted with `INT`, `TERM` or `HUP`, after it began to create the VM, it
+asks the node for that VMID and destroys the VM only when the node shows it
+is not a template, carries the base's name and carries this run's marker,
+checked again between `qm stop` and `qm destroy`. Any other guest at that
+VMID is reported and left alone; the error names the VMID and the marker, so
+a VM the run could not destroy (a lost connection, say) can be identified
+and removed by hand. The snippet is deleted on every exit; if the node cannot
+confirm it is gone, the run exits non-zero with an error naming its path.
+
+**Rebuilding for a new point release.** Ubuntu refreshes the 24.04 cloud
+image for each point release and between them for security updates. On
+`PVE_NODE`, replace the image at the `--image` path with the current one and
+check it against Ubuntu's published `SHA256SUMS` (the `noble/current/`
+directory keeps the file name the script expects):
+
+```
+cd /var/lib/vz/template/iso
+wget -O noble-server-cloudimg-amd64.img \
+  https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+wget -O SHA256SUMS https://cloud-images.ubuntu.com/noble/current/SHA256SUMS
+grep ' \*noble-server-cloudimg-amd64.img$' SHA256SUMS | sha256sum -c -
+```
+
+Then run the script, dry run first, then with `--apply`. The new base gets
+today's date in its name and the next free VMID pair. Prove it before any
+build uses it: full-clone it to a test VMID in the block, boot it, check the
+contract (guest agent reports an address, `builder` has passwordless `sudo`,
+`sshd` runs, no `authorized_keys`, a new machine ID), and destroy the clone.
+Copy it to the replica node with
+`scripts/sync_template.sh <PVE_HOST> <vmid> <PVE_REPLICA_HOST> <PVE_REPLICA_STORAGE> <vmid+500>`.
+Builds whose `BASE_PROXMOX` glob matches the new name use it from then on,
+since the newest match wins. Delete the old base (both copies) by hand once
+nothing needs it, as in "Deleting an old image".
+
 ### AWS
 
 The build runs one instance from the newest available AMI matching `BASE_AWS`,

@@ -45,6 +45,19 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   - On AWS, if `run-instances` fails or is interrupted before the instance ID
     is recorded, the cleanup finds the instance by this run's `image-build`
     tag and terminates it.
+  - `scripts/image_build/proxmox_base_ubuntu.sh` builds the Proxmox Linux
+    base, `base-ubuntu-2404-<yyyymmdd>`, from the official Ubuntu 24.04 cloud
+    image to the README's base-template contract: `builder` with passwordless
+    sudo and no key, guest agent and OpenSSH installed, DHCP matched by
+    interface name, no host keys, empty machine ID. It is a dry run unless
+    given `--apply`, reads `PVE_HOST`, `PVE_NODE`, `PVE_STORAGE`,
+    `PVE_BUILD_BRIDGE` and `PVE_BUILD_VLAN` from `config.env`, and builds at
+    the lowest free VMID pair in 8000-8499 (+500) on the build network. It
+    removes the cloud-init drive before templating and deletes its first-boot
+    user-data snippet on every exit, failing loudly if it cannot. A failed or
+    interrupted run destroys its half-made VM only when the VM carries the
+    run's construction marker. The README explains how to rebuild the base for
+    a new point release.
 - `scripts/sync_template.sh` takes an optional fifth argument, the target
   VMID, restricted to 8500-8999 so a replica can never land at VMID 9000 or
   above.
