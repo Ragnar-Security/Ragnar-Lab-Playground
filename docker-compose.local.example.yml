@@ -7,8 +7,8 @@ services:
     environment:
       # The orphan reaper scans the WHOLE cluster and deletes app-named guests that are past
       # their Expires: line and have no row in THIS database. A local database is empty, so
-      # with the reaper on it would delete other people's VMs. It must be the literal word
-      # false: an unset or EMPTY value turns the reaper on.
+      # with the reaper on it would delete other people's VMs. Use the supported literal false;
+      # unset or empty enables it (app/config.py compares the lowercased value with "true").
       - ORPHAN_REAPER_ENABLED=false
       - ORPHAN_REAPER_DRY_RUN=true
       - PYTHONUNBUFFERED=1
