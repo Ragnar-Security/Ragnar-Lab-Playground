@@ -71,7 +71,8 @@ def contract_run(live_proxmox, live_config):
             if live_config.portal_database_url else None)
     with ContractRun(live_proxmox, live_config.vmid_range,
                      portal_vmid_mark=mark,
-                     separate_cluster=live_config.separate_cluster) as run:
+                     separate_cluster=live_config.separate_cluster,
+                     vlan=live_config.vlan) as run:
         yield run
 
 

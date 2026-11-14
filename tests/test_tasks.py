@@ -1161,6 +1161,18 @@ def test_stopped_router_is_not_stopped_again_every_pass(app, router_backend):
     assert router_backend.router_running is True
 
 
+def test_an_already_stopped_router_is_not_reported_as_stopped(
+        app, router_backend, caplog):
+    # Catches a portal that starts with its router stopped logging a stop it
+    # never made (B2 M3), and listing it among the routers this pass stopped.
+    router_backend.router_running = False
+    observe_idle_at(0)
+    with caplog.at_level('INFO', logger='app.tasks'):
+        assert _stop_idle_cloud_routers(now_epoch=1_800) == []
+    assert 'Stopped the aws router' not in caplog.text
+    assert router_backend.router_running is False
+
+
 def test_failed_router_stop_keeps_its_idle_timestamp_for_retry(app, router_backend):
     # Catches a failed stop being reported as stopped, or restarting the idle window.
     def refuse_stop():

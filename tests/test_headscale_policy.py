@@ -47,6 +47,7 @@ EXPECTED_ALICE_CIDRS = [
     "172.20.25.0/26", "172.20.75.0/26", "172.20.100.0/26",
     "172.21.25.0/26", "172.21.75.0/26", "172.21.100.0/26",
 ]
+SELF_RULE = {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
 
 
 def _forward(policy, login):
@@ -69,7 +70,8 @@ def test_alice_reaches_exactly_her_entry_and_group_blocks_on_every_backend():
     alice_reverse = next(r for r in policy["acls"] if r["dst"] == ["alice@:*"])
     assert alice_reverse == {"action": "accept", "src": EXPECTED_ALICE_CIDRS,
                              "dst": ["alice@:*"]}
-    assert "autogroup:member" not in json.dumps(policy)
+    # The blanket rule survives only as its autogroup:self part.
+    assert [r for r in policy["acls"] if "autogroup:member" in r["src"]] == [SELF_RULE]
     assert all("200" not in dst for dst in alice_forward["dst"])
     assert "10.200.0.0/24" not in json.dumps(policy)
 
@@ -81,7 +83,8 @@ def test_login_is_normalized_exactly_once():
     slots = {**SLOTS, "users": [{"login": " Alice@ ", "entry_vlan": 100, "internal_vlan": 200}],
              "groups": []}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
-    assert policy["acls"][1]["src"] == ["alice@"]  # after the one preserved staff rule
+    # After the preserved staff rule and the blanket rule's self part.
+    assert policy["acls"][2]["src"] == ["alice@"]
     assert "Alice" not in json.dumps(policy)
 
 
@@ -96,30 +99,94 @@ def test_empty_or_malformed_login_is_rejected(raw):
                DEFAULT_POLICY_BANDS, {})
 
 
-# Catches KOTH players losing reachability to the arena once the blanket rule is gone.
+# Catches KOTH players losing reachability to the arena once the blanket rule
+# is gone, and (D-plan F2) a KOTH box any player has rooted reaching every
+# player's devices through the reverse rule.
 def test_every_roster_login_gets_non_ended_koth_blocks_on_proxmox_only():
     slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {"aws": "172.20.0.0/16"})
+    koth = {"10.150.2.0/24", "10.150.4.0/24"}
     for login in ("alice@", "bob@"):
         forward = _forward(policy, login)
-        assert {"10.150.2.0/24:*", "10.150.4.0/24:*"} <= set(forward["dst"])
+        assert {f"{cidr}:*" for cidr in koth} <= set(forward["dst"])
         assert not {"172.20.87.128/26:*", "172.20.112.128/26:*"} & set(forward["dst"])
         reverse = next(r for r in policy["acls"] if r["dst"] == [f"{login}:*"])
-        assert {"10.150.2.0/24", "10.150.4.0/24"} <= set(reverse["src"])
+        assert not koth & set(reverse["src"])
+        # The login's own and group blocks still reach back to its devices.
+        assert set(reverse["src"]) == {d[:-2] for d in forward["dst"]} - koth
+    assert not any(koth & set(r["src"]) for r in policy["acls"])
     cloud_only = render(BASE, slots, replace(DEFAULT_POLICY_BANDS, proxmox_enabled=False),
                         {"aws": "172.20.0.0/16"})
     assert "10.150." not in json.dumps(cloud_only)
 
 
+# A login whose only routed blocks are KOTH's gets the forward rule and no
+# reverse rule (an empty src would be an invalid policy).
+def test_a_login_with_only_koth_blocks_gets_no_reverse_rule():
+    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
+             "groups": [], "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
+    policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
+    assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*", "10.150.4.0/24:*"]
+    assert not [r for r in policy["acls"] if r["dst"] == ["carol@:*"]]
+
+
 # Catches the operator's infrastructure rules (e.g. the portal host probing KOTH) being dropped.
-def test_base_acls_are_preserved_except_the_blanket_member_rule():
+def test_base_acls_are_preserved_and_the_blanket_rule_keeps_only_self():
     infra = {"action": "accept", "src": ["node1-v4"], "dst": ["10.150.4.0/24:*"]}
-    members_and_more = {"action": "accept", "src": ["autogroup:member", "group:staff"],
-                        "dst": ["tag:jumpbox:22"]}
-    base = {**BASE, "acls": [BASE["acls"][0], BASE["acls"][1], infra, members_and_more]}
+    staff_to_jumpbox = {"action": "accept", "src": ["group:staff"], "dst": ["tag:jumpbox:22"]}
+    base = {**BASE, "acls": [BASE["acls"][0], BASE["acls"][1], infra, staff_to_jumpbox]}
     policy = render(base, SLOTS, DEFAULT_POLICY_BANDS, {})
-    assert policy["acls"][:3] == [BASE["acls"][0], infra, members_and_more]
-    assert not any(r["src"] == ["autogroup:member"] for r in policy["acls"])
+    assert policy["acls"][:4] == [BASE["acls"][0], SELF_RULE, infra, staff_to_jumpbox]
+    assert base["acls"][1] == BASE["acls"][1]  # the input is not modified
+
+
+# D-plan F3: catches a broad member rule that is not the exact blanket form
+# silently keeping blanket access next to the per-student rules.
+@pytest.mark.parametrize("src", [
+    ["autogroup:member", "group:staff"],
+    ["group:staff", "autogroup:member"],
+    ["*"],
+    ["autogroup:member", "*"],
+])
+@pytest.mark.parametrize("dst", [
+    ["tag:jumpbox:22"],
+    ["autogroup:self:*", "10.0.0.0/8:*"],
+    ["*:*"],
+])
+def test_any_other_broad_member_rule_fails_the_render(src, dst):
+    rule = {"action": "accept", "src": src, "dst": dst}
+    base = {**BASE, "acls": [BASE["acls"][0], BASE["acls"][1], rule]}
+    with pytest.raises(ValueError, match=r"acls\[2\].*autogroup:self"):
+        render(base, SLOTS, DEFAULT_POLICY_BANDS, {})
+
+
+# Catches the stricter check refusing the access-preserving self-only rule.
+@pytest.mark.parametrize("src", [["autogroup:member"], ["autogroup:member", "group:staff"],
+                                 ["*"]])
+def test_a_self_only_member_rule_is_kept_verbatim(src):
+    rule = {"action": "accept", "src": src, "dst": ["autogroup:self:*"]}
+    base = {**BASE, "acls": [BASE["acls"][0], rule]}
+    policy = render(base, SLOTS, DEFAULT_POLICY_BANDS, {})
+    assert policy["acls"][:2] == [BASE["acls"][0], rule]
+
+
+# The live base after narrowing (D-plan P1): the blanket rule becomes self-only.
+def test_the_narrowed_live_blanket_rule_keeps_self_and_drops_the_range():
+    blanket = {"action": "accept", "src": ["autogroup:member"],
+               "dst": ["autogroup:self:*", "10.0.0.0/8:*"]}
+    policy = render({**BASE, "acls": [BASE["acls"][0], blanket]}, SLOTS,
+                    DEFAULT_POLICY_BANDS, {})
+    assert policy["acls"][1] == SELF_RULE
+    assert "10.0.0.0/8:*" not in json.dumps(policy)
+
+
+# A blanket rule without autogroup:self is removed outright: the render never
+# grants device-to-device access the base did not.
+def test_a_blanket_rule_without_self_is_removed():
+    blanket = {"action": "accept", "src": ["autogroup:member"], "dst": ["10.0.0.0/8:*"]}
+    policy = render({**BASE, "acls": [BASE["acls"][0], blanket]}, SLOTS,
+                    DEFAULT_POLICY_BANDS, {})
+    assert not [r for r in policy["acls"] if "autogroup:member" in r["src"]]
 
 
 # Catches operator sections outside groups/tagOwners/hosts (autoApprovers) being lost.
@@ -167,7 +234,7 @@ def test_output_order_is_deterministic():
     first = render(BASE, SLOTS, DEFAULT_POLICY_BANDS, CLOUDS)
     second = render(BASE, shuffled, DEFAULT_POLICY_BANDS, {"gcp": CLOUDS["gcp"], "aws": CLOUDS["aws"]})
     assert first == second
-    sources = [r["src"] for r in first["acls"][1:]]
+    sources = [r["src"] for r in first["acls"][2:]]
     assert sources[0] == ["alice@"] and sources[2] == ["bob@"]
 
 
@@ -197,7 +264,7 @@ def test_student_with_no_routed_block_gets_no_rule():
     slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
              "groups": []}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
-    assert policy["acls"] == [BASE["acls"][0]]
+    assert policy["acls"] == [BASE["acls"][0], SELF_RULE]
 
 
 def _with(**changes):
@@ -242,7 +309,9 @@ def test_diff_shows_the_blanket_rule_removed_and_login_rules_added():
     diff = policy_diff(BASE, desired)
     lines = diff.splitlines()
     assert lines[:2] == ["--- current", "+++ desired"]
-    assert any(line.startswith("-") and "autogroup:member" in line for line in lines)
+    # The blanket rule's grants beyond autogroup:self are removed.
+    for removed in ("node1-v4:*", "tag:jumpbox:*", "192.0.2.0/24:*"):
+        assert any(line.startswith("-") and f'"{removed}"' in line for line in lines)
     assert any(line.startswith("+") and '"alice@"' in line for line in lines)
     assert any(line.startswith("+") and '"bob@:*"' in line for line in lines)
     assert not any(line.startswith("-") and "group:staff" in line for line in lines[2:])
@@ -280,7 +349,7 @@ def test_cli_diff_is_empty_when_equal_and_errors_go_to_stderr(tmp_path):
     desired.write_text(json.dumps(render(BASE, SLOTS, DEFAULT_POLICY_BANDS, {})))
     result = _cli("diff", str(current), str(desired))
     assert result.returncode == 0
-    assert "-        \"autogroup:member\"" in result.stdout
+    assert "-        \"tag:jumpbox:*\"," in result.stdout
 
     desired.write_text("{not json")
     result = _cli("diff", str(current), str(desired))

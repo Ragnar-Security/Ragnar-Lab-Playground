@@ -202,8 +202,12 @@ class FakeBackend:
         self._observe_locks('ensure_router_running')
         self.router_running = True
 
-    def stop_router(self) -> None:
-        self.router_running = False
+    def stop_router(self) -> bool:
+        was_running, self.router_running = self.router_running, False
+        return was_running
+
+    def router_stopped(self) -> bool:
+        return not self.router_running
 
 
 @dataclass

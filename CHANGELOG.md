@@ -19,10 +19,11 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   (or a machine's) selects where its labs go, with the machine spec in an
   `aws:` or `gcp:` block. Every cloud resource carries the `LAB_SITE_ID`
   ownership tag, launches without a public address into a private slot
-  subnet with no internet route, and is capped by `AWS_MAX_VMS` /
-  `GCP_MAX_VMS`. Per-deployment security groups and firewall rules isolate
-  deployments; one subnet router per cloud is started on demand and stopped
-  when idle. Operator runbook: `docs/CLOUD_BACKENDS.md`.
+  subnet with no direct TCP/UDP route to public addresses (the provider's
+  DNS resolver stays reachable until blocked separately), and is capped by
+  `AWS_MAX_VMS` / `GCP_MAX_VMS`. Per-deployment security groups and firewall
+  rules isolate deployments; one subnet router per cloud is started on
+  demand and stopped when idle. Operator runbook: `docs/CLOUD_BACKENDS.md`.
 - The orphan reaper sweeps each enabled cloud's site inventory as well as
   Proxmox, deleting only on positive evidence that nothing owns a resource.
 - A per-student Headscale policy (`scripts/apply_headscale_policy.sh`, dry run
@@ -52,6 +53,20 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `term_changeover.sh` keeps exported `HEADSCALE_BASE_POLICY` and
   `HEADSCALE_POLICY_FILE` values over `scripts/site.env`, as
   `apply_headscale_policy.sh` already did.
+- A destroy, expiry or failed-deploy cleanup in the first ~10 s after a
+  Proxmox clone is no longer refused with "guest identity could not be
+  verified". The cluster listing reports a fresh guest's name empty (or the
+  previous guest's, at a reused VMID) until pvestatd's next broadcast; when
+  only the name disagrees, the guest's own config on its node now decides.
+  A config naming another guest still refuses.
+- Every Proxmox destroy (student, expiry, admin, failed-deploy cleanup) and
+  the orphan reaper re-read the guest's identity immediately before the
+  delete, after the stop (which may wait up to a minute), and the reaper also
+  before the stop. A guest that took the VMID in that window is refused and
+  kept; a guest already gone counts as destroyed. v1.0.0's destroy paths
+  checked once, before the stop; its reaper trusted the sweep's listing.
+- The idle cloud-router stop logs "Stopped the … router" only when it
+  issued the stop, not when the router was already stopped or stopping.
 
 ### Upgrade notes
 
@@ -71,7 +86,14 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   done
   ```
 
-- **Proxmox-only sites change nothing else.** `ENABLED_BACKENDS` unset or
+- **Proxmox-only sites change nothing else in normal operation.** Two
+  behaviours differ while the Proxmox API is unreachable: `/extend` saves the
+  new expiry in the database and returns `success: true` with
+  `extended_count: 0`, where v1.0.0 refused the whole extend (the guest's
+  own `Expires:` line keeps the old time until an extend reaches Proxmox;
+  the orphan reaper does not act on it while the record exists); and
+  `/list` shows each VM as "state unknown, listing unverified", where
+  v1.0.0 failed the request. `ENABLED_BACKENDS` unset or
   `proxmox` keeps today's behaviour. The new variables are `ENABLED_BACKENDS`
   and `LAB_SITE_ID`; `JUMPBOX_VLAN_BANDS` (default the jumpbox's bands); and,
   only when that cloud is enabled, `AWS_REGION`, `AWS_AVAILABILITY_ZONE`,
@@ -81,16 +103,23 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   `GCP_NETWORK`, `GCP_LAB_CIDR`, `GCP_ROUTER_INSTANCE`, `GCP_MAX_VMS`,
   `GCP_ROUTER_IDLE_MINUTES` and `GCP_OPERATION_TIMEOUT_SECONDS`
   (`.env.example`). A Proxmox node named `aws` or `gcp` is no longer
-  supported: startup refuses such a `FIXED_NODE`.
+  supported: startup refuses such a `FIXED_NODE`, and admission never
+  places a VM on a node of that name.
 - **Enabling a cloud** follows `docs/CLOUD_BACKENDS.md`: operator-created
   VPC, router and IAM, a vCPU quota increase before the first class,
-  complete lab images (labs have no internet), and credentials through an
-  instance role or an untracked compose override, never a tracked file.
+  complete lab images (labs have no direct TCP/UDP route to public
+  addresses; the provider's DNS stays reachable until blocked separately,
+  which the runbook requires before students use the cloud), and
+  credentials through an instance role or an untracked compose override,
+  never a tracked file.
 - **Instructor steps after the upgrade, not part of it:** the Headscale
   policy (`scripts/apply_headscale_policy.sh --apply`) and jumpbox
-  `--isolate-vlans`. The policy removes the blanket `autogroup:member` rule,
-  which also changes what students reach on Proxmox; move any access it gave
-  that must stay into explicit rules in `config/headscale-acl.json` first.
+  `--isolate-vlans`. The policy cuts the blanket `autogroup:member` rule down
+  to its `autogroup:self` part, which also changes what students reach on
+  Proxmox; move any other access it gave that must stay into explicit rules
+  in `config/headscale-acl.json` first. Any other base rule whose `src`
+  includes `autogroup:member` or `*` must grant only `autogroup:self`, or
+  the render refuses to run.
 - **Still one gunicorn worker.**
 - **Rollback** to v1.0.0 needs no database restore (it ignores the new
   columns) **only while no cloud records and no cloud failed-deploy survivor

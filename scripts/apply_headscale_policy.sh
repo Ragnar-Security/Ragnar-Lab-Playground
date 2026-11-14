@@ -49,8 +49,10 @@ own lab networks, their group's networks and the running KOTH arena.
 
 The roster, VLANs, enabled backends, lab CIDRs and VLAN bands are exported
 from the running portal. The operator's base policy (HEADSCALE_BASE_POLICY)
-supplies every other section and rule; only its blanket
-"autogroup:member" rule is replaced.
+supplies every other section and rule; its blanket "autogroup:member" rule
+is cut down to its autogroup:self part, and any other rule whose src
+includes autogroup:member or "*" must grant only autogroup:self or the
+render refuses.
 
 The default dry run reads both hosts, prints the change, and writes nothing.
 Use --apply to check the policy inside the Headscale container, back up the

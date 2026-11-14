@@ -5,13 +5,19 @@
     headscale_policy.py diff CURRENT.json DESIRED.json       # unified diff
 
 BASE_POLICY is the operator's policy file (config/headscale-acl.json): every
-section and every ACL rule is kept except the blanket rule whose src is
-exactly ["autogroup:member"]. SLOTS is scripts/export_network_slots.py
+section and every ACL rule is kept, except the blanket rule whose src is
+exactly ["autogroup:member"], which is cut to its autogroup:self
+destinations (each member keeps reaching their own devices). Any other rule
+whose src includes autogroup:member or "*" must grant only autogroup:self,
+or the render fails: such a rule would keep the blanket access the
+per-student rules replace. SLOTS is scripts/export_network_slots.py
 output from the running portal; the backends, lab CIDRs and VLAN bands come
 only from it, so the policy grants exactly the networks that portal
 allocates. Each roster login gets one rule to its own entry network, its
 group's entry and internal networks, and every non-ended KOTH game's
-networks (Proxmox only), plus the reverse rule from those networks back.
+networks (Proxmox only), plus the reverse rule back to its devices from its
+own and its groups' networks. KOTH networks get no reverse rule: a box any
+player has rooted must not reach every player's devices.
 
 Standard library only: this runs on the operator's workstation.
 """
@@ -51,6 +57,9 @@ validate_lab_cidr = _slots.validate_lab_cidr
 CLOUD_BACKENDS = ("aws", "gcp")
 KNOWN_BACKENDS = ("proxmox",) + CLOUD_BACKENDS
 BLANKET_SRC = ["autogroup:member"]
+# Sources that cover every student.
+BROAD_SOURCES = frozenset({"autogroup:member", "*"})
+SELF_DST_PREFIX = "autogroup:self:"
 _LOGIN = re.compile(r"[a-z0-9][a-z0-9._-]*")
 
 
@@ -170,25 +179,67 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
     # KOTH is refused on the cloud backends, so its slots exist on Proxmox only.
     koth_routed = routed_slots(koth, bands.values) if bands.proxmox_enabled else []
 
-    acls = [copy.deepcopy(dict(rule)) for rule in base_policy["acls"]
-            if rule.get("src") != BLANKET_SRC]
+    acls = _base_rules(base_policy["acls"])
     for identity in sorted(granted):
         own = routed_slots(granted[identity], bands.values)
-        prefixes = []
+        forward, reverse = [], []
         if bands.proxmox_enabled:
-            prefixes += [proxmox_slot_cidr(slot, bands.values)
-                         for slot in sorted(set(own) | set(koth_routed))]
+            for slot in sorted(set(own) | set(koth_routed)):
+                prefix = proxmox_slot_cidr(slot, bands.values)
+                forward.append(prefix)
+                if slot in own:
+                    reverse.append(prefix)
         for backend in sorted(cloud_cidrs):
-            prefixes += [cloud_slot_cidr(cloud_cidrs[backend], slot) for slot in own]
-        if not prefixes:
+            cloud = [cloud_slot_cidr(cloud_cidrs[backend], slot) for slot in own]
+            forward += cloud
+            reverse += cloud
+        if not forward:
             continue
         acls.append({"action": "accept", "src": [identity],
-                     "dst": [f"{prefix}:*" for prefix in prefixes]})
-        acls.append({"action": "accept", "src": prefixes, "dst": [f"{identity}:*"]})
+                     "dst": [f"{prefix}:*" for prefix in forward]})
+        if reverse:
+            acls.append({"action": "accept", "src": reverse, "dst": [f"{identity}:*"]})
 
     policy = copy.deepcopy(dict(base_policy))
     policy["acls"] = acls
     return policy
+
+
+def _base_rules(base_acls: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """The base rules the policy keeps.
+
+    A rule whose src includes a broad source (autogroup:member, "*") may
+    grant only autogroup:self, which reaches each member's own devices. The
+    exact blanket rule is cut down to that part; any other broad rule that
+    grants more fails the render, since keeping it would keep the access
+    the per-student rules exist to replace.
+    """
+    kept = []
+    for index, base_rule in enumerate(base_acls):
+        rule = copy.deepcopy(dict(base_rule))
+        src, dst = rule.get("src"), rule.get("dst")
+        if not isinstance(src, list) or not any(s in BROAD_SOURCES for s in src
+                                                if isinstance(s, str)):
+            kept.append(rule)
+            continue
+        if not isinstance(dst, list) or not all(isinstance(d, str) for d in dst):
+            raise ValueError(f"base policy acls[{index}] has a malformed dst {dst!r}")
+        self_only = [d for d in dst if d.startswith(SELF_DST_PREFIX)]
+        if self_only == dst:
+            kept.append(rule)
+        elif src == BLANKET_SRC:
+            if self_only:
+                rule["dst"] = self_only
+                kept.append(rule)
+        else:
+            broad = [d for d in dst if not d.startswith(SELF_DST_PREFIX)]
+            raise ValueError(
+                f"base policy acls[{index}] gives {src} access to {broad}: a rule "
+                "whose src includes autogroup:member or \"*\" may grant only "
+                "autogroup:self, and only the rule whose src is exactly "
+                "[\"autogroup:member\"] is replaced by the per-student rules. "
+                "Narrow its src or its dst, or remove it")
+    return kept
 
 
 def canonical(policy: Any) -> str:

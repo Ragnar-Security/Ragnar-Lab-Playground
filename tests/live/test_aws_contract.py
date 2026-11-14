@@ -11,6 +11,7 @@ must never build a client.
 """
 
 import ipaddress
+import time
 from datetime import timedelta
 
 import pytest
@@ -20,7 +21,7 @@ from app.backends.cloud_common import (
     TAG_KIND, TAG_SITE, deployment_key, expires_epoch,
 )
 from app.backends.network_slots import cloud_slot_cidr
-from tests.live.cloud_harness import EXPIRY, CloudContractRun
+from tests.live.cloud_harness import EXPIRY, ROUTER_READ_LAG_SECONDS, CloudContractRun
 
 pytestmark = [pytest.mark.live, pytest.mark.live_aws]
 
@@ -172,10 +173,20 @@ def test_stop_router_while_pending_waits_for_running_then_stops(
     assert _instance(ec2_probe, router_id)['State']['Name'] == 'stopped'
 
     ec2_probe.start_instances(InstanceIds=[router_id])
+    aws_run.note_router_started()
+    # Straight after StartInstances EC2 can still answer 'stopped'
+    # (read-after-write lag). That read says nothing about the start.
+    deadline = time.monotonic() + ROUTER_READ_LAG_SECONDS
     observed = _instance(ec2_probe, router_id)['State']['Name']
+    while observed == 'stopped' and time.monotonic() < deadline:
+        time.sleep(1)
+        observed = _instance(ec2_probe, router_id)['State']['Name']
+    if observed == 'stopped':
+        pytest.fail(f'router still read stopped {ROUTER_READ_LAG_SECONDS}s after '
+                    'StartInstances')
     if observed != 'pending':
-        pytest.skip(f'router was {observed!r}, not pending, by the time it was read; '
+        pytest.skip(f'router was already {observed!r} when the start became visible; '
                     'the pending path was not exercised')
-    aws_backend.stop_router()
+    assert aws_run.stop_router() is True
 
     assert _instance(ec2_probe, router_id)['State']['Name'] == 'stopped'

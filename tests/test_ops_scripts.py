@@ -452,7 +452,7 @@ def test_apply_policy_dry_run_prints_the_diff_and_changes_nothing(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert "--- current\n+++ desired\n" in result.stdout
-    assert re.search(r'^-\s+"autogroup:member"$', result.stdout, re.M)
+    assert re.search(r'^-\s+"tag:jumpbox:\*",?$', result.stdout, re.M)
     assert re.search(r'^\+\s+"alice@"$', result.stdout, re.M)
     assert policy.read_text() == original
     assert sorted(p.name for p in policy.parent.iterdir()) == before

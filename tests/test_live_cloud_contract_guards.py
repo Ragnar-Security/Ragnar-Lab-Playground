@@ -18,6 +18,7 @@ import pytest
 from app.backends.base import BackendError, DestroyPolicy
 from tests.backends.fake_backend import FakeBackend
 from tests.live.cloud_harness import (
+    ROUTER_READ_LAG_SECONDS,
     CloudCleanupError,
     CloudContractRun,
     CloudLiveConfig,
@@ -372,6 +373,114 @@ def test_network_cleanup_is_retried_while_the_provider_reports_it_in_use():
         run.launch_one()
     assert fake.busy == 0 and fake.list_managed() == []
     assert len(slept) == 2
+
+
+# --- the router after teardown (B1 I2) -------------------------------------------
+# Live: a DescribeInstances straight after StartInstances answered 'stopped',
+# the teardown's stop_router believed it, and the router came up and billed
+# after a run that reported itself clean.
+
+class _StaleRouterReadFake(FakeBackend):
+    """EC2 read-after-write lag: for `lag` seconds after a direct start,
+    every read (stop_router's and router_stopped's) sees the pre-start
+    'stopped'. `stop_lag` overrides the window for stop_router alone."""
+
+    def __init__(self, name, clock, lag, stop_lag=None):
+        super().__init__(name)
+        self.clock, self.lag, self.started_at = clock, lag, None
+        self.stop_lag = lag if stop_lag is None else stop_lag
+
+    def start_directly(self):
+        self.router_running, self.started_at = True, self.clock()
+
+    def _stale(self, lag):
+        return self.started_at is not None and self.clock() - self.started_at < lag
+
+    def stop_router(self):
+        if self._stale(self.stop_lag):
+            return False
+        return super().stop_router()
+
+    def router_stopped(self):
+        return True if self._stale(self.lag) else super().router_stopped()
+
+
+class _Clock:
+    def __init__(self):
+        self.now, self.slept = 100.0, []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+def _direct_start_run(fake, clock):
+    with CloudContractRun(fake, CloudLiveConfig.from_env('aws', aws_env()),
+                          sleep=clock.sleep, clock=clock) as run:
+        fake.start_directly()
+        run.note_router_started()
+
+
+# Catches teardown stopping (and trusting 'stopped') before the start is
+# visible: it polls until a read shows the router running, then stops it.
+def test_teardown_retries_until_a_direct_start_is_visible_then_stops():
+    clock = _Clock()
+    fake = _StaleRouterReadFake('aws', clock, lag=20)
+    _direct_start_run(fake, clock)
+    assert fake.router_running is False
+    assert 20 <= sum(clock.slept) < ROUTER_READ_LAG_SECONDS
+
+
+# Review I2: both the stop and the final check read the stale 'stopped'
+# for longer than any fixed wait. A run that accepted it would report clean
+# while the router came up; teardown must fail, bounded, instead.
+def test_teardown_fails_when_a_direct_start_never_becomes_visible(capsys):
+    clock = _Clock()
+    fake = _StaleRouterReadFake('aws', clock, lag=10_000)
+    with pytest.raises(CloudCleanupError, match='still read stopped'):
+        _direct_start_run(fake, clock)
+    assert fake.router_running is True
+    assert ROUTER_READ_LAG_SECONDS <= sum(clock.slept) < ROUTER_READ_LAG_SECONDS + 5
+    assert 'aws ec2 stop-instances --region us-test-1 --instance-ids i-placeholder' in (
+        capsys.readouterr().err)
+
+
+# Catches the final check passing on an empty inventory while the
+# operator's router (never in the inventory) is still running.
+def test_teardown_fails_when_the_router_still_runs_after_its_stop(capsys):
+    clock = _Clock()
+    fake = _StaleRouterReadFake('aws', clock, lag=0, stop_lag=10_000)
+    with pytest.raises(CloudCleanupError, match='router is not stopped'):
+        _direct_start_run(fake, clock)
+    assert fake.router_running is True
+    assert 'aws ec2 stop-instances --region us-test-1 --instance-ids i-placeholder' in (
+        capsys.readouterr().err)
+
+
+# A stop the run issued itself proves the start was visible, so teardown
+# does not then wait for a start it can no longer observe.
+def test_a_stop_issued_through_the_run_settles_a_direct_start():
+    clock = _Clock()
+    fake = _StaleRouterReadFake('aws', clock, lag=0)
+    with CloudContractRun(fake, CloudLiveConfig.from_env('aws', aws_env()),
+                          sleep=clock.sleep, clock=clock) as run:
+        fake.start_directly()
+        run.note_router_started()
+        assert run.stop_router() is True
+    assert clock.slept == [] and fake.router_running is False
+
+
+def test_teardown_without_a_direct_start_does_not_wait():
+    clock = _Clock()
+    fake = FakeBackend('aws')
+    with CloudContractRun(fake, CloudLiveConfig.from_env('aws', aws_env()),
+                          sleep=clock.sleep, clock=clock) as run:
+        run.launch_one()
+    assert clock.slept == [] and fake.router_running is False
+
 
 
 # --- live response classification ------------------------------------------------

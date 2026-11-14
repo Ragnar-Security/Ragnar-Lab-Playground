@@ -1287,9 +1287,12 @@ def test_router_start_and_stop_use_the_reserved_lock_boundary(backend, gce):
     with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
         backend.ensure_router_running()
     assert gce.instances[(ZONE, 'lab-router')]['status'] == 'RUNNING'
+    assert backend.router_stopped() is False
     with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
-        backend.stop_router()
+        assert backend.stop_router() is True
+        assert backend.stop_router() is False
     assert gce.instances[(ZONE, 'lab-router')]['status'] == 'TERMINATED'
+    assert backend.router_stopped() is True
     assert all(r.name != 'lab-router' for r in backend.list_managed())
 
 
@@ -1378,6 +1381,25 @@ def test_router_transitional_states_are_waited_out(
     _settles_on_second_read(gce, monkeypatch, settled)
     _start(backend) if action == 'start' else _stop(backend)
     assert _router_status(gce) == final
+
+
+# Catches the idle stop reporting (and logging) a stop another caller made:
+# stop_router() is True only when this call issued the stop operation.
+@pytest.mark.parametrize('first, settled, issued', [
+    ('STOPPING', 'TERMINATED', False),
+    ('STAGING', 'RUNNING', True),
+    ('RUNNING', None, True),
+    ('TERMINATED', None, False),
+])
+def test_stop_router_reports_only_a_stop_it_issued(
+        backend, gce, router_clock, monkeypatch, first, settled, issued):
+    gce.add_router(ZONE, ROUTER, status=first)
+    if settled is not None:
+        _settles_on_second_read(gce, monkeypatch, settled)
+    with vm_lifecycle_lock(router_lock_key(BACKEND_GCP)):
+        assert backend.stop_router() is issued
+    assert _router_status(gce) == 'TERMINATED'
+    assert bool(gce.operations) is issued
 
 
 # Instance placement on mutation paths

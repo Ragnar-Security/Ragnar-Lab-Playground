@@ -44,6 +44,17 @@ CI does run. The AWS and GCP runs have their own, separate opt-in; see
    VMID only if this run created it and fresh inventory still shows the exact
    name and node it gave that guest. Otherwise it leaves the VMID alone and
    reports it.
+6. **No quick VMID reuse.** A VMID this process freed in the last 15 s is
+   not cloned onto again.
+
+`cluster/resources` takes a guest's `name` from pvestatd's ~10 s status
+broadcast. For about 10 s after a clone it reads empty, or the previous
+guest's name at a reused VMID (measured at 10.5 s and 10.0 s on a live
+cluster). Before rule 5 trusts or refuses a row, the run polls for up to
+30 s until the row shows its own name; a name that never becomes its own
+is still refused. `clone_template` returns only once the name is listed,
+so a test's own reads see it too. Rule 6 keeps a stale name from appearing
+at all.
 
 If a delete fails, the run prints copy-paste removal commands to stderr and
 fails the test's teardown.
@@ -64,6 +75,7 @@ fails the test's teardown.
 | `LIVE_SEPARATE_CLUSTER` | no | `1` | The cluster is one the portal never deploys to; skips the high-water check. Not allowed together with `LIVE_PORTAL_DATABASE_URL`. |
 | `LIVE_CLONE_STORAGE` | no | `fast-zfs` or `node2:fast-zfs` | Enables the full-clone-onto-storage test for those nodes. |
 | `LIVE_AGENT_TIMEOUT` | no | `90` | Seconds to wait for the guest agent when the template enables it. |
+| `LIVE_VLAN` | no | `20` | VLAN tag (1-4094) for the clone's single NIC. Unset leaves the NIC untagged, which on a VLAN-aware bridge is usually the management network; set it on any cluster where a booted template must not sit there. |
 
 The app's config module also loads a `.env` file from the working directory.
 Run from a checkout without a production `.env`, so that only the variables
@@ -215,10 +227,18 @@ they are unit-tested against the in-memory backend in
    release the slot; release the admission; stop the router. Network deletes
    are retried for up to five minutes while the provider still reports them
    in use (EC2 frees a terminated instance's interface asynchronously).
-7. **Zero resources left.** A fresh `list_managed()` of the site must be
-   empty. If it is not, the run deletes exactly what that fresh inventory
-   lists (`delete_resource`, which re-proves ownership) and requires a second
-   empty inventory.
+7. **Zero resources left, router stopped.** A fresh `list_managed()` of the
+   site must be empty. If it is not, the run deletes exactly what that fresh
+   inventory lists (`delete_resource`, which re-proves ownership) and
+   requires a second empty inventory. The inventory never lists the
+   operator's router, so a fresh `router_stopped()` read must also be true.
+   EC2 can answer a read straight after `StartInstances` with the old
+   `stopped`; a test that starts the router directly calls
+   `note_router_started()`, and teardown then accepts `stopped` only after a
+   fresh read has shown the router not stopped, polling for up to 60 s from
+   the start and failing the run if the start never becomes visible. A test
+   that stops the router itself does it through `run.stop_router()`, whose
+   issued stop proves the start was seen.
 
 Any cleanup failure fails the test's teardown, even after the test body
 failed, with the provider ids and the inventory commands below filled in.

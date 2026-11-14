@@ -382,14 +382,8 @@ class ProxmoxBackend:
     def destroy(self, ref: VMRef, policy: DestroyPolicy) -> None:
         # Always a fresh identity read, even if the caller just inspected:
         # a replacement at the same VMID must never inherit this request.
-        identity = self.inspect(ref)
-        if identity == GUEST_ABSENT:
-            self._forget_guest(ref)
+        if not self._still_ours(ref):
             return
-        if identity == GUEST_MISMATCH:
-            raise DestroyRefused(f'VMID {ref.vmid} no longer names {ref.vm_name}')
-        if identity != GUEST_MATCH:
-            raise BackendError(f'identity of VM {ref.vmid} could not be verified')
 
         force_corrupt = False
         if policy is DestroyPolicy.FORCE_CORRUPT:
@@ -418,8 +412,26 @@ class ProxmoxBackend:
                 logger.warning("VM %s did not stop; deleting anyway (%s)",
                                ref.vmid, policy.value)
 
+        # The stop may have waited up to a minute: read the identity again
+        # immediately before the delete, the one step that cannot be undone.
+        if not self._still_ours(ref):
+            return
         self._delete(ref, policy, force_corrupt)
         self._forget_guest(ref)
+
+    def _still_ours(self, ref: VMRef) -> bool:
+        """True while fresh inventory names `ref`'s guest; False (and the
+        guest forgotten) when it is gone. Raises DestroyRefused when the
+        VMID names another guest and BackendError when it cannot be read."""
+        identity = self.inspect(ref)
+        if identity == GUEST_ABSENT:
+            self._forget_guest(ref)
+            return False
+        if identity == GUEST_MISMATCH:
+            raise DestroyRefused(f'VMID {ref.vmid} no longer names {ref.vm_name}')
+        if identity != GUEST_MATCH:
+            raise BackendError(f'identity of VM {ref.vmid} could not be verified')
+        return True
 
     @_operation
     def confirm_absent(self, ref: VMRef, error: Optional[Exception] = None) -> bool:
@@ -582,5 +594,8 @@ class ProxmoxBackend:
     def ensure_router_running(self) -> None:
         pass
 
-    def stop_router(self) -> None:
-        pass
+    def stop_router(self) -> bool:
+        return False
+
+    def router_stopped(self) -> bool:
+        return True

@@ -122,11 +122,18 @@ def test_force_corrupt_on_a_readable_guest_is_a_plain_best_effort_delete(
     assert case.ref.vmid not in case.api.guests
 
 
+def _replace_guest(case, name):
+    """Another guest now holds the VMID: inventory and config both name it."""
+    guest = case.api.guests[case.ref.vmid]
+    guest['name'] = name
+    guest['config']['name'] = name
+
+
 # Catches a stale request deleting a replacement at the same VMID.
 @pytest.mark.parametrize('policy', list(DestroyPolicy))
 def test_every_policy_refuses_identity_mismatch(proxmox_case, policy):
     case = proxmox_case
-    case.api.guests[case.ref.vmid]['name'] = 'replacement'
+    _replace_guest(case, 'replacement')
     with pytest.raises(DestroyRefused):
         case.backend.destroy(case.ref, policy)
     assert case.api.guests[case.ref.vmid]['name'] == 'replacement'
@@ -169,7 +176,7 @@ def test_destroy_reads_fresh_inventory_even_when_one_is_cached(proxmox_case):
     case = proxmox_case
     reset_cluster_vm_index()
     assert case.backend.status(case.ref) == 'running'  # caches the index
-    case.api.guests[case.ref.vmid]['name'] = 'replacement'
+    _replace_guest(case, 'replacement')
     with pytest.raises(DestroyRefused):
         case.backend.destroy(case.ref, DestroyPolicy.BEST_EFFORT)
     assert case.api.guests[case.ref.vmid]['name'] == 'replacement'
@@ -245,6 +252,123 @@ def test_inspect_reports_match_mismatch_and_absence(proxmox_case):
     assert case.backend.inspect(replace(case.ref, vmid=4242)) == GUEST_ABSENT
 
 
+# The ~10 s after a clone: /cluster/resources reports the name empty, or as
+# the previous guest's at a reused VMID, while the guest's config already
+# names it (measured live, LIVE-REPORT I1/I2). Catches the portal refusing
+# to destroy (or clean up) its own fresh guest during that window.
+@pytest.mark.parametrize('listed_name', [None, '', 'student-previous-vm'],
+                         ids=['none', 'empty', 'stale-previous-name'])
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_inspect_trusts_the_guest_config_while_the_listed_name_lags(
+        proxmox_case, listed_name, policy):
+    case = proxmox_case
+    case.api.guests[case.ref.vmid]['name'] = listed_name
+    assert case.backend.inspect(case.ref) == GUEST_MATCH
+    case.backend.destroy(case.ref, policy)
+    assert case.ref.vmid not in case.api.guests
+
+
+# Catches the config fallback admitting a guest that is genuinely someone
+# else's, whatever the lagging listing says about it, including a name that
+# only shares the expected name as a prefix (review M2).
+@pytest.mark.parametrize('foreign', ['other', 'prefix', 'truncated'])
+@pytest.mark.parametrize('listed_name', [None, 'student-previous-vm',
+                                         'student-other-vm'])
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_inspect_refuses_a_foreign_guest_even_while_the_listing_lags(
+        proxmox_case, foreign, listed_name, policy):
+    case = proxmox_case
+    guest = case.api.guests[case.ref.vmid]
+    guest['name'] = listed_name
+    guest['config']['name'] = {'other': 'student-other-vm',
+                               'prefix': case.ref.vm_name + '-foreign',
+                               'truncated': case.ref.vm_name[:-1]}[foreign]
+    assert case.backend.inspect(case.ref) == GUEST_MISMATCH
+    with pytest.raises(DestroyRefused):
+        case.backend.destroy(case.ref, policy)
+    assert case.api.mutations(case.ref.vmid) == []
+
+
+def _after_the_stop(case, monkeypatch, change):
+    """Run `change` once the stop has been handled, before anything else."""
+    answer = case.api.handle
+
+    def handle(method, parts, kwargs):
+        result = answer(method, parts, kwargs)
+        if method == 'POST' and parts[4:] == ('status', 'stop'):
+            change()
+        return result
+    monkeypatch.setattr(case.api, 'handle', handle)
+
+
+def _deletes(case):
+    return [call for call in case.api.calls if call[0] == 'DELETE']
+
+
+# Review I1: catches the delete trusting the identity read before the stop,
+# which may wait up to a minute, while another guest took the VMID.
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_destroy_rechecks_identity_between_the_stop_and_the_delete(
+        proxmox_case, monkeypatch, policy):
+    case = proxmox_case
+
+    def replaced():
+        del case.api.guests[case.ref.vmid]
+        case.api.add_guest(case.ref.vmid, 'student-intruder-vm', node=case.ref.location,
+                           status='running', vm_type=case.ref.vm_type)
+    _after_the_stop(case, monkeypatch, replaced)
+    with pytest.raises(DestroyRefused):
+        case.backend.destroy(case.ref, policy)
+    assert _deletes(case) == []
+    assert case.api.guests[case.ref.vmid]['name'] == 'student-intruder-vm'
+
+
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_destroy_refuses_the_delete_when_identity_turns_unreadable_after_the_stop(
+        proxmox_case, monkeypatch, policy):
+    case = proxmox_case
+    _after_the_stop(case, monkeypatch, lambda: setattr(
+        case.api, 'cluster_error', RuntimeError('inventory unavailable')))
+    with pytest.raises(BackendError):
+        case.backend.destroy(case.ref, policy)
+    assert _deletes(case) == []
+    assert case.ref.vmid in case.api.guests
+
+
+@pytest.mark.parametrize('policy', list(DestroyPolicy))
+def test_destroy_is_done_when_the_guest_vanishes_after_the_stop(
+        proxmox_case, monkeypatch, policy):
+    case = proxmox_case
+    _after_the_stop(case, monkeypatch, lambda: case.api.guests.pop(case.ref.vmid))
+    case.backend.destroy(case.ref, policy)
+    assert _deletes(case) == []
+
+
+# Catches an unreadable config being taken as proof while the listed name
+# disagrees.
+def test_inspect_refuses_when_the_config_cannot_confirm_a_lagging_name(
+        proxmox_case):
+    case = proxmox_case
+    case.api.guests[case.ref.vmid]['name'] = None
+    case.api.corrupt_config.add(case.ref.vmid)
+    assert case.backend.inspect(case.ref) == GUEST_MISMATCH
+    with pytest.raises(DestroyRefused):
+        case.backend.destroy(case.ref, DestroyPolicy.FORCE_CORRUPT)
+    assert case.api.mutations(case.ref.vmid) == []
+
+
+# Catches the config fallback being read on the wrong node or for the wrong
+# type: only a lagging *name* is ever settled by the config.
+def test_inspect_does_not_consult_config_for_a_node_or_type_mismatch(
+        proxmox_case):
+    case = proxmox_case
+    before = len(case.api.calls)
+    assert case.backend.inspect(replace(case.ref, location='node-b')) == GUEST_MISMATCH
+    assert case.backend.inspect(replace(case.ref, vm_type='lxc')) == GUEST_MISMATCH
+    assert not [call for call in case.api.calls[before:]
+                if call[1][-1:] == ('config',)]
+
+
 # Catches treating a transport error as positive absence.
 def test_confirm_absent_requires_fresh_inventory(proxmox_case):
     case = proxmox_case
@@ -316,7 +440,7 @@ def test_delete_resource_reverifies_identity(proxmox_case):
     case = proxmox_case
     resource = next(r for r in case.backend.list_managed()
                     if r.vmid == case.ref.vmid)
-    case.api.guests[case.ref.vmid]['name'] = 'replacement'
+    _replace_guest(case, 'replacement')
     with pytest.raises(DestroyRefused):
         case.backend.delete_resource(resource)
     assert case.api.guests[case.ref.vmid]['name'] == 'replacement'

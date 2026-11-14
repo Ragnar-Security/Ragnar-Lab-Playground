@@ -477,11 +477,14 @@ def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
                     since = _router_idle_since.setdefault(name, now_epoch)
                 if now_epoch - since < idle_seconds:
                     continue
-                get_backend(name).stop_router()
+                was_running = get_backend(name).stop_router()
             with _router_idle_guard:
                 # Forgotten once stopped, so a stopped router is not asked
                 # to stop again every pass.
                 _router_idle_since.pop(name, None)
+            if not was_running:
+                logger.debug("The %s router was already stopped", name)
+                continue
             stopped.append(name)
             logger.info("Stopped the %s router after %d idle minutes",
                         name, idle_seconds // 60)

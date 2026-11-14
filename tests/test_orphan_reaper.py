@@ -247,6 +247,40 @@ def test_failed_delete_task_is_reported_not_reaped(app):
                         "status": "delete_failed", "error": "locked"}]
 
 
+# Review I1 (pre-existing in v1.0.0's sweep): catches the delete acting on a
+# VMID another guest took while the stop waited, or the stop acting on one
+# taken since the sweep's listing.
+@pytest.mark.parametrize("when", ["before stop", "after stop"])
+@pytest.mark.parametrize("replacement", [
+    {"name": "student-bob-db"},
+    {"name": "student-alice-web", "node": "pve2"},
+    None,
+], ids=["other-name", "other-node", "vanished"])
+def test_identity_is_rechecked_before_the_stop_and_before_the_delete(
+        app, when, replacement):
+    boundary = ProxmoxBoundary([_resource()])
+    listing = boundary.api.cluster.resources.get
+    sweep_rows = [dict(row) for row in listing.return_value]
+    later_rows = [] if replacement is None else [{**sweep_rows[0], **replacement}]
+    guest = boundary.guests[700]
+    if when == "before stop":
+        reads = iter([sweep_rows])
+        listing.side_effect = lambda **_: next(reads, later_rows)
+    else:
+        def stop():
+            listing.return_value = later_rows
+            return "UPID:stop:700"
+        guest.status.stop.post.side_effect = stop
+    with app.app_context():
+        results = _run(boundary)
+
+    guest.delete.assert_not_called()
+    if when == "before stop":
+        guest.status.stop.post.assert_not_called()
+    expected = "not_found" if replacement is None else "identity_unverified"
+    assert [r["status"] for r in results] == [expected]
+
+
 def test_active_vmid_reservation_protects_expired_orphan_in_dry_run(app):
     boundary = ProxmoxBoundary([_resource()])
     allocator_view = MagicMock()

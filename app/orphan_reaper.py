@@ -34,7 +34,10 @@ from .models import (
     KothBox, NodeMemoryReservation, VMIDReservation, VMRecord, db,
 )
 from .proxmox_service import (
+    VM_GUEST_ABSENT,
+    VM_GUEST_MATCH,
     confirm_proxmox_absence,
+    inspect_vm_guest,
     is_proxmox_not_found,
     is_vmid_reserved,
     reset_cluster_vm_index,
@@ -269,6 +272,12 @@ def _recheck_and_reap(proxmox, guest, resource, vmid, node, name, vm_type,
                        vmid, name, node)
         return {**report, 'status': 'dry_run'}
 
+    # The listing is as old as the sweep, and a stop may wait up to 60 s:
+    # re-read the VMID's identity before each mutation, so a guest that
+    # replaced this one at the same VMID is never stopped or deleted.
+    changed = _identity_changed(proxmox, report, vmid, node, name, vm_type, 'stop')
+    if changed is not None:
+        return changed
     if resource.get('status') == 'stopped':
         # Interrupted deploys often die before start_vm, and a later sweep
         # may have completed stop but failed delete. Proxmox rejects a
@@ -293,6 +302,9 @@ def _recheck_and_reap(proxmox, guest, resource, vmid, node, name, vm_type,
                          vmid, name, error)
             return {**report, 'status': 'stop_failed', 'error': error}
 
+    changed = _identity_changed(proxmox, report, vmid, node, name, vm_type, 'delete')
+    if changed is not None:
+        return changed
     try:
         delete_upid = guest.delete()
         delete_result = wait_for_proxmox_task(
@@ -315,6 +327,21 @@ def _recheck_and_reap(proxmox, guest, resource, vmid, node, name, vm_type,
                    vmid, name, node)
     _record_reaped_alert(vmid, name, node, vm_type, expires_at)
     return {**report, 'status': 'reaped'}
+
+
+def _identity_changed(proxmox, report, vmid, node, name, vm_type, action):
+    """None while fresh inventory still names this guest; otherwise the
+    report to return instead of the mutation."""
+    identity = inspect_vm_guest(proxmox, vmid, node=node, vm_name=name,
+                                vm_type=vm_type)
+    if identity == VM_GUEST_MATCH:
+        return None
+    if identity == VM_GUEST_ABSENT:
+        logger.info("Orphan reaper VM %s (%s) vanished before %s", vmid, name, action)
+        return {**report, 'status': 'not_found'}
+    logger.error("Orphan reaper kept VM %s (%s): its identity changed or could not be "
+                 "verified before %s (%s)", vmid, name, action, identity)
+    return {**report, 'status': 'identity_unverified', 'error': identity}
 
 
 def _resource_identity(resource):

@@ -1154,10 +1154,13 @@ def test_router_start_stop_is_idempotent_under_reserved_lock(aws_network_backend
         backend.ensure_router_running()
         backend.ensure_router_running()
     assert _instance_state(ec2, router_id) == 'running'
+    assert backend.router_stopped() is False
     with vm_lifecycle_lock(router_lock_key(BACKEND_AWS)):
-        backend.stop_router()
-        backend.stop_router()
+        # True only for the call that stopped it (the idle-stop log line).
+        assert backend.stop_router() is True
+        assert backend.stop_router() is False
     assert _instance_state(ec2, router_id) == 'stopped'
+    assert backend.router_stopped() is True
 
 
 def test_router_missing_terminated_or_unconfigured_raises(aws_network_backend, monkeypatch):
@@ -1324,6 +1327,48 @@ def test_router_ownership_is_rechecked_after_a_transitional_wait(
         else:
             run()
     assert _instance_state(ec2, router_id) == (settled if retagged else final)
+
+
+# Catches the idle stop reporting (and logging) a stop another caller made:
+# stop_router() is True only when this call issued StopInstances.
+@pytest.mark.parametrize('settled, first_read, issued', [
+    ('stopped', 'stopping', False),
+    ('running', 'pending', True),
+    ('running', 'running', True),
+    ('stopped', 'stopped', False),
+])
+def test_stop_router_reports_only_a_stop_it_issued(
+        aws_network_backend, monkeypatch, settled, first_read, issued):
+    backend, spec, ec2, resources = aws_network_backend
+    router_id = resources['router_instance_id']
+    if _instance_state(ec2, router_id) != settled:
+        getattr(ec2, 'start_instances' if settled == 'running' else 'stop_instances')(
+            InstanceIds=[router_id])
+        ec2.get_waiter(f'instance_{settled}').wait(
+            InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
+    real_describe, real_stop = ec2.describe_instances, ec2.stop_instances
+    reads, stops = [], []
+
+    def describe_instances(**kwargs):
+        # moto settles instantly: only the first read sees the transition.
+        response = real_describe(**kwargs)
+        if not reads:
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    instance['State'] = {'Code': 0, 'Name': first_read}
+        reads.append(kwargs)
+        return response
+
+    def stop_instances(**kwargs):
+        stops.append(kwargs)
+        return real_stop(**kwargs)
+
+    monkeypatch.setattr(ec2, 'describe_instances', describe_instances)
+    monkeypatch.setattr(ec2, 'stop_instances', stop_instances)
+    with vm_lifecycle_lock(router_lock_key(BACKEND_AWS)):
+        assert backend.stop_router() is issued
+    assert len(stops) == int(issued)
+    assert _instance_state(ec2, router_id) == 'stopped'
 
 
 @pytest.mark.parametrize('winner_deployment, adopted', [('d' * 32, True),

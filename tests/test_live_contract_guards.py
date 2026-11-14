@@ -14,6 +14,8 @@ from proxmoxer.core import ResourceException
 from app.orphan_reaper import _parse_expiration
 from tests.live.harness import (
     NAME_PREFIX,
+    NAME_SETTLE_SECONDS,
+    VMID_REUSE_COOLDOWN,
     ContractRun,
     Guest,
     LiveConfig,
@@ -86,6 +88,9 @@ class FakeProxmox(_Path):
         self.corrupt_config = set()
         self.extra_nodes = []
         self.node_memory = {}
+        # (reads, listed_as): a new clone is listed under `listed_as` for its
+        # first `reads` cluster/resources reads, as pvestatd lags a clone.
+        self.clone_name_lag = None
         self._upids = itertools.count(1)
 
     def add_guest(self, vmid, name, node='node1', template=0, status='stopped',
@@ -131,9 +136,15 @@ class FakeProxmox(_Path):
         if parts == ('cluster', 'resources'):
             if self.cluster_error is not None:
                 raise self.cluster_error
-            return [{k: g[k] for k in ('vmid', 'name', 'node', 'type',
-                                       'status', 'template')}
-                    for g in self.guests.values()]
+            rows = []
+            for g in self.guests.values():
+                row = {k: g[k] for k in ('vmid', 'name', 'node', 'type',
+                                         'status', 'template')}
+                if g.get('lag_reads', 0) > 0:
+                    g['lag_reads'] -= 1
+                    row['name'] = g['listed_as']
+                rows.append(row)
+            return rows
         if method == 'GET':
             answer = self._node_read(parts)
             if answer is not None:
@@ -165,6 +176,9 @@ class FakeProxmox(_Path):
                 raise ResourceException(500, 'Internal Server Error',
                                         f'VM {newid} already exists')
             self.add_guest(newid, kwargs['name'], node=node)
+            if self.clone_name_lag:
+                reads, listed_as = self.clone_name_lag
+                self.guests[newid].update(lag_reads=reads, listed_as=listed_as)
             return self._task()
         if guest is None or guest['node'] != node:
             raise _missing(node, vmid)
@@ -216,10 +230,26 @@ class FakeProxmox(_Path):
 TEMPLATE = {'vmid': 9000, 'name': 'contract-template', 'template': 1}
 
 
+class _Clock:
+    """A monotonic clock that only moves when the harness sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 def _run(api, vmids='99000-99009', **guards):
     # Most tests exercise other guards, on a cluster the portal never uses.
-    guards = guards or {'separate_cluster': True}
+    if not {'portal_vmid_mark', 'separate_cluster'} & guards.keys():
+        guards['separate_cluster'] = True
+    clock = _Clock()
     return ContractRun(api, parse_vmid_range(vmids), now=lambda: FIXED_NOW,
+                       clock=clock, sleep=clock.sleep, recently_freed={},
                        **guards)
 
 
@@ -527,6 +557,84 @@ def test_destroy_stops_deletes_and_confirms_absence():
     assert run.owned_vmids() == []
 
 
+# --- the listed name lags a clone (LIVE-REPORT I1) ------------------------------
+# /cluster/resources reports a fresh clone's name empty for ~10 s, or as the
+# previous guest's at a reused VMID. Every guard used to read it at once and
+# refused (and so leaked) the run's own guests.
+
+@pytest.mark.parametrize('listed_as', [None, f'{NAME_PREFIX}previous'],
+                         ids=['empty', 'previous-guest'])
+def test_clone_waits_out_a_lagging_listed_name_then_runs_the_lifecycle(listed_as):
+    api = FakeProxmox([TEMPLATE])
+    api.clone_name_lag = (10, listed_as)
+    run = _run(api)
+    started_at = run.clock()
+
+    guest = run.clone_template('node1', 9000)
+
+    waited = run.clock() - started_at
+    assert 0 < waited < NAME_SETTLE_SECONDS
+    assert run.start(guest)['success']
+    run.destroy(guest.vmid)
+    assert guest.vmid not in api.guests
+    assert run.owned_vmids() == []
+
+
+def test_a_listed_name_that_never_becomes_ours_is_refused_and_left_alone():
+    api = FakeProxmox([TEMPLATE])
+    api.clone_name_lag = (10_000, 'student-zed')
+    run = _run(api)
+    started_at = run.clock()
+
+    with pytest.raises(UnsafeLiveRun, match='student-zed'):
+        run.clone_template('node1', 9000)
+    assert run.clock() - started_at >= NAME_SETTLE_SECONDS
+    api.calls.clear()
+
+    failures = run.cleanup()
+
+    assert 99000 in api.guests
+    assert api.mutations(99000) == []
+    assert len(failures) == 1 and 'left alone' in failures[0]
+
+
+def test_a_vmid_freed_moments_ago_is_not_reused_until_the_cooldown_passes():
+    api = FakeProxmox([TEMPLATE])
+    run = _run(api, '99000-99001')
+    first = run.clone_template('node1', 9000)
+    run.destroy(first.vmid)
+
+    second = run.clone_template('node1', 9000)
+    assert second.vmid == 99001
+    run.destroy(second.vmid)
+    with pytest.raises(UnsafeLiveRun, match='free VMID'):
+        run.clone_template('node1', 9000)
+
+    run.sleep(VMID_REUSE_COOLDOWN)
+    assert run.clone_template('node1', 9000).vmid == 99000
+
+
+# --- LIVE_VLAN ---------------------------------------------------------------------
+
+def test_a_configured_vlan_tags_the_single_nic_of_every_clone():
+    api = FakeProxmox([TEMPLATE])
+
+    guest = _run(api, vlan=20).clone_template('node1', 9000)
+
+    config = api.guests[guest.vmid]['config']
+    assert config['net0'] == 'virtio,bridge=vmbr0,tag=20'
+    puts = [c[2] for c in api.calls if c[0] == 'PUT']
+    assert {'delete': 'net1'} in puts
+
+
+def test_without_a_vlan_the_clone_stays_untagged():
+    api = FakeProxmox([TEMPLATE])
+
+    guest = _run(api).clone_template('node1', 9000)
+
+    assert 'tag=' not in api.guests[guest.vmid]['config']['net0']
+
+
 # --- cleanup ---------------------------------------------------------------------------
 
 def test_failure_inside_the_run_still_destroys_every_guest_it_created():
@@ -649,3 +757,14 @@ def test_config_rejects_a_portal_mark_on_a_separate_cluster():
         LiveConfig.from_env(dict(
             LIVE_ENV, LIVE_SEPARATE_CLUSTER='1',
             LIVE_PORTAL_DATABASE_URL='mysql+pymysql://ro@db/portal'))
+
+
+def test_config_reads_an_optional_vlan():
+    assert LiveConfig.from_env(LIVE_ENV).vlan is None
+    assert LiveConfig.from_env(dict(LIVE_ENV, LIVE_VLAN=' 20 ')).vlan == 20
+
+
+@pytest.mark.parametrize('text', ['0', '4095', 'x', '20,30', '-1'])
+def test_config_rejects_a_vlan_outside_1_to_4094(text):
+    with pytest.raises(ValueError, match='LIVE_VLAN'):
+        LiveConfig.from_env(dict(LIVE_ENV, LIVE_VLAN=text))

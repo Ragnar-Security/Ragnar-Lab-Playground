@@ -53,12 +53,23 @@ Rules the code keeps, and you must keep too:
   The configured id or name alone never proves which machine it is: an
   untagged or foreign router makes every router start and stop fail, so every
   cloud deploy fails before anything is launched.
-- **No public lab address, no NAT, no internet.** Lab instances launch with
-  `AssociatePublicIpAddress: false` (AWS; slot subnets also get
-  `MapPublicIpOnLaunch=false`) or no `accessConfigs` (GCP). There is no NAT
-  gateway or Cloud NAT, and the slot subnets have no internet route. A lab
-  image must therefore be complete: nothing can be downloaded at boot or
-  during the lab.
+- **No public lab address, no NAT: no direct TCP/UDP route to public
+  addresses; the provider's DNS stays reachable until blocked separately.**
+  Lab instances launch with `AssociatePublicIpAddress: false` (AWS; slot
+  subnets also get `MapPublicIpOnLaunch=false`) or no `accessConfigs` (GCP).
+  There is no NAT gateway or Cloud NAT, and the slot subnets have no route
+  to public addresses, so a lab image must be complete. **Name resolution
+  still works unless you close it.** On AWS the VPC's Amazon-provided
+  resolver (the VPC base address + 2) answers
+  a lab machine for any public name, and security groups do not filter it:
+  measured on a live lab VM, `getent hosts example.com` resolved while every
+  TCP and HTTPS attempt timed out. Recursive resolution of arbitrary names is
+  a DNS-tunnel channel out of the lab (for example `iodine`), and a privilege
+  escalation lab hands students root. **Before students run labs on AWS**,
+  close it with AWS one-time setup step 7. GCP is untested for the same gap:
+  its VMs resolve through the metadata server (`169.254.169.254`), which
+  firewall rules do not filter either, so check and close it before students
+  run labs on GCP.
 - **Caps and expiry bound the bill.** `AWS_MAX_VMS` / `GCP_MAX_VMS` are
   required when the backend is enabled; admission counts live records plus
   unexpired reservations in one locked transaction and refuses past the cap.
@@ -175,22 +186,28 @@ lists or deletes them.
    ```
 
 4. **Router instance**, a `t4g.nano` (arm64, so an arm64 image) in the router
-   subnet with an ephemeral public IPv4, tagged for this site, with the
-   source/destination check off so it may forward:
+   subnet with an ephemeral public IPv4, tagged for this site, requiring
+   IMDSv2, with the source/destination check off so it may forward:
 
    ```bash
    aws ec2 run-instances --region <aws-region> --image-id <arm64-linux-ami-id> \
      --instance-type t4g.nano --subnet-id <router-subnet-id> \
      --security-group-ids <router-sg-id> --key-name <staff-key-pair> \
+     --metadata-options HttpTokens=required,HttpEndpoint=enabled \
      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=<site-id>-router},{Key=lab-playground-site,Value=<site-id>},{Key=lab-playground-kind,Value=router}]'
    aws ec2 modify-instance-attribute --region <aws-region> \
      --instance-id <router-instance-id> --no-source-dest-check
    ```
 
+   An account on the AWS **Free plan** refuses every instance type outside
+   a short eligible list (`InvalidParameterCombination: ... not eligible for
+   Free Tier`), `t4g.nano` included; use `t4g.micro` there, the smallest
+   eligible arm64 type.
+
    Inside it, enable forwarding (`net.ipv4.ip_forward=1` in
-   `/etc/sysctl.d/`) and join Headscale (see
-   [Router Tailscale flags](#router-tailscale-flags)). The portal starts and
-   stops this instance; never terminate it.
+   `/etc/sysctl.d/`), join Headscale and install the host input filter (both
+   in [Router Tailscale flags](#router-tailscale-flags)). The portal starts
+   and stops this instance; never terminate it.
 
 5. **Return route.** Lab machines see students' tailnet addresses (no SNAT),
    so the main route table sends `100.64.0.0/10` to the router's network
@@ -360,6 +377,52 @@ lists or deletes them.
    `BackendError` naming the refused EC2 call in the portal log, and the
    record or resource is kept, never retired.
 
+7. **Close lab DNS before students use AWS.** The Amazon-provided resolver
+   answers lab machines for any name (see the safety model above). Use Route
+   53 Resolver DNS Firewall to block every name the labs do not need: it is
+   associated with the whole VPC, so first make the router resolve through
+   public resolvers rather than the VPC resolver, or the block also cuts the
+   router off from Headscale. On the router:
+
+   ```bash
+   sudo mkdir -p /etc/systemd/resolved.conf.d
+   printf '[Resolve]\nDNS=1.1.1.1 9.9.9.9\nDomains=~.\n' | \
+     sudo tee /etc/systemd/resolved.conf.d/90-public-dns.conf
+   sudo systemctl restart systemd-resolved
+   resolvectl status   # the global servers above, not the VPC resolver
+   ```
+
+   Then, on the VPC (wait for each association to reach `COMPLETE`):
+
+   ```bash
+   all=$(aws route53resolver create-firewall-domain-list --region <aws-region> \
+     --creator-request-id <site-id>-dns-all --name <site-id>-all \
+     --query FirewallDomainList.Id --output text)
+   aws route53resolver update-firewall-domains --region <aws-region> \
+     --firewall-domain-list-id "$all" --operation ADD --domains '*'
+   group=$(aws route53resolver create-firewall-rule-group --region <aws-region> \
+     --creator-request-id <site-id>-dns-group --name <site-id>-lab-dns \
+     --query FirewallRuleGroup.Id --output text)
+   aws route53resolver create-firewall-rule --region <aws-region> \
+     --creator-request-id <site-id>-dns-block --firewall-rule-group-id "$group" \
+     --firewall-domain-list-id "$all" --priority 200 --action BLOCK \
+     --block-response NXDOMAIN --name block-everything-else
+   aws route53resolver associate-firewall-rule-group --region <aws-region> \
+     --creator-request-id <site-id>-dns-assoc --firewall-rule-group-id "$group" \
+     --vpc-id <aws-vpc-id> --priority 101 --name <site-id>-lab-dns
+   aws route53resolver list-firewall-rule-group-associations --region <aws-region> \
+     --query "FirewallRuleGroupAssociations[?VpcId=='<aws-vpc-id>']"
+   ```
+
+   If a lab needs a name, put it in a second domain list and add an `ALLOW`
+   rule for it at a lower priority (for example `100`) than the block.
+   Verify from a lab machine that `getent hosts example.com` now fails, and
+   from the router that `tailscale status` still shows it online after a
+   `sudo reboot`. The alternative is to turn VPC DNS off
+   (`aws ec2 modify-vpc-attribute --vpc-id <aws-vpc-id> --no-enable-dns-support`)
+   with the router on public resolvers as above; then lab images must not
+   depend on name resolution at all (a Windows image may log on slowly).
+
 ## Google Cloud one-time setup
 
 Create these once in `<gcp-project>`. Name your own resources without the
@@ -453,9 +516,24 @@ sudo tailscale up --login-server=<headscale-url> --advertise-routes=172.21.0.0/1
   --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false
 ```
 
-Use a short-lived pre-auth key for a user that `tagOwners` lets own
-`tag:jumpbox`, as for the jumpbox (`docs/JUMPBOX.md`, step 3). Then approve
-the route on the Headscale host:
+Join with a short-lived, single-use pre-auth key **created with
+`--tags tag:jumpbox`**, for a user that `tagOwners` lets own `tag:jumpbox`:
+
+```bash
+# On the Headscale host
+headscale preauthkeys create --user <infrastructure-user-id> --expiration 1h --tags tag:jumpbox
+```
+
+An untagged key plus `--advertise-tags` is not enough. Headscale v0.27
+treats a node as tagged only when the tag comes from the key or is forced,
+so such a router stays its user's node: excluded from `autogroup:member`
+but included in its user's identity. When that user is in `group:staff`
+(the owner of `tag:jumpbox` usually is), the router gets the staff rule
+(`*:*`) and can open connections to every student device and every
+infrastructure node. In `headscale nodes list -o json` the router must list
+`tag:jumpbox` in `forced_tags`, not only in `valid_tags`. The jumpbox joins
+the same way (`docs/JUMPBOX.md`, step 3). Then approve the route on the
+Headscale host:
 
 ```bash
 headscale nodes list-routes
@@ -464,6 +542,60 @@ headscale nodes approve-routes --identifier <router-node-id> --routes <cloud-cid
 
 or add `"autoApprovers": {"routes": {"<cloud-cidr>": ["tag:jumpbox"]}}` to
 the base policy.
+
+**Router host input filter (required before students use the cloud).** A
+student may reach every `tag:jumpbox` node's own tailnet address while the
+base policy grants `tag:jumpbox:*`, and a student with root on a lab machine
+reaches the router from the lab subnet: the router security group must
+admit all traffic from the lab CIDR, because the router forwards lab replies
+and reverse shells, and a security group cannot tell traffic forwarded
+through the router from traffic to it. So the router itself drops new
+connections addressed to it from the tailnet and from the labs, and leaves
+forwarding alone. Replace `<lab-cidr>` with `AWS_LAB_CIDR` or
+`GCP_LAB_CIDR`:
+
+```bash
+sudo mkdir -p /etc/nftables.d
+sudo tee /etc/nftables.d/lab-router-input.nft >/dev/null <<'EOF'
+table inet lab_router_input
+delete table inet lab_router_input
+table inet lab_router_input {
+    chain input {
+        type filter hook input priority -10; policy accept;
+        ct state established,related accept
+        iifname "tailscale0" counter drop
+        ip saddr <lab-cidr> counter drop
+    }
+}
+EOF
+sudo tee /etc/systemd/system/lab-router-input-filter.service >/dev/null <<'EOF'
+[Unit]
+Description=Drop new connections to the lab router itself (nftables)
+DefaultDependencies=no
+Before=network-pre.target tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables.d/lab-router-input.nft
+ExecReload=/usr/sbin/nft -f /etc/nftables.d/lab-router-input.nft
+ExecStop=-/usr/sbin/nft delete table inet lab_router_input
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo nft -c -f /etc/nftables.d/lab-router-input.nft
+sudo systemctl daemon-reload
+sudo systemctl enable --now lab-router-input-filter.service
+sudo nft list table inet lab_router_input
+```
+
+The input hook sees only traffic addressed to the router; traffic it
+forwards between the tailnet and the labs takes the forward hook and is not
+touched. Staff reach the router over SSH on its public address (the
+security group's staff rule), never over the tailnet. After a `sudo reboot`,
+check that the unit is active, `tailscale status` shows the router online,
+and the route still serves.
 
 `--snat-subnet-routes=false` lets lab machines see each student's tailnet
 address, which reverse shells need. That only works because the reply to
@@ -494,6 +626,11 @@ dials out, so a new address on the next start needs no change.
   quota for `e2-*` types), instances, in-use IP addresses, and per project the
   subnetwork, route and firewall rule quotas: the portal holds one
   subnetwork per slot in use and one firewall rule per live deployment.
+- **An AWS Free plan account launches only free-tier-eligible types**
+  (measured: `t3.micro`/`small`, `t4g.micro`/`small`, `t8i.micro`/`small`,
+  `c7i-flex.large`, `m7i-flex.large`); any other `instance_type` in
+  `templates.yaml`, `t3.medium` included, is refused at launch until the
+  account moves to a paid plan.
 - **Rehearse with one student.** Deploy one group as a test student, reach
   the machine over the VPN, destroy it, and confirm the inventory is empty
   (see [Configure and validate the portal](#configure-and-validate-the-portal))
@@ -617,7 +754,9 @@ only the router disks bill.
    `multi-backend-example` group shows a machine with Proxmox, `aws:` and
    `gcp:` specs. Set `backend: aws` or `backend: gcp` on a group only after
    that backend is enabled; every machine of one group must resolve to the
-   same backend, and `koth_mode` groups stay on Proxmox.
+   same backend, and `koth_mode` groups stay on Proxmox. On an AWS Free plan
+   account, `instance_type` must be one of the eligible types (see
+   [Capacity and quota checks](#capacity-and-quota-checks)).
 
 5. **Preflight, then start.**
 
@@ -630,7 +769,11 @@ only the router disks bill.
    Startup refuses missing settings of an enabled backend, a missing or
    invalid `LAB_SITE_ID`, a non-positive cap and an overlapping or undersized
    lab CIDR. The admin template validation reports groups whose backend is
-   not enabled or whose cloud block is incomplete.
+   not enabled or whose cloud block is incomplete. `preflight_env.py`
+   applies the production rules: run against a local test instance's `.env`
+   (the development compose's fixed MySQL passwords) it exits 1 on
+   `MYSQL_ROOT_PASSWORD` and `MYSQL_PASSWORD` alone. Those two lines are
+   expected there; every other line, the cloud ones included, still counts.
 
 6. **Verify with one VM.** Turn on `ORPHAN_REAPER_DRY_RUN=true` for the first
    session. As a test student, deploy one cloud group: the first deployment
@@ -641,14 +784,21 @@ only the router disks bill.
    after the idle minutes. Read the reaper's `would delete` lines before you
    turn dry run off.
 
+   To test a lab machine from the router itself, use the router's tailnet
+   address as the source, for example
+   `nc -s "$(tailscale ip -4)" -zv <lab-ip> 2222`. A connection from the
+   router's own VPC address times out on every port: the deployment
+   security group admits only its own members and `100.64.0.0/10`, by
+   design.
+
 Two accepted limits:
 
 - **A Proxmox node may not be named `aws` or `gcp`.** Cloud admission
   reservations use those names as their node key, so a Proxmox node of that
   name would share (and lose) capacity. Startup refuses such a `FIXED_NODE`,
-  and the admin template validation reports such a
+  the admin template validation reports such a
   `load_balancing.fixed_node` or `template_locations`/`storage_locations`
-  key.
+  key, and admission never selects a cluster node of that name.
 - **With Proxmox enabled, a Proxmox outage also blocks cloud deploys.** VMID
   allocation still reads the Proxmox inventory so that it never hands out a
   VMID someone occupied by hand (accepted trade-off, ruling M20). A
@@ -753,14 +903,23 @@ What the policy grants:
   and internal slots, and the entry and internal blocks of **every KOTH game
   whose status is not `ended`** (Proxmox only, since KOTH runs only there).
   Only slots inside `JUMPBOX_VLAN_BANDS` are granted, the same kinds on every
-  backend. Those blocks may connect back to that login's own devices only.
-- **The render keeps every section and every `acls` rule of the base file
-  except the blanket rule whose `src` is exactly `["autogroup:member"]`.**
-  Removing that rule removes everything it granted students:
-  `autogroup:self`, `tag:jumpbox`, and any host or range it listed. Keep what
-  must stay reachable as explicit rules in `config/headscale-acl.json`: the
-  staff rule, and rules for infrastructure nodes, for example one letting
-  the portal host's tailnet identity probe KOTH services.
+  backend. The login's own and groups' blocks may connect back to that
+  login's own devices only. KOTH blocks may not connect back at all: a box
+  any player has rooted must not reach every player's devices.
+- **The render keeps every section and every `acls` rule of the base file,
+  except the blanket rule whose `src` is exactly `["autogroup:member"]`,
+  which it cuts down to its `autogroup:self` destinations.** Students keep
+  reaching their own other devices; everything else that rule granted is
+  removed: `tag:jumpbox`, and any host or range it listed. Keep what must
+  stay reachable as explicit rules in `config/headscale-acl.json`: the staff
+  rule, and rules for infrastructure nodes, for example one letting the
+  portal host's tailnet identity probe KOTH services.
+- **Any other base rule whose `src` includes `autogroup:member` or `*` must
+  grant only `autogroup:self`** (for example
+  `["autogroup:member", "group:x"]`, or `["*"]`, with any other
+  destination). Otherwise the render refuses, names the rule, and installs
+  nothing: kept, such a rule would give every student the blanket access the
+  per-student rules replace.
 - **Strict JSON only.** The base file and the live policy are parsed as JSON;
   a HuJSON policy (comments, trailing commas) makes the run fail closed
   before anything is installed.

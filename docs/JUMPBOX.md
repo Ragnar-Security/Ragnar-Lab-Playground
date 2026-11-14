@@ -165,8 +165,8 @@ difference.
 ## 3. Join Headscale as the subnet router
 
 ```bash
-# On the Headscale host: a pre-auth key for a user that tagOwners lets own tag:jumpbox
-headscale preauthkeys create --user <infrastructure-user> --expiration 1h
+# On the Headscale host: a tagged pre-auth key for a user that tagOwners lets own tag:jumpbox
+headscale preauthkeys create --user <infrastructure-user-id> --expiration 1h --tags tag:jumpbox
 # On the jumpbox: the key is read from stdin and never appears in argv
 sudo jumpbox/jumpbox_configure.sh --apply --tailscale --authkey-stdin
 ```
@@ -187,6 +187,13 @@ therefore route back through the jumpbox, which it does because the jumpbox is
 every lab VLAN's gateway. If the jumpbox has already joined, the script
 re-asserts the routes, SNAT and filtering settings with `tailscale set` and
 needs no key.
+
+Create the key with `--tags tag:jumpbox`. With an untagged key, Headscale
+v0.27 ignores the advertised tag when it resolves users, so the jumpbox
+stays a node of its user: if that user is in `group:staff`, the jumpbox
+gets the staff rule (`*:*`) and can open connections to every student
+device. `headscale nodes list -o json` must show `tag:jumpbox` in the
+node's `forced_tags`.
 
 Approve the route in Headscale. Headscale 0.26 and later:
 
@@ -216,7 +223,9 @@ renders it from the portal (dry run by default, `--apply` to install): each
 roster login reaches only its own entry network, its groups' networks and the
 running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
 rule of your base policy except the blanket rule whose `src` is exactly
-`["autogroup:member"]`, so a rule like this one is replaced:
+`["autogroup:member"]`, which it cuts down to its `autogroup:self`
+destinations (students keep reaching their own devices), so a rule like
+this one becomes `"dst": ["autogroup:self:*"]`:
 
 ```json
 {
@@ -226,7 +235,9 @@ rule of your base policy except the blanket rule whose `src` is exactly
 }
 ```
 
-Keep the staff rule, and any infrastructure access, as explicit rules in the
+Any other rule whose `src` includes `autogroup:member` or `*` must grant
+only `autogroup:self`; the render refuses a base policy that has one. Keep
+the staff rule, and any infrastructure access, as explicit rules in the
 base file. `docs/CLOUD_BACKENDS.md` ("Apply the Headscale policy") has the
 procedure, when to re-run it, and the rollback. Test with one student before
 applying it to everyone.

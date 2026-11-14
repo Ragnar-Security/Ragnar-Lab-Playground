@@ -603,7 +603,7 @@ class AWSBackend:
             raise BackendError(f'router {router_id} is {state}')
         self._wait_router(router_id, 'instance_running', config.AWS_LAUNCH_TIMEOUT_SECONDS)
 
-    def stop_router(self) -> None:
+    def stop_router(self) -> bool:
         config = _config()
         router_id, state = self._router()
         if state == 'pending':
@@ -613,13 +613,20 @@ class AWSBackend:
             # The waiter reads state, never tags: re-prove the router.
             router_id, state = self._router()
         if state == 'stopped':
-            return
-        if state == 'running':
+            return False
+        # True only when this call issues the stop; a router another caller
+        # is already stopping is waited out and reported as not ours.
+        issued = state == 'running'
+        if issued:
             self._router_call(router_id, 'stop_instances')
         elif state != 'stopping':
             raise BackendError(f'router {router_id} is {state}')
         self._wait_router(router_id, 'instance_stopped',
                           config.AWS_TERMINATE_TIMEOUT_SECONDS)
+        return issued
+
+    def router_stopped(self) -> bool:
+        return self._router()[1] == 'stopped'
 
     # Create
 

@@ -582,19 +582,26 @@ class GCPBackend:
             raise BackendError(f'router {name} is {status}')
         self._settle(zone, name, 'RUNNING')
 
-    def stop_router(self) -> None:
+    def stop_router(self) -> bool:
         zone, name, status = self._router()
         if status == 'TERMINATED':
-            return
+            return False
         if status in _TRANSITIONS['RUNNING']:
             # Compute cannot stop an instance that is still starting.
             self._settle(zone, name, 'RUNNING')
             status = 'RUNNING'
-        if status == 'RUNNING':
+        # True only when this call issues the stop; a router already
+        # stopping is waited out and reported as not ours.
+        issued = status == 'RUNNING'
+        if issued:
             self._router_call(zone, name, 'stop')
         elif status not in _TRANSITIONS['TERMINATED']:
             raise BackendError(f'router {name} is {status}')
         self._settle(zone, name, 'TERMINATED')
+        return issued
+
+    def router_stopped(self) -> bool:
+        return self._router()[2] == 'TERMINATED'
 
     # Create
 

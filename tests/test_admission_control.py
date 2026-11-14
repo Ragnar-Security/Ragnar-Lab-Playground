@@ -122,6 +122,25 @@ class AdmissionMemoryMathTestCase(unittest.TestCase):
         self.assertEqual(resources['memory_free'], 10 * GIB)
         self.assertEqual(resources['memory_linux_free'], 1 * GIB)
 
+    def test_a_proxmox_node_named_after_a_cloud_backend_is_never_admitted(self):
+        # D-plan F5: cloud admission reserves under node 'aws'/'gcp' in the
+        # same ledger, so a Proxmox node of that name would share its count.
+        for name in ('aws', 'GCP'):
+            proxmox = _proxmox(available_gib=10)
+            proxmox.nodes.get.return_value = [{'node': name}, {'node': 'pve'}]
+            with patch('app.proxmox_service._load_live_vm_records', return_value=[]):
+                for _ in range(20):  # weighted-random selection
+                    self.assertEqual(select_best_node(
+                        proxmox, required_memory_mb=1024, required_cores=1,
+                        load_balancing_config=LB_ON), 'pve')
+
+            proxmox.nodes.get.return_value = [{'node': name}]
+            with patch('app.proxmox_service._load_live_vm_records', return_value=[]):
+                self.assertIsNone(select_best_node(
+                    proxmox, required_memory_mb=1024, required_cores=1,
+                    load_balancing_config=LB_ON, reservation_id='cloud-named'))
+            self.assertFalse(release_node_reservation('cloud-named'))
+
 
 class ReservationLedgerTestCase(unittest.TestCase):
     def setUp(self):

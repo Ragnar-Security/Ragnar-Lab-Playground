@@ -13,10 +13,11 @@ through ``CloudContractRun``, which enforces these rules:
   raises half-way is still destroyed;
 * teardown runs on exit even when the body raised, in a fixed order
   (instances with positive absence, deployment networks, slots, admission,
-  router), then requires a fresh inventory of the site to be empty. A
-  leftover is deleted from that fresh inventory only, and a second empty
-  inventory is required. Any cleanup failure fails the run with provider
-  ids and copy-paste inventory commands; none is swallowed.
+  router), then requires a fresh inventory of the site to be empty and the
+  site router to read stopped. A leftover is deleted from that fresh
+  inventory only, and a second empty inventory is required. Any cleanup
+  failure fails the run with provider ids and copy-paste inventory
+  commands; none is swallowed.
 
 This module imports no provider SDK: a skipped run must not build a client.
 The guards are unit-tested against the in-memory backend in
@@ -52,6 +53,14 @@ LIVE_SLOT = 1
 # gone, which can take a minute or two after the termination waiter returns.
 NETWORK_SETTLE_SECONDS = 300
 NETWORK_POLL_SECONDS = 10
+# EC2 can answer a DescribeInstances straight after StartInstances with the
+# old 'stopped' (read-after-write lag; measured live: the read right after
+# the start said 'stopped' and the router came up anyway). A stop or a
+# final check that believes that read leaves the router billing, so after a
+# direct start teardown accepts 'stopped' only once it has seen the start:
+# it polls for a non-stopped read for up to this long, then fails.
+ROUTER_READ_LAG_SECONDS = 60
+ROUTER_POLL_SECONDS = 2
 # Fallback deletion order: an instance holds its networks.
 _KIND_ORDER = {'instance': 0, 'deployment-network': 1, 'slot-network': 2}
 
@@ -218,6 +227,14 @@ class CloudLiveConfig:
             f'gcloud compute networks subnets delete <name> --project {project} '
             f'--region {region}')
 
+    def manual_router_stop_command(self) -> str:
+        s = self.settings
+        if self.backend == 'aws':
+            return (f"  aws ec2 stop-instances --region {s['AWS_REGION']} "
+                    f"--instance-ids {s['AWS_ROUTER_INSTANCE_ID']}")
+        return (f"  gcloud compute instances stop {s['GCP_ROUTER_INSTANCE']} "
+                f"--project {s['GCP_PROJECT']} --zone <router zone>")
+
 
 def _describe(resource: ManagedResource) -> str:
     where = f' in {resource.location}' if resource.location else ''
@@ -268,6 +285,7 @@ class CloudContractRun:
         self._slots: List[int] = []
         self._reservations: List[str] = []
         self._next_vmid = 1
+        self._router_started_at: Optional[float] = None
 
     def __enter__(self) -> 'CloudContractRun':
         self.preflight()
@@ -316,6 +334,24 @@ class CloudContractRun:
 
     def ensure_router(self) -> None:
         self.backend.ensure_router_running()
+
+    def note_router_started(self) -> None:
+        """Record a router start made outside the backend.
+
+        ensure_router_running() waits until the provider reports the router
+        running, so its reads are settled. A test that starts the router
+        directly calls this; teardown then requires a non-stopped read
+        before it stops the router or trusts a 'stopped' read."""
+        self._router_started_at = self.clock()
+
+    def stop_router(self) -> bool:
+        """Stop the router through the backend, as a test step. A stop this
+        call issued proves the start was visible, which settles a recorded
+        direct start; the backend's answer is returned."""
+        issued = self.backend.stop_router()
+        if issued:
+            self._router_started_at = None
+        return issued
 
     def ensure_slot(self, slot: int) -> None:
         if slot not in self._slots:
@@ -424,12 +460,17 @@ class CloudContractRun:
             except Exception as error:
                 failures.append(self._failure(f'admission {reservation_id}', error))
 
+        if self._router_started_at is not None:
+            unseen = self._await_router_start()
+            if unseen is not None:
+                failures.append(unseen)
         try:
             self.backend.stop_router()
         except Exception as error:
             failures.append(self._failure('the live site router (stop)', error))
 
         failures.extend(self._prove_empty())
+        failures.extend(self._prove_router_stopped())
         for failure in failures:
             print(f'[live cloud contract cleanup] {failure}', file=sys.stderr, flush=True)
         return failures
@@ -463,3 +504,37 @@ class CloudContractRun:
                 + '\nInventory and remove them by hand:\n'
                 + self.config.manual_inventory_commands())
         return failures
+
+    def _await_router_start(self) -> Optional[str]:
+        """Poll until a fresh read shows the directly started router as not
+        stopped; None once it does, else a failure report after
+        ROUTER_READ_LAG_SECONDS from the start. Until the start is visible
+        every 'stopped' read may be the pre-start answer, so neither the stop
+        nor the final check could be trusted."""
+        deadline = self._router_started_at + ROUTER_READ_LAG_SECONDS
+        while True:
+            try:
+                if not self.backend.router_stopped():
+                    return None
+            except Exception as error:
+                return self._failure('the live site router (state unreadable)', error)
+            if self.clock() >= deadline:
+                return (f'the live site {self.config.site_id!r} router still read stopped '
+                        f'{ROUTER_READ_LAG_SECONDS}s after this run started it, so no '
+                        "stopped reading can be trusted; it may be running\nCheck it and "
+                        'stop it (never terminate it) by hand:\n'
+                        + self.config.manual_router_stop_command())
+            self.sleep(ROUTER_POLL_SECONDS)
+
+    def _prove_router_stopped(self) -> List[str]:
+        """The site router must read stopped after teardown. The inventory
+        lists only what a run creates, never the operator's router, so an
+        empty inventory says nothing about a router left billing."""
+        try:
+            if self.backend.router_stopped():
+                return []
+        except Exception as error:
+            return [self._failure('the live site router (state unreadable)', error)]
+        return [f'the live site {self.config.site_id!r} router is not stopped after '
+                'teardown\nStop it (never terminate it) by hand:\n'
+                + self.config.manual_router_stop_command()]

@@ -201,5 +201,13 @@ class VMBackend(Protocol):
     def ensure_router_running(self) -> None:
         ...
 
-    def stop_router(self) -> None:
+    def stop_router(self) -> bool:
+        """Stop the site's router and wait until it is stopped. True only
+        when this call issued the stop (False when it was already stopped
+        or another caller's stop was in progress)."""
+        ...
+
+    def router_stopped(self) -> bool:
+        """A fresh read: True only when the provider reports the router
+        stopped (always True for a backend without one)."""
         ...
