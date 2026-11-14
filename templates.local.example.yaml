@@ -1,0 +1,23 @@
+# Test-only catalog for a LOCAL TEST INSTANCE (docs/LOCAL_TEST_INSTANCE.md).
+# Copy to templates.yaml (untracked) in the test checkout. List only templates you are testing,
+# never the production catalog. Replace the <...> values.
+deployment_groups:
+  - display_name: "Local test"
+    description: >
+      Local test instance. Not the production catalog.
+    enabled: true
+    group_mode: false          # individual deploys only; no group VLANs are allocated
+    uptime_minutes: 30
+    extend_time_minutes: 30
+    templates:
+      - name: "test-vm"
+        type: "qemu"
+        memory: 2048
+        cores: 2
+        entry_point: true
+        full_clone: true
+        internal_nic: false
+        storage_locations:
+          <node>: "<storage>"
+        template_locations:
+          <node>: <template-vmid>

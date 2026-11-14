@@ -38,6 +38,11 @@ Start here to get the application up and running:
   - Testing procedures
   - Debugging tips
 
+- **[LOCAL_TEST_INSTANCE.md](LOCAL_TEST_INSTANCE.md)** - Run a throwaway local portal against the real Proxmox cluster
+  - The orphan reaper must be `false` (an empty value turns it on)
+  - Test logins, a test VLAN and a test-only catalog
+  - Start, check, use and tear down
+
 - **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** - Original developer documentation
   - Code architecture
   - Contributing guidelines
