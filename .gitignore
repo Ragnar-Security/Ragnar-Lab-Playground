@@ -21,6 +21,8 @@ env/
 # Per-workstation tool permissions and deployment configuration.
 .claude/*
 scripts/site.env
+# Image builder hosts and cloud IDs; only config.env.example is tracked.
+scripts/image_build/config.env
 config/headscale-acl.json
 # Operator-owned cloud credentials override (docs/CLOUD_BACKENDS.md).
 /docker-compose.cloud.yml

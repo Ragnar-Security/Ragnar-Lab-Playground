@@ -50,6 +50,12 @@ Utility scripts for database management, deployment, and system administration.
 - **update_headscale_keys.py** - Store `login,key` rows from stdin in the
   portal database; run by the rotation script inside the app container
 
+- **image_build/** - Build a VM image from a recipe on Proxmox, AWS or GCP;
+  dry run with `--dry-run`. Runbook: `scripts/image_build/README.md`
+  ```bash
+  bash scripts/image_build/build_image.sh --dry-run <recipe.env> <backend>
+  ```
+
 ## Usage
 
 All scripts should be run from the project root directory:

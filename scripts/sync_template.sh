@@ -14,23 +14,32 @@
 # The source/target nodes can be hostnames (node1, node2) or IP addresses.
 # Hostnames must be resolvable via DNS, /etc/hosts, or ~/.ssh/config.
 #
-# Usage: ./scripts/sync_template.sh <source_node> <source_vmid> <target_node> [target_storage]
+# Usage: ./scripts/sync_template.sh <source_node> <source_vmid> <target_node> [target_storage] [target_vmid]
 # Example (QEMU): ./scripts/sync_template.sh node1 137 node2 local-zfs
 # Example (LXC):  ./scripts/sync_template.sh node1 135 node2 local-zfs
 # Example (IPs):  ./scripts/sync_template.sh 192.0.2.10 135 192.0.2.20 local-zfs
+# Example (fixed target VMID): ./scripts/sync_template.sh node1 8002 node2 local-zfs 8502
+#
+# target_vmid restores the copy at that VMID instead of the cluster's next free
+# one. It must be in 8500-8999, the replica half of the image builder's VMID
+# block (never 9000 or above: the portal treats the highest VMID as a
+# high-water mark), and it is refused if any node already has a guest with it.
+# The image builder uses it to put each template's replica at its fixed
+# partner VMID.
 #
 
 set -euo pipefail
 
 # --- Argument validation ---
-if [ $# -lt 3 ]; then
-    echo "Usage: $0 <source_node> <source_vmid> <target_node> [target_storage]"
+if [ $# -lt 3 ] || [ $# -gt 5 ]; then
+    echo "Usage: $0 <source_node> <source_vmid> <target_node> [target_storage] [target_vmid]"
     echo ""
     echo "Arguments:"
     echo "  source_node      Hostname or IP of the source Proxmox node (e.g., node1 or 192.0.2.10)"
     echo "  source_vmid      VMID of the template to sync on the source node"
     echo "  target_node      Hostname or IP of the target Proxmox node (e.g., node2 or 192.0.2.20)"
     echo "  target_storage   Storage pool on the TARGET node to restore into (default: local-zfs)"
+    echo "  target_vmid      VMID to restore as, 8500-8999 only (default: the cluster's next free VMID)"
     echo ""
     echo "Supports both QEMU VMs and LXC containers (auto-detected)."
     echo ""
@@ -38,6 +47,7 @@ if [ $# -lt 3 ]; then
     echo "  $0 node1 137 node2 local-zfs        # QEMU VM, using hostnames"
     echo "  $0 node1 135 node2 local-zfs        # LXC container, using hostnames"
     echo "  $0 192.0.2.10 135 192.0.2.20 local-zfs  # Using IP addresses"
+    echo "  $0 node1 8002 node2 local-zfs 8502  # Fixed target VMID (image-build replica)"
     exit 1
 fi
 
@@ -46,6 +56,14 @@ SOURCE_VMID="$2"
 TARGET_NODE="$3"
 TARGET_STORAGE="${4:-local-zfs}"
 DUMP_DIR="/var/lib/vz/dump"
+TARGET_VMID=""
+if [ $# -eq 5 ]; then
+    TARGET_VMID="$5"
+    if ! [[ "$TARGET_VMID" =~ ^8[5-9][0-9][0-9]$ ]]; then
+        echo "ERROR: target_vmid must be in 8500-8999 (got '$TARGET_VMID')"
+        exit 1
+    fi
+fi
 
 echo "========================================"
 echo "  Cross-Node Template Sync"
@@ -113,6 +131,16 @@ else
     echo "  Available storage pools on $TARGET_NODE:"
     ssh "root@${TARGET_NODE}" "pvesm status" 2>/dev/null | head -20 || true
     exit 1
+fi
+
+if [ -n "$TARGET_VMID" ]; then
+    echo "  → Checking that VMID $TARGET_VMID is free in the cluster..."
+    IN_USE=$(ssh "root@${TARGET_NODE}" "ls /etc/pve/nodes/*/qemu-server/${TARGET_VMID}.conf /etc/pve/nodes/*/lxc/${TARGET_VMID}.conf 2>/dev/null" || true)
+    if [ -n "$IN_USE" ]; then
+        echo "  ERROR: VMID $TARGET_VMID is already in use: $IN_USE"
+        exit 1
+    fi
+    echo "  ✓ VMID $TARGET_VMID is free"
 fi
 
 # --- Step 3: Check for existing backups or create new one ---
@@ -202,11 +230,17 @@ else
     echo "[Step 5/8] Skipping transfer — backup already exists on $TARGET_NODE"
 fi
 
-# --- Step 6: Get next available VMID and restore ---
+# --- Step 6: Get next available VMID (or use the given one) and restore ---
 echo ""
-echo "[Step 6/8] Getting next available VMID on $TARGET_NODE..."
-NEW_VMID=$(ssh "root@${TARGET_NODE}" "pvesh get /cluster/nextid")
-echo "  ✓ Next available VMID: $NEW_VMID"
+if [ -n "$TARGET_VMID" ]; then
+    echo "[Step 6/8] Using the given target VMID on $TARGET_NODE..."
+    NEW_VMID="$TARGET_VMID"
+    echo "  ✓ Target VMID: $NEW_VMID"
+else
+    echo "[Step 6/8] Getting next available VMID on $TARGET_NODE..."
+    NEW_VMID=$(ssh "root@${TARGET_NODE}" "pvesh get /cluster/nextid")
+    echo "  ✓ Next available VMID: $NEW_VMID"
+fi
 
 echo ""
 echo "[Step 7/8] Restoring backup as $VM_TYPE VMID $NEW_VMID on $TARGET_NODE..."
