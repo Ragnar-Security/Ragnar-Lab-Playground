@@ -34,7 +34,7 @@ from .models import db
 if not PROXMOX_VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __all__ = ["create_app", "db"]
 
 

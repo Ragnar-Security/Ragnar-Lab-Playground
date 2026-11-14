@@ -12,6 +12,8 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-14
+
 ### Added
 
 - Lab VMs on Amazon EC2 and Google Compute Engine beside Proxmox.
@@ -76,13 +78,19 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   starts.** `migrate_add_vm_backend.py` adds the four `vm_records` columns and
   an index; existing rows become `backend='proxmox'`. All are idempotent.
 
+  The running v1.0.0 image does not contain `migrate_add_vm_backend.py`, so
+  copy each script from the upgraded checkout into the running container and
+  run it there (the scripts need only SQLAlchemy). Use plain `docker compose`
+  on a host whose `.env` sets `COMPOSE_FILE`:
+
   ```bash
   for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                    migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
                    migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
                    migrate_add_vm_backend.py; do
-    docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
-      python scripts/$migration
+    docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
+    docker compose exec -T vm-automation python /tmp/$migration
+    docker compose exec -T -u root vm-automation rm -f /tmp/$migration
   done
   ```
 
@@ -245,5 +253,6 @@ that runs a checkout of the older repository this one replaced follows
   failed-deploy survivor files; see the rollback step in
   `docs/PRODUCTION_DEPLOYMENT.md`.
 
-[Unreleased]: https://github.com/Ragnar-Security/Ragnar-Lab-Playground/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/Ragnar-Security/Ragnar-Lab-Playground/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/Ragnar-Security/Ragnar-Lab-Playground/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/Ragnar-Security/Ragnar-Lab-Playground/releases/tag/v1.0.0
