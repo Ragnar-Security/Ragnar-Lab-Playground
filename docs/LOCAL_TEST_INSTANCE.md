@@ -15,7 +15,7 @@ credentials. Everything else in this guide is convenience.
    *this instance's* database. A local database is empty, so a local reaper would delete other
    people's VMs. The code enables the reaper when the value is unset or **empty**
    (`ORPHAN_REAPER_ENABLED = (os.environ.get('ORPHAN_REAPER_ENABLED') or 'true').lower() == 'true'`,
-   `app/config.py:105`), so an empty `.env` line is not "off". Use the supported literal `false`;
+   in `app/config.py`), so an empty `.env` line is not "off". Use the supported literal `false`;
    unset or empty enables it. `docker-compose.local.example.yml` sets it as well, and you prove it
    with a first start that has no cluster access before the real host and token exist (steps 3-4).
 2. **Test logins and a test network.** Deployed VMs are named `student-<login>-<template>`, and a
@@ -127,7 +127,7 @@ Proxmox API). Steps 1-4 use no real credentials; the real host and token appear 
    # expect: <timestamp> app.orphan_reaper INFO Orphan reaper disabled by ORPHAN_REAPER_ENABLED
    ```
 
-   The log text comes from `app/orphan_reaper.py:55` (`logger.info("Orphan reaper disabled by
+   The log text comes from `maybe_reap_orphaned_vms` in `app/orphan_reaper.py` (`logger.info("Orphan reaper disabled by
    ORPHAN_REAPER_ENABLED")`), and `app.orphan_reaper` is the logger name. The example override
    starts the app with INFO logging so the line prints. **If `printenv` prints anything but `false`,
    or you see a sweep line instead of the disabled line, stop here:** run
