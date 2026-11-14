@@ -309,7 +309,8 @@ def test_both_production_migration_loops_run_the_backend_migration():
 
 
 def test_changelog_upgrade_notes_name_the_migration_and_new_settings():
-    lines = _section((ROOT / "CHANGELOG.md").read_text(), "## [Unreleased]")
+    # The release that introduced the migration and the cloud settings.
+    lines = _section((ROOT / "CHANGELOG.md").read_text(), "## [1.1.0] - 2026-11-14")
     notes = "\n".join(_section("\n".join(lines), "### Upgrade notes"))
     loops = _migration_loops(notes)
     assert len(loops) == 1 and "migrate_add_vm_backend.py" in loops[0].split()
