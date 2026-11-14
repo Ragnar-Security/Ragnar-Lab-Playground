@@ -5,6 +5,7 @@ import json
 import unittest
 from app import create_app
 from app.models import db, User, StudentGroup
+from tests.backends.fake_backend import StaticInventoryBackend
 
 
 def _mk_user(login_id, password='pw', is_admin=False):
@@ -149,8 +150,8 @@ class DetailUpdateDeleteTestCase(GroupsRoutesBaseTestCase):
         # delete_group now always runs the Proxmox name-prefix sweep (so an
         # orphaned VM with no VMRecord still gets caught). Mock it to return
         # nothing so the test doesn't hit a real Proxmox connection.
-        with patch('app.routes.student_groups.find_vms_by_name_prefix',
-                   return_value=[]):
+        with patch('app.routes.student_groups.get_backend',
+                   return_value=StaticInventoryBackend([])):
             r = self.client.delete(f"/admin/groups/{g['id']}")
         self.assertEqual(r.status_code, 200)
         self.assertIsNone(db.session.get(StudentGroup, g['id']))
@@ -171,8 +172,8 @@ class DetailUpdateDeleteTestCase(GroupsRoutesBaseTestCase):
             swept.extend(payload)
             return {item['vmid'] for item in payload}
 
-        with patch('app.routes.student_groups.find_vms_by_name_prefix',
-                   return_value=inventory), \
+        with patch('app.routes.student_groups.get_backend',
+                   return_value=StaticInventoryBackend(inventory)), \
              patch('app.routes.student_groups.cleanup_vms',
                    side_effect=cleanup):
             response = self.client.delete(
@@ -194,8 +195,8 @@ class DetailUpdateDeleteTestCase(GroupsRoutesBaseTestCase):
         db.session.commit()
 
         # Mock the Proxmox sweep across both DELETE calls below.
-        with patch('app.routes.student_groups.find_vms_by_name_prefix',
-                   return_value=[]):
+        with patch('app.routes.student_groups.get_backend',
+                   return_value=StaticInventoryBackend([])):
             r = self.client.delete(f"/admin/groups/{g['id']}")
             self.assertEqual(r.status_code, 409)
 

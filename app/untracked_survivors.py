@@ -8,8 +8,10 @@ unaccounted.
 
 The fallback is an append-only JSON-lines file on persistent storage
 (`config.untracked_survivors_file()`, mode 0600). Each line describes one
-guest: vmid, node, name, type, owner, and the reason. It holds no
-credentials. `recover_untracked_survivors()` runs at startup and on every
+guest: vmid, node, name, type, owner, its backend identity (backend,
+provider id, deployment id, network slot; a line without them is a Proxmox
+guest), and the reason. It holds no credentials.
+`recover_untracked_survivors()` runs at startup and on every
 expiry pass. It imports the lines as already-expired VMRecords once the
 database answers, and removes the file only after that commit.
 
@@ -26,6 +28,7 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 
+from .backends.base import BACKEND_PROXMOX, KNOWN_BACKENDS
 from .config import untracked_survivors_file
 from .models import KothGame, StudentGroup, User, VMRecord, db
 
@@ -39,7 +42,8 @@ logger = logging.getLogger(__name__)
 _file_lock = threading.Lock()
 
 _OPTIONAL_INTS = ('created_by_user_id', 'owner_group_id', 'koth_game_id',
-                  'memory', 'cores', 'storage')
+                  'memory', 'cores', 'storage', 'network_slot')
+_OPTIONAL_TEXTS = ('provider_id', 'deployment_id')
 _REFERENCES = (('created_by_user_id', User), ('owner_group_id', StudentGroup),
                ('koth_game_id', KothGame))
 
@@ -67,6 +71,11 @@ def track_survivor(entry, expires_at, record=None):
     record.is_entry_point = entry.get('is_entry_point', False)
     record.owner_group_id = entry.get('owner_group_id')
     record.koth_game_id = entry.get('koth_game_id')
+    # Lines and results from before backends existed are Proxmox guests.
+    record.backend = entry.get('backend') or BACKEND_PROXMOX
+    record.provider_id = entry.get('provider_id')
+    record.deployment_id = entry.get('deployment_id')
+    record.network_slot = entry.get('network_slot')
     record.destroyed = False
     record.destroyed_at = None
     record.deletion_retry_count = 0
@@ -241,13 +250,25 @@ def _parse(line):
     for key in ('node', 'vm_name'):
         if not isinstance(data.get(key), str) or not data[key]:
             raise ValueError(f'{key} must be a non-empty string')
-    if data.get('vm_type') not in ('qemu', 'lxc'):
-        raise ValueError("vm_type must be 'qemu' or 'lxc'")
+    backend = data.get('backend') or BACKEND_PROXMOX
+    if backend not in KNOWN_BACKENDS:
+        raise ValueError(f'unknown backend {backend!r}')
+    if backend == BACKEND_PROXMOX:
+        if data.get('vm_type') not in ('qemu', 'lxc'):
+            raise ValueError("vm_type must be 'qemu' or 'lxc'")
+    elif data.get('vm_type') != backend:
+        # A cloud record's vm_type is its backend name.
+        raise ValueError(f"vm_type must be {backend!r}")
     for key in _OPTIONAL_INTS:
         value = data.get(key)
         if value is not None and type(value) is not int:
             raise ValueError(f'{key} must be an integer')
-    entry = {key: data.get(key) for key in _OPTIONAL_INTS}
+    for key in _OPTIONAL_TEXTS:
+        value = data.get(key)
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ValueError(f'{key} must be a non-empty string')
+    entry = {key: data.get(key) for key in _OPTIONAL_INTS + _OPTIONAL_TEXTS}
+    entry['backend'] = backend
     entry.update(
         vmid=vmid,
         node=data['node'],

@@ -122,6 +122,25 @@ class AdmissionMemoryMathTestCase(unittest.TestCase):
         self.assertEqual(resources['memory_free'], 10 * GIB)
         self.assertEqual(resources['memory_linux_free'], 1 * GIB)
 
+    def test_a_proxmox_node_named_after_a_cloud_backend_is_never_admitted(self):
+        # D-plan F5: cloud admission reserves under node 'aws'/'gcp' in the
+        # same ledger, so a Proxmox node of that name would share its count.
+        for name in ('aws', 'GCP'):
+            proxmox = _proxmox(available_gib=10)
+            proxmox.nodes.get.return_value = [{'node': name}, {'node': 'pve'}]
+            with patch('app.proxmox_service._load_live_vm_records', return_value=[]):
+                for _ in range(20):  # weighted-random selection
+                    self.assertEqual(select_best_node(
+                        proxmox, required_memory_mb=1024, required_cores=1,
+                        load_balancing_config=LB_ON), 'pve')
+
+            proxmox.nodes.get.return_value = [{'node': name}]
+            with patch('app.proxmox_service._load_live_vm_records', return_value=[]):
+                self.assertIsNone(select_best_node(
+                    proxmox, required_memory_mb=1024, required_cores=1,
+                    load_balancing_config=LB_ON, reservation_id='cloud-named'))
+            self.assertFalse(release_node_reservation('cloud-named'))
+
 
 class ReservationLedgerTestCase(unittest.TestCase):
     def setUp(self):
@@ -313,12 +332,12 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
             proxmox, count=1, reservation_id=vmid_reservation_id)
         with patch('app.proxmox_service.ProxmoxAPI', return_value=proxmox), \
              patch(
-                 'app.routes.vm_creation.renew_node_reservation',
+                 'app.proxmox_service.renew_node_reservation',
                  create=True,
                  side_effect=renew_node_reservation,
              ) as renew, \
              patch(
-                 'app.routes.vm_creation.renew_vmid_reservation',
+                 'app.proxmox_service.renew_vmid_reservation',
                  side_effect=renew_vmid_reservation,
              ) as renew_vmid:
             result = create_single_vm_task(
@@ -361,7 +380,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
 
         with patch('app.proxmox_service.ProxmoxAPI', return_value=proxmox), \
              patch(
-                 'app.routes.vm_creation.renew_node_reservation',
+                 'app.proxmox_service.renew_node_reservation',
                  return_value=False,
              ):
             result = create_single_vm_task(
@@ -421,7 +440,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
         worker = threading.Thread(
             target=self._deploy_in_thread, args=(proxmox, outcome))
         with patch(
-            'app.routes.vm_creation.release_node_reservation',
+            'app.proxmox_service.release_node_reservation',
             side_effect=checked_release,
         ):
             worker.start()
@@ -547,7 +566,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
                  'app.routes.vm_creation._cleanup_with_sweep',
                  return_value=set(),
              ), patch(
-                 'app.routes.vm_creation.release_node_reservation',
+                 'app.proxmox_service.release_node_reservation',
                  side_effect=checked_release,
              ):
             with self.assertRaises(DeployFailed):
@@ -634,7 +653,7 @@ class CreationReservationLifecycleTestCase(unittest.TestCase):
                  'app.routes.vm_creation._cleanup_with_sweep',
                  side_effect=RuntimeError('cleanup connection failed'),
              ), patch(
-                 'app.routes.vm_creation.release_node_reservation',
+                 'app.proxmox_service.release_node_reservation',
                  side_effect=checked_release,
              ):
             with self.assertRaises(DeployFailed):

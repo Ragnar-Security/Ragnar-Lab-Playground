@@ -113,6 +113,9 @@ def test_clone_start_stop_destroy_round_trip(contract_run, live_proxmox,
                             vm_name=guest.name, vm_type='qemu') == VM_GUEST_MATCH
     config = endpoint.config.get()
     assert config['name'] == guest.name
+    if live_config.vlan:
+        assert f'tag={live_config.vlan}' in config['net0'], config['net0']
+        assert 'net1' not in config, config['net1']
     expires = _parse_expiration(config.get('description'))
     assert expires is not None, config.get('description')
     assert timedelta(minutes=20) < expires - datetime.now() <= timedelta(minutes=30)
@@ -178,7 +181,7 @@ def test_full_clone_lands_on_the_configured_storage(contract_run, live_proxmox,
 
 def test_cleanup_removes_guests_after_an_injected_failure(request, live_proxmox,
                                                           live_config, live_node):
-    run = ContractRun(live_proxmox, live_config.vmid_range)
+    run = ContractRun(live_proxmox, live_config.vmid_range, vlan=live_config.vlan)
     # Backstop if the context manager's own cleanup fails part-way; cleanup
     # is a no-op once nothing is owned.
     request.addfinalizer(run.cleanup)

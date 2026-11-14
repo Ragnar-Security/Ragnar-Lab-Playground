@@ -14,6 +14,8 @@ env/
 # Site-specific template catalog; copy templates.example.yaml before startup.
 /templates.yaml
 /templates.yaml.bak
+# Local test instance override; copy docker-compose.local.example.yml (docs/LOCAL_TEST_INSTANCE.md).
+/docker-compose.local.yml
 
 
 # Per-workstation tool permissions and deployment configuration.
@@ -22,6 +24,8 @@ scripts/site.env
 # Image builder hosts and cloud IDs; only config.env.example is tracked.
 scripts/image_build/config.env
 config/headscale-acl.json
+# Operator-owned cloud credentials override (docs/CLOUD_BACKENDS.md).
+/docker-compose.cloud.yml
 
 # Isolated worktrees (local working state, never repository content).
 .worktrees/

@@ -3,13 +3,26 @@ Component tests for API routes
 Tests VM creation, listing, extending, and destroying
 """
 
+import copy
+import os
 import unittest
 import json
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timedelta
+
+import pytest
+import yaml
+
 from app import create_app
+from app.backends import register_backend_factory
+from app.backends.base import VMSpec
+from app.backends.proxmox import ProxmoxBackend
 from app.routes.utils import VM_PRESENT
-from app.models import db, User, VMRecord, StudentGroup, StudentGroupMember
+from app.models import (
+    db, User, VMIDReservation, VMRecord, StudentGroup, StudentGroupMember,
+)
+from tests.backends.fake_backend import StaticDisplayBackend, registered_fake_backend
+from tests.test_live_contract_guards import FakeProxmox
 
 
 class TestAPIRoutes(unittest.TestCase):
@@ -85,8 +98,8 @@ class TestAPIRoutes(unittest.TestCase):
     
     def test_list_vms_empty(self):
         """Test listing VMs when none exist"""
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox:
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT)):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -130,10 +143,8 @@ class TestAPIRoutes(unittest.TestCase):
         db.session.add_all([vm1, vm2])
         db.session.commit()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses', return_value=[]):
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -165,13 +176,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=masked_config):
-            mock_proxmox.return_value = MagicMock()
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -200,13 +209,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=unmasked_config):
-            mock_proxmox.return_value = MagicMock()
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -244,13 +251,11 @@ class TestAPIRoutes(unittest.TestCase):
                 }
             ]
         }
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.101.4.56']), \
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(
+                       VM_PRESENT, ips=['10.101.4.56'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value=masked_config):
-            mock_proxmox.return_value = MagicMock()
             response = admin_client.get('/list')
 
         data = json.loads(response.data)
@@ -287,10 +292,8 @@ class TestAPIRoutes(unittest.TestCase):
         db.session.add_all([my_vm, other_vm])
         db.session.commit()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection') as mock_proxmox, \
-             patch('app.routes.vm_listing._verify_vm_exists', return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses', return_value=[]):
-            mock_proxmox.return_value = MagicMock()
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         data = json.loads(response.data)
@@ -357,14 +360,18 @@ class TestAPIRoutes(unittest.TestCase):
         new=lambda reservation_id: True,
     )
     @patch(
-        'app.routes.vm_creation.renew_node_reservation',
+        'app.proxmox_service.renew_vmid_reservation',
         new=lambda reservation_id: True,
     )
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix')
+    @patch(
+        'app.proxmox_service.renew_node_reservation',
+        new=lambda reservation_id: True,
+    )
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed')
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     def test_create_vm_success(self, mock_select_node, mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
         """Test successful VM creation with pre-allocated VMIDs"""
         # Setup mocks
@@ -434,7 +441,7 @@ class TestAPIRoutes(unittest.TestCase):
         original_expiration = expires_at
         
         with patch('app.template_manager.load_template_config') as mock_config, \
-             patch('app.routes.vm_lifecycle.get_proxmox_connection') as mock_proxmox:
+             patch('app.proxmox_service.ProxmoxAPI') as mock_proxmox:
             mock_config.return_value = {
                 'deployment_groups': [
                     {
@@ -670,11 +677,8 @@ class TestAPIRoutes(unittest.TestCase):
         """The Extend button can only name a deployment the list told it."""
         self._same_named_deployments(group_slug='testuser')
 
-        with patch('app.routes.vm_listing.get_proxmox_connection'), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=[]):
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         cards = [
@@ -689,9 +693,9 @@ class TestAPIRoutes(unittest.TestCase):
         ])
 
     def _destroy(self, **form):
-        with patch('app.routes.vm_lifecycle.get_proxmox_connection',
+        with patch('app.proxmox_service.ProxmoxAPI',
                    return_value=MagicMock()), \
-             patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+             patch('app.proxmox_service.wait_for_proxmox_task',
                    return_value={'success': True, 'status': 'stopped'}):
             return self.client.post(
                 '/destroy', data={'deployment_group': 'homework1', **form})
@@ -723,7 +727,7 @@ class TestAPIRoutes(unittest.TestCase):
         """A cached pre-fix page must not destroy two deployments at once."""
         individual_id, group_id, _ = self._same_named_deployments()
 
-        with patch('app.routes.vm_lifecycle.get_proxmox_connection') as prox:
+        with patch('app.proxmox_service.ProxmoxAPI') as prox:
             response = self.client.post(
                 '/destroy', data={'deployment_group': 'homework1'})
 
@@ -848,11 +852,8 @@ class TestAPIRoutes(unittest.TestCase):
         [(first_group, _), (second_group, _)], _ = \
             self._two_groups_with_same_lab()
 
-        with patch('app.routes.vm_listing.get_proxmox_connection'), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=(VM_PRESENT, None)), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=[]):
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(VM_PRESENT, ips=[])):
             response = self.client.get('/list')
 
         cards = [
@@ -866,9 +867,9 @@ class TestAPIRoutes(unittest.TestCase):
             ('group', second_group, [131]),
         ])
     
-    @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_deployment_group(self, mock_proxmox, mock_wait):
         """Test destroying deployment group as student"""
         # Create test VMs
@@ -904,9 +905,9 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertIsNone(VMRecord.query.filter_by(vmid=100).first())
         self.assertIsNone(VMRecord.query.filter_by(vmid=101).first())
 
-    @patch('app.routes.vm_lifecycle.wait_for_proxmox_task',
+    @patch('app.proxmox_service.wait_for_proxmox_task',
            return_value={'success': True, 'status': 'stopped'})
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_deployment_group_admin_with_student_name(self, mock_proxmox, mock_wait):
         """Test admin destroying deployment group with student_name parameter"""
         # Create admin user and login
@@ -965,7 +966,7 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertIsNone(VMRecord.query.filter_by(vmid=100).first())
         self.assertIsNone(VMRecord.query.filter_by(vmid=101).first())
 
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_admin_without_student_name_fails(self, mock_proxmox):
         """Test that admin must provide student_name parameter"""
         # Create admin user and login
@@ -997,7 +998,7 @@ class TestAPIRoutes(unittest.TestCase):
         self.assertFalse(data['success'])
         self.assertIn('student_name', data['error'].lower())
     
-    @patch('app.routes.vm_lifecycle.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     def test_destroy_student_cannot_destroy_others_vms(self, mock_proxmox):
         """Test that students cannot destroy other students' VMs"""
         # Create another user
@@ -1030,6 +1031,214 @@ class TestAPIRoutes(unittest.TestCase):
         # Verify VM was not destroyed
         vm1_check = VMRecord.query.filter_by(vmid=100).first()
         self.assertFalse(vm1_check.destroyed)
+
+
+# --- /create: backend resolution before the Proxmox-only VLAN gate ----------
+
+FIXTURE_TEMPLATES = os.path.join(os.path.dirname(__file__), 'fixtures', 'templates.yaml')
+AWS_MACHINE = {'name': 'vm', 'entry_point': True,
+               'aws': {'image_id': 'ami-placeholder', 'instance_type': 't3.micro',
+                       'disk_gb': 20}}
+
+
+def valid_aws_catalog():
+    return {'deployment_groups': [
+        {'display_name': 'Cloud Lab', 'enabled': True, 'backend': 'aws',
+         'uptime_minutes': 60, 'templates': [copy.deepcopy(AWS_MACHINE)]}]}
+
+
+def valid_proxmox_catalog():
+    with open(FIXTURE_TEMPLATES, encoding='utf-8') as catalog:
+        group = copy.deepcopy(yaml.safe_load(catalog)['deployment_groups'][0])
+    group.update(display_name='Proxmox Lab', enabled=True)
+    return {'deployment_groups': [group]}
+
+
+def _invalid_lab(group_backend, second_machine_backend=None):
+    second = dict(copy.deepcopy(AWS_MACHINE), name='vm2', entry_point=False)
+    if second_machine_backend is not None:
+        second['backend'] = second_machine_backend
+    return {'deployment_groups': [
+        {'display_name': 'Invalid Lab', 'enabled': True, 'backend': group_backend,
+         'uptime_minutes': 60, 'templates': [copy.deepcopy(AWS_MACHINE), second]}]}
+
+
+def unknown_backend_catalog():
+    return _invalid_lab('azure')
+
+
+def disabled_backend_catalog():
+    # AWS is known but not in this portal's ENABLED_BACKENDS.
+    return _invalid_lab('aws')
+
+
+def mixed_backend_catalog():
+    return _invalid_lab('aws', second_machine_backend='proxmox')
+
+
+@pytest.fixture
+def student_client(app):
+    with app.app_context():
+        student = User(login_id='cloud-student', entry_vlan_tag=101,
+                       internal_vlan_tag=201, session_version=1)
+        student.set_password('Correct-Horse-9')
+        db.session.add(student)
+        db.session.commit()
+        user_id = student.id
+    client = app.test_client()
+    with client.session_transaction() as session:
+        session['user_id'] = user_id
+        session['session_version'] = 1
+    return client
+
+
+def set_student_tags(app, entry, internal):
+    with app.app_context():
+        student = User.query.filter_by(login_id='cloud-student').one()
+        student.entry_vlan_tag = entry
+        student.internal_vlan_tag = internal
+        db.session.commit()
+
+
+def serve_empty_proxmox():
+    """With Proxmox enabled the VMID allocator reads its inventory even for a
+    cloud bundle (ruling I19); an empty fake cluster answers that read."""
+    register_backend_factory('proxmox', lambda: ProxmoxBackend(client=FakeProxmox()))
+
+
+# Catches the Proxmox-only VLAN gate still deciding a tagged cloud deployment (I9):
+# the gate is forced to refuse, yet the cloud deploy with valid slot tags must succeed.
+def test_create_cloud_group_succeeds_when_the_proxmox_vlan_gate_would_refuse(
+        app, student_client):
+    with registered_fake_backend('aws') as fake, patch(
+            'app.routes.vm_creation.load_template_config',
+            return_value=valid_aws_catalog()), patch(
+            'app.routes.vm_creation.validate_user_vlans',
+            return_value=(False, 'Proxmox VLAN gate refused')):
+        serve_empty_proxmox()
+        response = student_client.post('/create', data={'deployment_group': 'Cloud Lab'})
+    assert response.get_json()['success'] is True
+    with app.app_context():
+        [record] = VMRecord.query.all()
+        assert (record.backend, record.network_slot) == ('aws', 101)
+    assert record.vmid in fake.instances
+
+
+# Catches the same forced gate refusal being ignored for Proxmox groups.
+def test_create_proxmox_group_still_obeys_the_vlan_gate(app, student_client):
+    with patch('app.routes.vm_creation.load_template_config',
+               return_value=valid_proxmox_catalog()), patch(
+            'app.routes.vm_creation.validate_user_vlans',
+            return_value=(False, 'Proxmox VLAN gate refused')):
+        body = student_client.post('/create', data={'deployment_group': 'Proxmox Lab'}).get_json()
+    assert body == {'success': False, 'error': 'Proxmox VLAN gate refused'}
+    with app.app_context():
+        assert VMIDReservation.query.count() == 0
+
+
+# Catches a cloud deploy reaching allocation with no slot identity (I9).
+@pytest.mark.parametrize('entry,internal,missing', [
+    (None, 201, 'entry_vlan_tag'),
+    (101, None, 'internal_vlan_tag'),
+    (None, None, 'entry_vlan_tag and internal_vlan_tag'),
+])
+def test_create_cloud_refuses_owner_without_slot_tags(
+        app, student_client, entry, internal, missing):
+    set_student_tags(app, entry, internal)
+    with registered_fake_backend('aws'), patch(
+            'app.routes.vm_creation.load_template_config',
+            return_value=valid_aws_catalog()):
+        body = student_client.post('/create', data={'deployment_group': 'Cloud Lab'}).get_json()
+    assert body == {'success': False,
+                    'error': f'Cloud deployment needs {missing} assigned. '
+                             'Please contact an administrator.'}
+    with app.app_context():
+        assert VMIDReservation.query.count() == 0
+
+
+# Catches the reorder changing the existing Proxmox missing-VLAN behaviour (M5).
+def test_create_proxmox_group_still_refuses_missing_vlans(app, student_client):
+    set_student_tags(app, None, None)
+    with patch('app.routes.vm_creation.load_template_config',
+               return_value=valid_proxmox_catalog()):
+        body = student_client.post('/create', data={'deployment_group': 'Proxmox Lab'}).get_json()
+    assert body == {'success': False,
+                    'error': 'VLANs not assigned. Please contact an administrator.'}
+    with app.app_context():
+        assert VMIDReservation.query.count() == 0
+
+
+# Catches the spec's "not found" not being reported first for a user without
+# VLANs, now that the group is read before the Proxmox-only VLAN gate.
+def test_create_unknown_group_reports_not_found_before_missing_vlans(app, student_client):
+    set_student_tags(app, None, None)
+    with patch('app.routes.vm_creation.load_template_config',
+               return_value=valid_proxmox_catalog()):
+        body = student_client.post('/create', data={'deployment_group': 'No Such Lab'}).get_json()
+    assert body == {'success': False, 'error': 'Deployment group No Such Lab not found'}
+
+
+# Catches an unknown/disabled/mixed group reaching allocation or provider calls;
+# the refusal carries the template validation error the admin must fix (M12).
+@pytest.mark.parametrize('catalog,reason', [
+    (unknown_backend_catalog(), "unknown backend 'azure'"),
+    (disabled_backend_catalog(), "backend 'aws' is not enabled"),
+    (mixed_backend_catalog(), 'mixed backends (aws, proxmox)'),
+])
+def test_create_refuses_invalid_backend_before_allocation(
+        app, student_client, catalog, reason):
+    with patch('app.routes.vm_creation.load_template_config', return_value=catalog), patch(
+            'app.routes.vm_creation.deploy_bundle',
+            side_effect=AssertionError('deploy_bundle reached')):
+        response = student_client.post('/create', data={'deployment_group': 'Invalid Lab'})
+    body = response.get_json()
+    assert body['success'] is False
+    assert body['error'].startswith("deployment_group 'Invalid Lab': ")
+    assert reason in body['error']
+    with app.app_context():
+        assert VMIDReservation.query.count() == 0
+        assert VMRecord.query.count() == 0
+
+
+# Catches a flat legacy catalog deploying on anything but Proxmox (a call
+# recording by nature, ruling M17).
+def test_create_flat_legacy_catalog_deploys_on_proxmox(app, student_client):
+    with patch('app.routes.vm_creation.load_template_config',
+               return_value=valid_proxmox_catalog()), patch(
+            'app.routes.vm_creation.get_proxmox_connection',
+            return_value=MagicMock()), patch(
+            'app.routes.vm_creation._preflight_deployment_group',
+            return_value=('fresh', [])) as preflight, patch(
+            'app.routes.vm_creation.deploy_bundle', return_value=[]) as deploy:
+        body = student_client.post('/create', data={'deployment_group': 'Proxmox Lab'}).get_json()
+    assert body['success'] is True
+    assert deploy.call_args.kwargs['backend_name'] == 'proxmox'
+    assert preflight.call_args.kwargs['backend_name'] == 'proxmox'
+
+
+# Catches the pre-flight reading Proxmox for a cloud deploy, or destroying a
+# cloud straggler through the Proxmox backend.
+def test_create_cloud_preflight_destroys_an_untracked_cloud_straggler(app, student_client):
+    with registered_fake_backend('aws') as fake, patch(
+            'app.routes.vm_creation.load_template_config',
+            return_value=valid_aws_catalog()):
+        serve_empty_proxmox()
+        # A prior deploy's instance whose VMRecord was never committed.
+        fake.ensure_slot(101)
+        fake.create(VMSpec(
+            vmid=900, vm_name='student-cloud-student-vm', display_name='vm',
+            backend='aws', template=dict(AWS_MACHINE['aws']),
+            memory_mb=1024, cores=1, storage_gb=20, is_entry_point=True,
+            entry_slot=101, internal_slot=201,
+            expires_at=datetime.now() + timedelta(hours=1),
+            deployment_id='b' * 32, owner='cloud-student'),
+            'memory-zone', heartbeat=lambda: None)
+        body = student_client.post('/create', data={'deployment_group': 'Cloud Lab'}).get_json()
+    assert body['success'] is True, body
+    assert 900 in fake.destroyed and 900 not in fake.instances
+    with app.app_context():
+        [record] = VMRecord.query.all()
+    assert record.backend == 'aws' and record.vmid in fake.instances
 
 
 if __name__ == '__main__':

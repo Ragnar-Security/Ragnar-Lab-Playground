@@ -62,7 +62,20 @@ LAB_PLAYGROUND_VERSION=<version>
 for example `1.0.0@sha256:<digest>`. It must name an exact release: the
 preflight below refuses a moving tag such as `latest`, which would let any
 restart change what runs. Edit `templates.yaml` for your Proxmox
-cluster, then check `.env` against the production rules:
+cluster.
+
+To place labs on AWS or Google Cloud as well, or instead, set
+`ENABLED_BACKENDS`, `LAB_SITE_ID` and the enabled cloud's `AWS_*` / `GCP_*`
+settings from the cloud section of `.env.example`, and add the backend blocks
+shown by `templates.example.yaml`'s `multi-backend-example` group. The cloud
+base infrastructure must exist first. The runbook, `docs/CLOUD_BACKENDS.md` in
+the repository (not in this bundle), covers it and the credentials. A host
+without an instance role or metadata-server identity needs its own
+`docker-compose.cloud.yml` override, named last:
+`COMPOSE_FILE=docker-compose.prod.yml:docker-compose.release.yml:docker-compose.cloud.yml`.
+Keep `.env.example`'s `ENABLED_BACKENDS=proxmox` for a Proxmox-only portal.
+
+Then check `.env` against the production rules:
 
 ```bash
 python3 scripts/preflight_env.py .env
@@ -106,4 +119,14 @@ To run it nightly, install the units in `scripts/systemd/` and set
 
 To roll back, set `LAB_PLAYGROUND_VERSION` to the previous version and run
 `docker compose up -d`. Restore the database backup only when the upgrade
-notes say the migrations cannot be undone by a code rollback alone.
+notes say the migrations cannot be undone by a code rollback alone. A version
+without cloud backends (v1.0.0) ignores the backend columns but never destroys
+a cloud machine, and sets a cloud line in the failed-deploy survivor files
+aside as corrupt. A cloud guest left by a failed deploy during a database
+outage can exist only in those files, with no record. Roll back to such a
+version only when **both** hold: no live cloud record, and no cloud line in
+`data/untracked-survivors.jsonl` or `.importing`. Run the two checks in step
+6, "Roll back", of "Redeploy an Existing Production Host" in
+`docs/PRODUCTION_DEPLOYMENT.md` in the repository. Until both are clean, tear
+the clouds down (`docs/CLOUD_BACKENDS.md`, "Teardown and incident response")
+and let the current release import and destroy the survivors.

@@ -24,7 +24,7 @@ class TestParallelVMCreation(unittest.TestCase):
         # These tests replace node selection itself, so no real reservation
         # exists for the production heartbeat to renew.
         self._renew_patcher = patch(
-            'app.routes.vm_creation.renew_node_reservation',
+            'app.proxmox_service.renew_node_reservation',
             return_value=True,
         )
         self._renew_patcher.start()
@@ -33,6 +33,11 @@ class TestParallelVMCreation(unittest.TestCase):
             return_value=True,
         )
         self._renew_vmid_patcher.start()
+        self._create_renew_vmid_patcher = patch(
+            'app.proxmox_service.renew_vmid_reservation',
+            return_value=True,
+        )
+        self._create_renew_vmid_patcher.start()
 
         self.client = self.app.test_client()
 
@@ -63,15 +68,16 @@ class TestParallelVMCreation(unittest.TestCase):
         """Clean up test fixtures"""
         self._renew_patcher.stop()
         self._renew_vmid_patcher.stop()
+        self._create_renew_vmid_patcher.stop()
         db.session.remove()
         db.drop_all()
         self.app_context.pop()
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     @patch('app.routes.vm_creation.load_template_config')
     def test_vmid_preallocation_sequential(self, mock_config, mock_select_node,
                                           mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
@@ -133,11 +139,11 @@ class TestParallelVMCreation(unittest.TestCase):
         # Verify all 3 VMs should get sequential VMIDs: 100, 101, 102
         self.assertEqual(response.status_code, 200)
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     @patch('app.routes.vm_creation.load_template_config')
     def test_no_vmid_collisions(self, mock_config, mock_select_node,
                                 mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
@@ -188,11 +194,11 @@ class TestParallelVMCreation(unittest.TestCase):
         self.assertEqual(len(created_vmids), len(set(created_vmids)),
                         f"VMID collision detected! VMIDs created: {created_vmids}")
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     @patch('app.routes.vm_creation.load_template_config')
     def test_semaphore_limits_concurrent_clones(self, mock_config, mock_select_node,
                                                 mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
@@ -255,11 +261,11 @@ class TestParallelVMCreation(unittest.TestCase):
         self.assertLessEqual(concurrent_count['max'], 2,
                            f"Semaphore failed! Max concurrent clones: {concurrent_count['max']}, expected <= 2")
 
-    @patch('app.routes.vm_creation.find_vms_by_name_prefix', return_value=[])
+    @patch('app.backends.proxmox.ProxmoxBackend.list_managed', return_value=[])
     @patch('app.routes.vm_creation.wait_for_proxmox_task')
-    @patch('app.routes.vm_creation.get_proxmox_connection')
+    @patch('app.proxmox_service.ProxmoxAPI')
     @patch('app.routes.vm_creation.get_next_available_vmid')
-    @patch('app.routes.vm_creation.select_best_node')
+    @patch('app.proxmox_service.select_best_node')
     @patch('app.routes.vm_creation.load_template_config')
     def test_task_monitoring_failure_triggers_cleanup(self, mock_config, mock_select_node,
                                                       mock_vmid, mock_proxmox, mock_wait_task, mock_find_vms):
@@ -317,7 +323,11 @@ class TestParallelVMCreation(unittest.TestCase):
             ]
         }
 
-        response = self.client.post('/create', data={'deployment_group': 'failure-test'})
+        # Cleanup's stop and destroy waits run in ProxmoxBackend, which
+        # calls the waiter at its definition site.
+        with patch('app.proxmox_service.wait_for_proxmox_task',
+                   side_effect=_next_task_result):
+            response = self.client.post('/create', data={'deployment_group': 'failure-test'})
 
         # Verify request failed
         data = response.get_json()
@@ -351,10 +361,10 @@ class TestParallelVMCreation(unittest.TestCase):
             'app.routes.vm_creation.load_template_config',
             return_value=config,
         ), patch(
-            'app.routes.vm_creation.find_vms_by_name_prefix',
+            'app.backends.proxmox.ProxmoxBackend.list_managed',
             return_value=[],
         ), patch(
-            'app.routes.vm_creation.get_proxmox_connection',
+            'app.proxmox_service.ProxmoxAPI',
             return_value=proxmox,
         ), patch(
             'app.routes.vm_creation.get_next_available_vmid',

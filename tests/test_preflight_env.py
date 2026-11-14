@@ -18,7 +18,28 @@ GOOD = {
     'SESSION_COOKIE_SAMESITE': 'Lax',
     'PROXMOX_VERIFY_SSL': 'true',
     'PROXMOX_CA_BUNDLE': '',
+    'ENABLED_BACKENDS': 'proxmox',
 }
+
+# Neutral placeholders: only key names are ever asserted on.
+AWS_ENV = {
+    'LAB_SITE_ID': 'site-a', 'AWS_REGION': 'us-test-1',
+    'AWS_AVAILABILITY_ZONE': 'us-test-1a', 'AWS_LAB_VPC_ID': 'vpc-placeholder',
+    'AWS_ROUTER_INSTANCE_ID': 'i-placeholder', 'AWS_MAX_VMS': '3',
+}
+GCP_ENV = {
+    'GCP_PROJECT': 'project-placeholder', 'GCP_REGION': 'region-test1',
+    'GCP_ZONE': 'region-test1-a', 'GCP_NETWORK': 'network-placeholder',
+    'GCP_ROUTER_INSTANCE': 'router-placeholder', 'GCP_MAX_VMS': '2',
+}
+
+
+def valid_aws_env():
+    return {**GOOD, **AWS_ENV, 'ENABLED_BACKENDS': 'aws'}
+
+
+def valid_cloud_env():
+    return {**GOOD, **AWS_ENV, **GCP_ENV, 'ENABLED_BACKENDS': 'aws,gcp'}
 
 
 def _write_env(path, values):
@@ -215,4 +236,101 @@ def test_exact_or_absent_release_version_passes(tmp_path, value):
     result = _run(str(_write_env(tmp_path / '.env',
                                  {**GOOD, 'LAB_PLAYGROUND_VERSION': value})))
 
+    assert result.returncode == 0, result.stderr
+
+
+# Catches a host preflight that rejects a valid cloud-only or two-cloud
+# host because it still demands the Proxmox-only settings.
+@pytest.mark.parametrize('values', [valid_aws_env(), valid_cloud_env()])
+def test_valid_cloud_env_passes(tmp_path, values):
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 0, result.stderr
+
+
+# Catches a host preflight that passes although the enabled cloud cannot boot.
+@pytest.mark.parametrize('key', [
+    'LAB_SITE_ID', 'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID',
+    'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS'])
+def test_aws_preflight_names_each_missing_required_key(tmp_path, key):
+    values = valid_aws_env()
+    values.pop(key)
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 1
+    problems = result.stderr.splitlines()
+    assert len(problems) == 1
+    assert problems[0].startswith(f'{key}:')
+
+
+# Catches the GCP half of the same gap.
+@pytest.mark.parametrize('key', list(GCP_ENV))
+def test_gcp_preflight_names_each_missing_required_key(tmp_path, key):
+    values = valid_cloud_env()
+    values.pop(key)
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 1
+    problems = result.stderr.splitlines()
+    assert len(problems) == 1
+    assert problems[0].startswith(f'{key}:')
+
+
+# Catches the host accepting a value the app refuses, and echoing it.
+@pytest.mark.parametrize('key, value', [
+    ('ENABLED_BACKENDS', 'azure'),
+    ('ENABLED_BACKENDS', ','),
+    ('LAB_SITE_ID', 'Site-Upper'),
+    ('LAB_SITE_ID', 'trailing-'),
+    ('AWS_MAX_VMS', '0'),
+    ('AWS_MAX_VMS', 'three'),
+])
+def test_invalid_cloud_value_fails_naming_only_its_key(tmp_path, key, value):
+    result = _run(str(_write_env(tmp_path / '.env', {**valid_aws_env(), key: value})))
+    assert result.returncode == 1
+    assert result.stderr.splitlines()[0].startswith(f'{key}:')
+    if len(value) > 1:
+        assert value not in result.stdout + result.stderr
+
+
+# Catches the host script and app accepting different CIDR safety boundaries.
+def test_preflight_rejects_reserved_overlapping_and_undersized_cidrs(tmp_path):
+    for cidr in ('10.20.0.0/16', '172.17.0.0/16', '172.20.0.0/24'):
+        result = _run(str(_write_env(
+            tmp_path / f'{cidr.replace("/", "_")}.env',
+            {**valid_aws_env(), 'AWS_LAB_CIDR': cidr})))
+        assert result.returncode == 1
+        assert result.stderr.startswith('AWS_LAB_CIDR:')
+
+
+# Catches the host accepting a tailnet-overlapping, malformed, IPv6 or
+# host-bits base that the app refuses at startup, for either cloud.
+@pytest.mark.parametrize('cidr', [
+    '100.64.0.0/16', '100.0.0.0/8', 'not-a-cidr', '172.20.0.0/33', 'fd00:20::/48',
+    # Host bits outside both clouds' bases, so nothing else can refuse it.
+    '172.22.1.0/16',
+], ids=['inside-cgnat', 'contains-cgnat', 'malformed', 'bad-prefix', 'ipv6', 'host-bits'])
+@pytest.mark.parametrize('key', ['AWS_LAB_CIDR', 'GCP_LAB_CIDR'])
+def test_preflight_rejects_cgnat_malformed_ipv6_and_host_bit_cidrs(tmp_path, key, cidr):
+    result = _run(str(_write_env(tmp_path / '.env', {**valid_cloud_env(), key: cidr})))
+    assert result.returncode == 1
+    assert result.stderr.startswith(f'{key}:')
+
+
+# Catches the two clouds being handed overlapping lab networks.
+def test_preflight_rejects_overlapping_cloud_cidrs(tmp_path):
+    result = _run(str(_write_env(tmp_path / '.env', {
+        **valid_cloud_env(), 'GCP_LAB_CIDR': '172.20.128.0/17'})))
+    assert result.returncode == 1
+    assert result.stderr.startswith('AWS_LAB_CIDR:')
+
+
+# Catches cloud reservations draining a Proxmox node named like a backend (M14).
+def test_preflight_rejects_fixed_node_named_like_a_backend(tmp_path):
+    result = _run(str(_write_env(tmp_path / '.env', {**GOOD, 'FIXED_NODE': 'GCP'})))
+    assert result.returncode == 1
+    assert result.stderr.startswith('FIXED_NODE:')
+
+
+# Catches a cloud-only host failing on a Proxmox CA bundle it never uses.
+def test_proxmox_ca_bundle_is_ignored_when_proxmox_is_disabled(tmp_path):
+    values = {**valid_aws_env(), 'PROXMOX_CA_BUNDLE': str(tmp_path / 'absent.pem')}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
     assert result.returncode == 0, result.stderr

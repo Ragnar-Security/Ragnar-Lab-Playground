@@ -1,6 +1,6 @@
 [project]
 name = "automation"
-version = "1.0.0"
+version = "1.1.0"
 description = "Add your description here"
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,6 +32,14 @@ dependencies = [
     # we rely on threading being patched so queue.Queue.get yields). The upper
     # bound caps a future major-version surprise in the monkey-patch surface.
     "gevent>=23.9.0,<26",
+    # boto3: AWS backend; google-auth: GCP backend (pinned: a bare constraint would let an unrelated `uv lock` upgrade the cloud SDKs).
+    "boto3==1.43.123",
+    "google-auth==2.62.1",
+]
+
+[dependency-groups]
+dev = [
+    "moto[ec2]==5.2.5",
 ]
 
 [tool.pytest.ini_options]

@@ -407,6 +407,11 @@ def get_cluster_vm_index(proxmox: ProxmoxAPI, *,
             'type': row.get('type'),
             'status': row.get('status'),
         }
+        # ProxmoxBackend.list_managed must tell templates from guests without
+        # a per-guest config read. Only when the row reports it, so an entry
+        # for a row without the field keeps exactly its previous shape.
+        if 'template' in row:
+            index[vmid]['template'] = row['template']
     with _vm_index_lock:
         _vm_index_cache = index
         _vm_index_fetched_at = time.monotonic()
@@ -419,12 +424,41 @@ VM_GUEST_MISMATCH = 'mismatch'
 VM_GUEST_UNKNOWN = 'unknown'
 
 
+def _configured_guest_name(proxmox: ProxmoxAPI, vmid: int, *, node: str,
+                           vm_type: str) -> Optional[str]:
+    """The guest's name from its own config on `node`, or None if unreadable.
+
+    The config file is written by the clone itself, so it is authoritative
+    the moment the clone returns; `/cluster/resources` takes its `name` from
+    pvestatd's ~10 s status broadcast instead.
+    """
+    if vm_type not in ('qemu', 'lxc'):
+        return None
+    try:
+        config = getattr(proxmox.nodes(node), vm_type)(vmid).config.get()
+    except Exception as error:
+        logger.warning("Cannot read config of VM %s on %s to verify its "
+                       "identity: %s", vmid, node, error)
+        return None
+    if not isinstance(config, dict):
+        return None
+    name = config.get('hostname' if vm_type == 'lxc' else 'name')
+    return name if isinstance(name, str) else None
+
+
 def inspect_vm_guest(proxmox: ProxmoxAPI, vmid: int, *, node: str,
                      vm_name: str, vm_type: str) -> str:
     """Read fresh inventory and verify the VMID still names the intended guest.
 
     A replacement at the same VMID must never inherit a stale destroy request.
     ``unknown`` fails closed when inventory cannot be read.
+
+    For about 10 s after a clone, `/cluster/resources` reports the guest's
+    `name` as empty, or as the previous guest's name at a reused VMID: node
+    and type come from the cluster's VM list and are current, the name comes
+    from the periodic status broadcast. When only the name disagrees, the
+    guest's own config on the expected node decides. A config naming another
+    guest, or one that cannot be read, still refuses.
     """
     try:
         index = get_cluster_vm_index(
@@ -441,17 +475,28 @@ def inspect_vm_guest(proxmox: ProxmoxAPI, vmid: int, *, node: str,
         return VM_GUEST_UNKNOWN
     if entry is None:
         return VM_GUEST_ABSENT
-    if (
-        entry.get('name') != vm_name
-        or entry.get('node') != node
-        or entry.get('type') != vm_type
-    ):
+    if entry.get('node') == node and entry.get('type') == vm_type:
+        if entry.get('name') == vm_name:
+            return VM_GUEST_MATCH
+        configured = _configured_guest_name(
+            proxmox, int(vmid), node=node, vm_type=vm_type)
+        if configured == vm_name:
+            logger.info(
+                "VM %s: inventory still lists name %r; its config names %s",
+                vmid, entry.get('name'), vm_name)
+            return VM_GUEST_MATCH
         logger.warning(
-            "Refusing to mutate VMID %s: expected %s/%s/%s, found %s/%s/%s",
+            "Refusing to mutate VMID %s: expected %s/%s/%s, found %s/%s/%s "
+            "(config name %r)",
             vmid, node, vm_type, vm_name,
-            entry.get('node'), entry.get('type'), entry.get('name'))
+            entry.get('node'), entry.get('type'), entry.get('name'),
+            configured)
         return VM_GUEST_MISMATCH
-    return VM_GUEST_MATCH
+    logger.warning(
+        "Refusing to mutate VMID %s: expected %s/%s/%s, found %s/%s/%s",
+        vmid, node, vm_type, vm_name,
+        entry.get('node'), entry.get('type'), entry.get('name'))
+    return VM_GUEST_MISMATCH
 
 
 def confirm_proxmox_absence(proxmox: ProxmoxAPI, vmid: int,
@@ -592,7 +637,7 @@ def get_vm_details(proxmox, vmid, node):
 
 
 def get_next_available_vmid(
-        proxmox: ProxmoxAPI, *,
+        proxmox: Optional[ProxmoxAPI] = None, *,
         count: int = 1,
         reservation_id: str) -> int:
     """Reserve and return the first VMID in a contiguous free block.
@@ -602,6 +647,10 @@ def get_next_available_vmid(
     receive overlapping blocks. The mark, not the inventory snapshot,
     serializes the app's own allocations; the Proxmox read therefore runs
     before the lock and never holds it across a network call.
+
+    ``proxmox`` is None on a portal without Proxmox: there is no cluster
+    inventory to avoid, and the mark, every VMRecord and the live
+    reservations still bound the block.
 
     ``reservation_id`` may be reused to extend a deployment's reservation
     when a defensive duplicate-VMID retry needs a fresh ID. Callers release
@@ -613,7 +662,8 @@ def get_next_available_vmid(
         raise ValueError('VMID reservation identifier is required')
 
     inventory_max = 0
-    for row in proxmox.cluster.resources.get(type='vm') or []:
+    rows = proxmox.cluster.resources.get(type='vm') if proxmox is not None else []
+    for row in rows or []:
         try:
             inventory_max = max(inventory_max, int(row['vmid']))
         except (KeyError, TypeError, ValueError):
@@ -659,40 +709,6 @@ def get_next_available_vmid(
         engine, coordination.VMID_ALLOCATOR, allocate)
     coordination.remember_lease_engine(table, reservation_id, engine)
     return base_vmid
-
-
-def find_vms_by_name_prefix(prefix):
-    """Return [{vmid, node, vm_type, name}, ...] for every VM in Proxmox
-    whose name starts with `prefix`.
-
-    Used to recover stranded KOTH VMs whose VMRecord rows never made it to
-    the DB (e.g. the worker was SIGTERM'd mid-deploy, so our in-process
-    cleanup never ran). Searches both QEMU and LXC across all cluster nodes.
-    """
-    proxmox = get_proxmox_connection()
-    found = []
-    try:
-        nodes = proxmox.nodes.get()
-    except Exception:
-        logger.exception("find_vms_by_name_prefix: failed to enumerate nodes")
-        return found
-    for node in nodes:
-        node_name = node['node']
-        try:
-            for vm in proxmox.nodes(node_name).qemu.get():
-                if (vm.get('name') or '').startswith(prefix):
-                    found.append({'vmid': vm['vmid'], 'node': node_name,
-                                  'vm_type': 'qemu', 'name': vm.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: qemu list failed on {node_name}")
-        try:
-            for lxc in proxmox.nodes(node_name).lxc.get():
-                if (lxc.get('name') or '').startswith(prefix):
-                    found.append({'vmid': lxc['vmid'], 'node': node_name,
-                                  'vm_type': 'lxc', 'name': lxc.get('name')})
-        except Exception:
-            logger.exception(f"find_vms_by_name_prefix: lxc list failed on {node_name}")
-    return found
 
 
 def get_available_node(proxmox: ProxmoxAPI) -> Optional[str]:
@@ -952,7 +968,8 @@ def select_best_node(proxmox: ProxmoxAPI,
     the VMRecord commit or after every failure/cleanup path.
     """
     from .config import (
-        CPU_THRESHOLD, MEMORY_THRESHOLD, ENABLE_LOAD_BALANCING, FIXED_NODE)
+        CLOUD_BACKENDS, CPU_THRESHOLD, MEMORY_THRESHOLD, ENABLE_LOAD_BALANCING,
+        FIXED_NODE)
 
     if load_balancing_config:
         lb_enabled = load_balancing_config.get(
@@ -989,6 +1006,17 @@ def select_best_node(proxmox: ProxmoxAPI,
     else:
         all_nodes = get_all_nodes_resources(proxmox)
         logger.info("Fetched fresh node resources (%d nodes)", len(all_nodes))
+
+    # Admission reservations are keyed by node name, and a cloud backend
+    # reserves under its own name ('aws', 'gcp'), so a Proxmox node with that
+    # name would share the cloud's ledger and miscount both. Never admit to it.
+    shadowed = sorted(node['node'] for node in all_nodes
+                      if str(node.get('node', '')).lower() in CLOUD_BACKENDS)
+    if shadowed:
+        logger.error("Refusing Proxmox node(s) %s: a node may not be named after a "
+                     "cloud backend (%s)", ', '.join(shadowed), ', '.join(CLOUD_BACKENDS))
+        all_nodes = [node for node in all_nodes
+                     if str(node.get('node', '')).lower() not in CLOUD_BACKENDS]
 
     if not all_nodes:
         logger.info("No nodes available")

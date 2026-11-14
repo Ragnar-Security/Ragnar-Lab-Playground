@@ -1,7 +1,7 @@
 """Safety harness for the opt-in live Proxmox contract run.
 
 The contract run clones, boots, stops and deletes real guests. Everything
-destructive goes through ``ContractRun``, which enforces five rules:
+destructive goes through ``ContractRun``, which enforces six rules:
 
 * it only ever allocates VMIDs inside ``LIVE_VMID_RANGE``, and refuses to
   start while any guest in that range lacks the ``lab-contract-test-`` prefix;
@@ -13,7 +13,18 @@ destructive goes through ``ContractRun``, which enforces five rules:
 * cleanup runs on exit even when the body raised;
 * it starts, stops or destroys only a guest it created in this run, and
   only while fresh inventory still shows the exact name and node it gave
-  that guest.
+  that guest;
+* it never reuses a VMID this process freed in the last
+  ``VMID_REUSE_COOLDOWN`` seconds.
+
+``/cluster/resources`` takes a guest's ``name`` from pvestatd's ~10 s status
+broadcast, so for about 10 s after a clone it reads empty, or the previous
+guest's name at a reused VMID (measured 10.49 s and 9.97 s). The harness
+waits up to ``NAME_SETTLE_SECONDS`` for its own name before it trusts or
+refuses a row; that wait never turns a different name into a match.
+
+``LIVE_VLAN`` (optional) tags the clone's single NIC, so a run need not put
+a booted template on the untagged (management) network.
 
 The guards are unit-tested against a fake API in
 ``tests/test_live_contract_guards.py``.
@@ -22,6 +33,7 @@ The guards are unit-tested against a fake API in
 import re
 import secrets
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Callable, Dict, List, Mapping, Optional
@@ -43,6 +55,14 @@ EXPIRY = timedelta(minutes=30)
 # Proxmox accepts VMIDs 100..999999999.
 MIN_VMID = 100
 MAX_VMID = 999_999_999
+# The listed name lags a clone by ~10 s; three cycles of margin.
+NAME_SETTLE_SECONDS = 30
+# A freed VMID keeps the old guest's listed name for ~10 s.
+VMID_REUSE_COOLDOWN = 15
+
+# VMID -> time.monotonic() when this process freed it. Module-level because
+# every test builds its own ContractRun over the same range.
+_RECENTLY_FREED: Dict[int, float] = {}
 
 REQUIRED_ENV = ('PROXMOX_HOST', 'LIVE_TEMPLATE_VMID', 'LIVE_NODE',
                 'LIVE_VMID_RANGE')
@@ -67,6 +87,16 @@ def parse_vmid_range(text: str) -> range:
             f'LIVE_VMID_RANGE {text!r} must satisfy '
             f'{MIN_VMID} <= low <= high <= {MAX_VMID}')
     return range(low, high + 1)
+
+
+def parse_vlan(text: Optional[str]) -> Optional[int]:
+    """Parse optional ``LIVE_VLAN``: empty means untagged, else 1..4094."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    if not re.fullmatch(r'\d+', text) or not 1 <= int(text) <= 4094:
+        raise ValueError(f'LIVE_VLAN must be a VLAN tag 1-4094, got {text!r}')
+    return int(text)
 
 
 def live_skip_reason(environ: Mapping[str, str]) -> Optional[str]:
@@ -144,6 +174,7 @@ class LiveConfig:
     vmid_range: range
     portal_database_url: Optional[str] = None
     separate_cluster: bool = False
+    vlan: Optional[int] = None
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str]) -> 'LiveConfig':
@@ -165,7 +196,8 @@ class LiveConfig:
                 'not both')
         return cls(nodes, templates, storage,
                    parse_vmid_range(environ.get('LIVE_VMID_RANGE', '')),
-                   portal_database_url, separate_cluster)
+                   portal_database_url, separate_cluster,
+                   parse_vlan(environ.get('LIVE_VLAN')))
 
     def template_for(self, node: str) -> int:
         return self.templates[node]
@@ -200,12 +232,20 @@ class ContractRun:
     def __init__(self, proxmox, vmid_range: range, *,
                  portal_vmid_mark: Optional[int] = None,
                  separate_cluster: bool = False,
-                 now: Callable[[], datetime] = datetime.now):
+                 vlan: Optional[int] = None,
+                 now: Callable[[], datetime] = datetime.now,
+                 clock: Callable[[], float] = time.monotonic,
+                 sleep: Callable[[float], None] = time.sleep,
+                 recently_freed: Optional[Dict[int, float]] = None):
         self.proxmox = proxmox
         self.vmid_range = vmid_range
         self.portal_vmid_mark = portal_vmid_mark
         self.separate_cluster = separate_cluster
+        self.vlan = vlan
         self.now = now
+        self.clock = clock
+        self.sleep = sleep
+        self._freed = _RECENTLY_FREED if recently_freed is None else recently_freed
         self._owned: Dict[int, Guest] = {}
 
     def __enter__(self) -> 'ContractRun':
@@ -280,23 +320,52 @@ class ContractRun:
         self._require_clean_range(inventory)
         self._require_range_below_portal_mark(inventory)
 
+    def _cooling(self, vmid: int) -> bool:
+        freed = self._freed.get(vmid)
+        if freed is None:
+            return False
+        if self.clock() - freed >= VMID_REUSE_COOLDOWN:
+            del self._freed[vmid]
+            return False
+        return True
+
     def _allocate_vmid(self) -> int:
         inventory = self._inventory()
         # Re-checked on every allocation: a guest that appeared since
         # preflight means someone else is using this range right now.
         self._require_clean_range(inventory)
         for vmid in self.vmid_range:
-            if vmid not in inventory and vmid not in self._owned:
+            if (vmid not in inventory and vmid not in self._owned
+                    and not self._cooling(vmid)):
                 return vmid
         raise UnsafeLiveRun(
             f'no free VMID left in LIVE_VMID_RANGE '
-            f'{self.vmid_range[0]}-{self.vmid_range[-1]}; remove leftover '
+            f'{self.vmid_range[0]}-{self.vmid_range[-1]} (VMIDs freed in the '
+            f'last {VMID_REUSE_COOLDOWN} s are not reused); remove leftover '
             f'{NAME_PREFIX}* guests by hand')
+
+    def _settled_row(self, guest: Guest) -> Optional[dict]:
+        """Fresh inventory's row for `guest.vmid`, once it lists `guest`.
+
+        Polls while the row is present under any other name or node, up to
+        NAME_SETTLE_SECONDS, then returns whatever it last read: an absent
+        VMID returns at once, and a row that never settles is returned as
+        is, for the caller to refuse.
+        """
+        deadline = self.clock() + NAME_SETTLE_SECONDS
+        while True:
+            row = self._inventory().get(guest.vmid)
+            if row is None or (row.get('name') == guest.name
+                               and row.get('node') == guest.node):
+                return row
+            if self.clock() >= deadline:
+                return row
+            self.sleep(1)
 
     def _settle_failed_clone(self, guest: Guest) -> None:
         """Keep the claim only while inventory shows this run's guest."""
         try:
-            row = self._inventory().get(guest.vmid)
+            row = self._settled_row(guest)
         except Exception:
             # Unknown state: keep the claim. Cleanup re-checks identity
             # before any mutation, so this cannot reach a foreign guest.
@@ -327,10 +396,12 @@ class ContractRun:
         if storage:
             config['storage_locations'] = {node: storage}
         expires = self.now() + EXPIRY
+        # One NIC: internal_vlan_tag without an entry tag tags net0 only.
+        network = {'internal_vlan_tag': self.vlan} if self.vlan else {}
         try:
             try:
                 create_qemu_vm(self.proxmox, node, node, guest.vmid, guest.name,
-                               template_vmid, config, expires)
+                               template_vmid, config, expires, **network)
             except Exception:
                 # Storage without linked-clone support rejects the POST
                 # before any guest exists; only then is a full clone safe.
@@ -338,10 +409,13 @@ class ContractRun:
                     raise
                 create_qemu_vm(self.proxmox, node, node, guest.vmid, guest.name,
                                template_vmid, dict(config, full_clone=True),
-                               expires)
+                               expires, **network)
         except Exception:
             self._settle_failed_clone(guest)
             raise
+        # Return only once inventory names the guest, so every later guard
+        # (and the caller's own reads) sees it as this run's.
+        self._require_identity(guest, self._settled_row(guest), 'use')
         return guest
 
     def _endpoint(self, guest: Guest):
@@ -367,7 +441,7 @@ class ContractRun:
         if self._owned.get(guest.vmid) != guest:
             raise UnsafeLiveRun(
                 f'refusing to {action} VMID {guest.vmid}: this run did not create it')
-        self._require_identity(guest, self._inventory().get(guest.vmid), action)
+        self._require_identity(guest, self._settled_row(guest), action)
         upid = getattr(self._endpoint(guest).status, action).post()
         result = wait_for_proxmox_task(self.proxmox, guest.node, upid,
                                        timeout=120, poll_interval=1)
@@ -385,7 +459,7 @@ class ContractRun:
         """Stop and delete one guest this run created; return the delete task result."""
         guest = self._owned_guest(vmid, 'destroy')
         vmid = guest.vmid
-        row = self._inventory().get(vmid)
+        row = self._settled_row(guest)
         if row is None:
             if confirm_proxmox_absence(self.proxmox, vmid):
                 self._owned.pop(vmid)
@@ -408,6 +482,7 @@ class ContractRun:
         if not result['success']:
             raise LiveCleanupError(
                 f"VMID {vmid}: delete task failed: {result.get('error')}")
+        self._freed[vmid] = self.clock()
         if not confirm_proxmox_absence(self.proxmox, vmid):
             raise LiveCleanupError(
                 f'VMID {vmid}: still in cluster inventory after delete')

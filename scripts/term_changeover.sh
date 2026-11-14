@@ -11,7 +11,8 @@ SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
-    EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS HEADSCALE_SCRIPT HEADSCALE_DB
+    EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS HEADSCALE_SCRIPT HEADSCALE_DB \
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE
 for name in PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
     EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS; do
@@ -47,6 +48,7 @@ else
 fi
 BUILD_MERGED="$SCRIPT_DIR/build_students_merged.py"
 PURGE_SQL="$SCRIPT_DIR/purge_roster.sql"
+APPLY_POLICY="$SCRIPT_DIR/apply_headscale_policy.sh"
 LOCAL_MERGED="$REPO_ROOT/data/students_merged.csv"
 APPLY=0
 CANVAS=""
@@ -63,6 +65,7 @@ The default dry run reads both real hosts and writes nothing. It reports:
   - Headscale users to remove and create.
   - Roster files to replace.
   - Whitelist rows to delete and seed.
+  - The Headscale policy change for the roster the portal holds now.
 
 Use --apply to create backups and perform the changeover. The script never
 changes a Proxmox VM, a template, or a dojo repository.
@@ -129,6 +132,7 @@ fi
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
 [[ -f "$BUILD_MERGED" ]] || die "Merge tool not found: $BUILD_MERGED"
 [[ -f "$PURGE_SQL" ]] || die "Purge SQL not found: $PURGE_SQL"
+[[ -f "$APPLY_POLICY" ]] || die "Policy stage not found: $APPLY_POLICY"
 
 # The helper needs a regular roster file. A Linux memory file keeps dry runs write-free.
 HEADSCALE_MEMFD_RUNNER='import os,sys; fd=os.memfd_create("incoming-roster.csv"); os.write(fd,sys.stdin.buffer.read()); os.lseek(fd,0,0); os.set_inheritable(fd,True); os.execv("/bin/bash",["bash",sys.argv[1],f"/proc/self/fd/{fd}",*sys.argv[2:]])'
@@ -451,7 +455,7 @@ read_headscale_summary
 helper_output="$(run_headscale_helper)" || die "The Headscale helper dry run failed."
 verify_helper_count "$helper_output"
 
-printf '[1/3] Headscale roster\n'
+printf '[1/4] Headscale roster\n'
 printf '  users to remove: %s\n' "$USERS_REMOVE"
 printf '  users to create: %s\n' "$USERS_CREATE"
 printf '  roster rows: %s\n' "$ROSTER_COUNT"
@@ -475,7 +479,7 @@ fi
 local_hash="missing"
 [[ -f "$LOCAL_MERGED" ]] && local_hash="$(file_hash_local "$LOCAL_MERGED")"
 remote_hash="$(file_hash_portal)"
-printf '\n[2/3] Mounted roster file\n'
+printf '\n[2/4] Mounted roster file\n'
 if [[ "$local_hash" == "$DESIRED_HASH" && "$remote_hash" == "$DESIRED_HASH" ]]; then
     printf '  nothing to do: local and production files match %s rows.\n' "$ROSTER_COUNT"
 else
@@ -494,7 +498,7 @@ else
 fi
 
 read_db_summary
-printf '\n[3/3] Production database\n'
+printf '\n[3/4] Production database\n'
 printf '  whitelist rows to delete: %s\n' "$WHITELIST_DELETE"
 printf '  whitelist rows to seed: %s\n' "$WHITELIST_SEED"
 if [[ "$WHITELIST_EXACT" == 1 ]]; then
@@ -509,9 +513,23 @@ else
     printf '  verified: the whitelist has the exact %s rows.\n' "$ROSTER_COUNT"
 fi
 
+# Last: the policy is rendered from the portal's roster, which --apply has
+# just purged and reseeded above.
+printf '\n[4/4] Headscale policy\n'
+((WHITELIST_EXACT == 1 || APPLY == 1)) \
+    || printf '  rendered from the roster the portal holds now; --apply renders it again after the reseed.\n'
+policy_mode=""
+((APPLY == 0)) || policy_mode="--apply"
+policy_output="$(SITE_ENV_FILE="$SITE_ENV_FILE" bash "$APPLY_POLICY" $policy_mode)" \
+    || { printf '%s\n' "$policy_output"; die "The Headscale policy stage failed."; }
+printf '%s\n' "$policy_output"
+POLICY_CURRENT=0
+[[ "$policy_output" != *"nothing to do: the policy file Headscale serves matches the rendered one."* ]] \
+    || POLICY_CURRENT=1
+
 printf '\n'
 if ((APPLY == 0)); then
-    if ((USERS_REMOVE == 0 && USERS_CREATE == 0 && KEYS_MISSING == 0 && KEYS_EXTRA == 0)) \
+    if ((USERS_REMOVE == 0 && USERS_CREATE == 0 && KEYS_MISSING == 0 && KEYS_EXTRA == 0 && POLICY_CURRENT == 1)) \
        && [[ "$local_hash" == "$DESIRED_HASH" && "$remote_hash" == "$DESIRED_HASH" && "$WHITELIST_EXACT" == 1 ]]; then
         printf 'Changeover complete. Every stage has nothing to do.\n'
     else

@@ -38,6 +38,11 @@ Start here to get the application up and running:
   - Testing procedures
   - Debugging tips
 
+- **[LOCAL_TEST_INSTANCE.md](LOCAL_TEST_INSTANCE.md)** - Run a throwaway local portal against the real Proxmox cluster
+  - The orphan reaper must be `false` (an empty value turns it on)
+  - Test logins, a test VLAN and a test-only catalog
+  - Start, check, use and tear down
+
 - **[DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md)** - Original developer documentation
   - Code architecture
   - Contributing guidelines
@@ -67,7 +72,7 @@ Start here to get the application up and running:
   - Canvas integration
 
 ### Load Balancing
-- **[LOAD_BALANCING.md](LOAD_BALANCING.md)** - Load balancing implementation
+- **[LOAD_BALANCING.md](LOAD_BALANCING.md)** - Proxmox node selection and memory admission (cloud backends use a machine cap instead)
   - Node selection algorithm
   - Weighted random distribution
   - Resource monitoring
@@ -86,10 +91,20 @@ Start here to get the application up and running:
   - Full HTTP API + file-by-file architecture reference
 
 ### Lab Jumpbox
-- **[JUMPBOX.md](JUMPBOX.md)** - The router for every lab VLAN
+- **[JUMPBOX.md](JUMPBOX.md)** - The router for every Proxmox lab VLAN
   - Provisioning the VM, VLAN gateways and DHCP, Tailscale subnet router
   - Recommended Headscale ACL and key-only SSH
   - Optional Zeek/RITA monitoring and student accounts
+  - VLAN isolation (`jumpbox_configure.sh --isolate-vlans`)
+
+### Cloud Backends (AWS, Google Cloud)
+- **[CLOUD_BACKENDS.md](CLOUD_BACKENDS.md)** - Operator runbook for lab VMs on Amazon EC2 and Google Compute Engine beside Proxmox
+  - Safety model: `LAB_SITE_ID` ownership, no public address or internet route, caps, conservative sweeping
+  - Shared address plan: per-owner `/26` network slots
+  - One-time VPC, subnet router and IAM setup per cloud; router Tailscale flags
+  - Settings, credentials, validation, cost model and quotas
+  - Applying the per-student Headscale policy and jumpbox VLAN isolation
+  - Teardown, incident response and rollback
 
 ## Architecture & Technical Details
 
@@ -109,6 +124,7 @@ Start here to get the application up and running:
 1. [PRODUCTION_QUICK_START.md](PRODUCTION_QUICK_START.md) - Start here
 2. [PRODUCTION_DEPLOYMENT.md](PRODUCTION_DEPLOYMENT.md) - Full details
 3. [DOCKER.md](DOCKER.md) - Docker specifics
+4. [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md) - Only when placing labs on AWS or Google Cloud
 
 ### "I want to develop/contribute"
 1. [DEVELOPMENT.md](DEVELOPMENT.md) - Development setup

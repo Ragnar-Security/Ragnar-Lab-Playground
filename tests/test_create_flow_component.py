@@ -200,3 +200,27 @@ def test_create_rejects_nodes_without_reclaimable_memory(create_client):
     )
     with app.app_context():
         assert VMRecord.query.count() == 0
+
+
+# Catches the generic create path committing a Proxmox record without the
+# backend identity later lifecycle paths dispatch on.
+def test_create_persists_proxmox_backend_identity(create_client):
+    app, client = create_client
+    boundary = ProxmoxBoundary(
+        {
+            "node1": node_status(cpu=0.10, available=56 * GIB),
+            "node2": node_status(cpu=0.95, available=63 * GIB),
+        }
+    )
+
+    with patch("app.proxmox_service.ProxmoxAPI", return_value=boundary.api):
+        response = client.post("/create", data={"deployment_group": GROUP_NAME})
+
+    assert response.get_json()["success"] is True
+    with app.app_context():
+        record = VMRecord.query.one()
+        assert record.backend == "proxmox"
+        assert record.provider_id is None
+        # The entry-point machine sits on the owner's entry VLAN.
+        assert record.network_slot == 111
+        assert len(record.deployment_id) == 32

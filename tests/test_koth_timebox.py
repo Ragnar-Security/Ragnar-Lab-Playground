@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from app import create_app, koth_scorer
 from app.models import db, User, StudentGroup, KothGame, KothTeam, KothBox
+from tests.backends.fake_backend import StaticInventoryBackend
 
 
 def _naive_utc():
@@ -111,7 +112,8 @@ class TimeboxTestCase(unittest.TestCase):
         g.ends_at = _compute_ends_at(g)
         db.session.commit()
         with patch('app.routes.koth_admin.cleanup_vms', return_value=None), \
-             patch('app.proxmox_service.find_vms_by_name_prefix', return_value=[]):
+             patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend([])):
             koth_scorer.run_tick(g.id)
         db.session.refresh(g)
         self.assertEqual(g.status, 'ended')

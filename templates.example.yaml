@@ -31,3 +31,58 @@ deployment_groups:
         template_locations:
           node1: 7101
           node2: 7201
+
+  # One machine described for all three backends. Which backend a group runs
+  # on is chosen by `backend:` — on the group it sets the default (proxmox
+  # when absent), on a machine it overrides the group's — and every machine
+  # of one group must resolve to the same backend. This group sets no
+  # `backend:` anywhere, so it resolves to Proxmox and validates on a
+  # Proxmox-only portal (ENABLED_BACKENDS=proxmox). Add `backend: aws` or
+  # `backend: gcp` to the group only after enabling that backend in
+  # ENABLED_BACKENDS: a group whose backend is not enabled is refused. A cloud
+  # machine's image and size come only from its own block (`aws:` or `gcp:`),
+  # and koth_mode groups stay on Proxmox. docs/CLOUD_BACKENDS.md is the
+  # operator runbook.
+  - display_name: "multi-backend-example"
+    description: >
+      Generic Linux workstation, one machine per student.
+    enabled: false
+    group_mode: false
+    uptime_minutes: 240
+    extend_time_minutes: 120
+    templates:
+      - name: "linux-workstation"
+        entry_point: true
+        connect:
+          protocol: "ssh"
+          port: 22
+          username: "student"
+        # Proxmox spec. Flat top-level keys are the Proxmox spec unchanged.
+        # A nested block overlays them instead, for a machine whose
+        # top-level keys are shared with the cloud specs:
+        #   proxmox:
+        #     template_locations: {node1: 7102, node2: 7202}
+        #     storage_locations: {node1: "local-zfs", node2: "local-zfs"}
+        # Node names aws and gcp are reserved for the cloud backends.
+        type: "qemu"
+        memory: 4096
+        cores: 2
+        full_clone: false
+        internal_nic: false
+        storage_locations:
+          node1: "local-zfs"
+          node2: "local-zfs"
+        template_locations:
+          node1: 7102
+          node2: 7202
+        # Cloud specs: an explicit size, never derived from memory/cores.
+        # The image must be complete; lab VMs have no internet route.
+        # disk_gb defaults to 20 when omitted.
+        aws:
+          image_id: "<aws-ami-id>"
+          instance_type: "t3.medium"
+          disk_gb: 30
+        gcp:
+          image: "projects/<gcp-project>/global/images/<image-name>"
+          machine_type: "e2-medium"
+          disk_gb: 30

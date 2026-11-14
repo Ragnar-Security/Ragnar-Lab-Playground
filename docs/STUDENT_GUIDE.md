@@ -48,8 +48,12 @@ registration URL from your instructor and verify that Tailscale reports
 
 ### Step 3: Verify Connection
 
-Once connected, your computer can reach the lab networks (`10.x.x.x`)
-directly. The lab jumpbox routes that traffic for you.
+Once connected, your computer can reach your lab networks directly. Labs on
+the course's own servers use `10.x.x.x` addresses, and the lab jumpbox routes
+that traffic for you. Labs your instructor runs in a cloud (AWS or Google
+Cloud) use other private addresses (by default `172.20.x.x` or `172.21.x.x`),
+routed by a cloud router instead. You connect to both the same way: use the
+address the portal shows.
 
 ---
 
@@ -228,10 +232,11 @@ local data.
 - Delete unused labs to free up resources for yourself and others
 
 ### Network Access
-- VMs are isolated on your personal VLAN
+- VMs are isolated on your personal VLAN (in a cloud lab, your personal private subnet)
 - Only you can access your VMs (plus instructor for support)
 - VMs in the same deployment group can communicate with each other
-- Entry point VMs may have external access (depending on template)
+- Entry point VMs on the course's own servers may have external access (depending on template)
+- Cloud-hosted labs have no internet access at all: everything the lab needs is already installed, and nothing can be downloaded inside it
 
 ### Best Practices
 1. **Monitor expiration times:** Check the My Labs tab regularly so you don't lose work to automatic deletion
@@ -289,7 +294,7 @@ local data.
 **Problem:** Lab creation seems stuck or never completes
 
 **Solution:**
-1. Wait 2-5 minutes (multi-VM labs take time to provision)
+1. Wait 2-5 minutes (multi-VM labs take time to provision). The first cloud lab of a session can take about a minute longer while the cloud router starts
 2. Refresh the My Labs tab
 3. If the lab appears but entry-point IP shows "N/A", wait another minute for the VM to boot and acquire an IP
 4. Contact instructor if the problem persists

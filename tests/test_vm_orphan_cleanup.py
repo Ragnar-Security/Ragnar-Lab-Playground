@@ -26,6 +26,7 @@ import app.routes.utils as route_utils
 from app.routes.utils import (
     VM_CONFIG_ERROR, VM_MISSING, VM_PRESENT, VM_UNKNOWN, _verify_vm_exists,
 )
+from tests.backends.fake_backend import StaticDisplayBackend
 
 
 class ProxmoxError(Exception):
@@ -182,12 +183,10 @@ class ListOrphanCleanupTests(unittest.TestCase):
         self.ctx.pop()
 
     def _list(self, verify_result):
-        with patch('app.routes.vm_listing.get_proxmox_connection',
-                   return_value=MagicMock()), \
-             patch('app.routes.vm_listing._verify_vm_exists',
-                   return_value=verify_result), \
-             patch('app.routes.vm_listing._get_vm_ip_addresses',
-                   return_value=['10.0.0.9']), \
+        # The verdict `_verify_vm_exists` used to return, now the backend's.
+        state, _error = verify_result
+        with patch('app.routes.vm_listing.backend_for',
+                   return_value=StaticDisplayBackend(state, ips=['10.0.0.9'])), \
              patch('app.routes.vm_listing.load_template_config',
                    return_value={'deployment_groups': []}):
             return self.client.get('/list')

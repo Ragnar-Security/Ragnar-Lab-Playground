@@ -5,6 +5,7 @@ Handles environment variables and Flask configuration
 
 import os
 import logging
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -97,6 +98,84 @@ ENABLE_LOAD_BALANCING = os.getenv('ENABLE_LOAD_BALANCING', 'false').lower() == '
 FIXED_NODE = os.getenv('FIXED_NODE', '')
 CPU_THRESHOLD = _env_number('CPU_THRESHOLD', '80.0', float)
 MEMORY_THRESHOLD = _env_number('MEMORY_THRESHOLD', '85.0', float)
+
+# ============ VM BACKENDS ============
+# Which VM backends this portal places labs on, as a comma list. Unset or
+# empty keeps the Proxmox-only behaviour every existing site runs. Only the
+# enabled backends' settings below are required (validate_config()).
+KNOWN_BACKENDS = ('proxmox', 'aws', 'gcp')
+CLOUD_BACKENDS = ('aws', 'gcp')
+
+
+def _parse_enabled_backends(raw):
+    """Lower-case unique names in declaration order; unset or empty means
+    ('proxmox',). Unknown names and a list of nothing (',') are kept, not
+    dropped, so validate_config() can refuse them instead of silently
+    running a different set than the operator wrote."""
+    if raw is None or not raw.strip():
+        return ('proxmox',)
+    names = []
+    for part in raw.split(','):
+        name = part.strip().lower()
+        if name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _env_text(name, default=''):
+    """A string env var, stripped; unset or empty means `default`."""
+    return (os.getenv(name) or '').strip() or default
+
+
+def _env_optional_int(name):
+    """An integer env var with no default: None when unset, empty or not an
+    integer, so validate_config() can say it is required."""
+    try:
+        return int(_env_text(name))
+    except ValueError:
+        return None
+
+
+ENABLED_BACKENDS = _parse_enabled_backends(os.getenv('ENABLED_BACKENDS'))
+# Ownership tag on every cloud resource this portal creates; the cloud
+# sweepers only ever touch resources carrying their own site's tag.
+LAB_SITE_ID = _env_text('LAB_SITE_ID')
+_LAB_SITE_ID_PATTERN = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,18}[a-z0-9])?')
+
+AWS_REGION = _env_text('AWS_REGION')
+AWS_AVAILABILITY_ZONE = _env_text('AWS_AVAILABILITY_ZONE')
+AWS_LAB_VPC_ID = _env_text('AWS_LAB_VPC_ID')
+AWS_LAB_CIDR = _env_text('AWS_LAB_CIDR', '172.20.0.0/16')
+AWS_ROUTER_INSTANCE_ID = _env_text('AWS_ROUTER_INSTANCE_ID')
+AWS_MAX_VMS = _env_optional_int('AWS_MAX_VMS')
+AWS_ROUTER_IDLE_MINUTES = _env_number('AWS_ROUTER_IDLE_MINUTES', 30, int)
+AWS_LAUNCH_TIMEOUT_SECONDS = _env_number('AWS_LAUNCH_TIMEOUT_SECONDS', 600, int)
+AWS_TERMINATE_TIMEOUT_SECONDS = _env_number('AWS_TERMINATE_TIMEOUT_SECONDS', 600, int)
+
+GCP_PROJECT = _env_text('GCP_PROJECT')
+GCP_REGION = _env_text('GCP_REGION')
+GCP_ZONE = _env_text('GCP_ZONE')
+GCP_NETWORK = _env_text('GCP_NETWORK')
+GCP_LAB_CIDR = _env_text('GCP_LAB_CIDR', '172.21.0.0/16')
+GCP_ROUTER_INSTANCE = _env_text('GCP_ROUTER_INSTANCE')
+GCP_MAX_VMS = _env_optional_int('GCP_MAX_VMS')
+GCP_ROUTER_IDLE_MINUTES = _env_number('GCP_ROUTER_IDLE_MINUTES', 30, int)
+GCP_OPERATION_TIMEOUT_SECONDS = _env_number('GCP_OPERATION_TIMEOUT_SECONDS', 600, int)
+
+# Settings each enabled cloud cannot place a VM without; the cap is checked
+# separately because it must also be positive.
+_CLOUD_REQUIRED = {
+    'aws': ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID',
+            'AWS_ROUTER_INSTANCE_ID'),
+    'gcp': ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK',
+            'GCP_ROUTER_INSTANCE'),
+}
+
+# The jumpbox's VLAN bands (docs/JUMPBOX.md), read here so the Headscale
+# policy export grants exactly the Proxmox networks the jumpbox routes.
+JUMPBOX_VLAN_BANDS = _env_text(
+    'JUMPBOX_VLAN_BANDS',
+    'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
 
 # ============ ORPHAN REAPER CONFIGURATION ============
 # A fallback for clones whose VMRecord was never committed because the app
@@ -350,21 +429,66 @@ def _production_secret_errors():
     return errors
 
 
+def _validate_configured_lab_cidrs(enabled, validate_lab_cidr):
+    """Validate each enabled cloud's lab base against the reserved ranges
+    and the other enabled clouds' bases; a disabled cloud's base is never
+    allocated, so it is not checked."""
+    bases = {'aws': AWS_LAB_CIDR, 'gcp': GCP_LAB_CIDR}
+    clouds = [name for name in enabled if name in CLOUD_BACKENDS]
+    for name in clouds:
+        others = {other: bases[other] for other in clouds if other != name}
+        validate_lab_cidr(name, bases[name], others=others)
+
+
+def _backend_errors(enabled):
+    """Missing or invalid settings of the enabled backends only."""
+    errors = []
+    if 'proxmox' in enabled:
+        if not PROXMOX_HOST:
+            errors.append("PROXMOX_HOST is not set")
+        has_token = PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET
+        has_password = PROXMOX_PASSWORD
+        if not has_token and not has_password:
+            errors.append("No Proxmox authentication configured. Set either PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET or PROXMOX_PASSWORD")
+        # Cloud admission reserves capacity under node='aws'/'gcp', and node
+        # reservations are summed by node name, so a Proxmox node with that
+        # name would lose capacity to cloud VMs.
+        if FIXED_NODE.strip().lower() in CLOUD_BACKENDS:
+            errors.append(f"FIXED_NODE {FIXED_NODE!r} is a cloud backend name; "
+                          "Proxmox nodes named aws or gcp are unsupported")
+    clouds = [name for name in enabled if name in CLOUD_BACKENDS]
+    if clouds:
+        if not LAB_SITE_ID:
+            errors.append(f"LAB_SITE_ID is required when {', '.join(clouds)} is enabled")
+        elif not _LAB_SITE_ID_PATTERN.fullmatch(LAB_SITE_ID):
+            errors.append(f"LAB_SITE_ID {LAB_SITE_ID!r} must be 1-20 characters of "
+                          "a-z, 0-9 and '-', not starting or ending with '-'")
+    for name in clouds:
+        for key in _CLOUD_REQUIRED[name]:
+            if not globals()[key]:
+                errors.append(f"{key} is required when {name} is enabled")
+        cap_key = f'{name.upper()}_MAX_VMS'
+        cap = globals()[cap_key]
+        if cap is None or cap < 1:
+            errors.append(f"{cap_key} must be a positive integer when {name} is enabled")
+    return errors
+
+
 def validate_config():
     """
     Validate critical configuration on startup.
     Raises ValueError for fatal misconfigurations, logs warnings for non-fatal issues.
+    Only the enabled backends' settings are required.
     """
-    errors = []
+    unknown = [name for name in ENABLED_BACKENDS if name and name not in KNOWN_BACKENDS]
+    if unknown:
+        raise ValueError(f"ENABLED_BACKENDS names unknown backend(s) {', '.join(unknown)}; "
+                         f"known: {', '.join(KNOWN_BACKENDS)}")
+    if '' in ENABLED_BACKENDS:
+        raise ValueError("ENABLED_BACKENDS contains an empty name; "
+                         f"list some of {', '.join(KNOWN_BACKENDS)}, comma-separated")
 
-    if not PROXMOX_HOST:
-        errors.append("PROXMOX_HOST is not set")
-
-    has_token = PROXMOX_TOKEN_ID and PROXMOX_TOKEN_SECRET
-    has_password = PROXMOX_PASSWORD
-    if not has_token and not has_password:
-        errors.append("No Proxmox authentication configured. Set either PROXMOX_TOKEN_ID/PROXMOX_TOKEN_SECRET or PROXMOX_PASSWORD")
-
+    errors = _backend_errors(ENABLED_BACKENDS)
     if errors:
         raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
 
@@ -386,14 +510,20 @@ def validate_config():
     if group_ranges_errors:
         raise ValueError("Group VLAN config errors:\n  - " + "\n  - ".join(group_ranges_errors))
 
-    if PROXMOX_VERIFY_SSL and PROXMOX_CA_BUNDLE:
-        problem = policy.ca_bundle_problem(PROXMOX_CA_BUNDLE)
-        if problem:
-            raise ValueError(f"PROXMOX_CA_BUNDLE={PROXMOX_CA_BUNDLE!r} {problem}")
-    if not PROXMOX_VERIFY_SSL:
-        logger.warning(
-            "PROXMOX_VERIFY_SSL=false: the Proxmox API certificate is not verified, so a "
-            "network attacker can capture the API credentials. Prefer PROXMOX_CA_BUNDLE.")
+    # Imported here, not at module top: the backends package must be
+    # importable while this module is still initialising.
+    from app.backends.network_slots import validate_lab_cidr
+    _validate_configured_lab_cidrs(ENABLED_BACKENDS, validate_lab_cidr)
+
+    if 'proxmox' in ENABLED_BACKENDS:
+        if PROXMOX_VERIFY_SSL and PROXMOX_CA_BUNDLE:
+            problem = policy.ca_bundle_problem(PROXMOX_CA_BUNDLE)
+            if problem:
+                raise ValueError(f"PROXMOX_CA_BUNDLE={PROXMOX_CA_BUNDLE!r} {problem}")
+        if not PROXMOX_VERIFY_SSL:
+            logger.warning(
+                "PROXMOX_VERIFY_SSL=false: the Proxmox API certificate is not verified, so a "
+                "network attacker can capture the API credentials. Prefer PROXMOX_CA_BUNDLE.")
 
     if is_production():
         secret_errors = _production_secret_errors()

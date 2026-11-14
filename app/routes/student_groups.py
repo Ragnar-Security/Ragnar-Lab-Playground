@@ -13,10 +13,12 @@ from flask import Blueprint, request, jsonify
 
 from ..auth import login_required, admin_required, get_authenticated_user
 from ..models import db, User, StudentGroup, StudentGroupMember, StudentWhitelist
-from ..proxmox_service import find_vms_by_name_prefix
+from ..backends import get_backend
+from ..backends.base import BACKEND_PROXMOX, VMRef
 from ..template_manager import load_template_config
 from ..vlan_allocator import allocate_pair, VlanPoolExhausted, VlanInUse
-from .vm_creation import cleanup_vms, _expected_vm_names
+from .. import vm_provisioning
+from .vm_creation import cleanup_vms, named_instances, _expected_vm_names
 
 logger = logging.getLogger(__name__)
 
@@ -184,7 +186,10 @@ def delete_group(group_id):
             group.name)
     stranded = []
     try:
-        for vm in find_vms_by_name_prefix(f"group-{group.name}-"):
+        # Group labs on a cloud are all tracked by record; the prefix sweep
+        # recovers Proxmox clones whose record never landed.
+        for vm in named_instances(get_backend(BACKEND_PROXMOX),
+                                  f"group-{group.name}-"):
             if (vm.get('name') in expected_names
                     and (vm['vmid'], vm['node']) not in known):
                 stranded.append(vm)
@@ -211,7 +216,9 @@ def delete_group(group_id):
         cleanup_payload = [{
             'vmid': vm.vmid, 'node': vm.node, 'vm_type': vm.vm_type,
             'vm_name': vm.vm_name, 'template_name': vm.template_name,
-            'db_record_id': vm.id,
+            'db_record_id': vm.id, 'backend': vm.backend,
+            'provider_id': vm.provider_id, 'deployment_id': vm.deployment_id,
+            'network_slot': vm.network_slot,
         } for vm in active]
         for vm in stranded:
             cleanup_payload.append({
@@ -226,9 +233,10 @@ def delete_group(group_id):
             logger.exception("Failed to cascade-destroy VMs for group %s", group.name)
             return jsonify({'error': f'Destroy failed: {e}'}), 500
 
-        # Only mark records destroyed for vmids Proxmox actually destroyed.
-        # Anything Proxmox refused (e.g. lock conflict) stays as-is so a
-        # retry can pick it up.
+        # Only mark records destroyed for vmids their backend actually
+        # destroyed. Anything it refused (e.g. lock conflict) stays as-is so
+        # a retry can pick it up.
+        retired = []
         for vm in active:
             if vm.vmid not in destroyed:
                 continue
@@ -236,7 +244,12 @@ def delete_group(group_id):
             if not vm.destroyed:
                 vm.destroyed = True
                 vm.destroyed_at = datetime.now()
+                retired.append(VMRef.from_record(vm))
         db.session.commit()
+        # After the commit: the group's last records free their deployment
+        # and slot networks.
+        for ref in retired:
+            vm_provisioning.after_record_retired(ref)
 
         # Failure check covers BOTH active and stranded — a stranded VM that
         # Proxmox refused to destroy is just as much an orphan blocker as
