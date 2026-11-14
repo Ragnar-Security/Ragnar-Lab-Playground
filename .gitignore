@@ -14,6 +14,8 @@ env/
 # Site-specific template catalog; copy templates.example.yaml before startup.
 /templates.yaml
 /templates.yaml.bak
+# Local test instance override; copy docker-compose.local.example.yml (docs/LOCAL_TEST_INSTANCE.md).
+/docker-compose.local.yml
 
 
 # Per-workstation tool permissions and deployment configuration.
