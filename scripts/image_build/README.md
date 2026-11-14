@@ -217,6 +217,19 @@ is passed (which the core does for `KEEP_SSH=yes`).
   `C:\ProgramData\ssh\administrators_authorized_keys`, then sets the local
   `Administrator` password to a random 32-character value generated in the
   guest. The value is held in a `SecureString` and is never printed or stored.
+- It also deletes the cached DHCP lease values under
+  `HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\*`
+  (`DhcpIPAddress`, `Lease*`, `T1`, `T2` and the rest). On Proxmox, whose
+  save shuts the VM down without another boot, the image's clones then start
+  with `DHCPDISCOVER` and each takes its own address. Without this, a clone
+  (new MAC, same adapter) asks to renew the build VM's address; pve's dnsmasq
+  is not authoritative and ignores that, Windows keeps the unexpired lease,
+  and every clone on one VLAN shares one address. The AWS save reboots the
+  instance after the seal, which caches a lease again, so AWS images carry
+  one; EC2's DHCP gives each instance its own address regardless. The
+  address in use is untouched, so the seal's SSH session survives
+  (`ipconfig /release` would cut it). The seal exits 1 if a lease is still
+  cached.
 - **Sysprep is not run.** Whether and how to run it is to be decided per cloud
   during the first Windows build.
 - The seal does not touch the firewall. The `tcp/22` allow rule that the build
@@ -377,9 +390,10 @@ finish the save with the commands the error prints.
 
 For a Windows base, the user is `Administrator` and the guest agent must run.
 OpenSSH Server must be installed, and the `sshd` service must be running and
-set to start automatically. The backend only injects the key, through the
-guest agent, into `C:\ProgramData\ssh\administrators_authorized_keys`; it
-never installs or starts `sshd`.
+set to start automatically by the time SSH answers. The backend only injects
+the key, through the guest agent, into
+`C:\ProgramData\ssh\administrators_authorized_keys`; it never installs or
+starts `sshd`. `proxmox_base_windows.sh` builds such a base (below).
 
 #### Building the Linux base: `proxmox_base_ubuntu.sh`
 
@@ -467,6 +481,100 @@ Copy it to the replica node with
 Builds whose `BASE_PROXMOX` glob matches the new name use it from then on,
 since the newest match wins. Delete the old base (both copies) by hand once
 nothing needs it, as in "Deleting an old image".
+
+#### Building the Windows base: `proxmox_base_windows.sh`
+
+`scripts/image_build/proxmox_base_windows.sh` builds `base-ws2022-<yyyymmdd>`:
+Windows Server 2022 Standard Evaluation (Desktop Experience), installed
+unattended from the evaluation ISO onto a 40 G virtio-scsi `scsi0` (so
+Windows recipes set `DISK_GB=40`). It runs where `proxmox_base_ubuntu.sh`
+runs, reads the same five `PVE_` keys, and is a dry run unless given
+`--apply`. The guest-side files are in `scripts/image_build/windows_base/`.
+
+```
+scripts/image_build/proxmox_base_windows.sh [--iso VOLID] [--virtio-iso VOLID]   # dry run
+scripts/image_build/proxmox_base_windows.sh --apply [--vmid N] [--skip-updates]
+```
+
+Options: `--iso` (default `local:iso/Windows_Server_2022_EVAL.iso`),
+`--virtio-iso` (default `local:iso/virtio-win-0.1.302.iso`; pass both when
+the ISOs sit on another storage), `--iso-store` (a storage with the `iso`
+content type for the run's own answer-file ISO, default `local`), `--vmid`,
+`--date`, `--disk` (default `40G`) and `--skip-updates`. VMID choice, the
+16 GiB memory floor, the construction marker and the cleanup on failure
+work as for the Linux base.
+
+**What it does.** It writes a per-run ISO holding `autounattend.xml` (with a
+random install password) and the guest scripts, creates the VM (SeaBIOS,
+`virtio-scsi-single`, the RTC in UTC because Windows runs in UTC, the
+installation, virtio-win and answer ISOs as CD drives) and boots it. Setup
+loads the virtio-scsi and NetKVM drivers from the virtio-win ISO, installs,
+and logs on once automatically; that logon installs the virtio drivers and
+the QEMU guest agent. Everything else runs as SYSTEM through the agent, each
+long step as a scheduled task (`windows_base/step.ps1`) so the agent's
+command timeout does not apply:
+
+1. `prepare.ps1`: installs OpenSSH Server (`Add-WindowsCapability`, which
+   needs internet), turns password login off, leaves the default shell as
+   `cmd.exe` (the core's Windows commands expect it), opens `tcp/22` on every
+   firewall profile, and proves that `sshd` writes new host keys when they are
+   missing.
+2. `windows_update.ps1`, in rounds until no update is left, rebooting when
+   one asks (`--skip-updates` skips this; the description then says so).
+   After every reboot the script waits for the guest to settle: Windows
+   servicing restarts it once more on its own about 40 s after a
+   cumulative-update reboot, and a step started before that would be killed.
+   A step that a reboot kills anyway is detected (the boot identity changed)
+   and run again.
+3. `cleanup.ps1`: DISM component cleanup with `/ResetBase`, the update cache
+   emptied, a retrim attempted (Windows answers "Not Supported" on this
+   disk; the step goes on). Then reboots until none is pending.
+4. `finalize.ps1`: no reboot pending and a licence rearm left (sysprep needs
+   both); every app installed for a user but not provisioned removed (the
+   cumulative update installs Microsoft Edge that way, and sysprep then fails
+   with `0x80073CF2`); `sshd` stopped and **disabled**, host keys and
+   authorized keys deleted; `SetupComplete.cmd` and `randomize-admin.ps1`
+   installed; the sysprep answer file written, with **no password in it**;
+   setup's copies of the install answer file deleted; automatic logon off;
+   event logs cleared.
+5. `ipconfig /release`, then `sysprep /generalize /oobe /shutdown /mode:vm`.
+   Without the release every clone boots with the template's cached DHCP
+   lease: pve's dnsmasq is not authoritative, so it ignores a request for an
+   address leased to another MAC, and Windows keeps an unexpired lease when
+   the gateway answers, so all clones on one VLAN shared one address. A
+   sysprep that ends without shutting the VM down fails the run with
+   `setuperr.log`. The script then removes the CD drives, sets 2 cores and
+   4096 MB (the Windows recipe's values), makes it a template and deletes the
+   answer-file ISO.
+
+**Why `sshd` is disabled in the template.** A clone's first boot runs
+Windows setup's specialize pass, reboots once, then runs OOBE unattended.
+If `sshd` answered before that reboot, the core could start the setup script
+and have it cut by setup's own reboot, and an exit 255 followed by a new boot
+ID reads as a setup that rebooted on purpose. `SetupComplete.cmd` runs once,
+as SYSTEM, after that reboot and after OOBE: it enables and starts `sshd`
+(which writes the clone's own host keys), deletes the sysprep answer file,
+`randomize-admin.ps1` and itself. So the first SSH answer comes from a clone
+that has finished setup.
+
+**Administrator password.** No answer file holds one. In the specialize
+pass the answer file runs `C:\Windows\Setup\Scripts\randomize-admin.ps1` as
+SYSTEM, which gives that clone's Administrator a 32-character password from
+the cryptographic RNG, held in a `SecureString` and never output. Every
+clone therefore has its own unrecorded password; the builder logs in with a
+key, and the seal sets yet another.
+
+**Licence.** Evaluation edition. The base was activated (180 days) before
+sysprep, which resets that: a fresh clone starts in a 10-day initial grace
+period (`slmgr /dlv`), and `slmgr /ato` on a clone returned `0x80041008` on
+2026-11-14, so online activation of a clone is not proven. Built images are
+not sysprepped and keep their build VM's licence state; check `slmgr /dlv`
+on a built image before relying on it for a term.
+
+Prove it as for the Linux base: full-clone it to a test VMID, boot it on
+the build VLAN, inject a key as the backend does, log in as `Administrator`
+over SSH through `root@PVE_HOST`, read `LastBootUpTime`, destroy the clone;
+then copy it to the replica node with `sync_template.sh`.
 
 ### AWS
 

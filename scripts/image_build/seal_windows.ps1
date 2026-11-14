@@ -1,9 +1,10 @@
 # Seal a Windows build VM just before its image is saved.
 #
 # Removes the uploaded payload and the build key, sets Administrator to a random
-# 32-character password that is never written anywhere, and (unless -KeepSsh)
-# disables sshd. Exits 1 if the payload directory survives, so the build stops
-# before the image is saved.
+# 32-character password that is never written anywhere, forgets the build VM's
+# DHCP lease, and (unless -KeepSsh) disables sshd. Exits 1 if the payload
+# directory survives or a cached lease is left, so the build stops before the
+# image is saved.
 param(
     [switch]$KeepSsh
 )
@@ -35,6 +36,26 @@ try {
 }
 Set-LocalUser -Name 'Administrator' -Password $secure
 
+# Forget the DHCP lease. Windows keeps it per interface in the registry and,
+# at boot, asks to renew that address rather than discovering one; the clone
+# has a new MAC on the same adapter, a DHCP server that is not authoritative
+# (pve's dnsmasq) ignores the request, and Windows keeps the unexpired lease.
+# Every clone of the image on one VLAN would then share the build VM's
+# address. Without these values the next boot starts with DHCPDISCOVER. The
+# address in use now is untouched, so the SSH session running this survives
+# (`ipconfig /release` would cut it).
+$leaseValues = @('DhcpIPAddress', 'DhcpSubnetMask', 'DhcpSubnetMaskOpt', 'DhcpServer',
+    'DhcpDefaultGateway', 'DhcpNameServer', 'DhcpDomain', 'DhcpGatewayHardware',
+    'DhcpGatewayHardwareCount', 'Lease', 'LeaseObtainedTime', 'LeaseTerminatesTime', 'T1', 'T2')
+$interfaces = 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces'
+foreach ($key in Get-ChildItem -Path $interfaces) {
+    foreach ($name in $leaseValues) {
+        if ($null -ne $key.GetValue($name)) {
+            Remove-ItemProperty -Path $key.PSPath -Name $name -ErrorAction Stop
+        }
+    }
+}
+
 if (-not $KeepSsh) {
     Set-Service sshd -StartupType Disabled
 }
@@ -44,4 +65,9 @@ foreach ($p in $sealPaths) {
         [Console]::Error.WriteLine("seal_windows.ps1: $p still exists after removal")
         exit 1
     }
+}
+$cached = @(Get-ChildItem -Path $interfaces | Where-Object { $null -ne $_.GetValue('DhcpIPAddress') })
+if ($cached.Count) {
+    [Console]::Error.WriteLine("seal_windows.ps1: a DHCP lease is still cached for $($cached.PSChildName -join ', ')")
+    exit 1
 }
