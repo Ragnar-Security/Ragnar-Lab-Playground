@@ -8,13 +8,19 @@ see it. This is the opposite of a whitelist: you opt *in* to restriction, not
 out of it. Admins always bypass the filter.
 """
 
+import logging
+
 from flask import Blueprint, jsonify
 from ..auth import get_authenticated_user
-from ..template_manager import load_template_config, get_enabled_deployment_groups, get_group_mode
+from ..template_manager import (
+    load_template_config, get_enabled_deployment_groups, get_group_mode,
+    validate_template_config,
+)
 from ..models import db, StudentLabAssignment, StudentGroupMember
 
 # Create templates blueprint
 templates_bp = Blueprint('templates', __name__)
+logger = logging.getLogger(__name__)
 
 
 def _group_mode_visible_to(user):
@@ -22,6 +28,16 @@ def _group_mode_visible_to(user):
     if getattr(user, 'is_admin', False):
         return True
     return StudentGroupMember.query.filter_by(user_id=user.id).first() is not None
+
+
+def _config_errors(config):
+    """The errors half of validate_template_config(); a validator failure is
+    reported as one error so it cannot take the admin's listing down."""
+    try:
+        return validate_template_config(config)[0]
+    except Exception as exc:
+        logger.exception("Template validation failed")
+        return [f'template validation failed: {exc}']
 
 
 @templates_bp.route('/templates', methods=['GET'])
@@ -65,7 +81,7 @@ def get_templates_list():
             # Hide koth_mode deployment groups from non-admin users
             enabled_groups = [g for g in enabled_groups if not g.get('koth_mode')]
 
-        return jsonify({
+        response = {
             'success': True,
             'deployment_groups': [
                 {
@@ -90,7 +106,11 @@ def get_templates_list():
                 }
                 for g in enabled_groups
             ]
-        })
+        }
+        # Only admins can fix the YAML; students keep the unchanged listing.
+        if user is not None and user.is_admin:
+            response['config_errors'] = _config_errors(config)
+        return jsonify(response)
     except Exception as e:
         import logging
         logging.getLogger(__name__).error(f"Error loading templates: {e}")

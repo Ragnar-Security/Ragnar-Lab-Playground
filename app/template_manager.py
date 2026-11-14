@@ -6,6 +6,9 @@ Supports both deployment groups (multiple VMs per assignment) and legacy single 
 
 import yaml
 import logging
+from collections.abc import Mapping
+from .backends import enabled_backends
+from .backends.base import BACKEND_AWS, BACKEND_GCP
 from .config import TEMPLATES_FILE
 
 logger = logging.getLogger(__name__)
@@ -125,8 +128,41 @@ def get_enabled_templates(templates):
 KNOWN_DEPLOYMENT_GROUP_KEYS = {
     'display_name', 'description', 'enabled', 'uptime_minutes',
     'extend_time_minutes', 'load_balancing', 'templates',
-    'group_mode',
+    'group_mode', 'backend', 'koth_mode',
 }
+
+# Cloud admission reserves capacity under these node names, so a Proxmox node
+# spelled the same would share (and exhaust) the cloud backend's reservations.
+RESERVED_NODE_NAMES = (BACKEND_AWS, BACKEND_GCP)
+
+
+def _reserved_node_name_errors(group, name):
+    """One error per distinct Proxmox node name in `group` that is a cloud
+    backend name: load_balancing.fixed_node and the keys of every machine's
+    template_locations/storage_locations, top-level or in a nested proxmox:."""
+    candidates = []
+    load_balancing = group.get('load_balancing')
+    if isinstance(load_balancing, Mapping):
+        candidates.append(load_balancing.get('fixed_node'))
+    for template in group.get('templates') or []:
+        nested = template.get('proxmox')
+        sources = [template] + ([nested] if isinstance(nested, Mapping) else [])
+        for source in sources:
+            for key in ('template_locations', 'storage_locations'):
+                locations = source.get(key)
+                if isinstance(locations, Mapping):
+                    candidates.extend(locations)
+    errors = []
+    for value in candidates:
+        if not isinstance(value, str):
+            continue
+        backend = value.strip().lower()
+        if backend in RESERVED_NODE_NAMES:
+            message = (f"deployment_group {name!r}: Proxmox node name {value!r} "
+                       f"is reserved for the {backend} backend")
+            if message not in errors:
+                errors.append(message)
+    return errors
 
 
 def get_group_mode(deployment_group):
@@ -142,10 +178,16 @@ def validate_template_config(config):
     Returns (errors, warnings) — both lists of str. Callers decide whether to
     hard-fail on errors. Errors currently include:
         - group_mode: true with no template having entry_point: true
+        - backend problems (mixed, unknown, not enabled, koth_mode on cloud,
+          incomplete aws/gcp blocks), against ENABLED_BACKENDS read now
+        - Proxmox node names that are reserved cloud backend names
 
     Warnings currently include:
         - unknown top-level keys on a deployment_group (typo detection)
     """
+    # Lazy: template_spec imports TemplateConfigError from this module.
+    from .backends.template_spec import validate_group_backends
+    enabled = enabled_backends()
     errors = []
     warnings = []
     for group in config.get('deployment_groups', []) or []:
@@ -162,6 +204,9 @@ def validate_template_config(config):
                     f"deployment_group {name!r}: group_mode=true requires exactly one "
                     "template with entry_point: true"
                 )
+
+        errors.extend(validate_group_backends(group, enabled))
+        errors.extend(_reserved_node_name_errors(group, name))
     return errors, warnings
 
 

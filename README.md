@@ -1,6 +1,8 @@
 # Ragnar Lab Playground
 
-A reusable Flask lab portal for deploying, managing, and destroying Proxmox virtual machines. Students use a web dashboard while operators control access, lab visibility, and the VM fleet.
+A reusable Flask lab portal for deploying, managing, and destroying lab virtual machines on Proxmox and, optionally, Amazon EC2 and Google Compute Engine. Students use a web dashboard while operators control access, lab visibility, and the VM fleet.
+
+Each deployment group runs on one backend, chosen in `templates.yaml` by `backend:` on the group (default `proxmox`) or on a machine. `ENABLED_BACKENDS` lists the backends a portal may use; unset, it is `proxmox` alone and the portal behaves as v1.0.0 did. Cloud labs need base infrastructure the operator creates once (VPC, subnet router, IAM); [docs/CLOUD_BACKENDS.md](docs/CLOUD_BACKENDS.md) is the runbook for that, the settings, cost, and teardown.
 
 ## Features
 
@@ -19,7 +21,7 @@ A reusable Flask lab portal for deploying, managing, and destroying Proxmox virt
 - **Alert system** -- email, webhook (Slack/Discord), database, and file alerts for failed VM deletions and config corruption
 
 ### King of the Hill (KOTH) Mode
-- **Competitive lab arena** -- one shared deployment of a `templates.yaml` group, multiple `StudentGroup`s play as teams, single-active-game enforced at the DB
+- **Competitive lab arena** -- one shared deployment of a `templates.yaml` group, multiple `StudentGroup`s play as teams, single-active-game enforced at the DB. Proxmox backend only: a `koth_mode` group on a cloud backend is refused
 - **Live scoreboard + network map** -- Cytoscape.js topology view, scoreboard with rank/score, event log, all updated via Server-Sent Events
 - **Token-authenticated box claims** -- students `curl /koth/claim -d token=... -d box=$(hostname)` from inside rooted boxes; per-team submission tokens are rotatable
 - **Service-uptime scoring** -- in-process port scanner ticks every 12s, awards points for each open service the team owns; exponential late-game multiplier
@@ -29,10 +31,11 @@ A reusable Flask lab portal for deploying, managing, and destroying Proxmox virt
 - See [docs/KING_OF_THE_HILL.md](docs/KING_OF_THE_HILL.md) for the full guide. Operators enable KOTH on deployment groups in their own `templates.yaml`.
 
 ### Infrastructure
-- **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%)
+- **Proxmox, AWS or Google Cloud per deployment group** -- every lifecycle path dispatches through the VM record's backend. Cloud labs launch without a public address or internet route into the owner's private `/26` slot subnets, reached over the VPN through one subnet router per cloud that the portal starts on demand and stops when idle. `AWS_MAX_VMS` / `GCP_MAX_VMS` cap what can bill at once
+- **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%); cloud backends admit against their machine cap instead
 - **Cross-node template sync** -- `sync_template.sh` replicates templates between nodes using vzdump/qmrestore (no NFS)
-- **Automatic cleanup** -- a background task destroys expired VMs every minute; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record
-- **Per-student VLAN isolation** -- entry VLAN (100-200) and internal VLAN (200-300) per student
+- **Automatic cleanup** -- a background task destroys expired VMs every minute on every backend; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record, and on each enabled cloud only leftovers carrying this portal's `LAB_SITE_ID`
+- **Per-student VLAN isolation** -- entry VLAN (100-200) and internal VLAN (200-300) per student; on a cloud backend the same tags select the student's two network slots
 - **Startup config validation** -- templates.yaml is validated at boot; mismatches are caught before any VM is created
 
 ## Tech Stack
@@ -42,6 +45,7 @@ A reusable Flask lab portal for deploying, managing, and destroying Proxmox virt
 | Backend | Flask 2.3, Python 3.12 |
 | Database | MySQL 8.0 via SQLAlchemy, SQLite for tests |
 | Proxmox API | Proxmoxer 2.0 |
+| Cloud APIs | boto3 (AWS EC2), google-auth with the Compute Engine REST API (GCP) |
 | Frontend | HTML5, Bootstrap 5, Vanilla JS (5 modules) |
 | Fonts | DM Sans (UI), JetBrains Mono (code/data) |
 | Configuration | `.env` + `templates.yaml` |
@@ -55,11 +59,14 @@ A reusable Flask lab portal for deploying, managing, and destroying Proxmox virt
 Ragnar-Lab-Playground/
 ├── app/                          # Flask application package
 │   ├── __init__.py               # App factory
+│   ├── backends/                 # VMBackend contract + registry; proxmox/aws/gcp adapters, network slots, cloud admission
 │   ├── auth.py                   # Authentication routes & decorators
 │   ├── config.py                 # Configuration from env vars
 │   ├── models.py                 # SQLAlchemy models
 │   ├── proxmox_service.py        # Proxmox API wrapper
-│   ├── tasks.py                  # Background tasks (cleanup, alerts)
+│   ├── vm_provisioning.py        # Backend-generic create/destroy: admit, router, slot network, create
+│   ├── orphan_reaper.py          # Sweep of Proxmox guests and cloud resources that have no record
+│   ├── tasks.py                  # Background tasks (expiry, cleanup, idle cloud routers, alerts)
 │   ├── template_manager.py       # templates.yaml loader & validator
 │   ├── utils.py                  # Shared utilities
 │   └── routes/                   # Modular route blueprints
@@ -97,6 +104,8 @@ Ragnar-Lab-Playground/
 │   ├── test_tasks.py             # Background task tests
 │   ├── test_template_manager.py  # Template loading tests
 │   ├── test_vm_creation_parallel.py  # Parallel creation tests
+│   ├── backends/                 # Backend contract suite; AWS/GCP adapters against in-memory provider fakes
+│   ├── live/                     # Opt-in runs against real Proxmox, AWS and GCP (tests/live/README.md)
 │   └── integration/
 │       ├── conftest.py           # Integration test fixtures
 │       └── test_flows.py         # Playwright browser tests
@@ -111,6 +120,9 @@ Ragnar-Lab-Playground/
 │   ├── backup-database.sh        # MySQL backup utility
 │   ├── rotate_headscale_keys.sh  # Rotate students' Headscale pre-auth keys (dry run by default)
 │   ├── update_headscale_keys.py  # Store rotated keys in the portal database (run in the app container)
+│   ├── apply_headscale_policy.sh # Render and apply the per-student Headscale policy (dry run by default)
+│   ├── headscale_policy.py       # Policy renderer used by apply_headscale_policy.sh
+│   ├── export_network_slots.py   # Roster, groups, VLAN pairs and backends exported for the policy (run in the app container)
 │   └── migrate_*.py              # Database migration scripts
 ├── .github/workflows/ci.yml     # CI pipeline definition
 ├── .github/workflows/release.yml # Tag-driven release: GHCR image + GitHub Release
@@ -142,6 +154,7 @@ cd Ragnar-Lab-Playground
 cp .env.example .env
 cp templates.example.yaml templates.yaml
 # Edit both files for your Proxmox cluster and site
+# (AWS or GCP labs: docs/CLOUD_BACKENDS.md)
 
 # 3. Start everything
 docker compose up -d --build
@@ -229,7 +242,8 @@ curl http://localhost:5000/auth/health
 ## Site configuration
 
 Real hostnames, IP addresses, usernames, credentials, node names, storage
-pools, and VMIDs belong only in operator-owned untracked configuration. Start
+pools, VMIDs, and cloud account, project, VPC, image and router identifiers
+belong only in operator-owned untracked configuration. Start
 from the committed examples; never put a deployment's values in a tracked
 file.
 
@@ -237,10 +251,11 @@ file.
 
 | File | Create from / purpose |
 |------|------------------------|
-| `.env` | Copy `.env.example`; application, database, Proxmox, proxy, and image settings |
-| `templates.yaml` | Copy `templates.example.yaml`; deployment groups, node/storage mappings, and template VMIDs |
+| `.env` | Copy `.env.example`; application, database, Proxmox, cloud backend, proxy, and image settings |
+| `templates.yaml` | Copy `templates.example.yaml`; deployment groups, each group's backend, node/storage mappings, template VMIDs, and cloud images and sizes |
+| `docker-compose.cloud.yml` | Optional; cloud credentials for a portal host without an instance role or metadata-server identity. Copy the snippet for your clouds from `docs/CLOUD_BACKENDS.md` and name it in `COMPOSE_FILE` |
 | `scripts/site.env` | Copy `scripts/site.env.example`; workstation operations and remote-host settings |
-| `config/headscale-acl.json` | Copy `config/headscale-acl.example.json`; deployment-specific Headscale users and hosts |
+| `config/headscale-acl.json` | Copy `config/headscale-acl.example.json`; deployment-specific Headscale users and hosts, and the base `scripts/apply_headscale_policy.sh` renders the per-student rules onto |
 | `data/students_merged.csv` | Generated roster with student records and live VPN credentials; never commit it |
 
 When upgrading a deployment from a revision that tracked `templates.yaml`,
@@ -270,7 +285,7 @@ These values normally live in `.env`:
 | `ACME_EMAIL` | ACME contact address consumed by Caddy |
 | `ADMIN_PASSWORD` | Bootstrap admin password; production refuses one that is missing, a known default, or shorter than 16 characters when the account is about to be seeded (see `SEED_ADMIN_ACCOUNT`) |
 | `SEED_ADMIN_ACCOUNT` | Whether `init_db` creates the generic `ADMIN_LOGIN_ID` account when it does not exist; defaults to `true`. Set `false` when staff use personal accounts listed in `ADMIN_USERS`; `ADMIN_PASSWORD` is then not required, in production or by `scripts/preflight_env.py`. It never deletes or changes an account that already exists. To retire an existing generic account, sign in as another admin and `PUT /admin/students/<id>` with `{"disabled": true}` (the same toggle as the Admin Dashboard's student list). Anything other than a recognised boolean fails startup |
-| `PROXMOX_HOST` | Proxmox API hostname or IP |
+| `PROXMOX_HOST` | Proxmox API hostname or IP; the Proxmox settings are required only while `proxmox` is in `ENABLED_BACKENDS` |
 | `PROXMOX_USER` / `PROXMOX_PASSWORD` | Password authentication (development) |
 | `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN_SECRET` | API token authentication (production) |
 | `PROXMOX_VERIFY_SSL` | Verify the Proxmox API TLS certificate; defaults to `true`. Set `false` only for a self-signed Proxmox reached over a private tunnel (startup logs a warning); prefer `PROXMOX_CA_BUNDLE` |
@@ -287,9 +302,13 @@ These values normally live in `.env`:
 | `ADMIN_LOGIN_ID` | Bootstrap admin login ID |
 | `ADMIN_USERS` | Comma-separated admin login IDs |
 | `ENABLE_LOAD_BALANCING` | Global load-balancing toggle |
-| `FIXED_NODE` | Default node when load balancing is off |
+| `FIXED_NODE` | Default node when load balancing is off; may not be `aws` or `gcp`, the names cloud admission reserves under |
 | `CPU_THRESHOLD` / `MEMORY_THRESHOLD` | Global resource thresholds |
 | `DISTRIBUTED_VM_LOCKS` | Serialize each VMID's stop/delete/retire across gunicorn workers with MySQL `GET_LOCK`; defaults to `false`, which uses an in-process lock only, enough for the single production worker. Set `true` before running more than one worker; each lock holder then uses a second database connection |
+| `ENABLED_BACKENDS` | Comma list of `proxmox`, `aws`, `gcp`; unset or empty means `proxmox`. Startup refuses an unknown name and the missing settings of an enabled backend |
+| `LAB_SITE_ID` | Ownership tag on every cloud resource; required when `aws` or `gcp` is enabled. The orphan reaper deletes resources carrying it that no record owns, so two portals sharing one value would sweep each other's machines |
+| `JUMPBOX_VLAN_BANDS` | The jumpbox's VLAN bands, exactly as `scripts/site.env` sets them; exported to the Headscale policy |
+| `AWS_*` / `GCP_*` | Region and zone, lab VPC or network, lab CIDR, router instance, the mandatory `AWS_MAX_VMS` / `GCP_MAX_VMS` cap, router idle minutes and timeouts; each is described in `.env.example`. Credentials come from boto3's standard chain and Application Default Credentials (`docs/CLOUD_BACKENDS.md`) |
 | `SMTP_*` / `ALERT_WEBHOOK_*` | Alert notification settings |
 | `DOCKERHUB_USERNAME` | Docker Hub namespace |
 | `IMAGE_NAME` | Image repository name; defaults to `lab-playground` |
@@ -354,6 +373,8 @@ deployment_groups:
 
 The startup validator cross-checks `templates.yaml` against Proxmox to catch missing templates or misconfigured VMIDs before students deploy anything.
 
+A group runs on Proxmox unless it, or one of its machines, sets `backend: aws` or `backend: gcp`. Every machine of a group must resolve to the same backend, that backend must be in `ENABLED_BACKENDS`, and `koth_mode` groups stay on Proxmox. A cloud machine takes its image and size only from its own `aws:` (`image_id`, `instance_type`) or `gcp:` (`image`, `machine_type`) block, with `disk_gb` defaulting to 20; `memory`, `cores`, `template_locations` and `load_balancing` apply to Proxmox only. The disabled `multi-backend-example` group in `templates.example.yaml` describes one machine for all three backends. A group that breaks these rules is refused at create, and the admin template listing reports why.
+
 ## Student Management
 
 ### Whitelist import (Canvas CSV)
@@ -395,6 +416,17 @@ rotation refuses to start. A roster login missing from the portal database
 keeps its old key and makes the run exit non-zero unless `--allow-partial` is
 given. The portal container must include `scripts/update_headscale_keys.py`.
 See `docs/TERM_CHANGEOVER.md`.
+
+### Per-student Headscale policy
+
+`scripts/apply_headscale_policy.sh` (dry run by default; `--apply` installs)
+renders a policy in which each roster login reaches only its own entry slot,
+its groups' slots and the non-ended KOTH arenas, on every enabled backend. It
+is a snapshot: re-run it after every roster import, group or membership change,
+VLAN reassignment, and KOTH game creation or ending. Until then a new student
+or member is refused, never let in. `scripts/term_changeover.sh` runs it as its
+last stage. Details and rollback: "Apply the Headscale policy" in
+`docs/CLOUD_BACKENDS.md`.
 
 ### Password recovery
 
@@ -465,7 +497,7 @@ Prerequisites: SSH key-based access to both nodes, vzdump/qmrestore installed, s
 python -m pytest tests/ -v --ignore=tests/integration
 ```
 
-Unit tests cover models, config validation, template loading, auth routes, API routes, admin dashboard, lab assignments, background tasks, and parallel VM creation. They use an in-memory SQLite database and mock the Proxmox API.
+Unit tests cover models, config validation, template loading, auth routes, API routes, admin dashboard, lab assignments, background tasks, and parallel VM creation. They use an in-memory SQLite database and mock the Proxmox API; the AWS and GCP adapters run against in-memory provider fakes, and one contract suite in `tests/backends/` holds every backend to the same lifecycle. `tests/live/` checks real Proxmox, AWS and GCP accounts and is skipped unless opted in (`LIVE_PROXMOX=1`, `LIVE_AWS=1`, `LIVE_GCP=1`; `tests/live/README.md`).
 
 ### Integration tests (16 tests)
 

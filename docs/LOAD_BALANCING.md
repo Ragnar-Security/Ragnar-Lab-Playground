@@ -11,6 +11,32 @@ The system can automatically select the best node for VM deployment based on cur
 2. **Per-deployment-group**: The operator-owned YAML selected by
    `TEMPLATES_FILE` (defaults to untracked `templates.yaml`)
 
+### Proxmox only
+
+Everything in this document applies to deployment groups on the `proxmox`
+backend. A group on `aws` or `gcp` (`docs/CLOUD_BACKENDS.md`) has no nodes to
+weigh: its `load_balancing` block, `FIXED_NODE` and the thresholds are not
+read, and every machine launches in the configured `AWS_AVAILABILITY_ZONE` or
+`GCP_ZONE`. What bounds a cloud instead is a machine cap:
+
+- **One reservation per machine against `AWS_MAX_VMS` / `GCP_MAX_VMS`.**
+  Admission counts that backend's live VMRecords plus its unexpired
+  reservations and refuses at the cap (`aws is at its cap of N machines`).
+  A missing or non-positive cap refuses every launch rather than reading as
+  unlimited (`app/backends/cloud_admission.py`).
+- **The same ledger and lock as memory admission.** A cloud reservation is a
+  `node_memory_reservations` row whose node is the backend name and whose
+  memory is 1 byte, taken under the same admission lock, so renewal, release
+  and the 15-minute leak expiry below behave identically and every worker
+  counts against one ledger.
+- **So `aws` and `gcp` are reserved node names.** A Proxmox node with either
+  name would share its reservations with that cloud. Startup refuses such a
+  `FIXED_NODE`, and the admin template validation reports such a
+  `load_balancing.fixed_node` or `template_locations` / `storage_locations`
+  key.
+
+`GET /nodes/resources` reports Proxmox nodes only.
+
 ## Configuration
 
 ### Global Settings (`.env` file)

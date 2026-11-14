@@ -12,6 +12,125 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 
 ## [Unreleased]
 
+### Added
+
+- Lab VMs on Amazon EC2 and Google Compute Engine beside Proxmox.
+  `ENABLED_BACKENDS` selects the backends; a deployment group's `backend:`
+  (or a machine's) selects where its labs go, with the machine spec in an
+  `aws:` or `gcp:` block. Every cloud resource carries the `LAB_SITE_ID`
+  ownership tag, launches without a public address into a private slot
+  subnet with no direct TCP/UDP route to public addresses (the provider's
+  DNS resolver stays reachable until blocked separately), and is capped by
+  `AWS_MAX_VMS` / `GCP_MAX_VMS`. Per-deployment security groups and firewall
+  rules isolate deployments; one subnet router per cloud is started on
+  demand and stopped when idle. Operator runbook: `docs/CLOUD_BACKENDS.md`.
+- The orphan reaper sweeps each enabled cloud's site inventory as well as
+  Proxmox, deleting only on positive evidence that nothing owns a resource.
+- A per-student Headscale policy (`scripts/apply_headscale_policy.sh`, dry run
+  by default): each roster login reaches only its own and its groups' lab
+  networks, and the non-ended KOTH arenas, on every backend.
+- `jumpbox_configure.sh --isolate-vlans [--allow-vlans LIST]` drops traffic
+  routed between lab VLANs on the jumpbox (`docs/JUMPBOX.md`).
+- Opt-in live contract runs against real AWS and GCP accounts
+  (`LIVE_AWS=1`, `LIVE_GCP=1`; `tests/live/README.md`).
+
+### Changed
+
+- `vm_records` carries each VM's backend identity (`backend`,
+  `provider_id`, `deployment_id`, `network_slot`); every lifecycle path
+  dispatches through the record's backend.
+- Proxmox settings are required only while `proxmox` is enabled, so a
+  cloud-only portal can start.
+- `docker-compose.prod.yml` passes the backend settings into the app
+  container; an empty value behaves as unset.
+
+### Fixed
+
+- `jumpbox_configure.sh` no longer dies at its first diff with
+  `unrecognized arguments` on Ubuntu 24.04's Python 3.12.3, the jumpbox's
+  `python3`: `jumpbox_netgen.py` accepts options between its command and
+  its files.
+- `term_changeover.sh` keeps exported `HEADSCALE_BASE_POLICY` and
+  `HEADSCALE_POLICY_FILE` values over `scripts/site.env`, as
+  `apply_headscale_policy.sh` already did.
+- A destroy, expiry or failed-deploy cleanup in the first ~10 s after a
+  Proxmox clone is no longer refused with "guest identity could not be
+  verified". The cluster listing reports a fresh guest's name empty (or the
+  previous guest's, at a reused VMID) until pvestatd's next broadcast; when
+  only the name disagrees, the guest's own config on its node now decides.
+  A config naming another guest still refuses.
+- Every Proxmox destroy (student, expiry, admin, failed-deploy cleanup) and
+  the orphan reaper re-read the guest's identity immediately before the
+  delete, after the stop (which may wait up to a minute), and the reaper also
+  before the stop. A guest that took the VMID in that window is refused and
+  kept; a guest already gone counts as destroyed. v1.0.0's destroy paths
+  checked once, before the stop; its reaper trusted the sweep's listing.
+- The idle cloud-router stop logs "Stopped the … router" only when it
+  issued the stop, not when the router was already stopped or stopping.
+
+### Upgrade notes
+
+- **Back up the database first** (`scripts/backup-database.sh`) and record the
+  running commit or image as the rollback target.
+- **Run the new migration, with the earlier ones, before the new code
+  starts.** `migrate_add_vm_backend.py` adds the four `vm_records` columns and
+  an index; existing rows become `backend='proxmox'`. All are idempotent.
+
+  ```bash
+  for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
+                   migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
+                   migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
+                   migrate_add_vm_backend.py; do
+    docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
+      python scripts/$migration
+  done
+  ```
+
+- **Proxmox-only sites change nothing else in normal operation.** Two
+  behaviours differ while the Proxmox API is unreachable: `/extend` saves the
+  new expiry in the database and returns `success: true` with
+  `extended_count: 0`, where v1.0.0 refused the whole extend (the guest's
+  own `Expires:` line keeps the old time until an extend reaches Proxmox;
+  the orphan reaper does not act on it while the record exists); and
+  `/list` shows each VM as "state unknown, listing unverified", where
+  v1.0.0 failed the request. `ENABLED_BACKENDS` unset or
+  `proxmox` keeps today's behaviour. The new variables are `ENABLED_BACKENDS`
+  and `LAB_SITE_ID`; `JUMPBOX_VLAN_BANDS` (default the jumpbox's bands); and,
+  only when that cloud is enabled, `AWS_REGION`, `AWS_AVAILABILITY_ZONE`,
+  `AWS_LAB_VPC_ID`, `AWS_LAB_CIDR`, `AWS_ROUTER_INSTANCE_ID`, `AWS_MAX_VMS`,
+  `AWS_ROUTER_IDLE_MINUTES`, `AWS_LAUNCH_TIMEOUT_SECONDS`,
+  `AWS_TERMINATE_TIMEOUT_SECONDS`, `GCP_PROJECT`, `GCP_REGION`, `GCP_ZONE`,
+  `GCP_NETWORK`, `GCP_LAB_CIDR`, `GCP_ROUTER_INSTANCE`, `GCP_MAX_VMS`,
+  `GCP_ROUTER_IDLE_MINUTES` and `GCP_OPERATION_TIMEOUT_SECONDS`
+  (`.env.example`). A Proxmox node named `aws` or `gcp` is no longer
+  supported: startup refuses such a `FIXED_NODE`, and admission never
+  places a VM on a node of that name.
+- **Enabling a cloud** follows `docs/CLOUD_BACKENDS.md`: operator-created
+  VPC, router and IAM, a vCPU quota increase before the first class,
+  complete lab images (labs have no direct TCP/UDP route to public
+  addresses; the provider's DNS stays reachable until blocked separately,
+  which the runbook requires before students use the cloud), and
+  credentials through an instance role or an untracked compose override,
+  never a tracked file.
+- **Instructor steps after the upgrade, not part of it:** the Headscale
+  policy (`scripts/apply_headscale_policy.sh --apply`) and jumpbox
+  `--isolate-vlans`. The policy cuts the blanket `autogroup:member` rule down
+  to its `autogroup:self` part, which also changes what students reach on
+  Proxmox; move any other access it gave that must stay into explicit rules
+  in `config/headscale-acl.json` first. Any other base rule whose `src`
+  includes `autogroup:member` or `*` must grant only `autogroup:self`, or
+  the render refuses to run.
+- **Still one gunicorn worker.**
+- **Rollback** to v1.0.0 needs no database restore (it ignores the new
+  columns) **only while no cloud records and no cloud failed-deploy survivor
+  lines exist**: v1.0.0 would treat a cloud record as a Proxmox guest and
+  never destroy its machine, and would set a cloud line in
+  `data/untracked-survivors.jsonl` / `.importing` aside as corrupt. Before
+  rolling back, run both checks in the rollback step of
+  `docs/PRODUCTION_DEPLOYMENT.md`; tear the clouds down
+  (`docs/CLOUD_BACKENDS.md`, "Teardown and incident response") and drain the
+  survivor files on the new release until both are clean.
+
 ## [1.0.0] - 2026-10-27
 
 The first public release. Earlier builds were never versioned; their

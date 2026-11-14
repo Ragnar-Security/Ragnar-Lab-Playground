@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 from app import create_app
 from app.models import db, User, StudentGroup, KothGame, KothTeam, KothBox
+from tests.backends.fake_backend import StaticInventoryBackend
 
 
 class ScorerTestCase(unittest.TestCase):
@@ -75,7 +76,8 @@ class ScorerTestCase(unittest.TestCase):
         self.game.ends_at = datetime.now() - timedelta(seconds=10)
         db.session.commit()
         with patch('app.routes.koth_admin.cleanup_vms', return_value=None), \
-             patch('app.proxmox_service.find_vms_by_name_prefix', return_value=[]), \
+             patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend([])), \
              patch('app.koth_scorer.probe_port', return_value='open'):
             koth_scorer.run_tick(self.game.id)
         db.session.refresh(self.game)
@@ -282,7 +284,8 @@ class ScorerTestCase(unittest.TestCase):
         self.game.ends_at = _compute_ends_at(self.game)
         db.session.commit()
         with patch('app.routes.koth_admin.cleanup_vms', return_value=None), \
-             patch('app.proxmox_service.find_vms_by_name_prefix', return_value=[]), \
+             patch('app.routes.koth_admin.get_backend',
+                   return_value=StaticInventoryBackend([])), \
              patch('app.koth_scorer.probe_port', return_value='open'):
             koth_scorer.run_tick(self.game.id)
         db.session.refresh(self.game)

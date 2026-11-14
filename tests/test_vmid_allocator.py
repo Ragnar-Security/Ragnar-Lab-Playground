@@ -11,6 +11,7 @@ from flask import Flask
 from app.models import VMIDReservation, VMRecord, db
 from app import proxmox_service
 from app.routes.vm_creation import DeployFailed, deploy_bundle
+from tests.test_live_contract_guards import FakeProxmox as ContractFakeProxmox
 
 
 GIB = 1024 ** 3
@@ -438,6 +439,31 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
         self.assertEqual(len(vmids), len(set(vmids)))
         self.assertEqual(VMRecord.query.filter_by(destroyed=False).count(),
                          self.STUDENT_COUNT)
+
+
+# Catches a cloud-only portal trying to contact a disabled Proxmox cluster (I19).
+def test_allocator_uses_database_and_reservations_without_proxmox(app):
+    with app.app_context():
+        db.session.add(VMRecord(
+            vmid=9000, vm_name='student-test-cloud', vm_type='aws',
+            node='zone-placeholder', template_name='Cloud Lab/vm', student_name='test',
+            expires_at=datetime.now() + timedelta(hours=1), backend='aws'))
+        db.session.commit()
+        first = proxmox_service.get_next_available_vmid(
+            None, count=2, reservation_id='cloud-bundle')
+        second = proxmox_service.get_next_available_vmid(
+            None, count=1, reservation_id='cloud-bundle-2')
+    assert (first, second) == (9001, 9003)
+
+
+# Catches a mixed portal colliding with a manually allocated Proxmox guest.
+def test_allocator_still_observes_proxmox_inventory_when_available(app):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(9500, 'manual-guest')
+    with app.app_context():
+        base = proxmox_service.get_next_available_vmid(
+            proxmox, count=1, reservation_id='mixed-bundle')
+    assert base == 9501
 
 
 if __name__ == '__main__':

@@ -1,9 +1,12 @@
 # Claude / contributor notes for this repo
 
-A Flask + SQLAlchemy + MySQL portal that orchestrates Proxmox VM lifecycles.
-Students log in from an imported allowlist, pick a template, get VMs cloned +
-tracked + auto-expired. Group-mode and the King-of-the-Hill (KOTH)
-competitive arena layer on top.
+A Flask + SQLAlchemy + MySQL portal that orchestrates lab VM lifecycles on
+Proxmox and, optionally, Amazon EC2 and Google Compute Engine
+(`ENABLED_BACKENDS`, default `proxmox`). Students log in from an imported
+allowlist, pick a template, get VMs created + tracked + auto-expired.
+Group-mode and the King-of-the-Hill (KOTH, Proxmox-only) competitive arena
+layer on top. Every lifecycle path goes through `app/backends/` (one
+`VMBackend` per provider) and dispatches by the record's `backend` column.
 
 This file is loaded into context at the start of every Claude Code session
 in this directory. Keep it short, opinionated, and focused on things you
@@ -148,21 +151,48 @@ supplies the deployment's hostnames, credentials, and infrastructure values:
     cookies, so clearing one never revoked its copies. Authorize through
     `get_authenticated_user()` / `login_required`; never trust
     `session['user_id']` directly.
-12. **The orphan reaper destroys Proxmox guests.** `app/orphan_reaper.py`
-    removes expired `student-`/`group-` guests that have no VMRecord. Keep
-    the app naming and the `Expires:` line in clone descriptions stable, or
-    it stops recognising (safe) or misjudges (unsafe) guests.
+12. **The orphan reaper destroys Proxmox guests and cloud resources.**
+    `app/orphan_reaper.py` removes expired `student-`/`group-` guests that
+    have no VMRecord. Keep the app naming and the `Expires:` line in clone
+    descriptions stable, or it stops recognising (safe) or misjudges
+    (unsafe) guests. Its cloud pass lists only resources carrying this
+    portal's `LAB_SITE_ID` tag/label (GCP networks: the exact
+    `lp-<site>-s-<slot>` / `lp-<site>-d-<key>` names) and deletes only on
+    positive evidence that nothing owns one: no live record, no create
+    reservation or admission, and expiry (instances) or creation time
+    (networks) older than `ORPHAN_REAPER_GRACE_MINUTES`. Any unknown
+    (missing tag or timestamp, failed inventory) keeps the resource, and
+    every delete re-reads its identity first. Never widen inventory beyond
+    the site tag, and never treat a failed listing as an empty one.
+    Routers (`lab-playground-kind=router`) are never listed.
     `ORPHAN_REAPER_DRY_RUN=true` logs decisions only. A sweep runs after
-    the expiry pass and stops starting guests past
-    `ORPHAN_REAPER_MAX_PASS_SECONDS` / `_GUESTS`, so it cannot starve expiry.
+    the expiry pass and stops starting guests or cloud resources past
+    `ORPHAN_REAPER_MAX_PASS_SECONDS` / `_GUESTS` (one budget for the Proxmox
+    and cloud passes), so it cannot starve expiry.
     Alert outbox delivery follows the same rule: it runs after expiry and
     reconcile, and stops starting alerts past
     `ALERT_DISPATCH_MAX_PASS_SECONDS` / `_ALERTS`.
 13. **Site-specific identities and infrastructure never belong in tracked
-    files.** Real hosts, domains, usernames, node/storage names, VMIDs, and
-    credentials live only in operator-owned `.env`, `templates.yaml`,
-    `scripts/site.env`, `config/headscale-acl.json`, and
+    files.** Real hosts, domains, usernames, node/storage names, VMIDs,
+    cloud account/project/VPC/image/router ids, and credentials live only in
+    operator-owned `.env`, `templates.yaml`, `scripts/site.env`,
+    `config/headscale-acl.json`, `docker-compose.cloud.yml` and
     `data/students_merged.csv`. Commit only their neutral example files.
+14. **Cloud SDKs must stay gevent-safe.** AWS uses `boto3` (urllib3); GCP
+    uses the Compute REST API through `google.auth`'s `AuthorizedSession`
+    (`requests`). Never add a gRPC-based Google client library: grpcio is
+    not gevent-safe under `monkey.patch_all()`. Backends read settings as
+    `config.<NAME>` at call time via `importlib.import_module('app.config')`;
+    `from app import config` yields the config-class mapping, not the module.
+    Credentials come only from boto3's chain and Application Default
+    Credentials, never from a tracked file. `docs/CLOUD_BACKENDS.md` is the
+    operator runbook.
+15. **One-shot tools run beside the live server.** `create_app()` runs KOTH
+    boot recovery (a `deploying` game reverts to `draft`, an active game's
+    scorer starts) unless called with `start_background_tasks=False`, which
+    `scripts/export_network_slots.py` does. `init_db.py`, `cleanup_db.py`,
+    `import_students.py` and `migrate_add_vlan.py` still run the recovery;
+    a new one-shot tool must pass `start_background_tasks=False`.
 
 ### Changing the roster between semesters
 
@@ -215,6 +245,11 @@ app/                        # Flask app (blueprints, models, helpers)
   koth_scoring.py           # pure scoring math
   koth_scanner.py           # TCP service probe + claim-beacon read
   concurrency.py            # bounded fan-out (gevent pool or threads)
+  backends/                 # VMBackend registry + proxmox/aws/gcp adapters,
+                            # network slots, cloud admission and names
+  vm_provisioning.py        # admit -> router -> slot network -> create; retire cleanup
+  orphan_reaper.py          # Proxmox + cloud leftover sweep
+  tasks.py                  # expiry loop: destroy, reconcile, reap, stop idle cloud routers
   template_manager.py       # templates.yaml accessors
   models.py                 # SQLAlchemy models
   config.py                 # env-var-driven config + KOTH defaults
@@ -222,7 +257,11 @@ app/                        # Flask app (blueprints, models, helpers)
 docs/                       # user-facing docs
   KING_OF_THE_HILL.md       # KOTH user/admin guide
   PRODUCTION_DEPLOYMENT.md  # deploy guide (read this before changing prod stack)
-scripts/                    # idempotent migration scripts (migrate_*.py)
+  CLOUD_BACKENDS.md         # AWS/GCP operator runbook
+scripts/                    # idempotent migration scripts (migrate_*.py) + ops tools
+  export_network_slots.py   # roster/VLAN/backend export; create_app(start_background_tasks=False)
+  headscale_policy.py       # renders the per-student Headscale policy
+  apply_headscale_policy.sh # export -> render -> diff -> apply (dry run by default)
 static/                     # JS + CSS
 templates/                  # Jinja templates
 templates.example.yaml       # Example VM template + deployment-group catalog
@@ -230,7 +269,9 @@ gunicorn.conf.py            # production worker config — do not bump workers
 run_prod.py                 # gunicorn entry point — monkey.patch_all() first line
 docker-compose.prod.yml     # production stack
 Caddyfile                   # reverse proxy config
-tests/                      # unit tests; tests/integration runs against real Proxmox
+tests/                      # unit tests; tests/integration: Playwright against a fake Proxmox host
+  backends/                 # one contract suite for every backend + AWS/GCP in-memory fakes
+  live/                     # opt-in real Proxmox/AWS/GCP runs (LIVE_PROXMOX/LIVE_AWS/LIVE_GCP=1)
 ```
 
 ## Conventions
@@ -264,6 +305,9 @@ tests/                      # unit tests; tests/integration runs against real Pr
 
 - `docs/KING_OF_THE_HILL.md` — KOTH user-facing guide
 - `docs/PRODUCTION_DEPLOYMENT.md` — full prod deploy + rollback playbook
+- `docs/CLOUD_BACKENDS.md` — AWS/GCP setup, IAM, cost, Headscale policy,
+  jumpbox VLAN isolation, teardown and rollback
+- `docs/JUMPBOX.md` — the Proxmox lab router
 - **Never delete a `VMRecord` because a Proxmox call failed.** The expiry
   daemon tracks VMs by database row, so a deleted row means the VM runs
   until a human notices. `_verify_vm_exists` returns

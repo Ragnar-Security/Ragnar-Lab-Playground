@@ -3,25 +3,27 @@ VM Listing routes module.
 Handles displaying and querying VM information.
 
 Orphaned-record cleanup: when /list is called, each DB record is verified
-against Proxmox. A record whose VM the cluster inventory has not listed for
-ORPHAN_CONFIRM_SECONDS (manually deleted, failed cleanup, etc.) is retired
-through the reconcile pass's helper, under the VMID lifecycle lock and with
-an admin alert, so the dashboard stays accurate.
+against its own backend. A record whose VM the backend's inventory has not
+listed for ORPHAN_CONFIRM_SECONDS (manually deleted, failed cleanup, etc.)
+is retired through the reconcile pass's helper, under the VMID lifecycle
+lock and with an admin alert, so the dashboard stays accurate.
 """
 
+from contextlib import ExitStack
 from flask import Blueprint, request, jsonify, current_app
 from datetime import datetime
 import logging
 
-from .. import tasks
+from .. import tasks, vm_provisioning
+from ..backends import backend_for
+from ..backends.base import BACKEND_PROXMOX, VMRef
 from ..models import db, VMRecord, StudentGroupMember
-from ..proxmox_service import get_proxmox_connection, get_cluster_vm_index
 from ..auth import login_required, get_authenticated_user
 from ..template_manager import load_template_config, get_template_for_vm
 from .utils import (
-    _verify_vm_exists, _get_vm_ip_addresses, _format_time_remaining,
-    _ip_cache_get, mask_ip_address, note_vm_state, user_can_access_vm,
-    ORPHAN_CONFIRM_SECONDS, VM_CONFIG_ERROR, VM_MISSING, VM_UNKNOWN,
+    _format_time_remaining, mask_ip_address, note_vm_state,
+    user_can_access_vm, ORPHAN_CONFIRM_SECONDS, VM_CONFIG_ERROR, VM_MISSING,
+    VM_PRESENT, VM_UNKNOWN,
 )
 from .admin import _send_config_issue_webhook
 from sqlalchemy import or_
@@ -30,6 +32,94 @@ logger = logging.getLogger(__name__)
 
 # Create blueprint
 vm_listing_bp = Blueprint('vm_listing', __name__)
+
+
+class _RenderBackends:
+    """Each record's backend for one render, on one connection per backend.
+
+    A Proxmox render must stay one login and one cluster read however many
+    VMs it shows (ruling C5). A backend that cannot be resolved or reached —
+    one later removed from ENABLED_BACKENDS included (ruling I18) — answers
+    None, and its VMs are listed unverified with their records kept.
+    """
+
+    def __init__(self, sessions):
+        self._sessions = sessions
+        self._backends = {}
+
+    def __call__(self, record):
+        name = record.backend or BACKEND_PROXMOX
+        if name not in self._backends:
+            try:
+                backend = backend_for(record)
+                self._sessions.enter_context(
+                    vm_provisioning.provider_session(backend))
+            except Exception as error:
+                current_app.logger.warning(
+                    "backend %s unavailable for this render: %s", name, error)
+                backend = None
+            self._backends[name] = backend
+        return self._backends[name]
+
+
+def _display_state(status):
+    """Map a backend status onto the confirmation states /list acts on."""
+    if status == VM_MISSING:
+        return VM_MISSING
+    if status == VM_CONFIG_ERROR:
+        return VM_CONFIG_ERROR
+    if status == 'unknown':
+        return VM_UNKNOWN
+    return VM_PRESENT
+
+
+def _observe(backend, record):
+    """(backend, state, status, ips, diagnostic) of one record for this render.
+
+    A disabled or unreachable backend, or a failed read, is UNKNOWN: the
+    VM is listed unverified and its record is never put up for retirement.
+    """
+    if backend is None:
+        return None, VM_UNKNOWN, 'unknown', [], None
+    ref = VMRef.from_record(record)
+    # Proxmox answers status, its error text (the config-error webhook
+    # carries it) and addresses from one probe: an unknown guest's addresses
+    # come from its cache, never from a second probe that would time out too.
+    display_read = getattr(backend, 'display_read', None)
+    if display_read is not None:
+        try:
+            status, diagnostic, ips = display_read(ref)
+        except Exception as error:
+            current_app.logger.warning("status of VM %s unavailable: %s",
+                                       record.vmid, error)
+            return backend, VM_UNKNOWN, 'unknown', [], str(error)
+        return backend, _display_state(status), status, ips, diagnostic
+    try:
+        status, diagnostic = backend.status(ref), None
+    except Exception as error:
+        current_app.logger.warning("status of VM %s unavailable: %s",
+                                   record.vmid, error)
+        status, diagnostic = 'unknown', str(error)
+    state = _display_state(status)
+    ips = []
+    if state in (VM_PRESENT, VM_UNKNOWN):
+        try:
+            ips = backend.ip_addresses(ref)
+        except Exception as error:
+            current_app.logger.warning("addresses of VM %s unavailable: %s",
+                                       record.vmid, error)
+    return backend, state, status, ips, diagnostic
+
+
+def _power_state(backend, record):
+    """(status, uptime) for the detail page, or (None, None) when unread.
+
+    Only Proxmox needs the extra read: its display status is presence, not
+    power, while a cloud backend's status() is already the power state.
+    The page shows N/A for a None uptime.
+    """
+    read = getattr(backend, 'power_state', None)
+    return read(VMRef.from_record(record)) if read is not None else (None, None)
 
 
 @vm_listing_bp.route('/list', methods=['GET'])
@@ -72,33 +162,23 @@ def list_vms():
 
         # Group VMs by student, then by deployment group
         students = {}
-        orphaned_records = []  # Track VMs that don't exist in Proxmox
-
-        # Get live IP addresses from Proxmox
-        proxmox = get_proxmox_connection()
+        orphaned_records = []  # Track VMs their backend no longer lists
 
         # Load template config once for per-VM mask_ip lookup. Admins always
         # see real IPs (so they can debug); non-admins get masked IPs for any
         # VM whose template sets mask_ip: true in templates.yaml.
         template_config = load_template_config()
 
-        # One cluster-wide inventory for the whole render. Without it each
-        # VM cost a `config.get()` plus a guest-agent call: 14 Proxmox
-        # round trips for a 7-VM student, ~350 for an admin, ~1,400 when a
-        # class refreshes at once. Best-effort — `_verify_vm_exists` falls
-        # back to its per-VM path when the snapshot is absent or unsure.
-        try:
-            vm_index = get_cluster_vm_index(proxmox)
-        except Exception as e:
-            current_app.logger.warning(
-                "cluster inventory unavailable (%s); falling back to per-VM "
-                "config reads for this request", e)
-            vm_index = None
+        # Each record's own backend supplies status and addresses; Proxmox
+        # serves both from one cached cluster read per render, and its 10/8
+        # lab-address filter and cache fallback stay inside ProxmoxBackend.
+        with ExitStack() as sessions:
+            backend_of = _RenderBackends(sessions)
+            observed = {record.id: _observe(backend_of(record), record)
+                        for record in vm_records}
 
         for record in vm_records:
-            vm_state, error_msg = _verify_vm_exists(
-                proxmox, record.node, record.vmid, record.vm_type,
-                index=vm_index)
+            backend, vm_state, status, ips, error_msg = observed[record.id]
 
             confirmed_gone = note_vm_state(record.node, record.vmid, vm_state)
 
@@ -112,30 +192,32 @@ def list_vms():
                     # responsible for this VM.
                     current_app.logger.warning(
                         f"VM {record.vmid} ({record.vm_name}) is not in the "
-                        f"Proxmox cluster; holding the record until a second "
-                        f"sighting confirms it")
+                        f"{record.backend} inventory; holding the record "
+                        f"until a second sighting confirms it")
                     continue
                 current_app.logger.warning(
                     f"VM {record.vmid} ({record.vm_name}) has been absent from "
-                    f"the Proxmox cluster for over {ORPHAN_CONFIRM_SECONDS:.0f}s "
-                    f"- marking for cleanup")
-                orphaned_records.append(record)
+                    f"the {record.backend} inventory for over "
+                    f"{ORPHAN_CONFIRM_SECONDS:.0f}s - marking for cleanup")
+                orphaned_records.append((record, backend))
                 continue  # Skip this VM from the list
 
             if vm_state == VM_UNKNOWN:
-                # We could not reach Proxmox, or could not classify the
-                # error. Keep showing the VM and NEVER delete its row: a
+                # We could not reach the backend, or it could not classify
+                # the guest. Keep showing the VM and NEVER delete its row: a
                 # deleted row means the expiry daemon stops tracking the
-                # VM and it runs in Proxmox forever.
+                # VM and it runs forever.
                 current_app.logger.warning(
                     f"VM {record.vmid} ({record.vm_name}): state unknown "
-                    f"({error_msg}); listing it unverified and keeping the record")
+                    f"on {record.backend} ({error_msg}); listing it "
+                    f"unverified and keeping the record")
 
             has_config_issues = vm_state == VM_CONFIG_ERROR
             if has_config_issues:
                 # The cluster still lists this VM but its config file is
                 # unreadable. It is real, it is consuming resources, and it
                 # needs a manual purge.
+                error_msg = error_msg or 'configuration file unreadable'
                 current_app.logger.error(
                     f"VM {record.vmid} ({record.vm_name}) has configuration issues: {error_msg}")
                 current_app.logger.error(
@@ -179,33 +261,20 @@ def list_vms():
                     'vms': []
                 }
 
-            # Fetch live IP addresses from Proxmox (skip when we already
-            # know Proxmox won't answer for this VM).
+            # The backend already returned only usable addresses; empty
+            # means none yet (or, unverified, none cached).
             if has_config_issues:
                 ip_display = 'CONFIG ERROR'
                 vm_status = 'error'
             elif vm_state == VM_UNKNOWN:
-                # Proxmox did not answer for this VM, so a guest-agent call
-                # would only be another timeout. The cache may still hold a
-                # seconds-old address though, and reading it costs nothing -
-                # a student mid-SSH should not lose the address they were
-                # about to use because of a one-render blip.
-                cached_ips = _ip_cache_get((record.node, record.vmid)) or []
-                usable = [ip for ip in cached_ips if ip.startswith('10.')]
-                ip_display = ', '.join(usable) if usable else 'UNKNOWN'
+                ip_display = ', '.join(ips) if ips else 'UNKNOWN'
                 vm_status = 'unknown'
             elif record.is_entry_point:
-                # Entry point VM: show only 10.0.x.x IP (entry VLAN network)
-                ip_addresses = _get_vm_ip_addresses(proxmox, record.node, record.vmid, record.vm_type)
-                entry_ips = [ip for ip in ip_addresses if ip.startswith('10.')]
-                ip_display = ', '.join(entry_ips) if entry_ips else 'N/A'
-                vm_status = 'running'
+                ip_display = ', '.join(ips) if ips else 'N/A'
+                vm_status = status
             else:
-                # Non-entry-point VMs: show internal 10.x.1.x IP
-                ip_addresses = _get_vm_ip_addresses(proxmox, record.node, record.vmid, record.vm_type)
-                internal_ips = [ip for ip in ip_addresses if ip.startswith('10.')]
-                ip_display = ', '.join(internal_ips) if internal_ips else '-'
-                vm_status = 'running'
+                ip_display = ', '.join(ips) if ips else '-'
+                vm_status = status
 
             # Per-VM mask_ip flag: hide host octet from non-admins so the
             # subnet is still visible (10.101.4.xxx) but the specific host
@@ -231,9 +300,9 @@ def list_vms():
                 'connect': tpl.get('connect') if tpl else None
             })
 
-        # Orphaned record cleanup: rows the Proxmox CLUSTER INVENTORY has
-        # not listed for ORPHAN_CONFIRM_SECONDS - deleted through the
-        # Proxmox UI, or a destroy that removed the VM but crashed before
+        # Orphaned record cleanup: rows their backend's inventory has not
+        # listed for ORPHAN_CONFIRM_SECONDS - deleted through the provider's
+        # own UI, or a destroy that removed the VM but crashed before
         # updating the database. Only a CONFIRMED VM_MISSING reaches this
         # list. A VM we merely failed to reach, or saw missing once, must
         # never land here: the expiry daemon tracks VMs by database row, so
@@ -243,11 +312,12 @@ def list_vms():
         if orphaned_records:
             # Capture identities first: the helper's rollback expires the
             # loaded rows.
-            targets = [(r.id, r.vmid, r.node) for r in orphaned_records]
-            for record_id, vmid, node in targets:
+            targets = [(r.id, r.vmid, r.node, backend)
+                       for r, backend in orphaned_records]
+            for record_id, vmid, node, backend in targets:
                 try:
                     tasks.reconcile_missing_vm_record(
-                        proxmox, record_id, vmid, node)
+                        backend, record_id, vmid, node)
                 except Exception as cleanup_error:
                     db.session.rollback()
                     logger.error(f"Error cleaning up orphaned record {vmid}: {cleanup_error}")
@@ -344,10 +414,10 @@ def api_vms_list():
 @login_required
 def api_vm_detail(vmid):
     """
-    Get details of a specific VM by ID from Proxmox and the database.
+    Get details of a specific VM from its database record and its backend.
 
     Non-admin users can view VMs assigned to them or one of their groups.
-    Admin users can view any VM.
+    Admin users can view any VM the portal tracks.
 
     Returns:
         JSON: { vm: {...} }
@@ -355,7 +425,7 @@ def api_vm_detail(vmid):
     try:
         user = get_authenticated_user()
 
-        # Authorize against the database record before making any Proxmox
+        # Authorize against the database record before making any provider
         # calls. Group ownership is membership-based, not creator-based:
         # another member may legitimately have created the shared VM.
         db_vm = VMRecord.query.filter_by(vmid=vmid).first()
@@ -368,79 +438,51 @@ def api_vm_detail(vmid):
                 return jsonify({
                     'error': 'You can only view VMs assigned to you or your group',
                 }), 403
+        if not db_vm:
+            return jsonify({'success': False, 'error': f'VM {vmid} not found'}), 404
 
-        proxmox = get_proxmox_connection()
+        # The record names the VM's backend and its identity, so only that
+        # backend is asked, and only for what the record cannot know.
+        try:
+            backend = backend_for(db_vm)
+        except Exception as error:
+            current_app.logger.warning(
+                "backend %s unavailable for VM %s: %s", db_vm.backend, vmid, error)
+            backend = None
+        uptime = None
+        if backend is None:
+            status, ip_addresses = 'unknown', []
+        else:
+            with vm_provisioning.provider_session(backend):
+                _backend, state, status, ip_addresses, _diagnostic = _observe(
+                    backend, db_vm)
+                if state == VM_PRESENT:
+                    power, uptime = _power_state(backend, db_vm)
+                    # A failed read keeps the present-guest status.
+                    status = power or status
+        if status == VM_MISSING:
+            return jsonify({'success': False,
+                            'error': f'VM {vmid} not found on {db_vm.backend}'}), 404
 
-        # Search for the VM in Proxmox across all nodes
-        vm_info = None
-        for node_data in proxmox.nodes.get():
-            node = node_data['node']
-            try:
-                # Check QEMU VMs
-                vms = proxmox.nodes(node).qemu.get()
-                for vm in vms:
-                    if vm['vmid'] == vmid:
-                        # Get full config for QEMU VM
-                        config = proxmox.nodes(node).qemu(vmid).config.get()
-                        status = proxmox.nodes(node).qemu(vmid).status.current.get()
-
-                        vm_info = {
-                            'vmid': vm['vmid'],
-                            'name': vm['name'],
-                            'type': 'qemu',
-                            'node': node,
-                            'status': status.get('status', 'unknown'),
-                            'memory': config.get('memory'),
-                            'cores': config.get('cores'),
-                            'uptime': status.get('uptime')
-                        }
-                        # Get IP addresses for QEMU VM
-                        vm_info['ip_addresses'] = _get_vm_ip_addresses(proxmox, node, vmid, 'qemu')
-                        break
-            except Exception:
-                pass
-
-            try:
-                # Check LXC containers
-                containers = proxmox.nodes(node).lxc.get()
-                for container in containers:
-                    if container['vmid'] == vmid:
-                        # Get full config for LXC container
-                        config = proxmox.nodes(node).lxc(vmid).config.get()
-                        status = proxmox.nodes(node).lxc(vmid).status.current.get()
-
-                        vm_info = {
-                            'vmid': container['vmid'],
-                            'name': container['name'],
-                            'type': 'lxc',
-                            'node': node,
-                            'status': status.get('status', 'unknown'),
-                            'memory': config.get('memory'),
-                            'cores': config.get('cores'),
-                            'uptime': status.get('uptime')
-                        }
-                        # Get IP addresses for LXC container
-                        vm_info['ip_addresses'] = _get_vm_ip_addresses(proxmox, node, vmid, 'lxc')
-                        break
-            except Exception:
-                pass
-
-            if vm_info:
-                break
-
-        if not vm_info:
-            return jsonify({'success': False, 'error': f'VM {vmid} not found in Proxmox'}), 404
-
-        # Combine with database info if available
-        if db_vm:
-            vm_info['database_info'] = db_vm.to_dict()
-            vm_info['expires_at'] = db_vm.expires_at.isoformat() if db_vm.expires_at else None
-            vm_info['created_at'] = db_vm.created_at.isoformat() if db_vm.created_at else None
-            # Calculate time remaining
-            if db_vm.expires_at:
-                time_remaining = db_vm.expires_at - datetime.now()
-                vm_info['time_remaining_seconds'] = int(time_remaining.total_seconds())
-                vm_info['time_remaining'] = _format_time_remaining(time_remaining)
+        vm_info = {
+            'vmid': db_vm.vmid,
+            'name': db_vm.vm_name,
+            'type': db_vm.vm_type,
+            'node': db_vm.node,
+            'backend': db_vm.backend,
+            'status': status,
+            'memory': db_vm.memory,
+            'cores': db_vm.cores,
+            'uptime': uptime,
+            'ip_addresses': ip_addresses,
+            'database_info': db_vm.to_dict(),
+            'expires_at': db_vm.expires_at.isoformat() if db_vm.expires_at else None,
+            'created_at': db_vm.created_at.isoformat() if db_vm.created_at else None,
+        }
+        if db_vm.expires_at:
+            time_remaining = db_vm.expires_at - datetime.now()
+            vm_info['time_remaining_seconds'] = int(time_remaining.total_seconds())
+            vm_info['time_remaining'] = _format_time_remaining(time_remaining)
 
         # Per-VM mask_ip: hide host octet for non-admins when the VM's
         # template has mask_ip: true. Mask each IP in the list independently.

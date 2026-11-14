@@ -14,6 +14,8 @@ from proxmoxer.core import ResourceException
 from app.orphan_reaper import _parse_expiration
 from tests.live.harness import (
     NAME_PREFIX,
+    NAME_SETTLE_SECONDS,
+    VMID_REUSE_COOLDOWN,
     ContractRun,
     Guest,
     LiveConfig,
@@ -59,9 +61,14 @@ class _Path:
     def delete(self, **kwargs):
         return self._api.handle('DELETE', self._parts, kwargs)
 
+    def create(self, **kwargs):
+        # proxmoxer's alias for POST, which create_lxc_container uses.
+        return self._api.handle('POST', self._parts, kwargs)
+
 
 class FakeProxmox(_Path):
-    """Just enough of the proxmoxer surface for one clone/start/stop/delete."""
+    """Just enough of the proxmoxer surface for one clone/start/stop/delete,
+    plus the node and guest-agent reads ProxmoxBackend makes."""
 
     def __init__(self, guests=()):
         super().__init__(self, ())
@@ -74,13 +81,23 @@ class FakeProxmox(_Path):
         self.reject_linked = False
         self.before_clone = None
         self.fail_config_put = False
+        # Failure knobs and node state for ProxmoxBackend tests.
+        self.fail_stop = set()
+        self.delete_kwargs = {}
+        self.cluster_error = None
+        self.corrupt_config = set()
+        self.extra_nodes = []
+        self.node_memory = {}
+        # (reads, listed_as): a new clone is listed under `listed_as` for its
+        # first `reads` cluster/resources reads, as pvestatd lags a clone.
+        self.clone_name_lag = None
         self._upids = itertools.count(1)
 
     def add_guest(self, vmid, name, node='node1', template=0, status='stopped',
-                  description='', vm_type='qemu'):
+                  description='', vm_type='qemu', ips=()):
         self.guests[int(vmid)] = {
             'vmid': int(vmid), 'name': name, 'node': node, 'type': vm_type,
-            'status': status, 'template': template,
+            'status': status, 'template': template, 'ips': list(ips),
             'config': {'name': name, 'memory': '1024', 'cores': 1,
                        'template': template, 'description': description},
         }
@@ -95,14 +112,53 @@ class FakeProxmox(_Path):
                 if call[0] in ('POST', 'PUT', 'DELETE')
                 and len(call[1]) > 3 and call[1][3] == str(vmid)]
 
+    def _node_read(self, parts):
+        """Answer the node-level GETs, or None when `parts` is not one."""
+        if parts == ('nodes',):
+            names = sorted({g['node'] for g in self.guests.values()}
+                           | set(self.extra_nodes))
+            return [{'node': name, 'status': 'online'} for name in names]
+        if len(parts) == 3 and parts[0] == 'nodes' and parts[2] == 'status':
+            memory = self.node_memory.get(
+                parts[1], {'total': 64 * 1024 ** 3, 'used': 8 * 1024 ** 3})
+            # Admission skips a node without uptime as offline.
+            return {'memory': dict(memory), 'cpu': 0.1, 'uptime': 1000,
+                    'cpuinfo': {'cpus': 8}}
+        if len(parts) == 3 and parts[0] == 'nodes' and parts[2] in ('qemu', 'lxc'):
+            return [{'vmid': g['vmid'], 'name': g['name'],
+                     'status': g['status'], 'template': g['template']}
+                    for g in self.guests.values()
+                    if g['node'] == parts[1] and g['type'] == parts[2]]
+        return None
+
     def handle(self, method, parts, kwargs):
         self.calls.append((method, parts, kwargs))
         if parts == ('cluster', 'resources'):
-            return [{k: g[k] for k in ('vmid', 'name', 'node', 'type',
-                                       'status', 'template')}
-                    for g in self.guests.values()]
+            if self.cluster_error is not None:
+                raise self.cluster_error
+            rows = []
+            for g in self.guests.values():
+                row = {k: g[k] for k in ('vmid', 'name', 'node', 'type',
+                                         'status', 'template')}
+                if g.get('lag_reads', 0) > 0:
+                    g['lag_reads'] -= 1
+                    row['name'] = g['listed_as']
+                rows.append(row)
+            return rows
+        if method == 'GET':
+            answer = self._node_read(parts)
+            if answer is not None:
+                return answer
         if parts[0] == 'nodes' and parts[2] == 'tasks':
             return dict(self.tasks[parts[3]])
+        if method == 'POST' and parts[0] == 'nodes' and parts[2:] == ('lxc',):
+            vmid = int(kwargs['vmid'])
+            if vmid in self.guests:
+                raise ResourceException(500, 'Internal Server Error',
+                                        f'CT {vmid} already exists')
+            self.add_guest(vmid, kwargs['hostname'], node=parts[1], vm_type='lxc')
+            self.guests[vmid]['config'].update(kwargs)
+            return self._task()
         node, vmid, rest = parts[1], int(parts[3]), parts[4:]
         guest = self.guests.get(vmid)
         if method == 'POST' and rest == ('clone',):
@@ -120,11 +176,18 @@ class FakeProxmox(_Path):
                 raise ResourceException(500, 'Internal Server Error',
                                         f'VM {newid} already exists')
             self.add_guest(newid, kwargs['name'], node=node)
+            if self.clone_name_lag:
+                reads, listed_as = self.clone_name_lag
+                self.guests[newid].update(lag_reads=reads, listed_as=listed_as)
             return self._task()
         if guest is None or guest['node'] != node:
             raise _missing(node, vmid)
         if rest == ('config',):
             if method == 'GET':
+                if vmid in self.corrupt_config:
+                    # The cluster still lists the guest; only its config
+                    # read fails, with the same text as a missing guest.
+                    raise _missing(node, vmid)
                 return dict(guest['config'])
             if self.fail_config_put:
                 raise ResourceException(400, 'Parameter verification failed',
@@ -135,11 +198,27 @@ class FakeProxmox(_Path):
             guest['status'] = 'running'
             return self._task()
         if rest == ('status', 'stop'):
+            if vmid in self.fail_stop:
+                raise ResourceException(500, 'Internal Server Error',
+                                        'VM is locked')
             guest['status'] = 'stopped'
             return self._task()
         if rest == ('status', 'current'):
-            return {'status': guest['status'], 'vmid': vmid}
+            return {'status': guest['status'], 'vmid': vmid,
+                    'uptime': guest.get('uptime', 0)}
+        if rest == ('agent', 'network-get-interfaces') and method == 'GET':
+            if not guest['ips']:
+                raise ResourceException(500, 'Internal Server Error',
+                                        'QEMU guest agent is not running')
+            return {'result': [
+                {'name': 'lo', 'ip-addresses': [
+                    {'ip-address': '127.0.0.1', 'ip-address-type': 'ipv4'}]},
+                {'name': 'eth0', 'ip-addresses': [
+                    {'ip-address': ip, 'ip-address-type': 'ipv4'}
+                    for ip in guest['ips']]},
+            ]}
         if method == 'DELETE' and rest == ():
+            self.delete_kwargs[vmid] = dict(kwargs)
             if vmid in self.fail_delete:
                 raise ResourceException(500, 'Internal Server Error',
                                         'storage is locked')
@@ -151,10 +230,26 @@ class FakeProxmox(_Path):
 TEMPLATE = {'vmid': 9000, 'name': 'contract-template', 'template': 1}
 
 
+class _Clock:
+    """A monotonic clock that only moves when the harness sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 def _run(api, vmids='99000-99009', **guards):
     # Most tests exercise other guards, on a cluster the portal never uses.
-    guards = guards or {'separate_cluster': True}
+    if not {'portal_vmid_mark', 'separate_cluster'} & guards.keys():
+        guards['separate_cluster'] = True
+    clock = _Clock()
     return ContractRun(api, parse_vmid_range(vmids), now=lambda: FIXED_NOW,
+                       clock=clock, sleep=clock.sleep, recently_freed={},
                        **guards)
 
 
@@ -462,6 +557,84 @@ def test_destroy_stops_deletes_and_confirms_absence():
     assert run.owned_vmids() == []
 
 
+# --- the listed name lags a clone (LIVE-REPORT I1) ------------------------------
+# /cluster/resources reports a fresh clone's name empty for ~10 s, or as the
+# previous guest's at a reused VMID. Every guard used to read it at once and
+# refused (and so leaked) the run's own guests.
+
+@pytest.mark.parametrize('listed_as', [None, f'{NAME_PREFIX}previous'],
+                         ids=['empty', 'previous-guest'])
+def test_clone_waits_out_a_lagging_listed_name_then_runs_the_lifecycle(listed_as):
+    api = FakeProxmox([TEMPLATE])
+    api.clone_name_lag = (10, listed_as)
+    run = _run(api)
+    started_at = run.clock()
+
+    guest = run.clone_template('node1', 9000)
+
+    waited = run.clock() - started_at
+    assert 0 < waited < NAME_SETTLE_SECONDS
+    assert run.start(guest)['success']
+    run.destroy(guest.vmid)
+    assert guest.vmid not in api.guests
+    assert run.owned_vmids() == []
+
+
+def test_a_listed_name_that_never_becomes_ours_is_refused_and_left_alone():
+    api = FakeProxmox([TEMPLATE])
+    api.clone_name_lag = (10_000, 'student-zed')
+    run = _run(api)
+    started_at = run.clock()
+
+    with pytest.raises(UnsafeLiveRun, match='student-zed'):
+        run.clone_template('node1', 9000)
+    assert run.clock() - started_at >= NAME_SETTLE_SECONDS
+    api.calls.clear()
+
+    failures = run.cleanup()
+
+    assert 99000 in api.guests
+    assert api.mutations(99000) == []
+    assert len(failures) == 1 and 'left alone' in failures[0]
+
+
+def test_a_vmid_freed_moments_ago_is_not_reused_until_the_cooldown_passes():
+    api = FakeProxmox([TEMPLATE])
+    run = _run(api, '99000-99001')
+    first = run.clone_template('node1', 9000)
+    run.destroy(first.vmid)
+
+    second = run.clone_template('node1', 9000)
+    assert second.vmid == 99001
+    run.destroy(second.vmid)
+    with pytest.raises(UnsafeLiveRun, match='free VMID'):
+        run.clone_template('node1', 9000)
+
+    run.sleep(VMID_REUSE_COOLDOWN)
+    assert run.clone_template('node1', 9000).vmid == 99000
+
+
+# --- LIVE_VLAN ---------------------------------------------------------------------
+
+def test_a_configured_vlan_tags_the_single_nic_of_every_clone():
+    api = FakeProxmox([TEMPLATE])
+
+    guest = _run(api, vlan=20).clone_template('node1', 9000)
+
+    config = api.guests[guest.vmid]['config']
+    assert config['net0'] == 'virtio,bridge=vmbr0,tag=20'
+    puts = [c[2] for c in api.calls if c[0] == 'PUT']
+    assert {'delete': 'net1'} in puts
+
+
+def test_without_a_vlan_the_clone_stays_untagged():
+    api = FakeProxmox([TEMPLATE])
+
+    guest = _run(api).clone_template('node1', 9000)
+
+    assert 'tag=' not in api.guests[guest.vmid]['config']['net0']
+
+
 # --- cleanup ---------------------------------------------------------------------------
 
 def test_failure_inside_the_run_still_destroys_every_guest_it_created():
@@ -584,3 +757,14 @@ def test_config_rejects_a_portal_mark_on_a_separate_cluster():
         LiveConfig.from_env(dict(
             LIVE_ENV, LIVE_SEPARATE_CLUSTER='1',
             LIVE_PORTAL_DATABASE_URL='mysql+pymysql://ro@db/portal'))
+
+
+def test_config_reads_an_optional_vlan():
+    assert LiveConfig.from_env(LIVE_ENV).vlan is None
+    assert LiveConfig.from_env(dict(LIVE_ENV, LIVE_VLAN=' 20 ')).vlan == 20
+
+
+@pytest.mark.parametrize('text', ['0', '4095', 'x', '20,30', '-1'])
+def test_config_rejects_a_vlan_outside_1_to_4094(text):
+    with pytest.raises(ValueError, match='LIVE_VLAN'):
+        LiveConfig.from_env(dict(LIVE_ENV, LIVE_VLAN=text))

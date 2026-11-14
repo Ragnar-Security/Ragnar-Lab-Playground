@@ -1,10 +1,14 @@
 """Validation tests for the production VM deployment catalog."""
 
+import importlib
 from pathlib import Path
 import pytest
 
 import yaml
 from app.template_manager import validate_template_config
+from app.backends.template_spec import (
+    backend_block, resolve_group_backend, validate_group_backends,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -15,7 +19,10 @@ CATALOG_PATHS = [
 
 
 @pytest.mark.parametrize("catalog_path", CATALOG_PATHS, ids=["test-fixture", "example"])
-def test_enabled_groups_have_consistent_node_maps_and_positive_resources(catalog_path):
+def test_enabled_groups_have_consistent_node_maps_and_positive_resources(catalog_path, monkeypatch):
+    # Pinned: these are Proxmox catalogs, whatever ENABLED_BACKENDS the shell exports.
+    monkeypatch.setattr(importlib.import_module("app.config"),
+                        "ENABLED_BACKENDS", ("proxmox",))
     config = yaml.safe_load(catalog_path.read_text())
     errors, warnings = validate_template_config(config)
     assert errors == []
@@ -38,3 +45,17 @@ def test_enabled_groups_have_consistent_node_maps_and_positive_resources(catalog
                     f"{group['display_name']}/{template.get('name')} {field} "
                     f"must be a positive integer, got {value!r}"
                 )
+
+
+# Catches the backend migration moving any committed catalog group off Proxmox.
+@pytest.mark.parametrize("catalog_path", CATALOG_PATHS, ids=["test-fixture", "example"])
+def test_committed_catalog_groups_resolve_to_proxmox(catalog_path, monkeypatch):
+    monkeypatch.setattr(importlib.import_module("app.config"),
+                        "ENABLED_BACKENDS", ("proxmox",))
+    config = yaml.safe_load(catalog_path.read_text())
+    assert validate_template_config(config) == ([], [])
+    for group in config["deployment_groups"]:
+        assert resolve_group_backend(group) == "proxmox"
+        assert validate_group_backends(group, ("proxmox",)) == []
+        for template in group.get("templates", []):
+            assert backend_block(template, "proxmox") == template

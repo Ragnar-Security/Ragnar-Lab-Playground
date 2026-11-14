@@ -3,10 +3,15 @@ Unit tests for configuration validation
 Tests validate_config() behavior with various configurations
 """
 
+import importlib
 import os
+import sys
 import unittest
 import logging
 from unittest.mock import patch
+
+import pytest
+
 from app.config import validate_config
 
 
@@ -242,6 +247,195 @@ class TestGroupVlanConfig(unittest.TestCase):
             importlib.reload(cfg)
             with self.assertNoLogs('app.config', level=logging.WARNING):
                 cfg.validate_config()
+
+
+# ============ VM backend selection ============
+
+# Every key whose value decides which backends run and what they need. A
+# key is set to '' rather than deleted so an operator's .env cannot refill
+# it when the reloaded module calls load_dotenv().
+BACKEND_ENV_KEYS = (
+    'ENABLED_BACKENDS', 'LAB_SITE_ID', 'JUMPBOX_VLAN_BANDS',
+    'PROXMOX_HOST', 'PROXMOX_USER', 'PROXMOX_PASSWORD', 'PROXMOX_TOKEN_ID',
+    'PROXMOX_TOKEN_SECRET', 'PROXMOX_VERIFY_SSL', 'PROXMOX_CA_BUNDLE',
+    'ENABLE_LOAD_BALANCING', 'FIXED_NODE',
+    'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR',
+    'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS', 'AWS_ROUTER_IDLE_MINUTES',
+    'AWS_LAUNCH_TIMEOUT_SECONDS', 'AWS_TERMINATE_TIMEOUT_SECONDS',
+    'GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK', 'GCP_LAB_CIDR',
+    'GCP_ROUTER_INSTANCE', 'GCP_MAX_VMS', 'GCP_ROUTER_IDLE_MINUTES',
+    'GCP_OPERATION_TIMEOUT_SECONDS',
+)
+
+AWS_VALUES = {
+    'LAB_SITE_ID': 'site-a', 'AWS_REGION': 'us-test-1',
+    'AWS_AVAILABILITY_ZONE': 'us-test-1a', 'AWS_LAB_VPC_ID': 'vpc-placeholder',
+    'AWS_ROUTER_INSTANCE_ID': 'i-placeholder', 'AWS_MAX_VMS': '3',
+}
+GCP_VALUES = {
+    'GCP_PROJECT': 'project-placeholder', 'GCP_REGION': 'region-test1',
+    'GCP_ZONE': 'region-test1-a', 'GCP_NETWORK': 'network-placeholder',
+    'GCP_ROUTER_INSTANCE': 'router-placeholder', 'GCP_MAX_VMS': '2',
+}
+
+
+@pytest.fixture(autouse=True)
+def _restore_reloaded_config():
+    """Reload app.config after each test, so a module reloaded under
+    patched env does not carry that state into later test files.
+
+    The conftest autouse fixtures request monkeypatch before this one is
+    set up, so monkeypatch is torn down after it and cannot be relied on
+    to have restored the environment. Restore a snapshot of os.environ
+    here, then reload against it."""
+    snapshot = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(snapshot)
+    importlib.reload(sys.modules['app.config'])
+
+
+def reload_config(monkeypatch, **overrides):
+    # Unset FLASK_ENV means production, whose secret checks are not under
+    # test here; a test that wants production says so in overrides.
+    monkeypatch.setenv('FLASK_ENV', 'development')
+    for key in BACKEND_ENV_KEYS:
+        monkeypatch.setenv(key, '')
+    for key, value in overrides.items():
+        monkeypatch.setenv(key, value)
+    return importlib.reload(sys.modules['app.config'])
+
+
+def reload_valid_aws_config(monkeypatch, **overrides):
+    return reload_config(monkeypatch, **{
+        'ENABLED_BACKENDS': 'aws', **AWS_VALUES, **overrides})
+
+
+def reload_valid_cloud_config(monkeypatch, **overrides):
+    return reload_config(monkeypatch, **{
+        'ENABLED_BACKENDS': 'aws,gcp', **AWS_VALUES, **GCP_VALUES, **overrides})
+
+
+# Catches the contract's defaults drifting, or an unset ENABLED_BACKENDS
+# no longer meaning the Proxmox-only portal every existing site runs.
+def test_backend_defaults_match_the_contract(monkeypatch):
+    cfg = reload_config(monkeypatch)
+    assert cfg.ENABLED_BACKENDS == ('proxmox',)
+    assert cfg.LAB_SITE_ID == ''
+    assert (cfg.AWS_LAB_CIDR, cfg.GCP_LAB_CIDR) == ('172.20.0.0/16', '172.21.0.0/16')
+    assert (cfg.AWS_MAX_VMS, cfg.GCP_MAX_VMS) == (None, None)
+    assert (cfg.AWS_ROUTER_IDLE_MINUTES, cfg.GCP_ROUTER_IDLE_MINUTES) == (30, 30)
+    assert (cfg.AWS_LAUNCH_TIMEOUT_SECONDS, cfg.AWS_TERMINATE_TIMEOUT_SECONDS,
+            cfg.GCP_OPERATION_TIMEOUT_SECONDS) == (600, 600, 600)
+    assert cfg.JUMPBOX_VLAN_BANDS == (
+        'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
+
+
+# Catches a list that keeps case, whitespace or duplicates, which every
+# `name in ENABLED_BACKENDS` check downstream would then mis-answer.
+def test_enabled_backends_are_normalized_in_declaration_order(monkeypatch):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS=' GCP, proxmox ,gcp,AWS ')
+    assert cfg.ENABLED_BACKENDS == ('gcp', 'proxmox', 'aws')
+    assert cfg.AWS_MAX_VMS is None
+
+
+# Catches cloud-only startup still requiring an unrelated Proxmox cluster.
+def test_cloud_only_config_does_not_require_proxmox(monkeypatch):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS='aws', LAB_SITE_ID='site-a',
+        AWS_REGION='us-test-1', AWS_AVAILABILITY_ZONE='us-test-1a',
+        AWS_LAB_VPC_ID='vpc-placeholder', AWS_ROUTER_INSTANCE_ID='i-placeholder',
+        AWS_MAX_VMS='3', PROXMOX_HOST='', PROXMOX_PASSWORD='')
+    cfg.validate_config()
+    assert cfg.AWS_MAX_VMS == 3
+
+
+# Catches accidentally enabling an unimplemented or misspelled provider.
+@pytest.mark.parametrize('value', ['azure', 'proxmox,azure', ','])
+def test_unknown_or_empty_enabled_backend_is_rejected(monkeypatch, value):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS=value,
+                        FLASK_ENV='development')
+    with pytest.raises(ValueError, match='ENABLED_BACKENDS'):
+        cfg.validate_config()
+
+
+# Catches an ownership tag that cloud naming APIs reject.
+@pytest.mark.parametrize('site', ['', '-site', 'site-', 'UPPER', 'x' * 21])
+def test_cloud_site_id_is_validated(monkeypatch, site):
+    cfg = reload_valid_aws_config(monkeypatch, LAB_SITE_ID=site)
+    with pytest.raises(ValueError, match='LAB_SITE_ID'):
+        cfg.validate_config()
+
+
+# Catches an enabled cloud starting without a setting it needs to place a
+# VM, or with a cap that admits nothing (or everything).
+@pytest.mark.parametrize('key,value', [
+    *[(key, '') for key in AWS_VALUES if key != 'LAB_SITE_ID'],
+    *[(key, '') for key in GCP_VALUES],
+    ('AWS_MAX_VMS', '0'), ('AWS_MAX_VMS', '-1'), ('AWS_MAX_VMS', 'three'),
+    ('GCP_MAX_VMS', '0'),
+])
+def test_enabled_cloud_requires_each_setting(monkeypatch, key, value):
+    cfg = reload_valid_cloud_config(monkeypatch, **{key: value})
+    with pytest.raises(ValueError, match=key):
+        cfg.validate_config()
+
+
+# Catches cross-backend routing collisions and slot 500 escaping the base range.
+@pytest.mark.parametrize('aws_cidr,gcp_cidr,message', [
+    ('10.20.0.0/16', '172.21.0.0/16', '10.0.0.0/8'),
+    ('172.17.0.0/16', '172.21.0.0/16', '172.17.0.0/16'),
+    ('172.20.0.0/24', '172.21.0.0/16', 'slot 500'),
+    ('172.20.0.0/16', '172.20.128.0/17', 'overlap'),
+])
+def test_lab_cidrs_fail_closed(monkeypatch, aws_cidr, gcp_cidr, message):
+    cfg = reload_valid_cloud_config(
+        monkeypatch, AWS_LAB_CIDR=aws_cidr, GCP_LAB_CIDR=gcp_cidr)
+    with pytest.raises(ValueError, match=message):
+        cfg.validate_config()
+
+
+# Catches the tailnet range, a malformed value, an IPv6 network or a base
+# with host bits set reaching the slot arithmetic of either cloud.
+@pytest.mark.parametrize('cidr,message', [
+    ('100.64.0.0/16', 'overlaps reserved range 100.64.0.0/10'),
+    ('100.0.0.0/8', 'overlaps reserved range 100.64.0.0/10'),
+    ('not-a-cidr', 'is not an IPv4 network address/prefix'),
+    ('172.20.0.0/33', 'is not an IPv4 network address/prefix'),
+    ('fd00:20::/48', 'is not an IPv4 network address/prefix'),
+    # Outside both clouds' bases, so only the host bits can refuse it.
+    ('172.22.1.0/16', 'is not an IPv4 network address/prefix'),
+], ids=['inside-cgnat', 'contains-cgnat', 'malformed', 'bad-prefix', 'ipv6', 'host-bits'])
+@pytest.mark.parametrize('key', ['AWS_LAB_CIDR', 'GCP_LAB_CIDR'])
+def test_lab_cidr_rejects_cgnat_malformed_ipv6_and_host_bits(monkeypatch, key, cidr, message):
+    cfg = reload_valid_cloud_config(monkeypatch, **{key: cidr})
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert f'{key} ' in str(exc.value) and message in str(exc.value)
+
+
+# Catches validate_config() drifting from the shared validator's exact peer message.
+def test_lab_cidr_peer_overlap_message_is_the_shared_validators(monkeypatch):
+    cfg = reload_valid_cloud_config(
+        monkeypatch, AWS_LAB_CIDR='172.20.0.0/16', GCP_LAB_CIDR='172.20.128.0/17')
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert 'AWS_LAB_CIDR 172.20.0.0/16 overlaps gcp lab CIDR 172.20.128.0/17' in str(exc.value)
+
+
+# Catches the boundary drifting: a /17 holds slot 500 (32,064 addresses).
+def test_smallest_base_that_holds_slot_500_is_accepted(monkeypatch):
+    cfg = reload_valid_cloud_config(
+        monkeypatch, AWS_LAB_CIDR='172.20.0.0/17', GCP_LAB_CIDR='172.20.128.0/17')
+    cfg.validate_config()
+
+
+# Catches cloud admission reservations silently consuming a Proxmox node's capacity (M14).
+@pytest.mark.parametrize('node', ['aws', 'GCP'])
+def test_proxmox_fixed_node_named_like_a_backend_is_rejected(monkeypatch, node):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS='proxmox', FIXED_NODE=node,
+                        FLASK_ENV='development')
+    with pytest.raises(ValueError, match='FIXED_NODE'):
+        cfg.validate_config()
 
 
 if __name__ == '__main__':
