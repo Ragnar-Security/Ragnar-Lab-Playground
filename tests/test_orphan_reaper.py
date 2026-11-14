@@ -281,6 +281,41 @@ def test_identity_is_rechecked_before_the_stop_and_before_the_delete(
     assert [r["status"] for r in results] == [expected]
 
 
+# A failed inventory read during either recheck must refuse, never fall
+# through to the stop or the delete.
+@pytest.mark.parametrize("when", ["before stop", "after stop"])
+def test_identity_recheck_inventory_error_refuses(app, when):
+    boundary = ProxmoxBoundary([_resource()])
+    listing = boundary.api.cluster.resources.get
+    sweep_rows = [dict(row) for row in listing.return_value]
+    guest = boundary.guests[700]
+
+    def unreachable(**_):
+        raise ConnectionError("cluster/resources unreachable")
+
+    if when == "before stop":
+        reads = iter([sweep_rows])
+
+        def listing_read(**kwargs):
+            rows = next(reads, None)
+            if rows is None:
+                return unreachable(**kwargs)
+            return rows
+        listing.side_effect = listing_read
+    else:
+        def stop():
+            listing.side_effect = unreachable
+            return "UPID:stop:700"
+        guest.status.stop.post.side_effect = stop
+    with app.app_context():
+        results = _run(boundary)
+
+    guest.delete.assert_not_called()
+    if when == "before stop":
+        guest.status.stop.post.assert_not_called()
+    assert [r["status"] for r in results] == ["identity_unverified"]
+
+
 def test_active_vmid_reservation_protects_expired_orphan_in_dry_run(app):
     boundary = ProxmoxBoundary([_resource()])
     allocator_view = MagicMock()
