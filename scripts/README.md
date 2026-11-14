@@ -50,11 +50,9 @@ Utility scripts for database management, deployment, and system administration.
 - **update_headscale_keys.py** - Store `login,key` rows from stdin in the
   portal database; run by the rotation script inside the app container
 
-- **image_build/** - Build a VM image from a recipe on Proxmox, AWS or GCP;
-  dry run with `--dry-run`. Runbook: `scripts/image_build/README.md`
-  ```bash
-  bash scripts/image_build/build_image.sh --dry-run <recipe.env> <backend>
-  ```
+- **Image builder** - moved to its own public repo,
+  [`Ragnar-Security/lab-image-builder`](https://github.com/Ragnar-Security/lab-image-builder),
+  which keeps a copy of `sync_template.sh` for its Proxmox backend
 
 ## Usage
 
