@@ -21,7 +21,8 @@ env/
 # Per-workstation tool permissions and deployment configuration.
 .claude/*
 scripts/site.env
-# Image builder hosts and cloud IDs; only config.env.example is tracked.
+# The image builder moved to Ragnar-Security/lab-image-builder. Keep an older
+# checkout's config.env (hosts and cloud IDs) out of commits.
 scripts/image_build/config.env
 config/headscale-acl.json
 # Operator-owned cloud credentials override (docs/CLOUD_BACKENDS.md).
