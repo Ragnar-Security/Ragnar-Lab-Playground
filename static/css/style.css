@@ -129,6 +129,7 @@ a:hover { color: #ff2a45; }
    ============================================ */
 .card {
     background: var(--bg-card);
+    color: var(--text-primary);
     border: 1px solid var(--border-color);
     border-radius: 10px;
     transition: box-shadow 0.15s ease;

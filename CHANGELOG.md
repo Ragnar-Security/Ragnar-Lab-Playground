@@ -54,6 +54,12 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - The image builder (`scripts/image_build/`), added after 1.1.0 and never in a
   release, moved to its own public repo, `Ragnar-Security/lab-image-builder`.
 
+### Fixed
+
+- Card text on the dark theme was near-invisible (dark text on the dark card
+  background), which hid the VPN setup instructions on the student page;
+  `.card` now sets the theme's text colour.
+
 ### Upgrade notes
 
 - No action. `VPN_MODE` defaults to `headscale`, `AWS_CLIENT_CIDRS` to the

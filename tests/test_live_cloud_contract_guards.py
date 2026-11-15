@@ -232,7 +232,8 @@ def test_cloud_live_config_pins_the_validated_values_and_the_template():
         'ENABLED_BACKENDS': ('proxmox', 'aws'), 'LAB_SITE_ID': 'live-test',
         'AWS_MAX_VMS': 1, 'AWS_REGION': 'us-test-1', 'AWS_AVAILABILITY_ZONE': 'us-test-1a',
         'AWS_LAB_VPC_ID': 'vpc-placeholder', 'AWS_LAB_CIDR': '172.20.0.0/16',
-        'AWS_ROUTER_INSTANCE_ID': 'i-placeholder'}
+        'AWS_ROUTER_INSTANCE_ID': 'i-placeholder', 'AWS_CLIENT_CIDRS': '',
+        'VPN_MODE': 'headscale'}
     assert aws.template() == {'image_id': 'ami-placeholder', 'instance_type': 't3.micro',
                               'disk_gb': 20}
     gcp = CloudLiveConfig.from_env('gcp', gcp_env())
@@ -240,6 +241,31 @@ def test_cloud_live_config_pins_the_validated_values_and_the_template():
     assert gcp.template() == {
         'image': 'projects/example-project/global/images/placeholder',
         'machine_type': 'e2-small', 'disk_gb': 20}
+
+
+def test_cloud_live_config_pins_a_router_less_site_and_its_client_networks():
+    # Catches a stray .env router or client range reaching a router-less run.
+    env = aws_env(AWS_CLIENT_CIDRS=' 10.99.0.0/16 ', VPN_MODE='External')
+    del env['AWS_ROUTER_INSTANCE_ID']
+    assert cloud_live_skip_reason('aws', env) is None
+    settings = CloudLiveConfig.from_env('aws', env).settings
+    assert (settings['AWS_ROUTER_INSTANCE_ID'], settings['AWS_CLIENT_CIDRS'],
+            settings['VPN_MODE']) == ('', '10.99.0.0/16', 'external')
+    gcp = gcp_env()
+    del gcp['GCP_ROUTER_INSTANCE']
+    assert CloudLiveConfig.from_env('gcp', gcp).settings['GCP_ROUTER_INSTANCE'] == ''
+
+
+@pytest.mark.parametrize('backend', ['aws', 'gcp'])
+def test_a_router_less_run_never_touches_a_router(backend):
+    # Catches the harness starting, stopping or reading a router the site
+    # does not have (the backend refuses those calls when router-less).
+    fake = FakeBackend(backend)
+    fake.router_configured = False
+    with _run(fake, backend) as run:
+        run.launch_one()
+    assert fake.list_managed() == []
+    assert fake.router_touches == 0
 
 
 # --- preflight and teardown -----------------------------------------------------

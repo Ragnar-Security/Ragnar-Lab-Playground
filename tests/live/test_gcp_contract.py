@@ -393,6 +393,8 @@ def test_router_is_discovered_by_its_labels_but_never_listed_as_managed(
     # with the site and router labels; inventory must never offer it for
     # deletion although it carries the site label.
     site, router = gcp_live_config.site_id, gcp_live_config.settings['GCP_ROUTER_INSTANCE']
+    if not router:
+        pytest.skip('router-less site (GCP_ROUTER_INSTANCE empty): no router to test')
     [(zone, instance)] = compute.instances(f'(name = "{router}")')
     labels = instance.get('labels') or {}
     assert (labels.get(TAG_SITE), labels.get(TAG_KIND)) == (site, 'router'), labels
