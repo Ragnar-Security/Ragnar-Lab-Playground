@@ -10,6 +10,7 @@ Nothing here imports a provider module at collection time: a skipped run
 must never build a client.
 """
 
+import importlib
 import ipaddress
 import time
 from datetime import timedelta
@@ -48,9 +49,24 @@ def _managed(backend, kind):
     return [r for r in backend.list_managed() if r.kind == kind]
 
 
+def _rules(permissions):
+    """A group's rules in one direction, as ('group', id) / ('cidr', range)."""
+    rules = set()
+    for permission in permissions:
+        assert permission['IpProtocol'] == '-1', permission
+        assert not permission.get('Ipv6Ranges') and not permission.get('PrefixListIds'), \
+            permission
+        rules |= {('group', pair['GroupId'])
+                  for pair in permission.get('UserIdGroupPairs') or []}
+        rules |= {('cidr', block['CidrIp']) for block in permission.get('IpRanges') or []}
+    return rules
+
+
 def _require_live_router(ec2, config):
     """The configured router, after proving it is the live site's."""
     router_id = config.settings['AWS_ROUTER_INSTANCE_ID']
+    if not router_id:
+        pytest.skip('router-less site (LIVE_AWS_ROUTER_INSTANCE_ID unset): no router to test')
     router = _instance(ec2, router_id)
     tags = _tags(router)
     if tags.get(TAG_SITE) != config.site_id or tags.get(TAG_KIND) != 'router':
@@ -111,6 +127,14 @@ def test_private_launch_has_instance_security_groups_and_no_public_association(
         assert [g['GroupId'] for g in nic['Groups']] == [group.provider_id]
         for address in nic['PrivateIpAddresses']:
             assert 'Association' not in address, address['Association']
+
+    # Exactly its own group and the configured client networks, both ways.
+    client_cidrs = importlib.import_module('app.config').aws_client_cidrs()
+    [sg] = ec2_probe.describe_security_groups(
+        GroupIds=[group.provider_id])['SecurityGroups']
+    wanted = {('group', group.provider_id)} | {('cidr', cidr) for cidr in client_cidrs}
+    assert _rules(sg['IpPermissions']) == wanted
+    assert _rules(sg['IpPermissionsEgress']) == wanted
 
 
 class _LostRunInstancesResponse:

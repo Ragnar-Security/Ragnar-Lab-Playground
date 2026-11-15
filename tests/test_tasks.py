@@ -1087,6 +1087,26 @@ def test_router_stops_only_after_one_continuous_idle_window(app, router_backend)
     assert router_backend.router_running is False
 
 
+# Catches the idle job stopping, reading or even locking the router of a
+# router-less cloud (the VPN routes to the labs itself).
+def test_router_less_backend_is_skipped_by_the_idle_job(app, router_backend, monkeypatch):
+    router_backend.router_configured = False
+    taken = []
+    real_lock = vm_tasks.vm_lifecycle_lock
+
+    def recording_lock(key, *args, **kwargs):
+        taken.append(key)
+        return real_lock(key, *args, **kwargs)
+
+    monkeypatch.setattr(vm_tasks, 'vm_lifecycle_lock', recording_lock)
+    assert _stop_idle_cloud_routers(now_epoch=1_000) == []
+    assert _stop_idle_cloud_routers(now_epoch=100_000) == []
+    assert router_backend.router_running is True
+    assert router_backend.router_touches == 0
+    assert router_lock_key('aws') not in taken
+
+
+
 def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app, router_backend):
     # Catches a stop racing a new deployment that has reserved capacity but no VMRecord yet.
     observe_idle_at(1_000)

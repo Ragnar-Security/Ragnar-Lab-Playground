@@ -69,9 +69,6 @@ KIND_DEPLOYMENT_NETWORK = 'deployment-network'
 KIND_SLOT_NETWORK = 'slot-network'
 # The operator-provisioned shared router's kind tag.
 KIND_ROUTER = 'router'
-# The tailnet's CGNAT range: besides its own group, the only peers a
-# deployment's VMs may reach or be reached from. No internet rule exists.
-_TAILNET_CIDR = '100.64.0.0/10'
 _GROUP_DUPLICATE = 'InvalidGroup.Duplicate'
 _SUBNET_CONFLICT = 'InvalidSubnet.Conflict'
 _RULE_DUPLICATE = 'InvalidPermission.Duplicate'
@@ -216,11 +213,12 @@ def _permission(rule: tuple) -> dict:
     return permission
 
 
-def _isolation_rules(group_id: str) -> set:
+def _isolation_rules(group_id: str, client_cidrs) -> set:
     """A deployment's whole rule set, the same both ways: everything to and
-    from its own group and the tailnet, nothing else."""
-    return {('-1', None, None, 'group', group_id),
-            ('-1', None, None, 'cidr', _TAILNET_CIDR)}
+    from its own group and each client network (config.aws_client_cidrs(),
+    the tailnet by default), nothing else. No internet rule exists."""
+    return ({('-1', None, None, 'group', group_id)}
+            | {('-1', None, None, 'cidr', cidr) for cidr in client_cidrs})
 
 
 class _Resolution:
@@ -487,14 +485,16 @@ class AWSBackend:
                 f'{", ".join(problems)}')
         return group
 
-    def _converge_group_rules(self, group_id: str, deployment_id: str) -> None:
+    def _converge_group_rules(self, group_id: str, deployment_id: str,
+                              client_cidrs: Tuple[str, ...]) -> None:
         """Make the group's rules exactly the isolation set, both ways.
         Egress first, and in each direction revoke before authorize, so
         the default allow-all egress is gone before anything is granted.
         A fresh read proves the group is this deployment's before every
         mutation: one retagged after the first change gets no further one."""
         group = self._require_own_group(group_id, deployment_id)
-        wanted = _isolation_rules(group_id)
+        wanted = _isolation_rules(group_id, client_cidrs)
+        self._warn_on_client_change(group, wanted)
         mutations = []
         for field, revoke, authorize in (
                 ('IpPermissionsEgress', 'revoke_security_group_egress',
@@ -523,10 +523,35 @@ class AWSBackend:
                 raise BackendError(
                     f'could not {operation} on {group_id}: {error}') from error
 
+    @staticmethod
+    def _warn_on_client_change(group: dict, wanted: set) -> None:
+        """Log when a reused group's client networks differ from the
+        configured ones: AWS_CLIENT_CIDRS changed while the deployment was
+        live. Convergence then applies the new set to this group only,
+        never to groups no launch touches, so the operator must know."""
+        ingress = _rule_set(group.get('IpPermissions'))
+        if not ingress:
+            return  # a new group: nothing granted yet, nothing changes
+        current = {rule for rule in ingress if rule[3] == 'cidr'}
+        configured = {rule for rule in wanted if rule[3] == 'cidr'}
+        if current != configured:
+            logger.warning(
+                'Security group %s admitted %s, not the configured client '
+                'networks %s; converging it to AWS_CLIENT_CIDRS',
+                group.get('GroupId'), sorted(rule[4] for rule in current),
+                sorted(rule[4] for rule in configured))
+
     def _deployment_group(self, deployment_id: str) -> str:
+        # Read first: an invalid AWS_CLIENT_CIDRS must stop the launch
+        # before a group is created or any rule of an existing one changes.
+        try:
+            client_cidrs = _config().aws_client_cidrs()
+        except ValueError as error:
+            raise BackendError(
+                f'deployment {deployment_id} gets no security group: {error}') from error
         group = self._own_group(deployment_id)
         group_id = group['GroupId'] if group else self._create_group(deployment_id)
-        self._converge_group_rules(group_id, deployment_id)
+        self._converge_group_rules(group_id, deployment_id, client_cidrs)
         return group_id
 
     def _resolve_network(self, spec: VMSpec) -> Tuple[str, str]:
@@ -550,7 +575,12 @@ class AWSBackend:
 
     # Router. The caller holds vm_lifecycle_lock(router_lock_key('aws')).
     # The operator provisions it tagged TAG_SITE=<site> and TAG_KIND=router;
-    # the configured id alone never proves which machine it is.
+    # the configured id alone never proves which machine it is. Without
+    # AWS_ROUTER_INSTANCE_ID the site is router-less: callers ask has_router()
+    # first and never call the methods below, which still refuse.
+
+    def has_router(self) -> bool:
+        return bool(_config().AWS_ROUTER_INSTANCE_ID)
 
     def _router(self) -> Tuple[str, str]:
         config = _config()

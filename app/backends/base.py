@@ -198,6 +198,13 @@ class VMBackend(Protocol):
     def release_slot(self, slot: int) -> None:
         ...
 
+    def has_router(self) -> bool:
+        """Whether this site runs a router the portal starts and stops.
+        False for Proxmox and for a router-less cloud (its VPN reaches the
+        labs through routing the portal does not manage); callers then never
+        call the three router methods below."""
+        ...
+
     def ensure_router_running(self) -> None:
         ...
 

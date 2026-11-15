@@ -1336,6 +1336,61 @@ def test_router_absent_unconfigured_or_not_this_sites_raises(backend, gce, monke
     assert gce.instances == before and gce.operations == {}
 
 
+@pytest.fixture
+def registered_gcp(backend, gce, monkeypatch):
+    """The fake-GCE backend registered as the portal's only backend, with a
+    stopped router and every Compute request recorded."""
+    from app.backends import register_backend_factory, reset_backends_for_tests
+    config = importlib.import_module('app.config')
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('gcp',))
+    monkeypatch.setattr(config, 'GCP_ROUTER_IDLE_MINUTES', 0)
+    monkeypatch.setattr(config, 'GCP_ROUTER_INSTANCE', ROUTER)
+    gce.add_router(ZONE, ROUTER, status='TERMINATED')
+    urls = []
+    real_request = gce.request
+
+    def recording(method, url, **kwargs):
+        urls.append(url)
+        return real_request(method, url, **kwargs)
+
+    monkeypatch.setattr(gce, 'request', recording)
+    register_backend_factory('gcp', lambda: backend)
+    yield config, urls
+    reset_backends_for_tests()
+
+
+def _router_start_and_idle_passes():
+    from app import vm_provisioning
+    from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
+    vm_provisioning.ensure_router_running('gcp')
+    _reset_router_idle_state_for_tests()
+    return _stop_idle_cloud_routers(now_epoch=10_000)
+
+
+# Catches a router-less GCP site (the VPN routes to the network itself) still
+# reading, starting or stopping a router.
+def test_router_less_gcp_never_reads_starts_or_stops_a_router(
+        backend, gce, registered_gcp, monkeypatch):
+    config, urls = registered_gcp
+    monkeypatch.setattr(config, 'GCP_ROUTER_INSTANCE', '')
+    assert backend.has_router() is False
+    assert _router_start_and_idle_passes() == []
+    gce.instances[(ZONE, ROUTER)]['status'] = 'RUNNING'
+    assert _router_start_and_idle_passes() == []
+    assert _router_status(gce) == 'RUNNING'
+    assert urls == [] and gce.operations == {}
+
+
+# Catches the router-set mode changing: the same passes start, then stop it.
+def test_router_set_gcp_still_starts_and_stops_its_router(backend, gce, registered_gcp):
+    config, urls = registered_gcp
+    assert backend.has_router() is True
+    assert _router_start_and_idle_passes() == ['gcp']
+    assert _router_status(gce) == 'TERMINATED'
+    assert any(url.endswith(f'/instances/{ROUTER}/start') for url in urls)
+    assert any(url.endswith(f'/instances/{ROUTER}/stop') for url in urls)
+
+
 @pytest.mark.parametrize('action, knob, stuck', [
     ('start', 'start_status', 'STAGING'),
     ('start', 'start_status', 'TERMINATED'),

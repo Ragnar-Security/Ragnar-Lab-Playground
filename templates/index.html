@@ -11,7 +11,7 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
-<body>
+<body data-vpn-mode="{{ vpn_mode }}">
     <!-- Navigation -->
     <nav class="navbar sticky-top">
         <div class="container-fluid">
@@ -101,6 +101,7 @@
                             </form>
                             <div id="create-result" class="mt-3"></div>
 
+                            {% if vpn_mode == 'headscale' %}
                             <!-- Tailscale Setup Instructions -->
                             <div id="tailscale-setup" class="mt-4" style="display: none;">
                                 <div class="card border-secondary">
@@ -124,6 +125,25 @@
                                     </div>
                                 </div>
                             </div>
+                            {% elif vpn_mode == 'external' %}
+                            <!-- The operator's own VPN: its name and instructions, no key -->
+                            <div id="vpn-setup" class="mt-4">
+                                <div class="card border-secondary">
+                                    <div class="card-header bg-secondary text-white">
+                                        <h6 class="mb-0"><i class="bi bi-shield-lock"></i> Connecting to your labs</h6>
+                                    </div>
+                                    <div class="card-body">
+                                        <p class="mb-2">Your labs have private addresses. Connect to {{ vpn_name }} before you use them.</p>
+                                        {% if vpn_instructions %}
+                                        <p class="mb-2" id="vpn-instructions" style="white-space: pre-line;">{{ vpn_instructions }}</p>
+                                        {% endif %}
+                                        {% if vpn_instructions_url %}
+                                        <a href="{{ vpn_instructions_url }}" id="vpn-instructions-link" target="_blank" rel="noopener noreferrer">How to connect to {{ vpn_name }}</a>
+                                        {% endif %}
+                                    </div>
+                                </div>
+                            </div>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
@@ -379,9 +399,14 @@
             </table>
 
             <div class="alert alert-warning py-2">
+              {% if vpn_mode == 'none' %}
+              <strong>This address is private.</strong> It works only from the
+              course network, not from the open internet.
+              {% else %}
               <strong>You must be on the course VPN first.</strong> This address is
               private. It does not work from the open internet. Start your VPN
               client, then connect.
+              {% endif %}
             </div>
 
             <p>The quickest way on any system: select <strong>open .rdp</strong> in
@@ -446,7 +471,8 @@ xfreerdp /u:<span class="rdp-help-user">USER</span> /v:<span class="rdp-help-add
               <li><strong>Extend</strong> adds time when less than an hour remains.</li>
               <li>A black screen for a few seconds after you log in is normal. The
                   desktop is still starting.</li>
-              <li>If the connection is refused, check the VPN first, then check that
+              <li>If the connection is refused, check {% if vpn_mode == 'none' %}that you
+                  are on the course network{% else %}the VPN{% endif %} first, then check that
                   the address matches the Connect column exactly.</li>
             </ul>
 

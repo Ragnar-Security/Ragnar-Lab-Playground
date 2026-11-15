@@ -26,7 +26,7 @@ SPEC = ROOT / "docs" / "superpowers" / "specs" / "2026-11-04-multi-backend-vms-d
 CLOUD_ENV = {
     "ENABLED_BACKENDS", "LAB_SITE_ID", "JUMPBOX_VLAN_BANDS",
     "AWS_REGION", "AWS_AVAILABILITY_ZONE", "AWS_LAB_VPC_ID", "AWS_LAB_CIDR",
-    "AWS_ROUTER_INSTANCE_ID", "AWS_MAX_VMS", "AWS_ROUTER_IDLE_MINUTES",
+    "AWS_ROUTER_INSTANCE_ID", "AWS_MAX_VMS", "AWS_ROUTER_IDLE_MINUTES", "AWS_CLIENT_CIDRS",
     "AWS_LAUNCH_TIMEOUT_SECONDS", "AWS_TERMINATE_TIMEOUT_SECONDS",
     "GCP_PROJECT", "GCP_REGION", "GCP_ZONE", "GCP_NETWORK", "GCP_LAB_CIDR",
     "GCP_ROUTER_INSTANCE", "GCP_MAX_VMS", "GCP_ROUTER_IDLE_MINUTES",
@@ -55,6 +55,8 @@ REQUIRED_HEADINGS = {
     "## AWS one-time setup",
     "## Google Cloud one-time setup",
     "## Router Tailscale flags",
+    "## Using another VPN (AWS Client VPN, site-to-site)",
+    "## No VPN (internal network)",
     "## Capacity and quota checks",
     "## Cost model",
     "## Configure and validate the portal",
@@ -281,6 +283,28 @@ def test_credentials_overrides_are_per_cloud():
     assert len(examples) == 3, "AWS only, GCP only, and one labelled combined example"
     [both] = [s for label, s in examples.items() if "both" in label]
     assert _override_env_names(both) == _override_env_names(aws) | _override_env_names(gcp)
+
+
+# Catches the runbook and example disagreeing on which source CIDR a Client
+# VPN endpoint presents, or a live AWS_CLIENT_CIDRS change being documented
+# without restarting every portal process (each reads it once, at startup).
+def test_other_vpn_runbook_names_each_source_cidr_and_the_restart():
+    section = "\n".join(_section(RUNBOOK.read_text(),
+                                 "## Using another VPN (AWS Client VPN, site-to-site)"))
+    for needle in ("https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html",
+                   "https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-tgw.html",
+                   "**associated with a VPC subnet**", "**target subnet's** CIDR",
+                   "**associated with a Transit Gateway**", "**client CIDR**",
+                   "**on-premises ranges**", "`ss -tn`",
+                   "preflight_env.py --summary .env", "Never a rolling restart",
+                   "docker compose -f docker-compose.prod.yml up -d --force-recreate vm-automation"):
+        assert needle in section, needle
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for needle in ("associated with a VPC subnet: that dedicated target",
+                   "associated with a Transit Gateway: the endpoint's",
+                   "the on-premises ranges", "ss -tn"):
+        assert needle in example, needle
+    assert "client pool" not in example
 
 
 def test_jumpbox_doc_documents_vlan_isolation():

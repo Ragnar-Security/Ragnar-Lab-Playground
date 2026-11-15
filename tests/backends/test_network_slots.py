@@ -1,7 +1,8 @@
 import pytest
 
 from app.backends.network_slots import (
-    SLOT_MAX, SLOT_PREFIXLEN, VlanBand, cloud_slot_cidr, parse_vlan_bands,
+    CLIENT_CIDR_MIN_PREFIXLEN, CLIENT_CIDRS_MAX, SLOT_MAX, SLOT_PREFIXLEN,
+    TAILNET_CIDR, VlanBand, cloud_slot_cidr, parse_client_cidrs, parse_vlan_bands,
     proxmox_slot_cidr, routed_slots, validate_lab_cidr,
 )
 
@@ -95,3 +96,66 @@ def test_validate_lab_cidr_accepts_disjoint_bases():
 @pytest.mark.parametrize('slot', [0, 500])
 def test_cloud_slot_accepts_smallest_base_at_both_ends(slot):
     cloud_slot_cidr('172.20.0.0/17', slot)
+
+
+# ============ client networks (AWS_CLIENT_CIDRS) ============
+
+# Catches a valid VPN pool list being refused or reordered.
+def test_parse_client_cidrs_normalizes_in_order():
+    assert parse_client_cidrs(' 100.64.0.0/10 , 192.0.2.0/24,198.51.100.7') == (
+        '100.64.0.0/10', '192.0.2.0/24', '198.51.100.7/32')
+
+
+# Catches an allow-everyone, malformed or oversized list reaching a security group.
+@pytest.mark.parametrize('raw,message', [
+    ('', 'at least one'),
+    ('0.0.0.0/0', 'entry 1 admits every IPv4 address'),
+    ('192.0.2.0/24,0.0.0.0/0', 'entry 2 admits every IPv4 address'),
+    ('64.0.0.0/2', 'entry 1 is broader than a /8'),
+    ('10.0.0.0/7', 'entry 1 is broader than a /8'),
+    ('not-a-cidr', 'entry 1 is not an IPv4 network'),
+    ('::/0', 'entry 1 is not an IPv4 network'),
+    ('fd00::/8', 'entry 1 is not an IPv4 network'),
+    ('192.0.2.1/24', 'host bits'),
+    ('192.0.2.0/24,,198.51.100.0/24', 'entry 2 is empty'),
+    ('192.0.2.0/24,192.0.2.128/25', 'entries 1 and 2 overlap'),
+    (','.join(f'192.0.{i}.0/24' for i in range(CLIENT_CIDRS_MAX + 1)), 'at most 8'),
+])
+def test_parse_client_cidrs_refuses(raw, message):
+    with pytest.raises(ValueError, match=message):
+        parse_client_cidrs(raw)
+
+
+# Catches a message that echoes the value (the host preflight never prints values).
+def test_parse_client_cidrs_messages_never_echo_the_value():
+    with pytest.raises(ValueError) as exc:
+        parse_client_cidrs('192.0.2.0/24,203.0.113.99/16')
+    assert '203.0.113' not in str(exc.value)
+
+
+def test_client_cidr_limits_are_the_documented_ones():
+    assert (CLIENT_CIDRS_MAX, CLIENT_CIDR_MIN_PREFIXLEN, TAILNET_CIDR) == (
+        8, 8, '100.64.0.0/10')
+    parse_client_cidrs(','.join(f'192.0.{i}.0/24' for i in range(CLIENT_CIDRS_MAX)))
+    parse_client_cidrs('11.0.0.0/8')
+
+
+# Catches the tailnet staying reserved for a site that does not use it, or
+# being released for one that does.
+def test_tailnet_is_reserved_only_while_in_use():
+    with pytest.raises(ValueError, match='100.64.0.0/10'):
+        validate_lab_cidr('aws', '100.64.0.0/16', others={})
+    validate_lab_cidr('aws', '100.64.0.0/16', others={}, tailnet=False)
+    for always in ('10.20.0.0/16', '172.17.0.0/16'):
+        with pytest.raises(ValueError, match='reserved range'):
+            validate_lab_cidr('aws', always, others={}, tailnet=False)
+
+
+# Catches a slot base that overlaps the networks its own labs admit.
+def test_lab_cidr_overlapping_a_client_network_is_refused():
+    with pytest.raises(ValueError) as exc:
+        validate_lab_cidr('aws', '172.20.0.0/16', others={},
+                          clients=('192.0.2.0/24', '172.20.200.0/24'))
+    assert str(exc.value) == (
+        'AWS_LAB_CIDR 172.20.0.0/16 overlaps AWS_CLIENT_CIDRS network 172.20.200.0/24')
+    validate_lab_cidr('aws', '172.20.0.0/16', others={}, clients=('172.21.0.0/24',))

@@ -21,8 +21,11 @@ from botocore.exceptions import ClientError
 from moto import mock_aws
 
 from app import coordination
-from app.backends import get_backend
-from app.backends.aws import AWSBackend, _client_token, _waiter_config
+from app import vm_provisioning
+from app.backends import get_backend, register_backend_factory, reset_backends_for_tests
+from app.backends.aws import (
+    AWSBackend, _client_token, _isolation_rules, _permission, _rule_set, _waiter_config,
+)
 from app.backends.base import (
     BACKEND_AWS, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH, GUEST_UNKNOWN,
     AdmissionRefused, BackendError, DestroyPolicy, DestroyRefused,
@@ -959,6 +962,152 @@ def test_create_converges_a_reused_deployment_group_to_the_exact_rules(aws_netwo
     expected = {('-1', 'group', group_id), ('-1', 'cidr', '100.64.0.0/10')}
     assert _flatten_group_rules(group['IpPermissions']) == expected
     assert _flatten_group_rules(group['IpPermissionsEgress']) == expected
+
+
+def _client_config(monkeypatch, cidrs, mode='external'):
+    config = importlib.import_module('app.config')
+    monkeypatch.setattr(config, 'VPN_MODE', mode)
+    monkeypatch.setattr(config, 'AWS_CLIENT_CIDRS', cidrs)
+    return config
+
+
+def _group_rule_sets(ec2, deployment_id):
+    [group] = _deployment_groups(ec2, deployment_id)
+    return (group['GroupId'], _rule_set(group['IpPermissions']),
+            _rule_set(group['IpPermissionsEgress']))
+
+
+# Catches the default drifting from the rules every existing group carries:
+# the exact permissions sent, and the exact rule set read back.
+def test_default_client_networks_are_the_pre_change_rules_byte_for_byte(
+        aws_network_backend, monkeypatch):
+    backend, spec, ec2, resources = aws_network_backend
+    config = _client_config(monkeypatch, '', mode='headscale')
+    assert config.aws_client_cidrs() == ('100.64.0.0/10',)
+    rules = _isolation_rules('sg-0123456789abcdef0', config.aws_client_cidrs())
+    assert sorted((_permission(rule) for rule in rules), key=str) == [
+        {'IpProtocol': '-1', 'IpRanges': [{'CidrIp': '100.64.0.0/10'}]},
+        {'IpProtocol': '-1', 'UserIdGroupPairs': [{'GroupId': 'sg-0123456789abcdef0'}]},
+    ]
+    _ensure_slot(backend, 1)
+    backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    group_id, ingress, egress = _group_rule_sets(ec2, spec.deployment_id)
+    legacy = {('-1', None, None, 'group', group_id),
+              ('-1', None, None, 'cidr', '100.64.0.0/10')}
+    assert ingress == legacy and egress == legacy
+
+
+# Catches a configured VPN range not reaching the group, or the tailnet (or
+# the internet) staying admitted beside it.
+def test_configured_client_networks_are_exactly_the_group_rules(
+        aws_network_backend, monkeypatch):
+    backend, spec, ec2, resources = aws_network_backend
+    _client_config(monkeypatch, '192.0.2.0/24, 198.51.100.0/24')
+    _ensure_slot(backend, 1)
+    backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    group_id, ingress, egress = _group_rule_sets(ec2, spec.deployment_id)
+    expected = {('-1', None, None, 'group', group_id),
+                ('-1', None, None, 'cidr', '192.0.2.0/24'),
+                ('-1', None, None, 'cidr', '198.51.100.0/24')}
+    assert ingress == expected and egress == expected
+
+
+# Catches a changed AWS_CLIENT_CIDRS being applied silently, or not at all,
+# to a live deployment's group at its next launch.
+def test_changed_client_networks_converge_a_reused_group_and_warn(
+        aws_network_backend, monkeypatch, caplog):
+    backend, spec, ec2, resources = aws_network_backend
+    _ensure_slot(backend, 1)
+    _client_config(monkeypatch, '', mode='headscale')
+    backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    _client_config(monkeypatch, '192.0.2.0/24')
+    caplog.clear()
+    with caplog.at_level('WARNING', logger='app.backends.aws'):
+        backend.create(replace(spec, vmid=703), 'us-east-1a', heartbeat=lambda: None)
+    group_id, ingress, egress = _group_rule_sets(ec2, spec.deployment_id)
+    expected = {('-1', None, None, 'group', group_id),
+                ('-1', None, None, 'cidr', '192.0.2.0/24')}
+    assert ingress == expected and egress == expected
+    [warning] = [r.getMessage() for r in caplog.records if r.levelname == 'WARNING']
+    assert group_id in warning and '100.64.0.0/10' in warning and '192.0.2.0/24' in warning
+
+
+# Catches an invalid client list widening a group, or a launch proceeding
+# into a group whose rules could not be set.
+@pytest.mark.parametrize('cidrs, mode', [('0.0.0.0/0', 'external'), ('', 'none')])
+def test_invalid_client_networks_launch_nothing_and_touch_no_group(
+        aws_network_backend, monkeypatch, cidrs, mode):
+    backend, spec, ec2, resources = aws_network_backend
+    _ensure_slot(backend, 1)
+    _client_config(monkeypatch, cidrs, mode=mode)
+    with pytest.raises(BackendError, match='AWS_CLIENT_CIDRS'):
+        backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
+    assert _deployment_groups(ec2, spec.deployment_id) == []
+    assert not [r for r in backend.list_managed() if r.kind == 'instance']
+
+
+@pytest.fixture
+def registered_aws(aws_network_backend, monkeypatch):
+    """The moto AWSBackend registered as the portal's only backend, its
+    router stopped, and every router lookup counted."""
+    backend, spec, ec2, resources = aws_network_backend
+    config = importlib.import_module('app.config')
+    monkeypatch.setattr(config, 'ENABLED_BACKENDS', ('aws',))
+    monkeypatch.setattr(config, 'AWS_ROUTER_IDLE_MINUTES', 0)
+    router_id = resources['router_instance_id']
+    ec2.stop_instances(InstanceIds=[router_id])
+    ec2.get_waiter('instance_stopped').wait(
+        InstanceIds=[router_id], WaiterConfig={'Delay': 1, 'MaxAttempts': 10})
+    lookups = []
+    real_router = AWSBackend._router
+
+    def counted(self):
+        lookups.append(config.AWS_ROUTER_INSTANCE_ID)
+        return real_router(self)
+
+    monkeypatch.setattr(AWSBackend, '_router', counted)
+    register_backend_factory('aws', lambda: backend)
+    yield backend, spec, ec2, router_id, lookups, config
+    reset_backends_for_tests()
+
+
+def _create_through_the_portal(spec):
+    return vm_provisioning.create_vm(
+        spec, reservation_id='r-router-less', load_balancing_config=None,
+        heartbeat=lambda: None)
+
+
+# Catches a router-less site (the VPN routes to the VPC itself) still
+# starting, stopping or even reading a router on deploy, re-ensure or idle.
+def test_router_less_deploy_and_idle_job_never_touch_a_router(registered_aws, monkeypatch):
+    from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
+    backend, spec, ec2, router_id, lookups, config = registered_aws
+    monkeypatch.setattr(config, 'AWS_ROUTER_INSTANCE_ID', '')
+    _location, launched = _create_through_the_portal(spec)
+    assert _instance_state(ec2, launched.provider_id) == 'running'
+    assert _instance_state(ec2, router_id) == 'stopped'
+    vm_provisioning.ensure_router_running('aws')
+    ec2.start_instances(InstanceIds=[router_id])  # the idle job must not stop it either
+    _reset_router_idle_state_for_tests()
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == []
+    assert _stop_idle_cloud_routers(now_epoch=20_000) == []
+    assert _instance_state(ec2, router_id) in ('pending', 'running')
+    assert lookups == []
+
+
+# Catches the router-set mode changing: a deploy still starts the stopped
+# router, and the idle job still stops it.
+def test_router_set_deploy_and_idle_job_still_drive_the_router(registered_aws):
+    from app.tasks import _reset_router_idle_state_for_tests, _stop_idle_cloud_routers
+    backend, spec, ec2, router_id, lookups, config = registered_aws
+    _create_through_the_portal(spec)
+    assert _instance_state(ec2, router_id) == 'running'
+    assert lookups and set(lookups) == {router_id}
+    NodeMemoryReservation.query.delete()
+    db.session.commit()
+    _reset_router_idle_state_for_tests()
+    assert _stop_idle_cloud_routers(now_epoch=10_000) == ['aws']
+    assert _instance_state(ec2, router_id) == 'stopped'
 
 
 def test_create_refuses_a_deployment_group_it_cannot_prove_is_its_own(aws_network_backend):

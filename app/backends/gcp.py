@@ -518,7 +518,12 @@ class GCPBackend:
 
     # Router. The caller holds vm_lifecycle_lock(router_lock_key('gcp')).
     # The operator provisions it labelled TAG_SITE=<site> and TAG_KIND=router;
-    # the configured name alone never proves which machine it is.
+    # the configured name alone never proves which machine it is. Without
+    # GCP_ROUTER_INSTANCE the site is router-less: callers ask has_router()
+    # first and never call the methods below, which still refuse.
+
+    def has_router(self) -> bool:
+        return bool(_config().GCP_ROUTER_INSTANCE)
 
     def _router(self) -> Tuple[str, str, str]:
         """(zone, name, status) of the configured router, from discovery and

@@ -27,6 +27,16 @@ SITE_BRAND_TAG = os.getenv('SITE_BRAND_TAG') or ''
 SITE_ORG = os.getenv('SITE_ORG') or ''
 VPN_LOGIN_SERVER = os.getenv('VPN_LOGIN_SERVER') or ''
 
+# How students reach their labs: headscale (the default), external or none.
+# The modes are described in app/production_policy.py and
+# docs/CLOUD_BACKENDS.md. An unknown value is kept, so validate_config()
+# refuses it instead of silently showing another mode's instructions.
+VPN_MODE = policy.vpn_mode(os.getenv('VPN_MODE'))
+VPN_NAME = (os.getenv('VPN_NAME') or '').strip() or 'the course VPN'
+VPN_INSTRUCTIONS_URL = (os.getenv('VPN_INSTRUCTIONS_URL') or '').strip()
+# Plain text; the page escapes it, so it can never inject markup.
+VPN_INSTRUCTIONS = (os.getenv('VPN_INSTRUCTIONS') or '').strip()
+
 
 
 def _env_number(name, default, cast):
@@ -146,7 +156,14 @@ AWS_REGION = _env_text('AWS_REGION')
 AWS_AVAILABILITY_ZONE = _env_text('AWS_AVAILABILITY_ZONE')
 AWS_LAB_VPC_ID = _env_text('AWS_LAB_VPC_ID')
 AWS_LAB_CIDR = _env_text('AWS_LAB_CIDR', '172.20.0.0/16')
+# Empty means no router: the VPN reaches the lab VPC through routing the
+# portal does not manage (AWS Client VPN, site-to-site, an internal link),
+# so the portal never starts, stops or waits for one.
 AWS_ROUTER_INSTANCE_ID = _env_text('AWS_ROUTER_INSTANCE_ID')
+# The networks students reach AWS labs from: each deployment's security
+# group admits all traffic to and from exactly these and itself. Empty means
+# the tailnet (TAILNET_CIDR), which only VPN_MODE=headscale may rely on.
+AWS_CLIENT_CIDRS = _env_text('AWS_CLIENT_CIDRS')
 AWS_MAX_VMS = _env_optional_int('AWS_MAX_VMS')
 AWS_ROUTER_IDLE_MINUTES = _env_number('AWS_ROUTER_IDLE_MINUTES', 30, int)
 AWS_LAUNCH_TIMEOUT_SECONDS = _env_number('AWS_LAUNCH_TIMEOUT_SECONDS', 600, int)
@@ -157,19 +174,35 @@ GCP_REGION = _env_text('GCP_REGION')
 GCP_ZONE = _env_text('GCP_ZONE')
 GCP_NETWORK = _env_text('GCP_NETWORK')
 GCP_LAB_CIDR = _env_text('GCP_LAB_CIDR', '172.21.0.0/16')
+# Empty means no router, as for AWS_ROUTER_INSTANCE_ID.
 GCP_ROUTER_INSTANCE = _env_text('GCP_ROUTER_INSTANCE')
 GCP_MAX_VMS = _env_optional_int('GCP_MAX_VMS')
 GCP_ROUTER_IDLE_MINUTES = _env_number('GCP_ROUTER_IDLE_MINUTES', 30, int)
 GCP_OPERATION_TIMEOUT_SECONDS = _env_number('GCP_OPERATION_TIMEOUT_SECONDS', 600, int)
 
 # Settings each enabled cloud cannot place a VM without; the cap is checked
-# separately because it must also be positive.
+# separately because it must also be positive. The routers are optional.
 _CLOUD_REQUIRED = {
-    'aws': ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID',
-            'AWS_ROUTER_INSTANCE_ID'),
-    'gcp': ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK',
-            'GCP_ROUTER_INSTANCE'),
+    'aws': ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID'),
+    'gcp': ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK'),
 }
+
+
+def aws_client_cidrs():
+    """The networks AWS lab security groups admit, parsed and normalized.
+    Unset is the tailnet, but only under VPN_MODE=headscale: under any other
+    mode it raises ValueError rather than fall back to a range nobody uses.
+    validate_config() refuses the same values at startup."""
+    from app.backends.network_slots import TAILNET_CIDR, parse_client_cidrs
+    if AWS_CLIENT_CIDRS:
+        try:
+            return parse_client_cidrs(AWS_CLIENT_CIDRS)
+        except ValueError as error:
+            raise ValueError(f"AWS_CLIENT_CIDRS {error}") from None
+    if VPN_MODE != 'headscale':
+        raise ValueError(f"AWS_CLIENT_CIDRS is required when VPN_MODE={VPN_MODE}")
+    return (TAILNET_CIDR,)
+
 
 # The jumpbox's VLAN bands (docs/JUMPBOX.md), read here so the Headscale
 # policy export grants exactly the Proxmox networks the jumpbox routes.
@@ -316,6 +349,10 @@ class Config:
     SITE_BRAND_TAG = SITE_BRAND_TAG
     SITE_ORG = SITE_ORG
     VPN_LOGIN_SERVER = VPN_LOGIN_SERVER
+    VPN_MODE = VPN_MODE
+    VPN_NAME = VPN_NAME
+    VPN_INSTRUCTIONS_URL = VPN_INSTRUCTIONS_URL
+    VPN_INSTRUCTIONS = VPN_INSTRUCTIONS
     # The roster SIS ID is the only proof of identity a self-service reset
     # asks for, on top of the login ID. Off unless the operator opts in:
     # sites that consider that ID guessable or widely known leave it off and
@@ -431,13 +468,16 @@ def _production_secret_errors():
 
 def _validate_configured_lab_cidrs(enabled, validate_lab_cidr):
     """Validate each enabled cloud's lab base against the reserved ranges
-    and the other enabled clouds' bases; a disabled cloud's base is never
+    (the tailnet only while VPN_MODE=headscale), AWS's client networks and
+    the other enabled clouds' bases; a disabled cloud's base is never
     allocated, so it is not checked."""
     bases = {'aws': AWS_LAB_CIDR, 'gcp': GCP_LAB_CIDR}
     clouds = [name for name in enabled if name in CLOUD_BACKENDS]
     for name in clouds:
         others = {other: bases[other] for other in clouds if other != name}
-        validate_lab_cidr(name, bases[name], others=others)
+        clients = aws_client_cidrs() if name == 'aws' else ()
+        validate_lab_cidr(name, bases[name], others=others,
+                          tailnet=VPN_MODE == 'headscale', clients=clients)
 
 
 def _backend_errors(enabled):
@@ -464,6 +504,11 @@ def _backend_errors(enabled):
             errors.append(f"LAB_SITE_ID {LAB_SITE_ID!r} must be 1-20 characters of "
                           "a-z, 0-9 and '-', not starting or ending with '-'")
     for name in clouds:
+        if name == 'aws':
+            try:
+                aws_client_cidrs()
+            except ValueError as error:
+                errors.append(str(error))
         for key in _CLOUD_REQUIRED[name]:
             if not globals()[key]:
                 errors.append(f"{key} is required when {name} is enabled")
@@ -488,7 +533,9 @@ def validate_config():
         raise ValueError("ENABLED_BACKENDS contains an empty name; "
                          f"list some of {', '.join(KNOWN_BACKENDS)}, comma-separated")
 
-    errors = _backend_errors(ENABLED_BACKENDS)
+    errors = [f"{key} {problem}" for key, problem in policy.vpn_problems(
+        VPN_MODE, VPN_INSTRUCTIONS_URL, VPN_INSTRUCTIONS)]
+    errors += _backend_errors(ENABLED_BACKENDS)
     if errors:
         raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
 

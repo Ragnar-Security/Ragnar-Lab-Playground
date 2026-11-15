@@ -6,12 +6,14 @@ here against the in-memory backend, so CI proves the safety logic without a
 cloud account, an SDK client or a network call.
 """
 
+import importlib
 import os
 import re
 import subprocess
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -42,7 +44,7 @@ def aws_env(**overrides):
         'LIVE_AWS': '1', 'ENABLED_BACKENDS': 'aws', 'LAB_SITE_ID': 'live-test',
         'AWS_MAX_VMS': '1', 'AWS_REGION': 'us-test-1',
         'AWS_AVAILABILITY_ZONE': 'us-test-1a', 'AWS_LAB_VPC_ID': 'vpc-placeholder',
-        'AWS_LAB_CIDR': '172.20.0.0/16', 'AWS_ROUTER_INSTANCE_ID': 'i-placeholder',
+        'AWS_LAB_CIDR': '172.20.0.0/16', 'LIVE_AWS_ROUTER_INSTANCE_ID': 'i-placeholder',
         'LIVE_AWS_IMAGE_ID': 'ami-placeholder', 'LIVE_AWS_INSTANCE_TYPE': 't3.micro',
     }
     env.update(overrides)
@@ -55,7 +57,7 @@ def gcp_env(**overrides):
         'GCP_MAX_VMS': '1', 'GCP_PROJECT': 'example-project',
         'GCP_REGION': 'test-region1', 'GCP_ZONE': 'test-region1-a',
         'GCP_NETWORK': 'lab-vpc', 'GCP_LAB_CIDR': '172.21.0.0/16',
-        'GCP_ROUTER_INSTANCE': 'lab-router',
+        'LIVE_GCP_ROUTER_INSTANCE': 'lab-router',
         'LIVE_GCP_IMAGE': 'projects/example-project/global/images/placeholder',
         'LIVE_GCP_MACHINE_TYPE': 'e2-small',
     }
@@ -232,7 +234,8 @@ def test_cloud_live_config_pins_the_validated_values_and_the_template():
         'ENABLED_BACKENDS': ('proxmox', 'aws'), 'LAB_SITE_ID': 'live-test',
         'AWS_MAX_VMS': 1, 'AWS_REGION': 'us-test-1', 'AWS_AVAILABILITY_ZONE': 'us-test-1a',
         'AWS_LAB_VPC_ID': 'vpc-placeholder', 'AWS_LAB_CIDR': '172.20.0.0/16',
-        'AWS_ROUTER_INSTANCE_ID': 'i-placeholder'}
+        'AWS_ROUTER_INSTANCE_ID': 'i-placeholder', 'AWS_CLIENT_CIDRS': '',
+        'VPN_MODE': 'headscale'}
     assert aws.template() == {'image_id': 'ami-placeholder', 'instance_type': 't3.micro',
                               'disk_gb': 20}
     gcp = CloudLiveConfig.from_env('gcp', gcp_env())
@@ -240,6 +243,95 @@ def test_cloud_live_config_pins_the_validated_values_and_the_template():
     assert gcp.template() == {
         'image': 'projects/example-project/global/images/placeholder',
         'machine_type': 'e2-small', 'disk_gb': 20}
+
+
+def test_cloud_live_config_reads_router_networks_and_mode_only_from_live_inputs():
+    env = aws_env(LIVE_AWS_CLIENT_CIDRS=' 10.99.0.0/16 ', LIVE_VPN_MODE='External')
+    del env['LIVE_AWS_ROUTER_INSTANCE_ID']
+    assert cloud_live_skip_reason('aws', env) is None
+    settings = CloudLiveConfig.from_env('aws', env).settings
+    assert (settings['AWS_ROUTER_INSTANCE_ID'], settings['AWS_CLIENT_CIDRS'],
+            settings['VPN_MODE']) == ('', '10.99.0.0/16', 'external')
+    gcp = gcp_env()
+    del gcp['LIVE_GCP_ROUTER_INSTANCE']
+    assert CloudLiveConfig.from_env('gcp', gcp).settings['GCP_ROUTER_INSTANCE'] == ''
+    with pytest.raises(ValueError, match='LIVE_VPN_MODE'):
+        CloudLiveConfig.from_env('aws', aws_env(LIVE_VPN_MODE='wireguard'))
+
+
+# What a checkout's .env sets for the app. Importing `app` runs load_dotenv(),
+# so these reach os.environ before any live fixture reads it.
+DOTENV = ('AWS_ROUTER_INSTANCE_ID=i-0dotenvrouter0000\n'
+          'GCP_ROUTER_INSTANCE=dotenv-router\n'
+          'AWS_CLIENT_CIDRS=10.250.0.0/16\n'
+          'VPN_MODE=external\n')
+
+
+@pytest.fixture
+def dotenv_loaded(tmp_path):
+    """os.environ after the app's own load_dotenv() read a populated .env.
+    patch.dict restores the whole environment afterwards: monkeypatch.delenv
+    records nothing for an absent name, so it would leak what .env added."""
+    from dotenv import dotenv_values, load_dotenv
+    path = tmp_path / '.env'
+    path.write_text(DOTENV)
+    with patch.dict(os.environ):
+        for name in dotenv_values(path):
+            os.environ.pop(name, None)
+        assert load_dotenv(path)
+        assert os.environ['AWS_ROUTER_INSTANCE_ID'] == 'i-0dotenvrouter0000'
+        yield os.environ
+
+
+@pytest.mark.parametrize(('backend', 'router'), [('aws', 'AWS_ROUTER_INSTANCE_ID'),
+                                                 ('gcp', 'GCP_ROUTER_INSTANCE')])
+def test_a_dotenv_router_never_reaches_a_router_less_live_run(
+        dotenv_loaded, monkeypatch, backend, router):
+    # Catches a "router-less" live run inheriting a checkout's real router
+    # (and client ranges and mode) from .env, then starting or stopping it.
+    live = ENVS[backend]()
+    del live[f'LIVE_{router}']
+    for name, value in live.items():
+        monkeypatch.setenv(name, value)
+    config = CloudLiveConfig.from_env(backend, os.environ)
+    assert config.settings[router] == ''
+    assert config.settings['VPN_MODE'] == 'headscale'
+    if backend == 'aws':
+        assert config.settings['AWS_CLIENT_CIDRS'] == ''
+    # What the run pins into app.config is what the real backend reads: no
+    # router, so vm_provisioning and the harness skip every router call.
+    from app.backends.aws import AWSBackend
+    from app.backends.gcp import GCPBackend
+    app_config = importlib.import_module('app.config')
+    with patch.multiple(app_config, **config.settings):
+        assert getattr(app_config, router) == ''
+        assert app_config.VPN_MODE == 'headscale'
+        if backend == 'aws':
+            assert app_config.aws_client_cidrs() == ('100.64.0.0/10',)
+            assert AWSBackend(ec2_client=object()).has_router() is False
+        else:
+            assert GCPBackend(session=object()).has_router() is False
+
+
+def test_live_inputs_still_win_over_a_dotenv(dotenv_loaded, monkeypatch):
+    for name, value in aws_env(LIVE_AWS_CLIENT_CIDRS='10.99.0.0/16',
+                               LIVE_VPN_MODE='none').items():
+        monkeypatch.setenv(name, value)
+    settings = CloudLiveConfig.from_env('aws', os.environ).settings
+    assert (settings['AWS_ROUTER_INSTANCE_ID'], settings['AWS_CLIENT_CIDRS'],
+            settings['VPN_MODE']) == ('i-placeholder', '10.99.0.0/16', 'none')
+
+
+@pytest.mark.parametrize('backend', ['aws', 'gcp'])
+def test_a_router_less_run_never_touches_a_router(backend):
+    # Catches the harness starting, stopping or reading a router the site
+    # does not have (the backend refuses those calls when router-less).
+    fake = FakeBackend(backend)
+    fake.router_configured = False
+    with _run(fake, backend) as run:
+        run.launch_one()
+    assert fake.list_managed() == []
+    assert fake.router_touches == 0
 
 
 # --- preflight and teardown -----------------------------------------------------

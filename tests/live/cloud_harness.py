@@ -14,8 +14,10 @@ through ``CloudContractRun``, which enforces these rules:
 * teardown runs on exit even when the body raised, in a fixed order
   (instances with positive absence, deployment networks, slots, admission,
   router), then requires a fresh inventory of the site to be empty and the
-  site router to read stopped. A leftover is deleted from that fresh
-  inventory only, and a second empty inventory is required. Any cleanup
+  site router, when the site has one, to read stopped. A leftover is
+  deleted from that fresh inventory only, and a second empty inventory is
+  required. A router-less site (no LIVE_* router given) has no router step
+  at all: the run never starts, stops or reads one. Any cleanup
   failure fails the run with provider ids and copy-paste inventory
   commands; none is swallowed.
 
@@ -39,6 +41,7 @@ from app.backends.cloud_common import (
     TAG_SITE, deployment_network_name, instance_name, site_prefix,
     slot_network_name, validate_site_id,
 )
+from app.production_policy import VPN_MODES, vpn_mode
 from tests.live.harness import live_skip_reason
 
 
@@ -72,23 +75,34 @@ class _Provider:
     label: str
     flag: str
     cap: str
-    settings: Tuple[str, ...]  # app.config names the run pins, besides site/cap
+    settings: Tuple[str, ...]  # required app.config names the run pins, besides site/cap
     image: str
     machine: str
     template_keys: Tuple[str, str]  # (image key, machine-size key)
+    # Optional app.config names the run pins, each read ONLY from its own
+    # live input (live name, app.config name). Never from the app's name:
+    # importing `app` runs load_dotenv(), so a checkout's .env would put a
+    # real router into os.environ. An unset live input pins the app value
+    # empty, whatever the app environment or .env says.
+    optional: Tuple[Tuple[str, str], ...] = ()
+
+
+# The run's VPN mode, read only from this live input, like `optional`.
+LIVE_VPN_MODE = 'LIVE_VPN_MODE'
 
 
 _PROVIDERS = {
     'aws': _Provider(
         'AWS', 'LIVE_AWS', 'AWS_MAX_VMS',
-        ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR',
-         'AWS_ROUTER_INSTANCE_ID'),
-        'LIVE_AWS_IMAGE_ID', 'LIVE_AWS_INSTANCE_TYPE', ('image_id', 'instance_type')),
+        ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR'),
+        'LIVE_AWS_IMAGE_ID', 'LIVE_AWS_INSTANCE_TYPE', ('image_id', 'instance_type'),
+        (('LIVE_AWS_ROUTER_INSTANCE_ID', 'AWS_ROUTER_INSTANCE_ID'),
+         ('LIVE_AWS_CLIENT_CIDRS', 'AWS_CLIENT_CIDRS'))),
     'gcp': _Provider(
         'GCP', 'LIVE_GCP', 'GCP_MAX_VMS',
-        ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK', 'GCP_LAB_CIDR',
-         'GCP_ROUTER_INSTANCE'),
-        'LIVE_GCP_IMAGE', 'LIVE_GCP_MACHINE_TYPE', ('image', 'machine_type')),
+        ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK', 'GCP_LAB_CIDR'),
+        'LIVE_GCP_IMAGE', 'LIVE_GCP_MACHINE_TYPE', ('image', 'machine_type'),
+        (('LIVE_GCP_ROUTER_INSTANCE', 'GCP_ROUTER_INSTANCE'),)),
 }
 
 
@@ -187,8 +201,14 @@ class CloudLiveConfig:
                 f'{provider.cap}=1 is required for a live run (one machine at a time), '
                 f'got {cap!r}')
         settings = {name: environ[name].strip() for name in provider.settings}
+        settings.update({app_name: (environ.get(live_name) or '').strip()
+                         for live_name, app_name in provider.optional})
+        mode = vpn_mode(environ.get(LIVE_VPN_MODE))
+        if mode not in VPN_MODES:
+            raise ValueError(f'{LIVE_VPN_MODE} must be one of {", ".join(VPN_MODES)}, '
+                             f'got {mode!r}')
         settings.update({'ENABLED_BACKENDS': _enabled(environ), 'LAB_SITE_ID': site,
-                         provider.cap: 1})
+                         provider.cap: 1, 'VPN_MODE': mode})
         return cls(backend, site, settings, environ[provider.image].strip(),
                    environ[provider.machine].strip())
 
@@ -333,7 +353,9 @@ class CloudContractRun:
                                   load_balancing_config=None)
 
     def ensure_router(self) -> None:
-        self.backend.ensure_router_running()
+        # The app's order: a router-less backend has no router step at all.
+        if self.backend.has_router():
+            self.backend.ensure_router_running()
 
     def note_router_started(self) -> None:
         """Record a router start made outside the backend.
@@ -460,17 +482,19 @@ class CloudContractRun:
             except Exception as error:
                 failures.append(self._failure(f'admission {reservation_id}', error))
 
-        if self._router_started_at is not None:
-            unseen = self._await_router_start()
-            if unseen is not None:
-                failures.append(unseen)
-        try:
-            self.backend.stop_router()
-        except Exception as error:
-            failures.append(self._failure('the live site router (stop)', error))
+        if self.backend.has_router():
+            if self._router_started_at is not None:
+                unseen = self._await_router_start()
+                if unseen is not None:
+                    failures.append(unseen)
+            try:
+                self.backend.stop_router()
+            except Exception as error:
+                failures.append(self._failure('the live site router (stop)', error))
 
         failures.extend(self._prove_empty())
-        failures.extend(self._prove_router_stopped())
+        if self.backend.has_router():
+            failures.extend(self._prove_router_stopped())
         for failure in failures:
             print(f'[live cloud contract cleanup] {failure}', file=sys.stderr, flush=True)
         return failures

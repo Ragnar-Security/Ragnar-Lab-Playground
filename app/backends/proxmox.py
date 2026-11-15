@@ -591,6 +591,9 @@ class ProxmoxBackend:
     def release_slot(self, slot: int) -> None:
         pass
 
+    def has_router(self) -> bool:
+        return False
+
     def ensure_router_running(self) -> None:
         pass
 

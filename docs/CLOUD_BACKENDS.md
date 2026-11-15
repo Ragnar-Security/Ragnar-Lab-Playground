@@ -116,16 +116,18 @@ AWS_LAB_CIDR 172.20.0.0/16 (inside the lab VPC's CIDR)
 ```
 
 - **Forbidden overlaps.** Startup (and `scripts/preflight_env.py`) refuses a
-  base that overlaps `10.0.0.0/8` (Proxmox labs), `100.64.0.0/10` (the
-  tailnet), `172.17.0.0/16` (Docker's default bridge, present on the jumpbox)
-  or the other enabled cloud's base, and a base smaller than a `/17` (slots
+  base that overlaps `10.0.0.0/8` (Proxmox labs), `172.17.0.0/16` (Docker's
+  default bridge, present on the jumpbox), the other enabled cloud's base,
+  any network in `AWS_CLIENT_CIDRS` (AWS) and, with `VPN_MODE=headscale`,
+  `100.64.0.0/10` (the tailnet), and a base smaller than a `/17` (slots
   0–500 need 32,064 addresses).
 - **One shared VPC per cloud.** A VPC costs nothing on either cloud. All
   students share it; isolation comes from the per-deployment security group
   or firewall rule and the Headscale policy, not from separate VPCs.
 - **Deployment networks.** A deployment's first launch creates its security
-  group (AWS: all traffic to and from the group itself and `100.64.0.0/10`,
-  both directions, nothing else; the default allow-all egress is revoked) or
+  group (AWS: all traffic to and from the group itself and each network in
+  `AWS_CLIENT_CIDRS`, by default the tailnet `100.64.0.0/10`, both
+  directions, nothing else; the default allow-all egress is revoked) or
   firewall rule (GCP: ingress from instances with that deployment's network
   tag only). It is deleted after the deployment's last record retires.
 - **Slot networks.** A slot's subnet or subnetwork is created by the first
@@ -137,7 +139,10 @@ AWS_LAB_CIDR 172.20.0.0/16 (inside the lab VPC's CIDR)
 
 Create these once, in `<aws-region>`. None of them carries a
 `lab-playground-kind` other than the router's `router`, so the portal never
-lists or deletes them.
+lists or deletes them. Steps 2–5 build the Headscale subnet router; with
+another VPN or an internal network, follow
+[Using another VPN](#using-another-vpn-aws-client-vpn-site-to-site) or
+[No VPN](#no-vpn-internal-network) for those steps instead.
 
 1. **VPC** with a CIDR that contains `AWS_LAB_CIDR` (the default base needs
    the whole `172.20.0.0/16`):
@@ -369,7 +374,9 @@ lists or deletes them.
    The router carries the site tag too, so `TerminateSiteInstances` could
    terminate it; the portal never does (it only lists `kind=instance`). If
    you want IAM to forbid that as well, add a `Deny` on
-   `ec2:TerminateInstances` for the router's ARN.
+   `ec2:TerminateInstances` for the router's ARN. A router-less site (empty
+   `AWS_ROUTER_INSTANCE_ID`) never calls `StartInstances` or
+   `StopInstances`: drop the `StartStopTheRouter` statement.
 
    Test the policy before the class with the
    [live contract run](#live-contract-runs) and with the portal in sweeper
@@ -500,6 +507,144 @@ Create these once in `<gcp-project>`. Name your own resources without the
    live in another project, grant `roles/compute.imageUser` there. **Never
    grant Owner or Editor**: they reach every resource in the project,
    including the operator's base network and the router.
+
+## Using another VPN (AWS Client VPN, site-to-site)
+
+The tailnet is one way in, not the only one. A university may want students
+to reach AWS labs through its own VPN: AWS Client VPN into the lab VPC, or a
+site-to-site VPN or Transit Gateway from its campus network. Set:
+
+```bash
+VPN_MODE=external
+VPN_NAME="the UMD lab VPN"                 # what students are told to connect to
+VPN_INSTRUCTIONS_URL=https://<your-vpn-guide>   # and/or a short VPN_INSTRUCTIONS text
+AWS_CLIENT_CIDRS=<observed-source-cidr>    # what lab VMs see; table below. At most 8
+AWS_ROUTER_INSTANCE_ID=                    # empty: the VPN does the routing
+```
+
+**What the university must provide:**
+
+- **The source CIDR(s) lab VMs see**, which is what `AWS_CLIENT_CIDRS`
+  lists. It depends on how students arrive:
+
+  | How students connect | What lab VMs see as the source | `AWS_CLIENT_CIDRS` |
+  |---|---|---|
+  | Client VPN endpoint **associated with a VPC subnet** (IPv4) | the endpoint's network interface in that target subnet: the endpoint source-NATs client traffic | the **target subnet's** CIDR. Make it a dedicated subnet outside `AWS_LAB_CIDR` with nothing else in it, since every lab admits all of it |
+  | Client VPN endpoint **associated with a Transit Gateway** | the student's own client address: the source is preserved | the endpoint's **client CIDR** |
+  | Site-to-site VPN or Transit Gateway from campus | the campus address | the **on-premises ranges** routed over the link |
+
+  See [What is AWS Client VPN](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html)
+  and [Client VPN with a Transit Gateway](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-tgw.html).
+  **Confirm the observed source on one lab VM before the class:** connect
+  over the VPN, open a session to the lab, and run `ss -tn` on the lab; the
+  peer address must fall inside `AWS_CLIENT_CIDRS`. Each entry must be an
+  IPv4 network no broader than a `/8`; `0.0.0.0/0` is always refused.
+- **Routes to `AWS_LAB_CIDR`**, both ways: the VPN gives its clients a route
+  to `AWS_LAB_CIDR` (a Client VPN route and authorization rule; the campus
+  side of a site-to-site), and replies find their way back. With a
+  subnet-associated Client VPN endpoint the replies go to its interfaces
+  inside the VPC and need no route; with a Transit Gateway association or a
+  site-to-site link, the VPC's main route table needs an entry sending the
+  client CIDR or campus ranges to the Transit Gateway attachment or virtual
+  private gateway. The main route table must still never get a `0.0.0.0/0`
+  route.
+- **No overlap:** the client CIDRs must not overlap `AWS_LAB_CIDR`, the
+  Proxmox `10.0.0.0/8` or Docker's `172.17.0.0/16`. Startup and the
+  preflight refuse an overlap with `AWS_LAB_CIDR`.
+
+**What changes:**
+
+- **Each deployment's security group admits exactly `AWS_CLIENT_CIDRS`** and
+  itself, both directions, instead of the tailnet. Egress is still limited to
+  those, so labs keep no internet route.
+- **No router.** With `AWS_ROUTER_INSTANCE_ID` empty (likewise
+  `GCP_ROUTER_INSTANCE`), the portal never starts, stops, waits for or reads
+  a router: deploys skip the router step, and the idle-stop job skips that
+  backend. Skip AWS setup steps 2–5 (router subnet, router security group,
+  router instance, tailnet return route) and drop the `StartStopTheRouter`
+  IAM statement. Steps 1, 6 and 7 (VPC, IAM, closing lab DNS) still apply.
+  A router may still be configured with another VPN (say, a VPN appliance
+  the portal should start on demand); it must be tagged as above.
+- **The dashboard** shows "Connect to `VPN_NAME`" with your instructions
+  instead of the Tailscale setup, and never shows a Headscale key: `/auth/me`
+  stops returning it. Messages such as "you must be on the course VPN" stay.
+- **Headscale becomes optional.** `scripts/apply_headscale_policy.sh`,
+  `scripts/rotate_headscale_keys.sh` and the Headscale steps of the term
+  changeover are not needed; the roster's `headscale_key` column may be
+  empty or absent.
+
+**The isolation trade-off, plainly:** on the tailnet, the Headscale policy
+lets each student reach only their own and their groups' slots. Another VPN
+has no such per-student policy here: **any connected VPN user can reach any
+lab VM's address.** Labs remain isolated from each other (each deployment's
+security group admits only itself and the client networks) and have no
+internet or public address. If per-student isolation matters, the
+university's VPN must enforce it (Client VPN authorization rules per group,
+for example), or keep `VPN_MODE=headscale`.
+
+**GCP** has no client-network setting: the portal never writes a source
+range. GCP labs admit students through the operator's static
+`<site-id>-lab-tailnet` rule (setup step 3); point its `--source-ranges` at
+the source range lab VMs observe from the VPN instead of `100.64.0.0/10`,
+and replace the `<site-id>-tailnet-return` route (step 4) with the VPN's
+own return route.
+
+**Proxmox** needs no portal change: labs are reached through the jumpbox's
+routed lab VLANs, so any VPN that routes the lab VLAN ranges (by default
+`10.0.0.0/8`) to the jumpbox works. The jumpbox's Tailscale steps
+(`docs/JUMPBOX.md`) become optional.
+
+**Changing `AWS_CLIENT_CIDRS` on a live site.** Every portal process reads
+it once, at startup, so a process left running keeps the old value and
+would converge groups back to it. Change it atomically:
+
+1. Edit `AWS_CLIENT_CIDRS` (and `VPN_MODE`, if it changes) in `.env`.
+2. Run `python3 scripts/preflight_env.py --summary .env`; fix every problem
+   and check the `aws:` line lists the new networks.
+3. Recreate the `vm-automation` container (the only one that runs portal
+   code: every web worker and the scheduler) from the edited `.env`, using
+   the deployment's own production Compose files:
+
+   ```bash
+   # .env names COMPOSE_FILE (as "Running a released image" sets it up):
+   docker compose up -d --force-recreate vm-automation
+   # no COMPOSE_FILE in .env (e.g. instance-role or metadata credentials):
+   docker compose -f docker-compose.prod.yml up -d --force-recreate vm-automation
+   ```
+
+   A bare `docker compose` without `COMPOSE_FILE` reads `docker-compose.yml`,
+   the development stack, and leaves the production container running with
+   the old ranges. Never a rolling restart either: one old process left
+   running can launch a VM and put the old ranges back on its group.
+4. Only then let students launch again.
+
+After the restart, a deployment's group is brought to the new set the next
+time one of its VMs launches, and each such convergence logs a warning
+naming the old and new networks. A deployment that launches nothing more
+keeps its old ranges until it is deleted, so change the setting between
+sessions, or expect running deployments to keep the old set until they end.
+
+## No VPN (internal network)
+
+`VPN_MODE=none` is for students who are already on an internal network that
+routes to the labs, with no VPN client at all: a campus or on-premises
+network, or for a cloud, private connectivity the operator set up (a
+site-to-site link or Direct Connect into the lab VPC). **Labs are never
+exposed publicly in this mode either:** they keep private addresses and no
+internet route, and access relies entirely on the internal network's
+routing.
+
+- **Dashboard:** no VPN instructions and no Headscale key; each lab shows its
+  private address, reachable from the course network.
+- **AWS:** `AWS_CLIENT_CIDRS` is required and lists the internal ranges
+  allowed in (same limits: no `0.0.0.0/0`, nothing broader than a `/8`);
+  leave `AWS_ROUTER_INSTANCE_ID` empty. Everything in
+  [Using another VPN](#using-another-vpn-aws-client-vpn-site-to-site) about
+  routes, setup steps, IAM and isolation applies unchanged.
+- **GCP:** point the `<site-id>-lab-tailnet` rule's source at the internal
+  ranges, as above; leave `GCP_ROUTER_INSTANCE` empty.
+- **Proxmox:** routing only. The internal network must route the lab VLAN
+  ranges to the jumpbox.
 
 ## Router Tailscale flags
 
@@ -672,7 +817,10 @@ only the router disks bill.
 
 2. **Fill the cloud section of `.env`** from `.env.example`:
    `ENABLED_BACKENDS` (for example `proxmox,aws`), `LAB_SITE_ID`, and the
-   enabled cloud's `AWS_*` or `GCP_*` settings, including the cap.
+   enabled cloud's `AWS_*` or `GCP_*` settings, including the cap. Choose
+   `VPN_MODE` (`headscale`, the default, `external` or `none`); with
+   `external` or `none`, set `AWS_CLIENT_CIDRS` and leave the router empty
+   ([Using another VPN](#using-another-vpn-aws-client-vpn-site-to-site)).
    `docker-compose.prod.yml` passes each of these names into the container;
    an empty value means the code's default, exactly as if it were unset.
    Set `JUMPBOX_VLAN_BANDS` to the jumpbox's value if you changed it there.
@@ -761,14 +909,19 @@ only the router disks bill.
 5. **Preflight, then start.**
 
    ```bash
-   python3 scripts/preflight_env.py .env
+   python3 scripts/preflight_env.py --summary .env
    docker compose up -d --build                              # COMPOSE_FILE set (override)
    docker compose -f docker-compose.prod.yml up -d --build   # no override: instance role / metadata server
    ```
 
    Startup refuses missing settings of an enabled backend, a missing or
-   invalid `LAB_SITE_ID`, a non-positive cap and an overlapping or undersized
-   lab CIDR. The admin template validation reports groups whose backend is
+   invalid `LAB_SITE_ID`, a non-positive cap, an overlapping or undersized
+   lab CIDR, an unknown `VPN_MODE`, `external` without instructions, and an
+   invalid, too-broad or (outside `headscale`) missing `AWS_CLIENT_CIDRS`.
+   With `--summary` the preflight first prints the active VPN mode and, per
+   enabled backend, whether it uses a router and which client networks its
+   labs admit; without it the output is only the problems. The
+   admin template validation reports groups whose backend is
    not enabled or whose cloud block is incomplete. `preflight_env.py`
    applies the production rules: run against a local test instance's `.env`
    (the development compose's fixed MySQL passwords) it exits 1 on
@@ -776,20 +929,20 @@ only the router disks bill.
    expected there; every other line, the cloud ones included, still counts.
 
 6. **Verify with one VM.** Turn on `ORPHAN_REAPER_DRY_RUN=true` for the first
-   session. As a test student, deploy one cloud group: the first deployment
-   of a session starts the router first (allow roughly a minute). Check that
-   `/list` shows a private address inside the slot's `/26`, that you reach it
-   over the VPN, and that the router is running. Destroy it, then check the
-   inventory below is empty apart from the router, and that the router stops
-   after the idle minutes. Read the reaper's `would delete` lines before you
-   turn dry run off.
+   session. As a test student, deploy one cloud group: with a router, the
+   first deployment of a session starts it first (allow roughly a minute).
+   Check that `/list` shows a private address inside the slot's `/26`, that
+   you reach it over the VPN, and that the router (if any) is running.
+   Destroy it, then check the inventory below is empty apart from the
+   router, and that the router stops after the idle minutes. Read the
+   reaper's `would delete` lines before you turn dry run off.
 
    To test a lab machine from the router itself, use the router's tailnet
    address as the source, for example
    `nc -s "$(tailscale ip -4)" -zv <lab-ip> 2222`. A connection from the
    router's own VPC address times out on every port: the deployment
-   security group admits only its own members and `100.64.0.0/10`, by
-   design.
+   security group admits only its own members and `AWS_CLIENT_CIDRS` (the
+   tailnet `100.64.0.0/10` by default), by design.
 
 Two accepted limits:
 

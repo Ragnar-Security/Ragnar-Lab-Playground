@@ -37,6 +37,10 @@ class FakeBackend:
         self.deployment_networks: Set[str] = set()
         self.slot_networks: Set[int] = set()
         self.router_running = False
+        # False plays a router-less site; router_touches counts every router
+        # call (a caller's except-and-log would swallow an assertion).
+        self.router_configured = True
+        self.router_touches = 0
         self.destroyed: Dict[int, DestroyPolicy] = {}
         self.expiry: Dict[int, int] = {}
         self.observed_locks: Dict[str, Set[int]] = {}
@@ -198,15 +202,21 @@ class FakeBackend:
     def release_slot(self, slot: int) -> None:
         self.slot_networks.discard(slot)
 
+    def has_router(self) -> bool:
+        return self.router_configured
+
     def ensure_router_running(self) -> None:
         self._observe_locks('ensure_router_running')
+        self.router_touches += 1
         self.router_running = True
 
     def stop_router(self) -> bool:
+        self.router_touches += 1
         was_running, self.router_running = self.router_running, False
         return was_running
 
     def router_stopped(self) -> bool:
+        self.router_touches += 1
         return not self.router_running
 
 

@@ -119,7 +119,8 @@ def test_bundle_holds_the_deploy_files(clone, bundle):
     expected = {
         'docker-compose.prod.yml', 'docker-compose.release.yml', 'Caddyfile',
         '.env.example', 'templates.example.yaml', 'scripts/preflight_env.py',
-        'app/production_policy.py', 'scripts/backup-database.sh',
+        'app/production_policy.py', 'app/backends/network_slots.py',
+        'scripts/backup-database.sh',
         'scripts/systemd/vm-automation-backup.service',
         'scripts/systemd/vm-automation-backup.timer',
         'scripts/systemd/vm-automation-backup.env.example',
@@ -178,8 +179,9 @@ def test_sha256sums_lists_the_tarball(bundle):
 
 
 def test_extracted_preflight_runs_without_a_checkout(bundle, tmp_path):
-    """preflight_env.py loads app/production_policy.py by path, so the
-    bundle must carry it for the documented preflight step to work."""
+    """preflight_env.py loads app/production_policy.py and
+    app/backends/network_slots.py by path at import, so the bundle must
+    carry both for the documented preflight step to work."""
     with tarfile.open(bundle) as tar:
         tar.extractall(tmp_path, filter='data')
     env = tmp_path / 'good.env'
