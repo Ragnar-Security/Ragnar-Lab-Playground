@@ -2,13 +2,13 @@
 """Check an operator .env against the app's production rules on the Docker
 host, before `docker compose -f docker-compose.prod.yml up`.
 
-    python3 scripts/preflight_env.py [path/to/.env]     # default: ./.env
+    python3 scripts/preflight_env.py [--summary] [path/to/.env]   # default: ./.env
 
 Prints one line per problem as `KEY: problem`, never the value, and exits
 1 when there is any; exits 2 when the file cannot be read; 0 otherwise.
-Before that it prints, on stdout, which VPN mode is active and, per enabled
-backend, whether a router is used and which client networks the labs admit
-(network ranges are not secrets).
+With --summary it first prints, on stdout, which VPN mode is active and,
+per enabled backend, whether a router is used and which client networks the
+labs admit (network ranges are not secrets).
 
 The rules are the ones the app enforces at startup (app/production_policy.py
 and the backend checks of app/config.py:validate_config(), mirrored here),
@@ -266,15 +266,19 @@ def problems(env):
 
 
 def main(argv):
-    path = Path(argv[1] if len(argv) > 1 else '.env')
+    args = argv[1:]
+    show_summary = '--summary' in args
+    paths = [arg for arg in args if arg != '--summary']
+    path = Path(paths[0] if paths else '.env')
     try:
         text = path.read_text(encoding='utf-8')
     except OSError as exc:
         print(f'{path}: cannot read ({exc.strerror})', file=sys.stderr)
         return 2
     env = parse_env(text)
-    for line in summary(env):
-        print(line)
+    if show_summary:
+        for line in summary(env):
+            print(line)
     found = problems(env)
     for line in found:
         print(line, file=sys.stderr)

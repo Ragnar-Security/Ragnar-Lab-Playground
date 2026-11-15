@@ -511,36 +511,43 @@ Create these once in `<gcp-project>`. Name your own resources without the
 ## Using another VPN (AWS Client VPN, site-to-site)
 
 The tailnet is one way in, not the only one. A university may want students
-to reach AWS labs through its own VPN: AWS Client VPN in the lab VPC, or a
+to reach AWS labs through its own VPN: AWS Client VPN into the lab VPC, or a
 site-to-site VPN or Transit Gateway from its campus network. Set:
 
 ```bash
 VPN_MODE=external
 VPN_NAME="the UMD lab VPN"                 # what students are told to connect to
 VPN_INSTRUCTIONS_URL=https://<your-vpn-guide>   # and/or a short VPN_INSTRUCTIONS text
-AWS_CLIENT_CIDRS=<vpn-client-cidr>         # comma-separated, at most 8
+AWS_CLIENT_CIDRS=<observed-source-cidr>    # what lab VMs see; table below. At most 8
 AWS_ROUTER_INSTANCE_ID=                    # empty: the VPN does the routing
 ```
 
 **What the university must provide:**
 
-- **The client CIDR(s):** the source addresses lab VMs see. AWS Client VPN
-  translates client traffic into the VPC to its network interfaces in the
-  endpoint's associated (target) subnet, so list **that subnet's** CIDR,
-  not the endpoint's client CIDR; keep that subnet outside `AWS_LAB_CIDR`
-  and put nothing else in it, since every lab admits the whole subnet. For
-  a site-to-site VPN or Transit Gateway it is the campus range routed over
-  the link. Confirm with one lab
-  VM before the class (`ss -tn` on the lab shows the source address). Each
-  entry must be an IPv4 network no broader than a `/8`; `0.0.0.0/0` is
-  always refused.
+- **The source CIDR(s) lab VMs see**, which is what `AWS_CLIENT_CIDRS`
+  lists. It depends on how students arrive:
+
+  | How students connect | What lab VMs see as the source | `AWS_CLIENT_CIDRS` |
+  |---|---|---|
+  | Client VPN endpoint **associated with a VPC subnet** (IPv4) | the endpoint's network interface in that target subnet: the endpoint source-NATs client traffic | the **target subnet's** CIDR. Make it a dedicated subnet outside `AWS_LAB_CIDR` with nothing else in it, since every lab admits all of it |
+  | Client VPN endpoint **associated with a Transit Gateway** | the student's own client address: the source is preserved | the endpoint's **client CIDR** |
+  | Site-to-site VPN or Transit Gateway from campus | the campus address | the **on-premises ranges** routed over the link |
+
+  See [What is AWS Client VPN](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html)
+  and [Client VPN with a Transit Gateway](https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-tgw.html).
+  **Confirm the observed source on one lab VM before the class:** connect
+  over the VPN, open a session to the lab, and run `ss -tn` on the lab; the
+  peer address must fall inside `AWS_CLIENT_CIDRS`. Each entry must be an
+  IPv4 network no broader than a `/8`; `0.0.0.0/0` is always refused.
 - **Routes to `AWS_LAB_CIDR`**, both ways: the VPN gives its clients a route
   to `AWS_LAB_CIDR` (a Client VPN route and authorization rule; the campus
-  side of a site-to-site), and replies find their way back: Client VPN's
-  translation keeps them inside the VPC, while a site-to-site needs a main
-  route table entry sending the campus range to its virtual private gateway
-  or Transit Gateway attachment. The main route table must still never get
-  a `0.0.0.0/0` route.
+  side of a site-to-site), and replies find their way back. With a
+  subnet-associated Client VPN endpoint the replies go to its interfaces
+  inside the VPC and need no route; with a Transit Gateway association or a
+  site-to-site link, the VPC's main route table needs an entry sending the
+  client CIDR or campus ranges to the Transit Gateway attachment or virtual
+  private gateway. The main route table must still never get a `0.0.0.0/0`
+  route.
 - **No overlap:** the client CIDRs must not overlap `AWS_LAB_CIDR`, the
   Proxmox `10.0.0.0/8` or Docker's `172.17.0.0/16`. Startup and the
   preflight refuse an overlap with `AWS_LAB_CIDR`.
@@ -578,20 +585,33 @@ for example), or keep `VPN_MODE=headscale`.
 **GCP** has no client-network setting: the portal never writes a source
 range. GCP labs admit students through the operator's static
 `<site-id>-lab-tailnet` rule (setup step 3); point its `--source-ranges` at
-the VPN's client range instead of `100.64.0.0/10`, and replace the
-`<site-id>-tailnet-return` route (step 4) with the VPN's own return route.
+the source range lab VMs observe from the VPN instead of `100.64.0.0/10`,
+and replace the `<site-id>-tailnet-return` route (step 4) with the VPN's
+own return route.
 
 **Proxmox** needs no portal change: labs are reached through the jumpbox's
 routed lab VLANs, so any VPN that routes the lab VLAN ranges (by default
 `10.0.0.0/8`) to the jumpbox works. The jumpbox's Tailscale steps
 (`docs/JUMPBOX.md`) become optional.
 
-**Changing `AWS_CLIENT_CIDRS` on a live site.** A deployment's group is
-brought to the configured set whenever one of its VMs launches; a group
-whose deployment launches nothing more keeps its old networks until it is
-deleted. Each such convergence logs a warning naming the old and new
-networks, so the change is never silent. Change it between sessions, or
-expect running deployments to keep the old set until they end.
+**Changing `AWS_CLIENT_CIDRS` on a live site.** Every portal process reads
+it once, at startup, so a process left running keeps the old value and
+would converge groups back to it. Change it atomically:
+
+1. Edit `AWS_CLIENT_CIDRS` (and `VPN_MODE`, if it changes) in `.env`.
+2. Run `python3 scripts/preflight_env.py --summary .env`; fix every problem
+   and check the `aws:` line lists the new networks.
+3. Stop **every** portal container and worker, then recreate them all from
+   the edited `.env` (`docker compose down`, then `docker compose up -d`).
+   Never a rolling restart: one old process left running can launch a VM
+   and put the old ranges back on its group.
+4. Only then let students launch again.
+
+After the restart, a deployment's group is brought to the new set the next
+time one of its VMs launches, and each such convergence logs a warning
+naming the old and new networks. A deployment that launches nothing more
+keeps its old ranges until it is deleted, so change the setting between
+sessions, or expect running deployments to keep the old set until they end.
 
 ## No VPN (internal network)
 
@@ -878,7 +898,7 @@ only the router disks bill.
 5. **Preflight, then start.**
 
    ```bash
-   python3 scripts/preflight_env.py .env
+   python3 scripts/preflight_env.py --summary .env
    docker compose up -d --build                              # COMPOSE_FILE set (override)
    docker compose -f docker-compose.prod.yml up -d --build   # no override: instance role / metadata server
    ```
@@ -887,8 +907,9 @@ only the router disks bill.
    invalid `LAB_SITE_ID`, a non-positive cap, an overlapping or undersized
    lab CIDR, an unknown `VPN_MODE`, `external` without instructions, and an
    invalid, too-broad or (outside `headscale`) missing `AWS_CLIENT_CIDRS`.
-   The preflight first prints the active VPN mode and, per enabled backend,
-   whether it uses a router and which client networks its labs admit. The
+   With `--summary` the preflight first prints the active VPN mode and, per
+   enabled backend, whether it uses a router and which client networks its
+   labs admit; without it the output is only the problems. The
    admin template validation reports groups whose backend is
    not enabled or whose cloud block is incomplete. `preflight_env.py`
    applies the production rules: run against a local test instance's `.env`

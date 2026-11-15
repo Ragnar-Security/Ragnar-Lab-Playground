@@ -347,7 +347,7 @@ def _external_aws(**extra):
 # Catches the preflight still demanding a router a router-less site never has.
 def test_router_less_clouds_pass_and_say_so(tmp_path):
     values = {**valid_cloud_env(), 'AWS_ROUTER_INSTANCE_ID': '', 'GCP_ROUTER_INSTANCE': ''}
-    result = _run(str(_write_env(tmp_path / '.env', values)))
+    result = _run('--summary', str(_write_env(tmp_path / '.env', values)))
     assert result.returncode == 0, result.stderr
     assert 'aws: no router (AWS_ROUTER_INSTANCE_ID empty)' in result.stdout
     assert 'gcp: no router (GCP_ROUTER_INSTANCE empty)' in result.stdout
@@ -356,7 +356,7 @@ def test_router_less_clouds_pass_and_say_so(tmp_path):
 # Catches the operator not being told which mode, router and client
 # networks the file selects.
 def test_summary_states_mode_router_and_client_networks(tmp_path):
-    result = _run(str(_write_env(tmp_path / '.env', valid_cloud_env())))
+    result = _run('--summary', str(_write_env(tmp_path / '.env', valid_cloud_env())))
     assert result.returncode == 0, result.stderr
     lines = result.stdout.splitlines()
     assert lines[0].startswith('VPN_MODE=headscale: ')
@@ -364,13 +364,29 @@ def test_summary_states_mode_router_and_client_networks(tmp_path):
                and line.endswith('lab security groups admit 100.64.0.0/10') for line in lines)
     assert any(line.startswith('gcp: router GCP_ROUTER_INSTANCE') for line in lines)
     result = _run(str(_write_env(tmp_path / 'ext.env', _external_aws(
-        AWS_CLIENT_CIDRS='192.0.2.0/24,198.51.100.0/24'))))
+        AWS_CLIENT_CIDRS='192.0.2.0/24,198.51.100.0/24'))), '--summary')
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[0].startswith('VPN_MODE=external: ')
     assert 'lab security groups admit 192.0.2.0/24, 198.51.100.0/24' in result.stdout
-    result = _run(str(_write_env(tmp_path / 'none.env', {**GOOD, 'VPN_MODE': 'none'})))
+    result = _run('--summary', str(_write_env(tmp_path / 'none.env',
+                                              {**GOOD, 'VPN_MODE': 'none'})))
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines()[0].startswith('VPN_MODE=none: ')
+
+
+# Catches the default output changing for scripts and operators that read it:
+# without --summary, stdout is only the pass line, exactly as before.
+@pytest.mark.parametrize('values', [GOOD, valid_aws_env(), valid_cloud_env()])
+def test_default_output_has_no_summary(tmp_path, values):
+    path = _write_env(tmp_path / '.env', values)
+    result = _run(str(path))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f'{path}: passes the production preflight\n'
+    assert result.stderr == ''
+    with_summary = _run('--summary', str(path))
+    assert with_summary.returncode == 0
+    assert with_summary.stdout.endswith(result.stdout)
+    assert with_summary.stdout.startswith('VPN_MODE=headscale: ')
 
 
 # Catches the host accepting VPN settings the app refuses, or echoing them.

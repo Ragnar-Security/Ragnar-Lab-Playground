@@ -285,6 +285,27 @@ def test_credentials_overrides_are_per_cloud():
     assert _override_env_names(both) == _override_env_names(aws) | _override_env_names(gcp)
 
 
+# Catches the runbook and example disagreeing on which source CIDR a Client
+# VPN endpoint presents, or a live AWS_CLIENT_CIDRS change being documented
+# without restarting every portal process (each reads it once, at startup).
+def test_other_vpn_runbook_names_each_source_cidr_and_the_restart():
+    section = "\n".join(_section(RUNBOOK.read_text(),
+                                 "## Using another VPN (AWS Client VPN, site-to-site)"))
+    for needle in ("https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/what-is.html",
+                   "https://docs.aws.amazon.com/vpn/latest/clientvpn-admin/cvpn-tgw.html",
+                   "**associated with a VPC subnet**", "**target subnet's** CIDR",
+                   "**associated with a Transit Gateway**", "**client CIDR**",
+                   "**on-premises ranges**", "`ss -tn`",
+                   "preflight_env.py --summary .env", "Never a rolling restart"):
+        assert needle in section, needle
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    for needle in ("associated with a VPC subnet: that dedicated target",
+                   "associated with a Transit Gateway: the endpoint's",
+                   "the on-premises ranges", "ss -tn"):
+        assert needle in example, needle
+    assert "client pool" not in example
+
+
 def test_jumpbox_doc_documents_vlan_isolation():
     headings = markdown_headings(ROOT / "docs" / "JUMPBOX.md")
     assert "### VLAN isolation" in headings

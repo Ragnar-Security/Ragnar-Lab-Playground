@@ -29,12 +29,16 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   admits, instead of the hard-coded tailnet. Unset is `100.64.0.0/10`, as
   before; it is required outside `VPN_MODE=headscale`. Startup and the
   preflight refuse `0.0.0.0/0`, anything broader than a `/8`, overlapping
-  entries, more than 8, and an overlap with `AWS_LAB_CIDR`.
+  entries, more than 8, and an overlap with `AWS_LAB_CIDR`. It is read at
+  startup: changing it on a live site means stopping and recreating every
+  portal process (`docs/CLOUD_BACKENDS.md`, "Changing `AWS_CLIENT_CIDRS` on
+  a live site").
 - `AWS_ROUTER_INSTANCE_ID` and `GCP_ROUTER_INSTANCE` are optional. Empty
   means router-less: deploys never start or wait for a router, and the
   idle-stop job skips that backend.
-- `scripts/preflight_env.py` prints the active VPN mode and, per enabled
-  backend, its router and the client networks its labs admit.
+- `scripts/preflight_env.py --summary` prints the active VPN mode and, per
+  enabled backend, its router and the client networks its labs admit.
+  Without the flag its output is unchanged.
 
 ### Changed
 
