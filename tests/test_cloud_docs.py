@@ -296,7 +296,8 @@ def test_other_vpn_runbook_names_each_source_cidr_and_the_restart():
                    "**associated with a VPC subnet**", "**target subnet's** CIDR",
                    "**associated with a Transit Gateway**", "**client CIDR**",
                    "**on-premises ranges**", "`ss -tn`",
-                   "preflight_env.py --summary .env", "Never a rolling restart"):
+                   "preflight_env.py --summary .env", "Never a rolling restart",
+                   "docker compose -f docker-compose.prod.yml up -d --force-recreate vm-automation"):
         assert needle in section, needle
     example = (ROOT / ".env.example").read_text(encoding="utf-8")
     for needle in ("associated with a VPC subnet: that dedicated target",

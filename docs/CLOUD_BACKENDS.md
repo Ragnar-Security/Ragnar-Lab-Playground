@@ -601,10 +601,21 @@ would converge groups back to it. Change it atomically:
 1. Edit `AWS_CLIENT_CIDRS` (and `VPN_MODE`, if it changes) in `.env`.
 2. Run `python3 scripts/preflight_env.py --summary .env`; fix every problem
    and check the `aws:` line lists the new networks.
-3. Stop **every** portal container and worker, then recreate them all from
-   the edited `.env` (`docker compose down`, then `docker compose up -d`).
-   Never a rolling restart: one old process left running can launch a VM
-   and put the old ranges back on its group.
+3. Recreate the `vm-automation` container (the only one that runs portal
+   code: every web worker and the scheduler) from the edited `.env`, using
+   the deployment's own production Compose files:
+
+   ```bash
+   # .env names COMPOSE_FILE (as "Running a released image" sets it up):
+   docker compose up -d --force-recreate vm-automation
+   # no COMPOSE_FILE in .env (e.g. instance-role or metadata credentials):
+   docker compose -f docker-compose.prod.yml up -d --force-recreate vm-automation
+   ```
+
+   A bare `docker compose` without `COMPOSE_FILE` reads `docker-compose.yml`,
+   the development stack, and leaves the production container running with
+   the old ranges. Never a rolling restart either: one old process left
+   running can launch a VM and put the old ranges back on its group.
 4. Only then let students launch again.
 
 After the restart, a deployment's group is brought to the new set the next
