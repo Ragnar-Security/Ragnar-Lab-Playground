@@ -448,6 +448,8 @@ def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
     which is also the idle clock (ruling M13); it defaults to
     coordination.lease_clock(). A backend's failure is logged and keeps its
     idle timestamp, so the next pass retries; the other backends go ahead.
+    A backend without a router (has_router() False) is skipped outright: no
+    lock, no read, no provider call.
     """
     if now_epoch is None:
         now_epoch = coordination.lease_clock()
@@ -457,6 +459,8 @@ def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
         if name == BACKEND_PROXMOX:
             continue
         try:
+            if not get_backend(name).has_router():
+                continue
             idle_seconds = getattr(
                 config, f'{name.upper()}_ROUTER_IDLE_MINUTES') * 60
             with vm_lifecycle_lock(router_lock_key(name)):

@@ -63,6 +63,33 @@ def test_cloud_create_locks_only_router_start_and_slot_ensure(app, memory_backen
     }
 
 
+# Catches a router-less cloud (the VPN routes to the labs itself) still
+# taking the router lock, or touching a router, on create or re-ensure.
+def test_router_less_create_skips_the_router_and_its_lock(app, memory_backend_case,
+                                                          monkeypatch):
+    from app import vm_provisioning
+    case = memory_backend_case
+    case.backend.router_configured = False
+    taken = []
+    real_lock = vm_provisioning.vm_lifecycle_lock
+
+    def recording_lock(key, *args, **kwargs):
+        taken.append(key)
+        return real_lock(key, *args, **kwargs)
+
+    monkeypatch.setattr(vm_provisioning, 'vm_lifecycle_lock', recording_lock)
+    _location, launched = create_vm(
+        case.spec, reservation_id='reservation-r', load_balancing_config=None,
+        heartbeat=lambda: None)
+    vm_provisioning.ensure_router_running('aws')
+    assert launched.vmid in case.backend.instances
+    assert case.backend.router_touches == 0 and not case.backend.router_running
+    assert router_lock_key('aws') not in taken
+    assert taken == [slot_lock_key('aws', case.spec.network_slot)]
+    assert set(case.backend.observed_locks) == {'ensure_slot', 'create'}
+
+
+
 # Catches a slot released between ensure_slot and create failing the launch (I3).
 def test_create_re_ensures_a_slot_lost_before_launch_once(app, memory_backend_case):
     case = memory_backend_case

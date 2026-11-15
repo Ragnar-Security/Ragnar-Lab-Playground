@@ -261,6 +261,8 @@ BACKEND_ENV_KEYS = (
     'ENABLE_LOAD_BALANCING', 'FIXED_NODE',
     'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR',
     'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS', 'AWS_ROUTER_IDLE_MINUTES',
+    'AWS_CLIENT_CIDRS', 'VPN_MODE', 'VPN_NAME', 'VPN_INSTRUCTIONS_URL',
+    'VPN_INSTRUCTIONS',
     'AWS_LAUNCH_TIMEOUT_SECONDS', 'AWS_TERMINATE_TIMEOUT_SECONDS',
     'GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK', 'GCP_LAB_CIDR',
     'GCP_ROUTER_INSTANCE', 'GCP_MAX_VMS', 'GCP_ROUTER_IDLE_MINUTES',
@@ -367,10 +369,12 @@ def test_cloud_site_id_is_validated(monkeypatch, site):
 
 
 # Catches an enabled cloud starting without a setting it needs to place a
-# VM, or with a cap that admits nothing (or everything).
+# VM, or with a cap that admits nothing (or everything). The routers are
+# optional (router-less sites); see the tests below.
 @pytest.mark.parametrize('key,value', [
-    *[(key, '') for key in AWS_VALUES if key != 'LAB_SITE_ID'],
-    *[(key, '') for key in GCP_VALUES],
+    *[(key, '') for key in AWS_VALUES
+      if key not in ('LAB_SITE_ID', 'AWS_ROUTER_INSTANCE_ID')],
+    *[(key, '') for key in GCP_VALUES if key != 'GCP_ROUTER_INSTANCE'],
     ('AWS_MAX_VMS', '0'), ('AWS_MAX_VMS', '-1'), ('AWS_MAX_VMS', 'three'),
     ('GCP_MAX_VMS', '0'),
 ])
@@ -436,6 +440,119 @@ def test_proxmox_fixed_node_named_like_a_backend_is_rejected(monkeypatch, node):
                         FLASK_ENV='development')
     with pytest.raises(ValueError, match='FIXED_NODE'):
         cfg.validate_config()
+
+
+# ============ VPN mode, client networks, optional routers ============
+
+# Catches the defaults drifting from today's behaviour: the tailnet and a
+# Headscale dashboard.
+def test_vpn_defaults_keep_the_tailnet(monkeypatch):
+    cfg = reload_valid_aws_config(monkeypatch)
+    cfg.validate_config()
+    assert cfg.VPN_MODE == 'headscale'
+    assert cfg.VPN_NAME == 'the course VPN'
+    assert cfg.AWS_CLIENT_CIDRS == ''
+    assert cfg.aws_client_cidrs() == ('100.64.0.0/10',)
+    assert cfg.Config.VPN_MODE == 'headscale'
+
+
+# Catches a router-less site (AWS Client VPN, site-to-site) refused at startup.
+@pytest.mark.parametrize('reload', [reload_valid_aws_config, reload_valid_cloud_config])
+def test_routers_are_optional(monkeypatch, reload):
+    cfg = reload(monkeypatch, AWS_ROUTER_INSTANCE_ID='', GCP_ROUTER_INSTANCE='')
+    cfg.validate_config()
+    assert (cfg.AWS_ROUTER_INSTANCE_ID, cfg.GCP_ROUTER_INSTANCE) == ('', '')
+
+
+# Catches a typo or an instruction-less external VPN reaching students, and
+# a link that is not plainly http(s).
+@pytest.mark.parametrize('overrides,message', [
+    ({'VPN_MODE': 'wireguard'}, 'VPN_MODE must be one of headscale, external, none'),
+    ({'VPN_MODE': 'external'}, 'external needs VPN_INSTRUCTIONS_URL or VPN_INSTRUCTIONS'),
+    ({'VPN_MODE': 'external', 'VPN_INSTRUCTIONS_URL': 'javascript:alert(1)'},
+     'VPN_INSTRUCTIONS_URL must be an http:// or https:// URL'),
+    ({'VPN_MODE': 'external', 'VPN_INSTRUCTIONS_URL': 'https://'},
+     'VPN_INSTRUCTIONS_URL must be an http:// or https:// URL'),
+    ({'VPN_MODE': 'external', 'VPN_INSTRUCTIONS_URL': 'https://user@evil.example/x'},
+     'VPN_INSTRUCTIONS_URL must be an http:// or https:// URL'),
+])
+def test_vpn_settings_are_validated(monkeypatch, overrides, message):
+    cfg = reload_config(monkeypatch, PROXMOX_HOST='fake-host',
+                        PROXMOX_PASSWORD='fake-password', **overrides)
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert message in str(exc.value)
+    assert 'javascript' not in str(exc.value) and 'evil' not in str(exc.value)
+
+
+# Catches a valid external or internal-network site being refused.
+@pytest.mark.parametrize('overrides', [
+    {'VPN_MODE': 'external', 'VPN_INSTRUCTIONS_URL': 'https://vpn.example.edu/guide'},
+    {'VPN_MODE': 'EXTERNAL', 'VPN_INSTRUCTIONS': 'Use the campus VPN client.'},
+    {'VPN_MODE': 'none'},
+])
+def test_valid_vpn_modes_start(monkeypatch, overrides):
+    cfg = reload_config(monkeypatch, PROXMOX_HOST='fake-host',
+                        PROXMOX_PASSWORD='fake-password', **overrides)
+    cfg.validate_config()
+    assert cfg.VPN_MODE == overrides['VPN_MODE'].lower()
+
+
+# Catches an external or internal-network site silently admitting the tailnet
+# (a range nobody uses there) because AWS_CLIENT_CIDRS was left unset.
+@pytest.mark.parametrize('mode', ['external', 'none'])
+def test_aws_client_cidrs_are_required_outside_headscale(monkeypatch, mode):
+    cfg = reload_valid_aws_config(monkeypatch, VPN_MODE=mode,
+                                  VPN_INSTRUCTIONS='Connect first.')
+    with pytest.raises(ValueError,
+                       match=f'AWS_CLIENT_CIDRS is required when VPN_MODE={mode}'):
+        cfg.validate_config()
+    with pytest.raises(ValueError):
+        cfg.aws_client_cidrs()
+    cfg = reload_valid_aws_config(monkeypatch, VPN_MODE=mode,
+                                  VPN_INSTRUCTIONS='Connect first.',
+                                  AWS_CLIENT_CIDRS='192.0.2.0/24, 10.8.0.0/16',
+                                  AWS_ROUTER_INSTANCE_ID='')
+    cfg.validate_config()
+    assert cfg.aws_client_cidrs() == ('192.0.2.0/24', '10.8.0.0/16')
+
+
+# Catches an allow-everyone, too-broad, malformed or self-overlapping client
+# list reaching every deployment's security group.
+@pytest.mark.parametrize('cidrs,message', [
+    ('0.0.0.0/0', 'entry 1 admits every IPv4 address'),
+    ('192.0.2.0/24,0.0.0.0/0', 'entry 2 admits every IPv4 address'),
+    ('64.0.0.0/2', 'broader than a /8'),
+    ('::/0', 'not an IPv4 network'),
+    ('192.0.2.1/24', 'host bits'),
+    ('192.0.2.0/24,192.0.2.0/25', 'overlap'),
+    (','.join(f'192.0.{i}.0/24' for i in range(9)), 'at most 8'),
+])
+def test_invalid_aws_client_cidrs_are_refused(monkeypatch, cidrs, message):
+    cfg = reload_valid_aws_config(monkeypatch, AWS_CLIENT_CIDRS=cidrs)
+    with pytest.raises(ValueError) as exc:
+        cfg.validate_config()
+    assert 'AWS_CLIENT_CIDRS' in str(exc.value) and message in str(exc.value)
+
+
+# Catches a lab base that overlaps the networks its own labs admit.
+def test_aws_client_cidrs_overlapping_the_lab_cidr_are_refused(monkeypatch):
+    cfg = reload_valid_aws_config(monkeypatch, AWS_CLIENT_CIDRS='172.20.128.0/24')
+    with pytest.raises(ValueError, match='AWS_LAB_CIDR 172.20.0.0/16 overlaps '
+                                         'AWS_CLIENT_CIDRS network 172.20.128.0/24'):
+        cfg.validate_config()
+
+
+# Catches the tailnet range staying off-limits for a site without a tailnet,
+# or released for a site that has one.
+def test_tailnet_range_is_reserved_only_under_headscale(monkeypatch):
+    cloud = dict(AWS_LAB_CIDR='100.64.0.0/16', GCP_LAB_CIDR='100.65.0.0/16',
+                 AWS_CLIENT_CIDRS='192.0.2.0/24')
+    cfg = reload_valid_cloud_config(monkeypatch, **cloud)
+    with pytest.raises(ValueError, match='overlaps reserved range 100.64.0.0/10'):
+        cfg.validate_config()
+    cfg = reload_valid_cloud_config(monkeypatch, VPN_MODE='none', **cloud)
+    cfg.validate_config()
 
 
 if __name__ == '__main__':

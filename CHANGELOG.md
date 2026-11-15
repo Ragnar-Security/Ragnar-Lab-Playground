@@ -17,11 +17,47 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `scripts/sync_template.sh` takes an optional fifth argument, the target
   VMID, restricted to 8500-8999 so a replica can never land at VMID 9000 or
   above.
+- VPN-agnostic access. `VPN_MODE` selects how students reach labs:
+  `headscale` (the default, unchanged), `external` (a VPN the portal does
+  not run, such as AWS Client VPN or a site-to-site link: the dashboard
+  shows `VPN_NAME` with `VPN_INSTRUCTIONS_URL` and/or the plain-text
+  `VPN_INSTRUCTIONS`, and never a Headscale key) or `none` (students are
+  already on an internal network routed to the labs; no VPN instructions).
+  Labs stay private in every mode. `docs/CLOUD_BACKENDS.md` has "Using
+  another VPN" and "No VPN (internal network)".
+- `AWS_CLIENT_CIDRS`: the networks each AWS deployment's security group
+  admits, instead of the hard-coded tailnet. Unset is `100.64.0.0/10`, as
+  before; it is required outside `VPN_MODE=headscale`. Startup and the
+  preflight refuse `0.0.0.0/0`, anything broader than a `/8`, overlapping
+  entries, more than 8, and an overlap with `AWS_LAB_CIDR`.
+- `AWS_ROUTER_INSTANCE_ID` and `GCP_ROUTER_INSTANCE` are optional. Empty
+  means router-less: deploys never start or wait for a router, and the
+  idle-stop job skips that backend.
+- `scripts/preflight_env.py` prints the active VPN mode and, per enabled
+  backend, its router and the client networks its labs admit.
+
+### Changed
+
+- The tailnet range `100.64.0.0/10` is a reserved lab-CIDR range only under
+  `VPN_MODE=headscale`.
+- Outside `VPN_MODE=headscale`, `/auth/me` and the other user payloads no
+  longer carry `headscale_key`.
+- The release bundle also carries `app/backends/network_slots.py`, which
+  `scripts/preflight_env.py` now loads for the client-network checks.
 
 ### Removed
 
 - The image builder (`scripts/image_build/`), added after 1.1.0 and never in a
   release, moved to its own public repo, `Ragnar-Security/lab-image-builder`.
+
+### Upgrade notes
+
+- No action. `VPN_MODE` defaults to `headscale`, `AWS_CLIENT_CIDRS` to the
+  tailnet, and a configured router behaves exactly as before; existing
+  security groups already match the default rule set.
+- `docker-compose.prod.yml` passes the new `VPN_MODE`, `VPN_NAME`,
+  `VPN_INSTRUCTIONS_URL`, `VPN_INSTRUCTIONS` and `AWS_CLIENT_CIDRS`; a site
+  using its own compose file must add them to use the new modes.
 
 ## [1.1.0] - 2026-11-14
 

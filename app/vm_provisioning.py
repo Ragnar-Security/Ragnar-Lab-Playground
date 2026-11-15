@@ -13,7 +13,9 @@ router lock, no live record and no unexpired reservation exists for that
 backend. No path takes the router lock while holding a slot lock.
 
 Proxmox has no router or slot networks (its hooks are no-ops), so it takes
-neither lock.
+neither lock. A router-less cloud (has_router() False: the VPN reaches the
+labs through routing the portal does not manage) skips the router step and
+its lock entirely.
 """
 
 import logging
@@ -84,9 +86,13 @@ def _renewing_admission(heartbeat: Callable[[], None]
 
 
 def ensure_router_running(backend_name: str) -> None:
-    """Start `backend_name`'s router under its lifecycle lock (ruling C4)."""
+    """Start `backend_name`'s router under its lifecycle lock (ruling C4);
+    nothing for a backend without one."""
+    backend = get_backend(backend_name)
+    if not backend.has_router():
+        return
     with vm_lifecycle_lock(router_lock_key(backend_name)):
-        get_backend(backend_name).ensure_router_running()
+        backend.ensure_router_running()
 
 
 def create_vm(spec: VMSpec, *, reservation_id: str,
@@ -117,9 +123,10 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
             guard()
             heartbeat()
 
-        with vm_lifecycle_lock(router_lock_key(spec.backend)):
-            guard()
-            backend.ensure_router_running()
+        if backend.has_router():
+            with vm_lifecycle_lock(router_lock_key(spec.backend)):
+                guard()
+                backend.ensure_router_running()
         _ensure_slot(backend, spec)
         guard()
         try:

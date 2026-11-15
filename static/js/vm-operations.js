@@ -164,12 +164,16 @@ function loadDeploymentGroups(retryCount = 0) {
                             t => t.connect && t.connect.protocol === 'rdp');
                         if (rdpTemplate) {
                             const who = escapeHtml(String(rdpTemplate.connect.username || 'student'));
+                            // VPN_MODE=none: students are already on the course network.
+                            const reach = document.body.dataset.vpnMode === 'none'
+                                ? 'It works from the course network.'
+                                : 'You must be on the course VPN.';
                             templatesHTML += `
                               <div class="mt-2 small">
                                 <i class="bi bi-display"></i>
                                 This is a <strong>Windows desktop</strong>. You reach it with
                                 Remote Desktop, signing in as <code>${who}</code>.
-                                You must be on the course VPN.
+                                ${reach}
                                 Once it starts, use the <strong>Connect</strong> column in
                                 <strong>My Labs</strong> below.
                                 <a href="#" class="rdp-help" data-address="" data-user="${who}">Read how to connect</a>.

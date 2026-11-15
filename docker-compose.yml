@@ -30,6 +30,10 @@ services:
       - SITE_BRAND_TAG=${SITE_BRAND_TAG:-}
       - SITE_ORG=${SITE_ORG:-}
       - VPN_LOGIN_SERVER=${VPN_LOGIN_SERVER:-}
+      - VPN_MODE=${VPN_MODE:-}
+      - VPN_NAME=${VPN_NAME:-}
+      - VPN_INSTRUCTIONS_URL=${VPN_INSTRUCTIONS_URL:-}
+      - VPN_INSTRUCTIONS=${VPN_INSTRUCTIONS:-}
       # Alert notification settings
       - SMTP_SERVER=${SMTP_SERVER}
       - SMTP_PORT=${SMTP_PORT}

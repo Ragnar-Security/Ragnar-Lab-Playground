@@ -250,7 +250,7 @@ def test_valid_cloud_env_passes(tmp_path, values):
 # Catches a host preflight that passes although the enabled cloud cannot boot.
 @pytest.mark.parametrize('key', [
     'LAB_SITE_ID', 'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID',
-    'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS'])
+    'AWS_MAX_VMS'])
 def test_aws_preflight_names_each_missing_required_key(tmp_path, key):
     values = valid_aws_env()
     values.pop(key)
@@ -262,7 +262,7 @@ def test_aws_preflight_names_each_missing_required_key(tmp_path, key):
 
 
 # Catches the GCP half of the same gap.
-@pytest.mark.parametrize('key', list(GCP_ENV))
+@pytest.mark.parametrize('key', [key for key in GCP_ENV if key != 'GCP_ROUTER_INSTANCE'])
 def test_gcp_preflight_names_each_missing_required_key(tmp_path, key):
     values = valid_cloud_env()
     values.pop(key)
@@ -333,4 +333,98 @@ def test_preflight_rejects_fixed_node_named_like_a_backend(tmp_path):
 def test_proxmox_ca_bundle_is_ignored_when_proxmox_is_disabled(tmp_path):
     values = {**valid_aws_env(), 'PROXMOX_CA_BUNDLE': str(tmp_path / 'absent.pem')}
     result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 0, result.stderr
+
+
+# ============ VPN mode, client networks, optional routers ============
+
+def _external_aws(**extra):
+    return {**valid_aws_env(), 'VPN_MODE': 'external',
+            'VPN_INSTRUCTIONS_URL': 'https://vpn.example.edu/guide',
+            'AWS_ROUTER_INSTANCE_ID': '', 'AWS_CLIENT_CIDRS': '192.0.2.0/24', **extra}
+
+
+# Catches the preflight still demanding a router a router-less site never has.
+def test_router_less_clouds_pass_and_say_so(tmp_path):
+    values = {**valid_cloud_env(), 'AWS_ROUTER_INSTANCE_ID': '', 'GCP_ROUTER_INSTANCE': ''}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 0, result.stderr
+    assert 'aws: no router (AWS_ROUTER_INSTANCE_ID empty)' in result.stdout
+    assert 'gcp: no router (GCP_ROUTER_INSTANCE empty)' in result.stdout
+
+
+# Catches the operator not being told which mode, router and client
+# networks the file selects.
+def test_summary_states_mode_router_and_client_networks(tmp_path):
+    result = _run(str(_write_env(tmp_path / '.env', valid_cloud_env())))
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0].startswith('VPN_MODE=headscale: ')
+    assert any(line.startswith('aws: router AWS_ROUTER_INSTANCE_ID')
+               and line.endswith('lab security groups admit 100.64.0.0/10') for line in lines)
+    assert any(line.startswith('gcp: router GCP_ROUTER_INSTANCE') for line in lines)
+    result = _run(str(_write_env(tmp_path / 'ext.env', _external_aws(
+        AWS_CLIENT_CIDRS='192.0.2.0/24,198.51.100.0/24'))))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0].startswith('VPN_MODE=external: ')
+    assert 'lab security groups admit 192.0.2.0/24, 198.51.100.0/24' in result.stdout
+    result = _run(str(_write_env(tmp_path / 'none.env', {**GOOD, 'VPN_MODE': 'none'})))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines()[0].startswith('VPN_MODE=none: ')
+
+
+# Catches the host accepting VPN settings the app refuses, or echoing them.
+@pytest.mark.parametrize('values, key', [
+    ({'VPN_MODE': 'wireguard'}, 'VPN_MODE'),
+    ({'VPN_MODE': 'external'}, 'VPN_MODE'),
+    ({'VPN_MODE': 'external', 'VPN_INSTRUCTIONS_URL': 'javascript:alert(1)'},
+     'VPN_INSTRUCTIONS_URL'),
+])
+def test_invalid_vpn_settings_fail_naming_their_key(tmp_path, values, key):
+    result = _run(str(_write_env(tmp_path / '.env', {**GOOD, **values})))
+    assert result.returncode == 1
+    problems = result.stderr.splitlines()
+    assert problems and all(line.startswith(f'{key}:') for line in problems)
+    for value in values.values():
+        if value != 'external':
+            assert value not in result.stdout + result.stderr
+
+
+# Catches the host accepting a client list the app refuses at startup.
+@pytest.mark.parametrize('cidrs', [
+    '0.0.0.0/0', '64.0.0.0/2', '::/0', '192.0.2.1/24', '192.0.2.0/24,192.0.2.0/25',
+    ','.join(f'192.0.{i}.0/24' for i in range(9)),
+])
+def test_invalid_aws_client_cidrs_fail(tmp_path, cidrs):
+    result = _run(str(_write_env(tmp_path / '.env', {**valid_aws_env(),
+                                                    'AWS_CLIENT_CIDRS': cidrs})))
+    assert result.returncode == 1
+    assert result.stderr.splitlines()[0].startswith('AWS_CLIENT_CIDRS:')
+
+
+# Catches an external or internal-network site left on the tailnet default,
+# and a client network overlapping the lab base.
+@pytest.mark.parametrize('mode', ['external', 'none'])
+def test_aws_client_cidrs_required_outside_headscale_and_clear_of_lab_cidr(tmp_path, mode):
+    values = _external_aws(VPN_MODE=mode)
+    values.pop('AWS_CLIENT_CIDRS')
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.returncode == 1
+    assert result.stderr.splitlines()[0] == f'AWS_CLIENT_CIDRS: required when VPN_MODE={mode}'
+    result = _run(str(_write_env(tmp_path / 'overlap.env', _external_aws(
+        VPN_MODE=mode, AWS_CLIENT_CIDRS='172.20.9.0/24'))))
+    assert result.returncode == 1
+    assert result.stderr.splitlines() == [
+        'AWS_LAB_CIDR: overlaps a network in the client CIDRs']
+    result = _run(str(_write_env(tmp_path / 'ok.env', _external_aws(VPN_MODE=mode))))
+    assert result.returncode == 0, result.stderr
+
+
+# Catches the tailnet range staying reserved for a site without a tailnet.
+def test_tailnet_range_is_reserved_only_under_headscale(tmp_path):
+    values = {**valid_aws_env(), 'AWS_LAB_CIDR': '100.64.0.0/16'}
+    result = _run(str(_write_env(tmp_path / '.env', values)))
+    assert result.stderr.startswith('AWS_LAB_CIDR: overlaps reserved range 100.64.0.0/10')
+    result = _run(str(_write_env(tmp_path / 'ext.env', _external_aws(
+        AWS_LAB_CIDR='100.64.0.0/16'))))
     assert result.returncode == 0, result.stderr

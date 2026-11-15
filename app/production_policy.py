@@ -11,6 +11,7 @@ never include the value, because the values are secrets.
 """
 
 import os
+import re
 
 NON_PRODUCTION_ENVS = frozenset({'development', 'testing'})
 
@@ -124,3 +125,35 @@ def ca_bundle_problem(path):
         # Otherwise every Proxmox call fails later with an opaque TLS error.
         return "is not a readable file"
     return None
+
+
+# How students reach their labs (docs/CLOUD_BACKENDS.md):
+#   headscale  the course tailnet; the portal shows Tailscale setup and each
+#              student's Headscale key (the default: every existing site)
+#   external   a VPN the portal does not run (AWS Client VPN, a university
+#              VPN, site-to-site); the portal shows VPN_NAME and the
+#              operator's instructions, never a Headscale key
+#   none       students are already on an internal network routed to the
+#              labs: no VPN instructions at all. Labs stay private.
+VPN_MODES = ('headscale', 'external', 'none')
+DEFAULT_VPN_MODE = 'headscale'
+
+
+def vpn_mode(raw):
+    """VPN_MODE lower-cased; unset or empty means headscale. An unknown
+    value is returned as written so vpn_problems() can refuse it."""
+    return (raw or '').strip().lower() or DEFAULT_VPN_MODE
+
+
+def vpn_problems(mode, url, instructions):
+    """(key, problem) pairs for the VPN settings, never echoing a value."""
+    if mode not in VPN_MODES:
+        return [('VPN_MODE', f"must be one of {', '.join(VPN_MODES)}")]
+    problems = []
+    url = (url or '').strip()
+    if mode == 'external' and not (url or (instructions or '').strip()):
+        problems.append(('VPN_MODE', 'external needs VPN_INSTRUCTIONS_URL or '
+                         'VPN_INSTRUCTIONS, or students are told nothing'))
+    if url and not re.fullmatch(r'https?://[^\s/?#@]+(?:[/?#]\S*)?', url, re.IGNORECASE):
+        problems.append(('VPN_INSTRUCTIONS_URL', 'must be an http:// or https:// URL'))
+    return problems

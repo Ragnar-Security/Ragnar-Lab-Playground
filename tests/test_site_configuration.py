@@ -17,9 +17,10 @@ def app():
         db.drop_all()
 
 
-def _authenticated_client(app):
+def _authenticated_client(app, headscale_key=None):
     with app.app_context():
-        user = User(login_id="site-config-user", is_admin=False, session_version=1)
+        user = User(login_id="site-config-user", is_admin=False, session_version=1,
+                    headscale_key=headscale_key)
         user.set_password("not-a-real-password")
         db.session.add(user)
         db.session.commit()
@@ -70,6 +71,67 @@ def test_neutral_defaults_omit_deployment_identity_and_login_server(app):
     assert "Acme" not in rendered
     assert "Example University" not in rendered
     assert "vpn.example.edu" not in rendered
+
+
+_KEY = "hskey-0123456789abcdef"
+_HOSTILE = '<script>alert("x")</script> & <b>bold</b>'
+
+
+def _dashboard(app, **settings):
+    app.config.update(VPN_LOGIN_SERVER="https://vpn.example.edu", **settings)
+    client = _authenticated_client(app, headscale_key=_KEY)
+    return client.get("/").get_data(as_text=True), client.get("/auth/me").get_json()
+
+
+# Catches the Headscale default changing: Tailscale setup, the login server
+# and the student's own key, exactly as before.
+def test_headscale_mode_keeps_the_tailscale_panel_and_key(app):
+    html, me = _dashboard(app, VPN_MODE="headscale")
+    assert 'id="tailscale-setup"' in html
+    assert "sudo tailscale up --login-server=https://vpn.example.edu --auth-key=" in html
+    assert 'id="vpn-setup"' not in html
+    assert "You must be on the course VPN first." in html
+    assert me["user"]["headscale_key"] == _KEY
+
+
+# Catches a Headscale key or Tailscale instructions reaching students who use
+# another VPN, and operator text rendered as markup.
+def test_external_mode_shows_the_operators_vpn_and_no_key(app):
+    html, me = _dashboard(
+        app, VPN_MODE="external", VPN_NAME="the UMD lab VPN",
+        VPN_INSTRUCTIONS_URL="https://vpn.example.edu/guide?a=1&b=2",
+        VPN_INSTRUCTIONS=_HOSTILE)
+    assert "tailscale" not in html.lower() and "--auth-key" not in html
+    assert "headscale" not in html.lower() and "vpn.example.edu --" not in html
+    assert 'id="vpn-setup"' in html
+    assert "Connect to the UMD lab VPN before you use them." in html
+    assert 'href="https://vpn.example.edu/guide?a=1&amp;b=2"' in html
+    assert "&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;" in html
+    assert "<script>alert" not in html and "<b>bold</b>" not in html
+    assert "You must be on the course VPN first." in html
+    assert "headscale_key" not in me["user"] and _KEY not in str(me)
+
+
+# Catches VPN instructions, a VPN warning or a key shown to students who are
+# already on the course network.
+def test_none_mode_shows_no_vpn_text_and_no_key(app):
+    html, me = _dashboard(app, VPN_MODE="none")
+    assert "tailscale" not in html.lower() and "--auth-key" not in html
+    assert 'id="vpn-setup"' not in html
+    assert "VPN" not in html
+    assert "It works only from the" in html and "course network" in html
+    assert 'data-vpn-mode="none"' in html
+    assert "headscale_key" not in me["user"] and _KEY not in str(me)
+
+
+# Catches a roster row without a Headscale key breaking the dashboard in any mode.
+@pytest.mark.parametrize("mode", ["headscale", "external", "none"])
+def test_dashboard_works_without_a_headscale_key(app, mode):
+    app.config.update(VPN_MODE=mode, VPN_INSTRUCTIONS="Connect first.")
+    client = _authenticated_client(app, headscale_key=None)
+    assert client.get("/").status_code == 200
+    me = client.get("/auth/me")
+    assert me.status_code == 200 and me.get_json()["success"] is True
 
 
 @pytest.mark.parametrize(

@@ -40,8 +40,10 @@ REQUIRED = [
     ('.env.example', None),
     ('templates.example.yaml', None),
     ('scripts/preflight_env.py', None),
-    # preflight_env.py loads the production policy module by path.
+    # preflight_env.py loads the production policy and network-slot modules
+    # by path.
     ('app/production_policy.py', None),
+    ('app/backends/network_slots.py', None),
     ('scripts/backup-database.sh', None),
     ('LICENSE', None),
     ('NOTICE', None),

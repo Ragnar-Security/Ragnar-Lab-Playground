@@ -26,7 +26,7 @@ SPEC = ROOT / "docs" / "superpowers" / "specs" / "2026-11-04-multi-backend-vms-d
 CLOUD_ENV = {
     "ENABLED_BACKENDS", "LAB_SITE_ID", "JUMPBOX_VLAN_BANDS",
     "AWS_REGION", "AWS_AVAILABILITY_ZONE", "AWS_LAB_VPC_ID", "AWS_LAB_CIDR",
-    "AWS_ROUTER_INSTANCE_ID", "AWS_MAX_VMS", "AWS_ROUTER_IDLE_MINUTES",
+    "AWS_ROUTER_INSTANCE_ID", "AWS_MAX_VMS", "AWS_ROUTER_IDLE_MINUTES", "AWS_CLIENT_CIDRS",
     "AWS_LAUNCH_TIMEOUT_SECONDS", "AWS_TERMINATE_TIMEOUT_SECONDS",
     "GCP_PROJECT", "GCP_REGION", "GCP_ZONE", "GCP_NETWORK", "GCP_LAB_CIDR",
     "GCP_ROUTER_INSTANCE", "GCP_MAX_VMS", "GCP_ROUTER_IDLE_MINUTES",
@@ -55,6 +55,8 @@ REQUIRED_HEADINGS = {
     "## AWS one-time setup",
     "## Google Cloud one-time setup",
     "## Router Tailscale flags",
+    "## Using another VPN (AWS Client VPN, site-to-site)",
+    "## No VPN (internal network)",
     "## Capacity and quota checks",
     "## Cost model",
     "## Configure and validate the portal",

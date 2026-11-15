@@ -6,13 +6,16 @@ host, before `docker compose -f docker-compose.prod.yml up`.
 
 Prints one line per problem as `KEY: problem`, never the value, and exits
 1 when there is any; exits 2 when the file cannot be read; 0 otherwise.
+Before that it prints, on stdout, which VPN mode is active and, per enabled
+backend, whether a router is used and which client networks the labs admit
+(network ranges are not secrets).
 
 The rules are the ones the app enforces at startup (app/production_policy.py
 and the backend checks of app/config.py:validate_config(), mirrored here),
 plus MYSQL_ROOT_PASSWORD, which only the MySQL container reads and the app
 therefore never sees. Needs only the Python standard library: the policy
-module is loaded by path so the host needs neither Flask nor the app's
-other dependencies.
+and network-slot modules are loaded by path so the host needs neither Flask
+nor the app's other dependencies.
 """
 
 import importlib.util
@@ -30,27 +33,27 @@ RELEASE_VERSION = re.compile(
 # needs, and where its lab networks may live.
 KNOWN_BACKENDS = ('proxmox', 'aws', 'gcp')
 CLOUD_REQUIRED = {
-    'aws': ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID',
-            'AWS_ROUTER_INSTANCE_ID'),
-    'gcp': ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK',
-            'GCP_ROUTER_INSTANCE'),
+    'aws': ('AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID'),
+    'gcp': ('GCP_PROJECT', 'GCP_REGION', 'GCP_ZONE', 'GCP_NETWORK'),
 }
+ROUTER_KEYS = {'aws': 'AWS_ROUTER_INSTANCE_ID', 'gcp': 'GCP_ROUTER_INSTANCE'}
 DEFAULT_LAB_CIDRS = {'aws': '172.20.0.0/16', 'gcp': '172.21.0.0/16'}
-LAB_CIDR_RESERVED = ('10.0.0.0/8', '100.64.0.0/10', '172.17.0.0/16')
+LAB_CIDR_RESERVED = ('10.0.0.0/8', '172.17.0.0/16')
 # Slot 500's /26 sits at base + 500 * 64, so a base holds 501 * 64 addresses.
 LAB_CIDR_MIN_ADDRESSES = 501 * 64
 LAB_SITE_ID = re.compile(r'[a-z0-9](?:[a-z0-9-]{0,18}[a-z0-9])?')
 
 
-def _load_policy():
-    spec = importlib.util.spec_from_file_location(
-        'production_policy', REPO / 'app' / 'production_policy.py')
+def _load(name, relative):
+    spec = importlib.util.spec_from_file_location(name, REPO / relative)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # dataclasses resolve their module by name
     spec.loader.exec_module(module)
     return module
 
 
-policy = _load_policy()
+policy = _load('production_policy', 'app/production_policy.py')
+slots = _load('_preflight_network_slots', 'app/backends/network_slots.py')
 
 
 def _unquote(raw):
@@ -96,16 +99,21 @@ def _enabled_backends(raw):
     return tuple(names)
 
 
-def _lab_cidr_problem(cidr, others):
+def _lab_cidr_problem(cidr, others, tailnet, clients):
     """What app/config.py refuses in a cloud lab base, without the value.
-    `others` maps another enabled cloud's CIDR key to its base."""
+    `others` maps another enabled cloud's CIDR key to its base; `tailnet`
+    reserves the tailnet range (VPN_MODE=headscale); `clients` are the
+    backend's parsed client networks."""
     try:
         network = ipaddress.IPv4Network(cidr)
     except ValueError:
         return 'must be an IPv4 network address/prefix'
-    for reserved in LAB_CIDR_RESERVED:
-        if network.overlaps(ipaddress.IPv4Network(reserved)):
-            return f'overlaps reserved range {reserved}'
+    reserved = LAB_CIDR_RESERVED + ((slots.TAILNET_CIDR,) if tailnet else ())
+    for blocked in sorted(reserved, key=ipaddress.IPv4Network):
+        if network.overlaps(ipaddress.IPv4Network(blocked)):
+            return f'overlaps reserved range {blocked}'
+    if any(network.overlaps(ipaddress.IPv4Network(client)) for client in clients):
+        return 'overlaps a network in the client CIDRs'
     if network.num_addresses < LAB_CIDR_MIN_ADDRESSES:
         return 'is too small for slot 500; needs a /17 or larger'
     for key, other in others.items():
@@ -115,6 +123,20 @@ def _lab_cidr_problem(cidr, others):
         except ValueError:
             pass  # reported against that key itself
     return None
+
+
+def _aws_client_cidrs(env, mode):
+    """(networks, problem) for AWS_CLIENT_CIDRS as app/config.py reads it:
+    unset is the tailnet, under VPN_MODE=headscale only."""
+    raw = (env.get('AWS_CLIENT_CIDRS') or '').strip()
+    if raw:
+        try:
+            return slots.parse_client_cidrs(raw), None
+        except ValueError as error:
+            return (), str(error)
+    if mode != 'headscale':
+        return (), f'required when VPN_MODE={mode}'
+    return (slots.TAILNET_CIDR,), None
 
 
 def _backend_problems(env, check):
@@ -136,6 +158,7 @@ def _backend_problems(env, check):
     clouds = [name for name in backends if name in CLOUD_REQUIRED]
     if not clouds:
         return
+    mode = policy.vpn_mode(env.get('VPN_MODE'))
     site = (env.get('LAB_SITE_ID') or '').strip()
     if not site:
         check('LAB_SITE_ID', 'required when a cloud backend is enabled')
@@ -146,6 +169,10 @@ def _backend_problems(env, check):
              (env.get(f'{name.upper()}_LAB_CIDR') or '').strip() or DEFAULT_LAB_CIDRS[name]
              for name in clouds}
     for name in clouds:
+        clients = ()
+        if name == 'aws':
+            clients, problem = _aws_client_cidrs(env, mode)
+            check('AWS_CLIENT_CIDRS', problem)
         for key in CLOUD_REQUIRED[name]:
             if not (env.get(key) or '').strip():
                 check(key, f'required when {name} is enabled')
@@ -158,7 +185,46 @@ def _backend_problems(env, check):
             check(cap_key, f'must be a positive integer when {name} is enabled')
         key = f'{name.upper()}_LAB_CIDR'
         others = {other: cidr for other, cidr in bases.items() if other != key}
-        check(key, _lab_cidr_problem(bases[key], others))
+        check(key, _lab_cidr_problem(bases[key], others, mode == 'headscale', clients))
+
+
+_MODE_SUMMARY = {
+    'headscale': 'students reach labs over the Headscale tailnet; the dashboard '
+                 'shows Tailscale setup and each student\'s Headscale key',
+    'external': 'students reach labs over a VPN the portal does not run; the '
+                'dashboard shows VPN_NAME and the VPN instructions, never a Headscale key',
+    'none': 'students are already on an internal network routed to the labs; '
+            'the dashboard shows no VPN instructions. Labs stay private',
+}
+
+
+def summary(env):
+    """What the file selects, one line each: the VPN mode and, per enabled
+    backend, its router and the client networks its labs admit."""
+    mode = policy.vpn_mode(env.get('VPN_MODE'))
+    lines = [f'VPN_MODE={mode}: {_MODE_SUMMARY[mode]}' if mode in _MODE_SUMMARY
+             else 'VPN_MODE: not a known mode (see the problems)']
+    for name in _enabled_backends(env.get('ENABLED_BACKENDS')):
+        if name == 'proxmox':
+            lines.append('proxmox: no router; labs are reached through the jumpbox\'s '
+                         'routed lab VLANs (10.0.0.0/8), whatever the VPN')
+            continue
+        if name not in ROUTER_KEYS:
+            continue
+        key = ROUTER_KEYS[name]
+        router = (f'router {key} (started for launches, stopped when idle)'
+                  if (env.get(key) or '').strip() else
+                  f'no router ({key} empty): the VPN or internal network must '
+                  f'route to {name.upper()}_LAB_CIDR itself')
+        if name == 'aws':
+            clients, problem = _aws_client_cidrs(env, mode)
+            admits = ('lab security groups admit ' + ', '.join(clients)
+                      if not problem else 'AWS_CLIENT_CIDRS is invalid (see the problems)')
+        else:
+            admits = ('client networks are the operator\'s <site-id>-lab-tailnet '
+                      'firewall rule, not portal settings')
+        lines.append(f'{name}: {router}; {admits}')
+    return lines
 
 
 def problems(env):
@@ -168,6 +234,10 @@ def problems(env):
         if problem:
             found.append(f'{key}: {problem}')
 
+    for key, problem in policy.vpn_problems(
+            policy.vpn_mode(env.get('VPN_MODE')), env.get('VPN_INSTRUCTIONS_URL'),
+            env.get('VPN_INSTRUCTIONS')):
+        check(key, problem)
     check('SECRET_KEY', policy.secret_key_problem(env.get('SECRET_KEY')))
     # docker-compose.prod.yml builds DATABASE_URL from MYSQL_USER and
     # MYSQL_PASSWORD, so the passwords below are the ones that matter.
@@ -202,7 +272,10 @@ def main(argv):
     except OSError as exc:
         print(f'{path}: cannot read ({exc.strerror})', file=sys.stderr)
         return 2
-    found = problems(parse_env(text))
+    env = parse_env(text)
+    for line in summary(env):
+        print(line)
+    found = problems(env)
     for line in found:
         print(line, file=sys.stderr)
     if found:

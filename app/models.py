@@ -4,6 +4,7 @@ Defines the VMRecord model for storing VM metadata and lifecycle info
 """
 
 import secrets
+from flask import current_app
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
 from sqlalchemy import Index, UniqueConstraint, CheckConstraint
@@ -189,8 +190,10 @@ class User(db.Model):
         return check_password_hash(self.password_hash, password)
     
     def to_dict(self):
-        """Convert model to dictionary for JSON serialization"""
-        return {
+        """Convert model to dictionary for JSON serialization. The Headscale
+        key is included only under VPN_MODE=headscale: on any other VPN it
+        is a tailnet credential the student has no use for."""
+        data = {
             'id': self.id,
             'login_id': self.login_id,
             'email': self.email,
@@ -198,11 +201,13 @@ class User(db.Model):
             'is_admin': self.is_admin,
             'entry_vlan_tag': self.entry_vlan_tag,
             'internal_vlan_tag': self.internal_vlan_tag,
-            'headscale_key': self.headscale_key,
             'created_at': self.created_at.isoformat(),
             'last_login': self.last_login.isoformat() if self.last_login else None,
             'disabled': self.disabled
         }
+        if current_app.config['VPN_MODE'] == 'headscale':
+            data['headscale_key'] = self.headscale_key
+        return data
 
     def __repr__(self):
         """String representation of the user"""

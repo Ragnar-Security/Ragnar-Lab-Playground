@@ -120,6 +120,10 @@ def create_app(testing=False, test_config=None, start_background_tasks=True):
             'site_brand_tag': app.config['SITE_BRAND_TAG'],
             'site_org': app.config['SITE_ORG'],
             'vpn_login_server': app.config['VPN_LOGIN_SERVER'],
+            'vpn_mode': app.config['VPN_MODE'],
+            'vpn_name': app.config['VPN_NAME'],
+            'vpn_instructions_url': app.config['VPN_INSTRUCTIONS_URL'],
+            'vpn_instructions': app.config['VPN_INSTRUCTIONS'],
             'self_service_password_reset': app.config['SELF_SERVICE_PASSWORD_RESET'],
         }
 
