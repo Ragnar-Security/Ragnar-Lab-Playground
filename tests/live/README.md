@@ -176,8 +176,8 @@ backends, through the registry, against a real account and check:
   an empty inventory;
 - **AWS:** instance-level `SecurityGroups` populated and no public
   `Association` on a private launch; the deployment group's rules exactly
-  its own group and the client networks (`AWS_CLIENT_CIDRS`, or the tailnet
-  when unset), both ways; `RunInstances` `ClientToken`
+  its own group and the client networks (`LIVE_AWS_CLIENT_CIDRS`, or the
+  tailnet when unset), both ways; `RunInstances` `ClientToken`
   idempotency after a lost response (a client-side timeout); a deployment
   security group delete refused with `DependencyViolation` while attached,
   and surfaced to the caller; `stop_router` while the router is `pending`;
@@ -240,9 +240,10 @@ they are unit-tested against the in-memory backend in
    fresh read has shown the router not stopped, polling for up to 60 s from
    the start and failing the run if the start never becomes visible. A test
    that stops the router itself does it through `run.stop_router()`, whose
-   issued stop proves the start was seen. A router-less site (router
-   variable empty) skips both router steps: the run never starts, stops or
-   reads a router, and the `pending` stop test is skipped.
+   issued stop proves the start was seen. A router-less site (no
+   `LIVE_AWS_ROUTER_INSTANCE_ID` / `LIVE_GCP_ROUTER_INSTANCE`) skips both
+   router steps: the run never starts, stops or reads a router, and the
+   `pending` stop test is skipped.
 
 Any cleanup failure fails the test's teardown, even after the test body
 failed, with the provider ids and the inventory commands below filled in.
@@ -250,7 +251,14 @@ failed, with the provider ids and the inventory commands below filled in.
 The run only reads and pins `app.config` values it validated: the site, the
 cap, `ENABLED_BACKENDS` and the cloud settings below are patched into
 `app.config` for the session, so a stray `.env` value cannot widen the cap or
-change the site. Credentials stay in boto3's standard chain (environment,
+change the site. The router, the AWS client networks and the VPN mode are
+read **only** from their `LIVE_*` inputs, never from the app's own names:
+importing `app` runs `load_dotenv()`, so a checkout's `.env` (for example a
+production `AWS_ROUTER_INSTANCE_ID`) is already in the environment when the
+run reads it. A live input that is unset pins the app setting empty (or
+`headscale` for the mode), whatever the environment or `.env` says, so a
+router-less run can never inherit a real router and start or stop it.
+Credentials stay in boto3's standard chain (environment,
 shared config, instance role) or Google Application Default Credentials and
 are never printed.
 
@@ -269,12 +277,12 @@ flags are independent: `LIVE_AWS=1` alone runs the AWS tests (the Proxmox
 | `AWS_MAX_VMS` / `GCP_MAX_VMS` | `AWS_MAX_VMS` | `GCP_MAX_VMS` | `1` | Must be `1`. |
 | `AWS_REGION`, `AWS_AVAILABILITY_ZONE` | yes | | `us-east-1`, `us-east-1a` | Where the run launches. |
 | `AWS_LAB_VPC_ID`, `AWS_LAB_CIDR` | yes | | `vpc-…`, `172.20.0.0/16` | The lab VPC and its slot base, as for the app. |
-| `AWS_ROUTER_INSTANCE_ID` | no | | `i-…` | A router tagged `lab-playground-site=<live site>` and `lab-playground-kind=router`. Empty or unset runs the site router-less. |
-| `AWS_CLIENT_CIDRS`, `VPN_MODE` | no | | `10.99.0.0/16`, `external` | As for the app; pinned for the run (empty and `headscale` when unset). A mode other than `headscale` needs `AWS_CLIENT_CIDRS`. |
+| `LIVE_AWS_ROUTER_INSTANCE_ID` | no | | `i-…` | Pinned as the run's `AWS_ROUTER_INSTANCE_ID`: a router tagged `lab-playground-site=<live site>` and `lab-playground-kind=router`. Unset runs the site router-less; `AWS_ROUTER_INSTANCE_ID` itself (environment or `.env`) is ignored. |
+| `LIVE_AWS_CLIENT_CIDRS`, `LIVE_VPN_MODE` | no | | `10.99.0.0/16`, `external` | Pinned as the run's `AWS_CLIENT_CIDRS` and `VPN_MODE` (empty and `headscale` when unset); the app's own names are ignored. A mode other than `headscale` needs `LIVE_AWS_CLIENT_CIDRS`. |
 | `LIVE_AWS_IMAGE_ID`, `LIVE_AWS_INSTANCE_TYPE` | yes | | `ami-…`, `t3.micro` | What the run launches. The root disk is 20 GB. |
 | `GCP_PROJECT`, `GCP_REGION`, `GCP_ZONE` | | yes | `my-lab-project`, `us-central1`, `us-central1-a` | Where the run launches. |
 | `GCP_NETWORK`, `GCP_LAB_CIDR` | | yes | `lab-vpc`, `172.21.0.0/16` | The lab VPC network and its slot base, as for the app. |
-| `GCP_ROUTER_INSTANCE` | | no | `lab-router` | A router labelled `lab-playground-site=<live site>` and `lab-playground-kind=router`. Empty or unset runs the site router-less. |
+| `LIVE_GCP_ROUTER_INSTANCE` | | no | `lab-router` | Pinned as the run's `GCP_ROUTER_INSTANCE`: a router labelled `lab-playground-site=<live site>` and `lab-playground-kind=router`. Unset runs the site router-less; `GCP_ROUTER_INSTANCE` itself is ignored. |
 | `LIVE_GCP_IMAGE`, `LIVE_GCP_MACHINE_TYPE` | | yes | `projects/debian-cloud/global/images/family/debian-12`, `e2-small` | What the run launches. The boot disk is 20 GB. |
 
 The timeouts (`AWS_LAUNCH_TIMEOUT_SECONDS`, `AWS_TERMINATE_TIMEOUT_SECONDS`,
@@ -295,7 +303,7 @@ Run one provider at a time, from a checkout without a production `.env`:
 export LIVE_AWS=1 ENABLED_BACKENDS=aws LAB_SITE_ID=live-contract AWS_MAX_VMS=1 \
        AWS_REGION=us-east-1 AWS_AVAILABILITY_ZONE=us-east-1a \
        AWS_LAB_VPC_ID=vpc-... AWS_LAB_CIDR=172.20.0.0/16 \
-       AWS_ROUTER_INSTANCE_ID=i-... \
+       LIVE_AWS_ROUTER_INSTANCE_ID=i-... \
        LIVE_AWS_IMAGE_ID=ami-... LIVE_AWS_INSTANCE_TYPE=t3.micro
 uv run python -m pytest tests/live/test_aws_contract.py -v -rs
 ```
@@ -304,7 +312,7 @@ uv run python -m pytest tests/live/test_aws_contract.py -v -rs
 # GCP
 export LIVE_GCP=1 ENABLED_BACKENDS=gcp LAB_SITE_ID=live-contract GCP_MAX_VMS=1 \
        GCP_PROJECT=my-lab-project GCP_REGION=us-central1 GCP_ZONE=us-central1-a \
-       GCP_NETWORK=lab-vpc GCP_LAB_CIDR=172.21.0.0/16 GCP_ROUTER_INSTANCE=lab-router \
+       GCP_NETWORK=lab-vpc GCP_LAB_CIDR=172.21.0.0/16 LIVE_GCP_ROUTER_INSTANCE=lab-router \
        LIVE_GCP_IMAGE=projects/debian-cloud/global/images/family/debian-12 \
        LIVE_GCP_MACHINE_TYPE=e2-small
 uv run python -m pytest tests/live/test_gcp_contract.py -v -rs

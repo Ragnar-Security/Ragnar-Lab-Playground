@@ -66,7 +66,7 @@ def _require_live_router(ec2, config):
     """The configured router, after proving it is the live site's."""
     router_id = config.settings['AWS_ROUTER_INSTANCE_ID']
     if not router_id:
-        pytest.skip('router-less site (AWS_ROUTER_INSTANCE_ID empty): no router to test')
+        pytest.skip('router-less site (LIVE_AWS_ROUTER_INSTANCE_ID unset): no router to test')
     router = _instance(ec2, router_id)
     tags = _tags(router)
     if tags.get(TAG_SITE) != config.site_id or tags.get(TAG_KIND) != 'router':
