@@ -86,3 +86,46 @@ deployment_groups:
           image: "projects/<gcp-project>/global/images/<image-name>"
           machine_type: "e2-medium"
           disk_gb: 30
+
+  # A two-machine individual lab, for example a workstation that joins a
+  # domain controller. Each student gets both machines on their own VLANs.
+  # NIC rules, QEMU templates only (an LXC entry point always gets net1):
+  #   - The entry point gets net0 on the student's entry VLAN and net1 on the
+  #     internal VLAN. Set `internal_nic: false` to leave it single-homed.
+  #   - The plain machine gets one NIC, net0 on the internal VLAN. Never set
+  #     `internal_nic` on it: the key only affects an entry point.
+  # The portal rewrites net0 and deletes net1 on every clone, so build each
+  # template with one NIC. VMIDs below are placeholders.
+  - display_name: "two-machine-individual-example"
+    description: >
+      Workstation plus domain controller, one pair per student.
+    enabled: false
+    group_mode: false
+    uptime_minutes: 240
+    extend_time_minutes: 120
+    templates:
+      - name: "domain-workstation"
+        type: "qemu"
+        memory: 4096
+        cores: 2
+        entry_point: true
+        connect:
+          protocol: "rdp"
+          port: 3389
+          username: "student"
+        storage_locations:
+          node1: "local-zfs"
+          node2: "local-zfs"
+        template_locations:
+          node1: 7103
+          node2: 7203
+      - name: "domain-controller"
+        type: "qemu"
+        memory: 4096
+        cores: 2
+        storage_locations:
+          node1: "local-zfs"
+          node2: "local-zfs"
+        template_locations:
+          node1: 7104
+          node2: 7204

@@ -35,7 +35,7 @@ Each deployment group runs on one backend, chosen in `templates.yaml` by `backen
 - **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%); cloud backends admit against their machine cap instead
 - **Cross-node template sync** -- `sync_template.sh` replicates templates between nodes using vzdump/qmrestore (no NFS)
 - **Automatic cleanup** -- a background task destroys expired VMs every minute on every backend; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record, and on each enabled cloud only leftovers carrying this portal's `LAB_SITE_ID`
-- **Per-student VLAN isolation** -- entry VLAN (100-200) and internal VLAN (200-300) per student; on a cloud backend the same tags select the student's two network slots
+- **Per-student VLAN isolation** -- entry VLAN (100-199) and internal VLAN (200-299) per student; on a cloud backend the same tags select the student's two network slots
 - **Startup config validation** -- templates.yaml is validated at boot; mismatches are caught before any VM is created
 
 ## Tech Stack
@@ -363,13 +363,22 @@ deployment_groups:
     templates:
       - name: "hw2-active-recon"
         type: "qemu"
-        entry_point: true      # gets entry VLAN NIC; IP shown to student
+        entry_point: true      # entry VLAN NIC (net0) plus internal NIC (net1); IP shown to student
+        internal_nic: false    # QEMU templates only: single-homed, entry VLAN only
         memory: 2048
         cores: 1
         template_locations:
           node1: 116           # VMID on node1
           node2: 117           # VMID on node2
 ```
+
+NIC rules for QEMU templates. An LXC entry point always gets both NICs, and `internal_nic` is ignored:
+
+- An **entry point** machine gets `net0` on the student's entry VLAN and `net1` on the student's internal VLAN, unless it sets `internal_nic: false`, which leaves it with the entry NIC only. Set `internal_nic: false` on a single-machine lab: the jumpbox serves the internal VLANs, so a second NIC means a second lease and a second address.
+- A **plain machine** (no `entry_point`) gets one NIC, `net0` on the internal VLAN. Never set `internal_nic` on it.
+- The portal rewrites `net0` and deletes `net1` on every clone, so build templates with one NIC.
+
+The disabled `two-machine-individual-example` group in `templates.example.yaml` shows an entry point beside a plain machine.
 
 The startup validator cross-checks `templates.yaml` against Proxmox to catch missing templates or misconfigured VMIDs before students deploy anything.
 
@@ -383,7 +392,7 @@ A group runs on Proxmox unless it, or one of its machines, sets `backend: aws` o
 python scripts/import_students.py data/students.csv
 ```
 
-The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags (100-200) and internal VLAN tags (200-300), plus optional Headscale auth keys.
+The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags (100-199) and internal VLAN tags (200-299), plus optional Headscale auth keys.
 
 ### Registration flow
 

@@ -3,8 +3,8 @@
 ## Overview
 
 Each student is assigned **two unique VLAN tags** during database initialization:
-- **Entry VLAN** (100-200): Used for the entry point VM's second NIC. Network: `10.<vlan>.0.0/24`, with the jumpbox as gateway and DHCP server (`docs/JUMPBOX.md`)
-- **Internal VLAN** (200-300): Used for all VMs' primary NIC. The jumpbox does not serve these networks.
+- **Entry VLAN** (100-199): Network `10.<vlan>.0.0/24`, with the jumpbox as gateway and DHCP server (`docs/JUMPBOX.md`). The entry point VM's `net0` is on it.
+- **Internal VLAN** (200-299): Network `10.<vlan-100>.1.0/24`, which the jumpbox also serves (`docs/JUMPBOX.md`). The entry point VM's `net1` and a plain VM's only NIC are on it.
 
 ## Architecture
 
@@ -14,19 +14,19 @@ Each student is assigned **two unique VLAN tags** during database initialization
 - Student at index `i` gets: `entry_vlan = 100 + i`, `internal_vlan = 200 + i`
 
 ### VM Network Configuration
-- **All VMs**: `net0` uses the internal VLAN (200-300)
-- **Entry point VMs only**: `net1` additionally uses the entry VLAN (100-200)
+- **Entry point VMs**: `net0` uses the entry VLAN (100-199) and `net1` uses the internal VLAN (200-299). A QEMU template can set `internal_nic: false` to get `net0` only; an LXC entry point always gets both NICs.
+- **Plain VMs** (every other machine of the group): `net0` uses the internal VLAN (200-299) and there is no `net1`.
 - The entry point VM is marked with `entry_point: true` in `templates.yaml`
 
 ### IP Display
-- Only the entry point VM's entry-network (`10.<vlan>.0.x`) IP is shown to students
-- Non-entry-point VMs show `-` for IP in the dashboard
+- Every VM shows the addresses its guest reports in the dashboard, entry network (`10.<vlan>.0.x`) and internal network (`10.<vlan-100>.1.x`) alike
+- A VM with no usable address yet shows `N/A` (entry point) or `-` (other VMs)
 
 ## Database Schema
 
 ### Users Table
-- `entry_vlan_tag` (integer, unique): Entry point VLAN (100-200)
-- `internal_vlan_tag` (integer, unique): Internal VLAN (200-300)
+- `entry_vlan_tag` (integer, unique): Entry point VLAN (100-199)
+- `internal_vlan_tag` (integer, unique): Internal VLAN (200-299)
 
 ### Student Whitelist Table
 - `entry_vlan_tag` (integer, unique): Pre-assigned entry VLAN
@@ -37,10 +37,10 @@ Each student is assigned **two unique VLAN tags** during database initialization
 
 ## Network Configuration Applied
 
-- **LXC (all VMs)**: `net0=name=eth0,bridge=vmbr0,tag={internal_vlan},ip=dhcp`
-- **LXC (entry point)**: additionally `net1=name=eth1,bridge=vmbr0,tag={entry_vlan},ip=dhcp`
-- **QEMU (all VMs)**: `net0=virtio,bridge=vmbr0,tag={internal_vlan}`
-- **QEMU (entry point)**: additionally `net1=virtio,bridge=vmbr0,tag={entry_vlan}`
+- **LXC (entry point)**: `net0=name=eth0,bridge=vmbr0,tag={entry_vlan},ip=dhcp` and `net1=name=eth1,bridge=vmbr0,tag={internal_vlan},ip=dhcp`
+- **LXC (plain machine)**: `net0=name=eth0,bridge=vmbr0,tag={internal_vlan},ip=dhcp` only
+- **QEMU (entry point)**: `net0=virtio,bridge=vmbr0,tag={entry_vlan}` and `net1=virtio,bridge=vmbr0,tag={internal_vlan}`; with `internal_nic: false`, `net1` is deleted instead
+- **QEMU (plain machine)**: `net0=virtio,bridge=vmbr0,tag={internal_vlan}`, and any `net1` on the template is deleted
 
 ## Migration
 
@@ -72,7 +72,7 @@ iface vmbr0 inet static
     bridge-vids 100-500
 ```
 
-Configure your physical switch trunk port to allow VLANs 100-500 (student VLANs 100-300, group VLANs 300-500).
+Configure your physical switch trunk port to allow VLANs 100-500 (student VLANs 100-299, group VLANs 300-500).
 
 ## Verification
 

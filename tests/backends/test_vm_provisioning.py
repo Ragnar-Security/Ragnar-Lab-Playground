@@ -749,6 +749,20 @@ def test_proxmox_bundle_nic_layout(app, proxmox_portal, template, entry, expecte
     assert record.network_slot == (101 if entry else 201)
 
 
+# Catches the plain machine of a two-machine individual lab (an AD DC) gaining
+# a second NIC, whatever order the templates are listed in.
+@pytest.mark.parametrize('order', [('srv01', 'dc01'), ('dc01', 'srv01')])
+def test_proxmox_two_machine_bundle_keeps_the_plain_machine_single_homed(
+        app, proxmox_portal, order):
+    machines = {'srv01': _qemu('srv01', entry_point=True), 'dc01': _qemu('dc01')}
+    records = _deploy(app, [machines[name] for name in order])
+    nics = {r.is_entry_point: proxmox_portal.guests[r.vmid]['config'] for r in records}
+    assert (nics[True].get('net0'), nics[True].get('net1')) == (
+        'virtio,bridge=vmbr0,tag=101', 'virtio,bridge=vmbr0,tag=201')
+    assert (nics[False].get('net0'), nics[False].get('net1'), nics[False].get('delete')) == (
+        'virtio,bridge=vmbr0,tag=201', None, 'net1')
+
+
 # Catches a failed VMRecord commit leaving half a bundle recorded, or its
 # guests and leases behind.
 def test_proxmox_bundle_rolls_back_atomically_when_staging_fails(app, proxmox_portal):

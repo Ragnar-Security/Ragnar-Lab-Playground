@@ -59,3 +59,24 @@ def test_committed_catalog_groups_resolve_to_proxmox(catalog_path, monkeypatch):
         assert validate_group_backends(group, ("proxmox",)) == []
         for template in group.get("templates", []):
             assert backend_block(template, "proxmox") == template
+
+
+# Catches a documented single-machine lab keeping a second NIC, which the served
+# internal VLANs turn into a second lease and a second address.
+@pytest.mark.parametrize("catalog_path", CATALOG_PATHS, ids=["test-fixture", "example"])
+def test_single_machine_individual_labs_are_single_homed(catalog_path):
+    for group in yaml.safe_load(catalog_path.read_text())["deployment_groups"]:
+        templates = group.get("templates") or []
+        if not group.get("group_mode") and len(templates) == 1 and templates[0].get("entry_point"):
+            assert templates[0].get("internal_nic") is False, group["display_name"]
+
+
+def test_example_two_machine_lab_has_one_entry_point_and_one_plain_machine():
+    catalog = yaml.safe_load((REPO_ROOT / "templates.example.yaml").read_text())
+    group = next(g for g in catalog["deployment_groups"]
+                 if g["display_name"] == "two-machine-individual-example")
+    assert group["enabled"] is False and not group.get("group_mode", False)
+    entry = [t for t in group["templates"] if t.get("entry_point")]
+    plain = [t for t in group["templates"] if not t.get("entry_point")]
+    assert len(entry) == 1 and "internal_nic" not in entry[0]
+    assert len(plain) == 1 and "internal_nic" not in plain[0]
