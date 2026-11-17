@@ -870,8 +870,9 @@ It holds these sections. Commands are given exactly; prose is the implementer's.
      jq -e --argjson lo "$LO" --argjson hi "$HI" '[.[] | select(.vmid >= $lo and .vmid <= $hi)] | length == 0' <<<"$R" >/dev/null && echo "range empty ok"
      [ "$HI" -lt "$MAX" ] && echo "range below cluster max ok"
      [ $((HI - LO + 1)) -ge 100 ] && echo "range size ok"
+     [[ ! "<STAGING_BRIDGE>" =~ ^vmbr0 ]] && echo "bridge name ok"   # never matched by section 2's vmbr0* drift check
      ```
-     Expected: eight `ok` lines. A staging guest that became the cluster's highest VMID would raise production's next VMIDs for good (`app/proxmox_service.py:664-692`).
+     Expected: nine `ok` lines. A staging guest that became the cluster's highest VMID would raise production's next VMIDs for good (`app/proxmox_service.py:664-692`). The bridge name must not start with `vmbr0`, so that creating it can never show up as drift in section 2's `vmbr0*` comparison.
 2. **The isolated bridge**, on `<STAGING_NODE>` as root. Only the new bridge is brought up; **never `ifreload` the node**, which would re-apply every production interface.
    ```bash
    cp -a /etc/network/interfaces /root/interfaces.before-staging-bridge
@@ -939,7 +940,11 @@ It holds these sections. Commands are given exactly; prose is the implementer's.
 5. **The staging portal.** Follow `docs/LOCAL_TEST_INSTANCE.md` (development stack, local override, reaper proven off), but check out the **branch or release under test**, and use the token below instead of that guide's step 5 token.
 
    **Least-privilege API token**, on a node as root. Each role grants only what its path needs. The template is in a staging pool, so the token can clone it but cannot change or delete it.
+
+   `<STAGING_TEMPLATE_VMID>` is a **dedicated staging template**: a copy made for staging, never a production template. Nothing in production depends on its pool membership. Record its current pool before the change; it must print `none`, and if it prints anything else, stop and choose a dedicated template:
    ```bash
+   pvesh get /cluster/resources --type vm --output-format json \
+     | jq -r '.[] | select(.vmid == <STAGING_TEMPLATE_VMID>) | .pool // "none"'   # record the output
    pveum pool add <STAGING_POOL> --comment "staging portal templates (docs/STAGING.md)"
    pveum pool modify <STAGING_POOL> --vms <STAGING_TEMPLATE_VMID>
    pveum role add StagingClone   --privs "VM.Clone VM.Audit"
@@ -1150,7 +1155,7 @@ All of these must hold before continuing:
 
   Otherwise stop the rollout here. Nothing has changed yet. Without J2 the AD labs do not ship (Global Constraints).
 - **Free-slot gate for the smoke test.** Step 11 imports one test login, and `scripts/import_students.py` gives it the pair after the current highest roster pair (`:106-109`). So the new roster must leave one pair free: `python3 -c 'import sys; sys.path.insert(0, "."); from scripts.build_students_merged import read_canvas; n = len(read_canvas(sys.argv[1])); print(n); sys.exit(n > 99)' <canvas-export>.csv` prints at most `99`.
-  - **The reservation:** pair `100+n / 200+n` belongs to the smoke test from Step 11b until its cleanup (11i), which releases it. A late-added student imported meanwhile gets the next pair.
+  - **The reservation:** pair `100+n / 200+n` belongs to the smoke test from Step 11b until its cleanup (11i). **No late roster import may run while the smoke test holds that pair**; `import_students.py` and the admin roster tools wait until 11i's item 8 verification has passed. After cleanup the released pair is free again, and the next import takes it.
   - If the roster has 100 students, no pair is free. Stop and let the instructor choose: skip Step 11 (the staging pass then stands alone), or run it before seeding the full roster.
 - **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop. Either remove or renumber the offending rows, or run the term purge first: Step 10, then this audit again, then Steps 6-9 before the new term's students are told the VPN is open. Only after that may the jumpbox or the policy change.
 - **Lab subnets clear of the management side.** On the jumpbox, with `jumpbox_netgen.py` copied to `jumpbox/`:
@@ -1215,7 +1220,9 @@ Run this after Step 10, before students are told the VPN is open. It uses the no
 **a. A two-machine group.** Use an enabled individual group with an entry point and a plain machine, if production has one. Otherwise add a temporary enabled group `zz-internal-vlan-smoke`, shaped like `templates.example.yaml`'s `two-machine-individual-example`, with a small Linux template present on the production nodes. Then run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> restart vm-automation` and wait for `healthy` (the probe at `scripts/term_changeover.sh:413-422`).
 
 **b. A unique login and its slot.** Every run uses a fresh login, so a rerun never meets a leftover.
-1. Set `S=zz-smoke-$(date -u +%m%d%H%M)` and record it.
+1. Set `S=zz-smoke-$(date -u +%m%d%H%M%S)-$RANDOM` and record it. Then check that it is absent everywhere before using it. All of these must hold, and any hit means pick a new `S`:
+   - `SELECT COUNT(*) FROM users WHERE login_id='$S'` and `SELECT COUNT(*) FROM student_whitelist WHERE login_id='$S'` are both `0`;
+   - `headscale users list -o json | jq --arg s "$S" '[.[] | select(.name == $s)] | length'` prints `0`.
 2. The free-slot gate still holds: `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | jq '[.users[].entry_vlan] | max'` prints at most `198`.
 
 **c. The Headscale user, first.** On production Headscale, `headscale users create "$S"`. Creating it before the policy names it means `headscale policy check` never sees an identity that does not exist yet.
