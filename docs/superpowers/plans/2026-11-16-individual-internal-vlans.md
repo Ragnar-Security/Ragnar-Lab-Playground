@@ -674,9 +674,9 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
   - **After Step 11** (new roster, so `N` changes): exit 0 and `L = 0`.
 
   **At the first result that differs, stop and run Step 12 for every step done so far.**
-- **Procedure R: restore a Headscale policy file.** Run it on the Headscale host, in `HEADSCALE_DIR`. The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip the host prefix. The live file is the backup path without its `.<stamp>` suffix (`:138-140`). Record `BACKUP_REF` and `BACKUP` in the changeover notes.
+- **Procedure R: restore a Headscale policy file.** Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used (from the operator config). The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix (`:138-140`). Record `BACKUP_REF` and `BACKUP` in the changeover notes.
   ```bash
-  BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#*:}"; HOST_FILE="${BACKUP%.*}"
+  BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"; HOST_FILE="${BACKUP%.*}"
   STAMP=$(date -u +%Y%m%dT%H%M%SZ); printf 'ref=%s\nbackup=%s\nlive=%s\n' "$BACKUP_REF" "$BACKUP" "$HOST_FILE"
   [[ "${BACKUP##*.}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] && test -f "$BACKUP" && test -f "$HOST_FILE" && echo files-ok
   ```
@@ -780,12 +780,12 @@ Run this before the new roster is seeded. Sub-steps a-h run in order.
 - Neither client reaches any address of the other student.
 - From A's `dc01`, B's machines do not answer, and the J2 drop counter rises.
 
-**h. Cleanup, on a pass and on a failure alike:**
-1. Run Procedure R with the `BACKUP_REF` recorded in 10e. Expected: `files-ok`, then `restored`.
-2. Run the access check. Expected: exit 0, with `N`, `K` and `L` exactly the baseline's. If not, stop, keep the staging state for diagnosis, and escalate: production students are locked out until this passes.
-3. Destroy both deployments through the staging portal. The 10f query must then list nothing above `MAX0`.
-4. Stop the staging portal.
-5. Delete the test nodes, then the test users, in Headscale.
+**h. Cleanup, on a pass and on a failure alike.** A failure can come before 10e, so each item runs only if its step happened; item 6 always runs.
+1. Only if 10e installed the staging policy: run Procedure R with the `BACKUP_REF` recorded in 10e. Expected: `files-ok`, then `restored`.
+2. Only if item 1 ran: run the access check. Expected: exit 0, with `N`, `K` and `L` exactly the baseline's. If not, stop, keep the staging state for diagnosis, and escalate: production students are locked out until this passes.
+3. Only if deployments were created: destroy them through the staging portal. The 10f query must then list nothing above `MAX0`.
+4. Stop the staging portal if it was started.
+5. Delete whichever test nodes, then test users, were created in Headscale.
 6. Start production: `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> start vm-automation`. Verify that within 90 s `docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' <PORTAL_APP_CONTAINER>` prints `healthy` (the probe `scripts/term_changeover.sh:413-422` uses), and that `/auth/health` answers.
 
 If 10g failed, continue with Step 12.
