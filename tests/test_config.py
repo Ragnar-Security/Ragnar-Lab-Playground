@@ -258,7 +258,7 @@ BACKEND_ENV_KEYS = (
     'ENABLED_BACKENDS', 'LAB_SITE_ID', 'JUMPBOX_VLAN_BANDS',
     'PROXMOX_HOST', 'PROXMOX_USER', 'PROXMOX_PASSWORD', 'PROXMOX_TOKEN_ID',
     'PROXMOX_TOKEN_SECRET', 'PROXMOX_VERIFY_SSL', 'PROXMOX_CA_BUNDLE',
-    'ENABLE_LOAD_BALANCING', 'FIXED_NODE',
+    'ENABLE_LOAD_BALANCING', 'FIXED_NODE', 'LAB_BRIDGE', 'VMID_RANGE',
     'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR',
     'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS', 'AWS_ROUTER_IDLE_MINUTES',
     'AWS_CLIENT_CIDRS', 'VPN_MODE', 'VPN_NAME', 'VPN_INSTRUCTIONS_URL',
@@ -564,6 +564,38 @@ def test_tailnet_range_is_reserved_only_under_headscale(monkeypatch):
         cfg.validate_config()
     cfg = reload_valid_cloud_config(monkeypatch, VPN_MODE='none', **cloud)
     cfg.validate_config()
+
+
+# Catches a staging-only setting changing what production does when unset.
+def test_lab_bridge_and_vmid_range_defaults_are_todays_behaviour(monkeypatch):
+    cfg = reload_config(monkeypatch)
+    assert (cfg.LAB_BRIDGE, cfg.VMID_RANGE, cfg.VMID_RANGE_ERROR) == ('vmbr0', None, None)
+
+
+@pytest.mark.parametrize('text, parsed', [('', None), ('4000-4099', (4000, 4099)), (' 100-100 ', (100, 100))])
+def test_parse_vmid_range_accepts_min_dash_max(monkeypatch, text, parsed):
+    assert reload_config(monkeypatch).parse_vmid_range(text) == parsed
+
+
+@pytest.mark.parametrize('text', ['4000', '4099-4000', '99-200', '4000-1000000000', 'a-b', '4000-4099,4100-4199'])
+def test_parse_vmid_range_rejects_anything_else(monkeypatch, text):
+    with pytest.raises(ValueError):
+        reload_config(monkeypatch).parse_vmid_range(text)
+
+
+def test_invalid_vmid_range_is_refused_at_startup(monkeypatch):
+    cfg = reload_config(monkeypatch, VMID_RANGE='4099-4000')
+    assert cfg.VMID_RANGE is None and 'VMID_RANGE' in cfg.VMID_RANGE_ERROR
+    with pytest.raises(ValueError, match='VMID_RANGE'):
+        cfg.validate_config()
+
+
+# Catches a bridge value that injects options into a Proxmox net string.
+@pytest.mark.parametrize('bridge', ['vmbrtest,firewall=0', 'vmbr 7', '7vmbr', 'a' * 16])
+def test_invalid_lab_bridge_is_refused_at_startup(monkeypatch, bridge):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS='proxmox', LAB_BRIDGE=bridge)
+    with pytest.raises(ValueError, match='LAB_BRIDGE'):
+        cfg.validate_config()
 
 
 if __name__ == '__main__':

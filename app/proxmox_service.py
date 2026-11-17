@@ -5,6 +5,7 @@ Handles all interactions with the Proxmox API
 
 from contextlib import contextmanager
 import hashlib
+import importlib
 import threading
 import time
 import logging
@@ -636,6 +637,10 @@ def get_vm_details(proxmox, vmid, node):
             return None
 
 
+class VMIDRangeExhausted(RuntimeError):
+    """VMID_RANGE has no room left for the requested contiguous block."""
+
+
 def get_next_available_vmid(
         proxmox: Optional[ProxmoxAPI] = None, *,
         count: int = 1,
@@ -655,41 +660,70 @@ def get_next_available_vmid(
     ``reservation_id`` may be reused to extend a deployment's reservation
     when a defensive duplicate-VMID retry needs a fresh ID. Callers release
     it only after every VMRecord commits or cleanup has completed.
+
+    With ``VMID_RANGE`` set to (lo, hi), every source of the high-water value
+    counts only VMIDs inside [lo, hi], so a portal beside production never
+    follows production's VMIDs upward; the block starts at lo at the latest
+    and VMIDRangeExhausted is raised, before anything is reserved, when it
+    would pass hi. The stored mark never decreases in either mode.
     """
     if count < 1:
         raise ValueError('VMID reservation count must be at least 1')
     if not reservation_id:
         raise ValueError('VMID reservation identifier is required')
+    settings = importlib.import_module('app.config')
+    if settings.VMID_RANGE_ERROR:
+        raise ValueError(settings.VMID_RANGE_ERROR)
+    vmid_range = settings.VMID_RANGE
+
+    def counted(vmid: int) -> bool:
+        return vmid_range is None or vmid_range[0] <= vmid <= vmid_range[1]
 
     inventory_max = 0
     rows = proxmox.cluster.resources.get(type='vm') if proxmox is not None else []
     for row in rows or []:
         try:
-            inventory_max = max(inventory_max, int(row['vmid']))
+            vmid = int(row['vmid'])
         except (KeyError, TypeError, ValueError):
             continue
+        if counted(vmid):
+            inventory_max = max(inventory_max, vmid)
 
     engine = coordination.current_engine()
     table = _VMID_RESERVATIONS
 
+    def max_in_range(conn, column):
+        query = select(func.max(column))
+        if vmid_range is not None:
+            query = query.where(column.between(*vmid_range))
+        return conn.execute(query).scalar()
+
     def allocate(conn) -> int:
         now = coordination.lease_clock()
         _purge_expired_vmid_reservations(conn, now)
-        max_vmid = max(
-            inventory_max,
-            coordination.read_state(conn, coordination.VMID_ALLOCATOR))
+        mark = coordination.read_state(conn, coordination.VMID_ALLOCATOR)
+        max_vmid = max(inventory_max, mark if counted(mark) else 0)
         # Destroyed rows remain unique-indexed, so the database is part of
         # the allocation namespace even after the Proxmox guest is gone.
         if coordination.is_application_database(engine):
-            db_max = conn.execute(
-                select(func.max(VMRecord.__table__.c.vmid))).scalar()
+            db_max = max_in_range(conn, VMRecord.__table__.c.vmid)
             if db_max is not None:
                 max_vmid = max(max_vmid, int(db_max))
-        reserved_max = conn.execute(select(func.max(table.c.vmid))).scalar()
+        reserved_max = max_in_range(conn, table.c.vmid)
         if reserved_max is not None:
             max_vmid = max(max_vmid, int(reserved_max))
 
-        base_vmid = max_vmid + 1
+        if vmid_range is None:
+            base_vmid = max_vmid + 1
+        else:
+            low, high = vmid_range
+            base_vmid = max(low - 1, max_vmid) + 1
+            # Raised inside the locked transaction, before any insert, so
+            # the rollback leaves every reservation and the mark untouched.
+            if base_vmid + count - 1 > high:
+                raise VMIDRangeExhausted(
+                    f'VMID_RANGE {low}-{high} has no room for {count} more '
+                    f'VMID(s) after {base_vmid - 1}')
         expires_at = now + RESERVATION_TTL_SECONDS
         conn.execute(insert(table), [
             {'vmid': vmid, 'reservation_id': reservation_id,
@@ -701,8 +735,10 @@ def get_next_available_vmid(
             update(table)
             .where(table.c.reservation_id == reservation_id)
             .values(expires_at=expires_at))
+        # Unset, base_vmid is already above the mark, so this is the plain
+        # write; a range below the mark must not lower it for an unranged run.
         coordination.write_state(
-            conn, coordination.VMID_ALLOCATOR, base_vmid + count - 1)
+            conn, coordination.VMID_ALLOCATOR, max(mark, base_vmid + count - 1))
         return base_vmid
 
     base_vmid = coordination.run_locked(

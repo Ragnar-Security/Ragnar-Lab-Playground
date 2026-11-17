@@ -1,3 +1,4 @@
+import importlib
 import tempfile
 import threading
 import time
@@ -6,12 +7,15 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from flask import Flask
 
 from app.models import VMIDReservation, VMRecord, db
 from app import proxmox_service
 from app.routes.vm_creation import DeployFailed, deploy_bundle
 from tests.test_live_contract_guards import FakeProxmox as ContractFakeProxmox
+
+config = importlib.import_module('app.config')
 
 
 GIB = 1024 ** 3
@@ -464,6 +468,99 @@ def test_allocator_still_observes_proxmox_inventory_when_available(app):
         base = proxmox_service.get_next_available_vmid(
             proxmox, count=1, reservation_id='mixed-bundle')
     assert base == 9501
+
+
+# Fixture values are neutral (4000-4099), never a site's real range.
+def _get(proxmox, count, rid):
+    return proxmox_service.get_next_available_vmid(proxmox, count=count, reservation_id=rid)
+
+
+def _record(vmid):
+    return VMRecord(vmid=vmid, vm_name=f'student-x-vm{vmid}', vm_type='qemu', node='n',
+                    template_name='Lab/vm', student_name='x',
+                    expires_at=datetime.now() + timedelta(hours=1))
+
+
+def _reservation(vmid, rid):
+    return VMIDReservation(vmid=vmid, reservation_id=rid, expires_at=time.time() + 600)
+
+
+# Catches a staging portal following production's VMIDs upward.
+def test_range_ignores_cluster_guests_above_it(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(9500, 'production-guest')
+    proxmox.add_guest(4004, 'in-range-guest')
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4099))
+    with app.app_context():
+        assert (_get(proxmox, 2, 'r1'), _get(proxmox, 1, 'r2')) == (4005, 4007)
+
+
+def test_range_starts_at_its_minimum_whatever_the_database_holds(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4099))
+    with app.app_context():
+        db.session.add(_record(9000))
+        db.session.commit()
+        assert _get(ContractFakeProxmox(), 1, 'r') == 4000
+
+
+# Catches the record maximum being taken whole instead of clipped to the range.
+def test_range_advances_from_the_highest_in_range_record(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4099))
+    with app.app_context():
+        db.session.add_all([_record(9000), _record(4010)])
+        db.session.commit()
+        assert _get(ContractFakeProxmox(), 1, 'r') == 4011
+
+
+# Catches the reservation maximum being taken whole instead of clipped to the range.
+def test_range_advances_from_the_highest_in_range_reservation(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4099))
+    with app.app_context():
+        db.session.add_all([_reservation(9100, 'prod'), _reservation(4020, 'staging')])
+        db.session.commit()
+        assert _get(ContractFakeProxmox(), 1, 'r') == 4021
+
+
+# Catches a range silently spilling past its maximum.
+def test_range_refuses_when_exhausted_and_reserves_nothing(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(4001, 'in-range-guest')
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4002))
+    with app.app_context():
+        with pytest.raises(proxmox_service.VMIDRangeExhausted):
+            _get(proxmox, 2, 'r')
+        assert VMIDReservation.query.count() == 0
+
+
+# Catches the exhaustion check running after the insert when reservations already exist.
+def test_range_exhaustion_leaves_existing_reservations_untouched(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4002))
+    with app.app_context():
+        db.session.add_all([_reservation(9100, 'prod'), _reservation(4001, 'staging')])
+        db.session.commit()
+        with pytest.raises(proxmox_service.VMIDRangeExhausted):
+            _get(ContractFakeProxmox(), 2, 'r')
+        assert {r.vmid for r in VMIDReservation.query} == {9100, 4001}
+
+
+# Catches range mode lowering the high-water mark an unranged portal relies on.
+def test_range_never_lowers_the_stored_high_water_mark(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(9600, 'guest')
+    with app.app_context():
+        assert _get(proxmox, 1, 'a') == 9601
+        proxmox_service.release_vmid_reservation('a')
+        monkeypatch.setattr(config, 'VMID_RANGE', (4000, 4099))
+        assert _get(ContractFakeProxmox(), 1, 'b') == 4000
+        proxmox_service.release_vmid_reservation('b')
+        monkeypatch.setattr(config, 'VMID_RANGE', None)
+        assert _get(ContractFakeProxmox(), 1, 'c') == 9602
+
+
+def test_an_invalid_range_refuses_to_allocate(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE_ERROR', 'VMID_RANGE must be <min>-<max>')
+    with app.app_context(), pytest.raises(ValueError):
+        _get(ContractFakeProxmox(), 1, 'r')
 
 
 if __name__ == '__main__':

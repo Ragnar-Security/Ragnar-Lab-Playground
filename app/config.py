@@ -7,6 +7,7 @@ import os
 import logging
 import re
 from pathlib import Path
+from typing import Optional, Tuple
 from dotenv import load_dotenv
 
 from . import production_policy as policy
@@ -144,6 +145,43 @@ def _env_optional_int(name):
         return int(_env_text(name))
     except ValueError:
         return None
+
+
+# Proxmox bridge for every lab NIC. Only a staging portal on an isolated
+# bridge changes it. The value is spliced into Proxmox netN strings, where a
+# comma would add options, so _backend_errors refuses anything that is not
+# an interface name (a letter, then at most 14 more: IFNAMSIZ is 16).
+LAB_BRIDGE = _env_text('LAB_BRIDGE', 'vmbr0')
+_LAB_BRIDGE_PATTERN = re.compile(r'[A-Za-z][A-Za-z0-9_.-]{0,14}')
+
+_VMID_RANGE_PATTERN = re.compile(r'([0-9]+)-([0-9]+)')
+_VMID_LOWEST, _VMID_HIGHEST = 100, 999999999
+
+
+def parse_vmid_range(text: str) -> Optional[Tuple[int, int]]:
+    """'<min>-<max>' as (min, max); blank means no range (None).
+
+    Raises ValueError unless 100 <= min <= max <= 999999999, the VMIDs
+    Proxmox accepts."""
+    text = (text or '').strip()
+    if not text:
+        return None
+    match = _VMID_RANGE_PATTERN.fullmatch(text)
+    low, high = (int(match.group(1)), int(match.group(2))) if match else (0, -1)
+    if not _VMID_LOWEST <= low <= high <= _VMID_HIGHEST:
+        raise ValueError(f"VMID_RANGE {text!r} must be <min>-<max> with "
+                         f"{_VMID_LOWEST} <= min <= max <= {_VMID_HIGHEST}")
+    return low, high
+
+
+# The VMIDs this portal allocates from; None (unset) means above the
+# cluster's highest VMID, as always. An invalid value is kept as an error
+# for validate_config() and get_next_available_vmid(), never ignored.
+try:
+    VMID_RANGE = parse_vmid_range(_env_text('VMID_RANGE'))
+    VMID_RANGE_ERROR = None
+except ValueError as _vmid_range_error:
+    VMID_RANGE, VMID_RANGE_ERROR = None, str(_vmid_range_error)
 
 
 ENABLED_BACKENDS = _parse_enabled_backends(os.getenv('ENABLED_BACKENDS'))
@@ -483,6 +521,9 @@ def _validate_configured_lab_cidrs(enabled, validate_lab_cidr):
 def _backend_errors(enabled):
     """Missing or invalid settings of the enabled backends only."""
     errors = []
+    # Every backend allocates VMIDs from one namespace.
+    if VMID_RANGE_ERROR:
+        errors.append(VMID_RANGE_ERROR)
     if 'proxmox' in enabled:
         if not PROXMOX_HOST:
             errors.append("PROXMOX_HOST is not set")
@@ -496,6 +537,9 @@ def _backend_errors(enabled):
         if FIXED_NODE.strip().lower() in CLOUD_BACKENDS:
             errors.append(f"FIXED_NODE {FIXED_NODE!r} is a cloud backend name; "
                           "Proxmox nodes named aws or gcp are unsupported")
+        if not _LAB_BRIDGE_PATTERN.fullmatch(LAB_BRIDGE):
+            errors.append(f"LAB_BRIDGE {LAB_BRIDGE!r} must be a bridge interface name: "
+                          "a letter, then at most 14 letters, digits, '_', '.' or '-'")
     clouds = [name for name in enabled if name in CLOUD_BACKENDS]
     if clouds:
         if not LAB_SITE_ID:

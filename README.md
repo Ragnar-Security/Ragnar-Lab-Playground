@@ -303,6 +303,8 @@ These values normally live in `.env`:
 | `ADMIN_USERS` | Comma-separated admin login IDs |
 | `ENABLE_LOAD_BALANCING` | Global load-balancing toggle |
 | `FIXED_NODE` | Default node when load balancing is off; may not be `aws` or `gcp`, the names cloud admission reserves under |
+| `LAB_BRIDGE` | Proxmox bridge for every lab NIC; default `vmbr0`; only a staging portal on an isolated bridge changes it (`docs/STAGING.md`). Startup refuses a value that is not an interface name, because it is spliced into the Proxmox `netN` strings |
+| `VMID_RANGE` | `<min>-<max>` (100 to 999999999) that this portal allocates VMIDs from; unset means above the cluster's highest VMID. Inside a range the allocator ignores every VMID outside it and refuses a deployment that would pass `<max>`; an invalid value fails startup. Choose a range below the cluster's highest VMID: a guest above another portal's high-water mark raises that portal's next VMIDs for good (`app/proxmox_service.py`, `get_next_available_vmid`) |
 | `CPU_THRESHOLD` / `MEMORY_THRESHOLD` | Global resource thresholds |
 | `DISTRIBUTED_VM_LOCKS` | Serialize each VMID's stop/delete/retire across gunicorn workers with MySQL `GET_LOCK`; defaults to `false`, which uses an in-process lock only, enough for the single production worker. Set `true` before running more than one worker; each lock holder then uses a second database connection |
 | `ENABLED_BACKENDS` | Comma list of `proxmox`, `aws`, `gcp`; unset or empty means `proxmox`. Startup refuses an unknown name and the missing settings of an enabled backend |

@@ -763,6 +763,16 @@ def test_proxmox_two_machine_bundle_keeps_the_plain_machine_single_homed(
         'virtio,bridge=vmbr0,tag=201', None, 'net1')
 
 
+# Catches a NIC left on vmbr0 when the portal runs on an isolated bridge.
+def test_lab_bridge_replaces_vmbr0_on_every_nic(app, proxmox_portal, monkeypatch):
+    monkeypatch.setattr(config, 'LAB_BRIDGE', 'vmbrtest')
+    records = _deploy(app, [_qemu('srv01', entry_point=True), _qemu('dc01'), _lxc('ct')])
+    nets = [value for r in records
+            for key, value in proxmox_portal.guests[r.vmid]['config'].items() if key.startswith('net')]
+    assert len(nets) == 4
+    assert all('bridge=vmbrtest' in v for v in nets) and not any('vmbr0' in v for v in nets)
+
+
 # Catches a failed VMRecord commit leaving half a bundle recorded, or its
 # guests and leases behind.
 def test_proxmox_bundle_rolls_back_atomically_when_staging_fails(app, proxmox_portal):

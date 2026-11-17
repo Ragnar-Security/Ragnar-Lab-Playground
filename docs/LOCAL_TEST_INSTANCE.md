@@ -32,9 +32,12 @@ production data (`data/students_merged.csv`, `data/untracked-survivors.jsonl`).
 
 ## What it still shares with production
 
-- **VMIDs.** It allocates above the cluster's highest VMID, like production. Production reads the
-  cluster live when it allocates, so the two do not collide while a test VM exists, and nothing
-  remains after you destroy it.
+- **VMIDs.** With `VMID_RANGE` unset it allocates above the cluster's highest VMID, like
+  production. Production reads the cluster live when it allocates, so the two do not collide while
+  a test VM exists, and nothing remains after you destroy it. `VMID_RANGE=<min>-<max>` keeps it in
+  its own block instead. Choose a range below the cluster's highest VMID: a guest above another
+  portal's high-water mark raises that portal's next VMIDs for good
+  (`app/proxmox_service.py`, `get_next_available_vmid`).
 - **Capacity.** Test VMs use real memory and storage on the nodes.
 - **Proxmox task log.** Each operation shows up there under the token's user.
 
