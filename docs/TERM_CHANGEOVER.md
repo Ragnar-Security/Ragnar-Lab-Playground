@@ -17,6 +17,11 @@ The script never touches a dojo repository.
    `REMOTE_BACKUP_DIR`.
 5. Run the script from this repository root.
 6. Confirm that SSH reaches both production hosts.
+7. The roster holds at most 100 students, because each student gets one VLAN
+   pair; the script refuses a larger one before changing anything.
+8. After a seed,
+   `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`
+   must print `ok`.
 
 Exported environment variables override `scripts/site.env`. The scripts have
 no host, IP, or username defaults; they stop immediately and name a missing

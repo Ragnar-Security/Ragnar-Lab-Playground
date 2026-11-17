@@ -202,3 +202,9 @@ def test_user_pair_for_index_refuses_outside_the_pool():
         user_pair_for_index(100)
     with pytest.raises(ValueError):
         user_pair_for_index(-1)
+
+
+def test_changeover_roster_cap_equals_the_user_vlan_pool():
+    from scripts.build_students_merged import ROSTER_MAX
+    assert ROSTER_MAX == USER_ENTRY_MAX - USER_ENTRY_MIN + 1 \
+        == USER_INTERNAL_MAX - USER_INTERNAL_MIN + 1 == 100

@@ -36,6 +36,12 @@ import sys
 
 FIELDNAMES = ['SIS User ID', 'SIS Login ID', 'email', 'headscale_key']
 
+# One VLAN pair per student: the portal numbers entry 100-199 and internal
+# 200-299 (USER_ENTRY_MIN/MAX and USER_INTERNAL_MIN/MAX in app/vlan_allocator.py).
+# A literal, because this script stays standard-library only;
+# tests/test_vlan_allocator.py pins it to the allocator.
+ROSTER_MAX = 100
+
 
 def read_canvas(path):
     """Return [(uid, login)] for the real students in a Canvas export."""
@@ -58,6 +64,9 @@ def read_canvas(path):
 
     if dropped:
         print(f"Dropped {len(dropped)} row(s) with no SIS User ID: {', '.join(dropped)}")
+    if len(students) > ROSTER_MAX:
+        sys.exit(f"Error: {path} has {len(students)} students; the portal numbers "
+                 f"at most {ROSTER_MAX} (one VLAN pair each)")
     return students
 
 

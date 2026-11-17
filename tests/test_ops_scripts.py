@@ -740,6 +740,21 @@ def test_term_changeover_applies_the_policy_after_the_new_roster_is_seeded(tmp_p
     assert result.stdout.index("[3/4] Production database") < result.stdout.index("[4/4] Headscale policy")
 
 
+# Catches a roster too large to number reaching the purge.
+def test_term_changeover_refuses_a_roster_larger_than_the_vlan_pool(tmp_path):
+    repo, env, config, roster = _term_rig(tmp_path)
+    roster.write_text("SIS User ID,SIS Login ID\n"
+                      + "".join(f"{1000 + i},student{i}\n" for i in range(101)))
+    result = subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0
+    assert "101 students" in result.stderr and "at most 100" in result.stderr
+    log = Path(env["EVENT_LOG"])
+    events = log.read_text().splitlines() if log.exists() else []
+    assert not {"DB BACKUP", "PURGE", "PORTAL RESTART"} & set(events)
+
+
 # Catches site.env overwriting the operator's exported policy paths, so the
 # changeover installs the policy somewhere the operator did not choose.
 @pytest.mark.parametrize("exported", [True, False])
