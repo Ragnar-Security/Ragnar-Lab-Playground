@@ -376,7 +376,7 @@ NIC rules for QEMU templates. An LXC entry point always gets both NICs, and `int
 
 - An **entry point** machine gets `net0` on the student's entry VLAN and `net1` on the student's internal VLAN, unless it sets `internal_nic: false`, which leaves it with the entry NIC only. Set `internal_nic: false` on a single-machine lab: the jumpbox serves the internal VLANs, so a second NIC means a second lease and a second address.
 - A **plain machine** (no `entry_point`) gets one NIC, `net0` on the internal VLAN. Never set `internal_nic` on it.
-- The portal rewrites `net0` and deletes `net1` on every clone, so build templates with one NIC.
+- The portal rewrites `net0` on every clone, then rewrites `net1` to the internal VLAN (an entry point) or deletes it (a plain machine, or an entry point with `internal_nic: false`), so build templates with one NIC.
 
 The disabled `two-machine-individual-example` group in `templates.example.yaml` shows an entry point beside a plain machine.
 

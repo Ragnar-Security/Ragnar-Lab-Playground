@@ -94,8 +94,10 @@ deployment_groups:
   #     internal VLAN. Set `internal_nic: false` to leave it single-homed.
   #   - The plain machine gets one NIC, net0 on the internal VLAN. Never set
   #     `internal_nic` on it: the key only affects an entry point.
-  # The portal rewrites net0 and deletes net1 on every clone, so build each
-  # template with one NIC. VMIDs below are placeholders.
+  # The portal rewrites net0 on every clone, then rewrites net1 to the internal
+  # VLAN (an entry point) or deletes it (a plain machine, or an entry point with
+  # `internal_nic: false`), so build each template with one NIC. VMIDs below are
+  # placeholders.
   - display_name: "two-machine-individual-example"
     description: >
       Workstation plus domain controller, one pair per student.
