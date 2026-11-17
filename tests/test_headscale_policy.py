@@ -41,11 +41,11 @@ SLOTS = {
     "koth": [],
 }
 DEFAULT_POLICY_BANDS = PolicyBands(tuple(parse_vlan_bands(DEFAULT_BANDS)), proxmox_enabled=True)
-# Own entry 100 plus the group's 300/400 -- never the user-internal slot 200.
+# Own entry 100 and internal 200 plus the group's 300/400.
 EXPECTED_ALICE_CIDRS = [
-    "10.100.0.0/24", "10.100.2.0/24", "10.100.4.0/24",
-    "172.20.25.0/26", "172.20.75.0/26", "172.20.100.0/26",
-    "172.21.25.0/26", "172.21.75.0/26", "172.21.100.0/26",
+    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24", "10.100.4.0/24",
+    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26", "172.20.100.0/26",
+    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26", "172.21.100.0/26",
 ]
 SELF_RULE = {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
 
@@ -54,8 +54,7 @@ def _forward(policy, login):
     return next(r for r in policy["acls"] if r["src"] == [login])
 
 
-# Catches a student reaching another student's networks, their own internal
-# VLAN, or losing the operator's base sections.
+# Catches a student reaching another student's networks, or losing the operator's base sections.
 def test_alice_reaches_exactly_her_entry_and_group_blocks_on_every_backend():
     base = copy.deepcopy(BASE)
     policy = render(base, SLOTS, DEFAULT_POLICY_BANDS, CLOUDS)
@@ -72,7 +71,7 @@ def test_alice_reaches_exactly_her_entry_and_group_blocks_on_every_backend():
                              "dst": ["alice@:*"]}
     # The blanket rule survives only as its autogroup:self part.
     assert [r for r in policy["acls"] if "autogroup:member" in r["src"]] == [SELF_RULE]
-    assert all("200" not in dst for dst in alice_forward["dst"])
+    assert not {"10.101.0.0/24:*", "10.101.1.0/24:*"} & set(alice_forward["dst"])
     assert "10.200.0.0/24" not in json.dumps(policy)
 
 
@@ -254,9 +253,9 @@ def test_group_membership_grants_only_that_groups_blocks():
     ]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "alice@")["dst"] == [
-        "10.100.0.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
+        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
     assert _forward(policy, "bob@")["dst"] == [
-        "10.101.0.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
+        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
 
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
@@ -278,6 +277,10 @@ def _with(**changes):
                   {"login": "Alice", "entry_vlan": 101, "internal_vlan": 201}], groups=[]), {}),
     (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
                   {"login": "bob", "entry_vlan": 100, "internal_vlan": 201}], groups=[]), {}),
+    (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
+                  {"login": "bob", "entry_vlan": 101, "internal_vlan": 200}], groups=[]), {}),
+    (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
+                  {"login": "bob", "entry_vlan": 200, "internal_vlan": 201}], groups=[]), {}),
     (_with(groups=[{"slug": "red-team", "members": ["alice"], "entry_vlan": 101,
                     "internal_vlan": 400}]), {}),
     (_with(koth=[{"game_id": 1, "entry_vlan": 300, "internal_vlan": 450}]), {}),
@@ -295,6 +298,16 @@ def _with(**changes):
 def test_invalid_or_overlapping_inputs_are_refused(slots, clouds):
     with pytest.raises(ValueError):
         render(BASE, slots, DEFAULT_POLICY_BANDS, clouds)
+
+
+# Catches an internal VLAN granted on any backend where no band routes it.
+def test_internal_vlan_outside_every_band_is_not_granted():
+    bands = PolicyBands(tuple(parse_vlan_bands(
+        "entry:100-199:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4")),
+        proxmox_enabled=True)
+    dst = set(_forward(render(BASE, SLOTS, bands, CLOUDS), "alice@")["dst"])
+    assert "10.100.0.0/24:*" in dst
+    assert not {"10.100.1.0/24:*", "172.20.50.0/26:*", "172.21.50.0/26:*"} & dst
 
 
 @pytest.mark.parametrize("base", [{}, {"acls": {}}, {"acls": ["rule"]}, []])

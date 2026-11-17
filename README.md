@@ -420,9 +420,9 @@ See `docs/TERM_CHANGEOVER.md`.
 ### Per-student Headscale policy
 
 `scripts/apply_headscale_policy.sh` (dry run by default; `--apply` installs)
-renders a policy in which each roster login reaches only its own entry slot,
-its groups' slots and the non-ended KOTH arenas, on every enabled backend. It
-is a snapshot: re-run it after every roster import, group or membership change,
+renders a policy in which each roster login reaches only its own entry and
+internal slots, its groups' slots and the non-ended KOTH arenas, on every
+enabled backend. It is a snapshot: re-run it after every roster import, group or membership change,
 VLAN reassignment, and KOTH game creation or ending. Until then a new student
 or member is refused, never let in. `scripts/term_changeover.sh` runs it as its
 last stage. Details and rollback: "Apply the Headscale policy" in

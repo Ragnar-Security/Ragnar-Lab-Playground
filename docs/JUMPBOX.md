@@ -222,8 +222,8 @@ traffic is matched against its destination (`10.x.x.x`), not against the
 router's tag, so the policy is
 where per-student access is decided. `scripts/apply_headscale_policy.sh`
 renders it from the portal (dry run by default, `--apply` to install): each
-roster login reaches only its own entry network, its groups' networks and the
-running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
+roster login reaches only its own entry and internal networks, its groups'
+networks and the running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
 rule of your base policy except the blanket rule whose `src` is exactly
 `["autogroup:member"]`, which it cuts down to its `autogroup:self`
 destinations (students keep reaching their own devices), so a rule like

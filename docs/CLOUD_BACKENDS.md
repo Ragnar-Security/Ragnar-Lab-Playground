@@ -1052,9 +1052,9 @@ student every lab.
 
 What the policy grants:
 
-- Each roster login `<login>@` reaches its own entry slot, its groups' entry
-  and internal slots, and the entry and internal blocks of **every KOTH game
-  whose status is not `ended`** (Proxmox only, since KOTH runs only there).
+- Each roster login `<login>@` reaches its own entry and internal slots, its
+  groups' entry and internal slots, and the entry and internal blocks of
+  **every KOTH game whose status is not `ended`** (Proxmox only, since KOTH runs only there).
   Only slots inside `JUMPBOX_VLAN_BANDS` are granted, the same kinds on every
   backend. The login's own and groups' blocks may connect back to that
   login's own devices only. KOTH blocks may not connect back at all: a box

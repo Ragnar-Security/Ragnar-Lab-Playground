@@ -13,10 +13,10 @@ or the render fails: such a rule would keep the blanket access the
 per-student rules replace. SLOTS is scripts/export_network_slots.py
 output from the running portal; the backends, lab CIDRs and VLAN bands come
 only from it, so the policy grants exactly the networks that portal
-allocates. Each roster login gets one rule to its own entry network, its
-group's entry and internal networks, and every non-ended KOTH game's
-networks (Proxmox only), plus the reverse rule back to its devices from its
-own and its groups' networks. KOTH networks get no reverse rule: a box any
+allocates. Each roster login gets one rule to its own entry and internal
+networks, its group's entry and internal networks, and every non-ended KOTH
+game's networks (Proxmox only), plus the reverse rule back to its devices from
+its own and its groups' networks. KOTH networks get no reverse rule: a box any
 player has rooted must not reach every player's devices.
 
 Standard library only: this runs on the operator's workstation.
@@ -144,15 +144,13 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
         owners[tag] = owner
         return tag
 
-    entries: Dict[str, int] = {}
+    granted: Dict[str, Set[int]] = {}
     for user in _list(slots, "users"):
         identity = normalize_login(user.get("login"))
-        if identity in entries:
+        if identity in granted:
             raise ValueError(f"login {identity} appears twice in the roster")
-        entries[identity] = claim(_tag(user, "entry_vlan", identity), identity)
-        claim(_tag(user, "internal_vlan", identity), identity)
-
-    granted: Dict[str, Set[int]] = {identity: {entry} for identity, entry in entries.items()}
+        granted[identity] = {claim(_tag(user, "entry_vlan", identity), identity),
+                             claim(_tag(user, "internal_vlan", identity), identity)}
     slugs = set()
     for group in _list(slots, "groups"):
         slug = group.get("slug")
