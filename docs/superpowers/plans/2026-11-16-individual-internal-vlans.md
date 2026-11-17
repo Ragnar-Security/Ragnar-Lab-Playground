@@ -61,7 +61,10 @@
 - Produces: `app.vlan_allocator.USER_ENTRY_MIN, USER_ENTRY_MAX = 100, 199` and `USER_INTERNAL_MIN, USER_INTERNAL_MAX = 200, 299`.
 - Produces: `app.vlan_allocator.user_pair_for_index(index: int) -> Tuple[int, int]`. It returns `(USER_ENTRY_MIN + index, USER_INTERNAL_MIN + index)`, raises `VlanPoolExhausted` past `USER_ENTRY_MAX - USER_ENTRY_MIN`, and raises `ValueError` for a negative index.
 - Produces: `scripts.init_db.import_student_whitelist(csv_path: Optional[str] = None) -> None`. `None` keeps today's search of `data/` and `/app/data/`. It raises `ValueError` when the file holds more students than the pool, before adding any row.
-- Produces: `scripts.migrate_add_vlan.assign_vlans_to_users(users) -> None` and `assign_vlans_to_whitelist(entries) -> None`. Each counts the free pairs of its own table first (index *i* in 0-99 whose `100+i` and `200+i` are both unused there) and raises `VlanPoolExhausted` before assigning anything when there are fewer free pairs than records. Otherwise it assigns the lowest free pairs, in record order.
+- Produces: `scripts.migrate_add_vlan.assign_vlans_to_users(users) -> None` and `assign_vlans_to_whitelist(entries) -> None`. Both are owner-aware across tables:
+  - A record whose login has a row in the *other* table (`User` ↔ `StudentWhitelist`) with both tags set takes that pair, as it is. One login holds one pair; `audit_vlan_pairs.py` reports the pair if it breaks the rule.
+  - Any other record takes the lowest index *i* in 0-99 whose `100+i` and `200+i` are both absent from every tag in use anywhere: users, whitelist, groups and non-ended KOTH games (`app/vlan_allocator._used_tags`, `:43-58`), plus the pairs already chosen in this call.
+  - Every record's pair is chosen first. If any record has no safe pair, the function raises `VlanPoolExhausted` before setting any attribute. Otherwise it sets them all and commits once.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -94,7 +97,8 @@ def test_auto_allocate_user_is_exhausted_after_one_hundred(self):
 ```python
 # tests/test_student_vlan_numbering.py (uses the conftest `app` fixture). Imports: pytest; app.models
 # db, StudentWhitelist, User; app.vlan_allocator VlanPoolExhausted; scripts.init_db
-# import_student_whitelist; `from scripts import import_students, migrate_add_vlan`.
+# import_student_whitelist; `from scripts import import_students, migrate_add_vlan`;
+# app.models StudentGroup, KothGame for the cross-table tests.
 def _roster(path, count, start=0):
     rows = ''.join(f'{9000 + n},s{n:03d},Student {n}\n' for n in range(start, start + count))
     path.write_text('SIS User ID,SIS Login ID,Student\n' + rows)
@@ -170,19 +174,70 @@ def test_migrate_add_vlan_refuses_more_records_than_free_pairs_atomically(app, m
             getattr(migrate_add_vlan, assign)(rows)
         db.session.rollback()
         assert model.query.filter(model.entry_vlan_tag.isnot(None)).count() == 0
+
+# Catches one login ending up with two different pairs across the two tables.
+@pytest.mark.parametrize('model, other, assign', [
+    (User, StudentWhitelist, 'assign_vlans_to_users'),
+    (StudentWhitelist, User, 'assign_vlans_to_whitelist')])
+def test_migrate_add_vlan_reuses_the_matching_logins_pair(app, model, other, assign):
+    with app.app_context():
+        db.session.add(_row(other, 'alice', 105, 205))
+        target = _row(model, 'alice', None, None)
+        db.session.add(target)
+        db.session.commit()
+        getattr(migrate_add_vlan, assign)([target])
+        db.session.expire_all()
+        row = model.query.filter_by(login_id='alice').one()
+        assert (row.entry_vlan_tag, row.internal_vlan_tag) == (105, 205)
+
+# Catches a pair that is free in its own table but held by another student,
+# a group or a live KOTH game.
+@pytest.mark.parametrize('model, assign', ASSIGNERS)
+def test_migrate_add_vlan_skips_tags_held_in_other_tables(app, model, assign):
+    other = User if model is StudentWhitelist else StudentWhitelist
+    with app.app_context():
+        db.session.add_all([
+            _row(other, 'carol', 100, 200),
+            StudentGroup(name='g', display_name='G', entry_vlan_tag=101, internal_vlan_tag=401),
+            KothGame(name='k', deployment_group_name='arena', entry_vlan_tag=352,
+                     internal_vlan_tag=202, status='draft'),
+        ])
+        target = _row(model, 'dave', None, None)
+        db.session.add(target)
+        db.session.commit()
+        getattr(migrate_add_vlan, assign)([target])
+        db.session.expire_all()
+        row = model.query.filter_by(login_id='dave').one()
+        assert (row.entry_vlan_tag, row.internal_vlan_tag) == (103, 203)
+
+# Catches the migration taking a pair another table holds once the pool is full.
+@pytest.mark.parametrize('model, assign', ASSIGNERS)
+def test_migrate_add_vlan_refuses_when_no_globally_safe_pair_exists(app, model, assign):
+    other = User if model is StudentWhitelist else StudentWhitelist
+    with app.app_context():
+        db.session.add_all([_row(other, f'w{i}', 100 + i, 200 + i) for i in range(99)])
+        db.session.add(StudentGroup(name='g', display_name='G',
+                                    entry_vlan_tag=199, internal_vlan_tag=401))
+        target = _row(model, 'late', None, None)
+        db.session.add(target)
+        db.session.commit()
+        with pytest.raises(VlanPoolExhausted):
+            getattr(migrate_add_vlan, assign)([target])
+        db.session.rollback()
+        assert model.query.filter_by(login_id='late').one().entry_vlan_tag is None
 ```
 
 - [ ] **Step 2: Run the tests and confirm they fail**
 
 Run: `uv run python -m pytest tests/test_vlan_allocator.py tests/test_student_vlan_numbering.py -q`
-Expected: FAIL. `user_pair_for_index` does not exist, `USER_ENTRY_MAX == 200`, `import_student_whitelist` takes no argument, and `migrate_add_vlan` numbers all 101 records (the last as `200/300`, through its inclusive old maximum) instead of raising.
+Expected: FAIL. `user_pair_for_index` does not exist, `USER_ENTRY_MAX == 200`, `import_student_whitelist` takes no argument, `migrate_add_vlan` numbers all 101 records (the last as `200/300`, through its inclusive old maximum) instead of raising, and it looks only at its own table, so the cross-table tests get a pair another table holds (or, in the reuse test, a different pair).
 
 - [ ] **Step 3: Implement**
 
 - `app/vlan_allocator.py`: set the constants to 199/299 and add `user_pair_for_index` as specified. In the docstring, say that index *i* gets `100+i`/`200+i` and that the pool holds 100 students.
 - `scripts/init_db.py`: use `csv_path` when given, instead of the search at `:242-253`. Read every new row first. Number the *k*-th new student with `user_pair_for_index(k)`. On `VlanPoolExhausted`, raise `ValueError(f"{csv_path} has {n} students; the per-student VLAN pool holds {USER_ENTRY_MAX - USER_ENTRY_MIN + 1}")` before calling `db.session.add`. Delete the offset arithmetic at `:259-261`: the function returns at `:238-240` whenever a row exists, so that offset is always 0. A `ValueError` is re-raised as a configuration error at `:55-59`, so the container stops with the message instead of retrying.
 - `scripts/import_students.py:106-109`: assign `user_pair_for_index((max_entry or 99) - 99)`. On `VlanPoolExhausted`, call `db.session.rollback()` and `sys.exit("Error: ... nothing from this file was imported")`.
-- `scripts/migrate_add_vlan.py`: import the four `USER_*` values from `app.vlan_allocator` under the script's existing names (`:24-28`). Rewrite `assign_vlans_to_users` and `assign_vlans_to_whitelist` (`:182-249`) to the Interfaces contract: compute the free pairs first and raise before mutating; the current loops warn and `break` after committing earlier assignments.
+- `scripts/migrate_add_vlan.py`: import the four `USER_*` values from `app.vlan_allocator` under the script's existing names (`:24-28`). Rewrite `assign_vlans_to_users` and `assign_vlans_to_whitelist` (`:182-249`) to the Interfaces contract, sharing one helper. Today's loops look only at their own table's entry tags, then warn and `break` after committing earlier assignments.
 - Delete `app/routes/utils.py:23-27`.
 - Change the range text in `app/config.py` and `app/models.py` to 100-199 and 200-299. In the model comments, give the networks: entry `10.<N>.0.0/24`, internal `10.<N-100>.1.0/24`.
 
@@ -543,7 +598,7 @@ Expected:
 
 - [ ] **Step 3: Prove the provisioning test can go red**
 
-Temporarily change `delete="net1"` at `app/routes/vm_creation.py:241` to a no-op `config.put()`, run the provisioning test, and see it FAIL on `delete`. Revert, then confirm `git diff app/` is empty.
+Temporarily delete only the line `proxmox.nodes(target_node).qemu(vmid).config.put(delete="net1")` at `app/routes/vm_creation.py:241`, leaving the `net0` statements at `:243-246` in place. Run the provisioning test. Expected: FAIL on the plain machine's tuple assertion, which gets `None` where it expects `'net1'` for `delete`. Restore the line, then confirm `git diff app/` is empty.
 
 - [ ] **Step 4: Add the example group and the documentation listed in Files**
 
@@ -587,11 +642,13 @@ Under `### Upgrade notes`, **replace** the current first bullet (`CHANGELOG.md:6
 
 - [ ] **Step 2: Check the CHANGELOG and run the full suite on Linux**
 
-Run:
+Run (one chain: the full suite runs only if the CHANGELOG gate passes):
 ```bash
-awk '/^## \[Unreleased\]/{f=1; next} /^## \[/{f=0} f' CHANGELOG.md > /tmp/unreleased.md
-! grep -q 'No action' /tmp/unreleased.md && grep -q 'JUMPBOX_VLAN_BANDS' /tmp/unreleased.md && echo unreleased-ok
-uv run python -m pytest tests/test_release_notes.py -q && uv run python -m pytest tests/ --ignore=tests/integration -q
+awk '/^## \[Unreleased\]/{f=1; next} /^## \[/{f=0} f' CHANGELOG.md > /tmp/unreleased.md \
+  && ! grep -q 'No action' /tmp/unreleased.md \
+  && grep -q 'JUMPBOX_VLAN_BANDS' /tmp/unreleased.md && echo unreleased-ok \
+  && uv run python -m pytest tests/test_release_notes.py -q \
+  && uv run python -m pytest tests/ --ignore=tests/integration -q
 ```
 Expected: `unreleased-ok`, then PASS. This check is a one-off: a permanent test that `[Unreleased]` never says "No action" would be wrong for a later release that really needs none.
 
@@ -610,10 +667,21 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
 
 #### Operator rules for Steps 5-12
 
-- **Access check after every change.** Run the operator's student-access check (`check_student_access.py`, kept with the changeover isolation ticket) and compare it with the Step 5 baseline after Step 6, Step 7, Step 8, the staging policy apply (10e), the production policy restore (10h), and Step 11. **At the first unexpected result, stop and run Step 12 for every step done so far.** The only expected change is at 10e, explained there.
-- **Procedure R: restore a Headscale policy file.** Run it on the Headscale host, in `HEADSCALE_DIR`. `BACKUP` is the exact path the apply script printed after `backup:` (`scripts/apply_headscale_policy.sh:159`). The live file is that path without its `.<stamp>` suffix (`:138-140`).
+- **Access check after every change.** The operator's student-access check (`check_student_access.py`, kept with the changeover isolation ticket) prints `student nodes: N; reach own /24: K; LOST own /24: L; also reach a foreign /24: F; filter entries on jumpbox: E`. It exits 1 when `L > 0`. It counts only Headscale nodes of roster logins: users without nodes, staff and `zz-*` are skipped. It also tests only each student's **entry** /24, so 10g, not this check, proves the internal VLANs.
+  - **Baseline (Step 5):** exit 0 and `L = 0`. Record `N` and `K`. A red baseline stops the rollout before anything changes.
+  - **After Steps 6, 7 and 8, and after the restore in 10h:** exit 0, and `N`, `K`, `L` exactly equal the baseline.
+  - **At 10e:** expected exit 1 with `reach own /24: 0` and `LOST own /24` equal to `student nodes`, which equals the baseline `N`.
+  - **After Step 11** (new roster, so `N` changes): exit 0 and `L = 0`.
+
+  **At the first result that differs, stop and run Step 12 for every step done so far.**
+- **Procedure R: restore a Headscale policy file.** Run it on the Headscale host, in `HEADSCALE_DIR`. The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip the host prefix. The live file is the backup path without its `.<stamp>` suffix (`:138-140`). Record `BACKUP_REF` and `BACKUP` in the changeover notes.
   ```bash
-  BACKUP=<path printed after "backup:">; HOST_FILE="${BACKUP%.*}"; STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+  BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#*:}"; HOST_FILE="${BACKUP%.*}"
+  STAMP=$(date -u +%Y%m%dT%H%M%SZ); printf 'ref=%s\nbackup=%s\nlive=%s\n' "$BACKUP_REF" "$BACKUP" "$HOST_FILE"
+  [[ "${BACKUP##*.}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] && test -f "$BACKUP" && test -f "$HOST_FILE" && echo files-ok
+  ```
+  Expected: `files-ok`. Otherwise stop: nothing has been modified. Then:
+  ```bash
   docker compose exec -T headscale headscale policy check --file /dev/stdin < "$BACKUP"   # must exit 0
   cp -p "$HOST_FILE" "$HOST_FILE.$STAMP.replaced" && chmod 600 "$HOST_FILE.$STAMP.replaced"
   cp -p "$HOST_FILE" "$HOST_FILE.$STAMP.tmp" && cat "$BACKUP" > "$HOST_FILE.$STAMP.tmp" \
@@ -630,7 +698,12 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
 All of these must hold before continuing:
 - The instructor has approved the window and decisions 5 and 6 at the top of this plan.
 - The term is over. The admin dashboard shows no live VM record, and the cluster holds no portal guest: on a Proxmox node, `pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.name // "" | test("^(student|group)-")) | "\(.vmid) \(.name)"'` prints nothing.
-- The J1 counters have been read, as the changeover isolation ticket requires.
+- **J2 gate.** All three must hold:
+  - J1 has been read after at least 7 days (counters and `journalctl -k --grep jb-xvlan`), and every cross-VLAN flow maps to staff or test traffic, with zero legitimate student or group flows.
+  - The instructor has accepted that reading in the changeover isolation ticket.
+  - The `--allow-vlans` list for KOTH or staff VLANs is decided, possibly empty.
+
+  Otherwise stop the rollout here. Nothing has changed yet. Without J2 the AD labs do not ship (Global Constraints).
 - **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop. Either remove or renumber the offending rows, or run the term purge first: Step 11, then this audit again, then Steps 6-10 before the new term's students are told the VPN is open. Only after that may the jumpbox or the policy change.
 - **Lab subnets clear of the management side.** On the jumpbox, with `jumpbox_netgen.py` copied to `jumpbox/`:
   ```bash
@@ -660,7 +733,7 @@ Verify: `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.
 Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an interactive console session, with `scripts/site.env` carrying the same band string. Never start `nftables.service`.
 - Before moving the hand-built files aside, compare them with the rendered netplan (`python3 jumpbox/jumpbox_netgen.py netplan --bands "<band string>" --mgmt-if <mgmt> --trunk-if <trunk>`). The only VLAN differences must be `vlan200` moving from `10.200.0.1/24` to `10.100.1.1/24`, the new `vlan201`-`vlan299`, and `vlan500`.
 - After `--apply`:
-  - `ip -br addr show vlan200` lists only `10.100.1.1/24`. If the old `10.200.0.1/24` remains, delete it with `ip addr del`.
+  - `ip -br addr show vlan200` lists only `10.100.1.1/24`. If `10.200.0.1/24` is still there, run `sudo ip addr del 10.200.0.1/24 dev vlan200`, then `ip -br addr show vlan200` again; it must list only `10.100.1.1/24`.
   - `ip -br addr show vlan299` lists `10.199.1.1/24`.
   - `ip -br addr | grep -c '^vlan'` and `grep -c '^dhcp-range=' /etc/dnsmasq.d/jumpbox.conf` both print `401`.
   - `systemctl is-active dnsmasq tailscaled` prints `active` twice.
@@ -668,7 +741,7 @@ Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an int
 
 - [ ] **Step 8 (operator): Inter-VLAN drop (J2)**
 
-Install J2 as the isolation ticket says. On the now-converged jumpbox, the dry run of `sudo jumpbox/jumpbox_configure.sh --isolate-vlans` must report netplan and dnsmasq unchanged before `--apply --no-try --isolate-vlans`. If it does not, install the table by hand as the ticket describes.
+Install J2 as the isolation ticket says, with the `--allow-vlans` list decided at the Step 5 J2 gate. On the now-converged jumpbox, the dry run of `sudo jumpbox/jumpbox_configure.sh --isolate-vlans [--allow-vlans <list>]` must report netplan and dnsmasq unchanged before `--apply --no-try --isolate-vlans [--allow-vlans <list>]`. If it does not, install the table by hand as the ticket describes.
 Verify:
 - `sudo nft list table inet jumpbox_vlan_isolation` shows the drop rule.
 - `systemctl is-enabled jumpbox-vlan-isolation.service` prints `enabled`.
@@ -683,7 +756,7 @@ Every enabled individual group with a single machine sets `internal_nic: false` 
 
 Run this before the new roster is seeded. Sub-steps a-h run in order.
 
-**a. Freeze production.** On the portal host, run `docker compose -f <PORTAL_COMPOSE> stop vm-automation`. Nothing can deploy or allocate a VMID while it is stopped, and it stays stopped until 10h has passed.
+**a. Freeze production.** On the portal host, run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> stop vm-automation`. Verify that `docker inspect --format '{{.State.Status}}' <PORTAL_APP_CONTAINER>` prints `exited`. Do not record `MAX0` until it does. Nothing can deploy or allocate a VMID while the container is stopped, and it stays stopped until 10h.6.
 
 **b. Record the cluster.** On a Proxmox node:
 - `MAX0=$(pvesh get /cluster/resources --type vm --output-format json | jq 'map(.vmid) | max')`. Write the value down.
@@ -697,7 +770,7 @@ Run this before the new roster is seeded. Sub-steps a-h run in order.
 
 **d. VPN clients.** Create Headscale users `zz-a` and `zz-b`, and join one VPN client as each.
 
-**e. Apply the staging policy.** Run `SITE_ENV_FILE=<staging site.env> scripts/apply_headscale_policy.sh --apply` and **record the `backup:` path it prints**. That file is the production policy as it was before staging. Run the access check. It must report every real roster login denied, which proves the staging policy is the one enforced. Any other result: run Procedure R with that path, then 10h's cleanup, and stop.
+**e. Apply the staging policy.** Run `SITE_ENV_FILE=<staging site.env> scripts/apply_headscale_policy.sh --apply`. **Record the whole `backup:` value it prints** (`<HEADSCALE_HOST>:<path>`) as Procedure R's `BACKUP_REF`. That file is the production policy as it was before staging. Run the access check. Expected, exactly: exit 1, `reach own /24: 0`, and `LOST own /24` equal to `student nodes`, equal to the baseline `N`. That proves the staging policy is the one enforced. Any other result: run Procedure R with that value, then 10h's cleanup, and stop.
 
 **f. Deploy.** Each test student registers and deploys the group. Verify on a Proxmox node: `pvesh get /cluster/resources --type vm --output-format json | jq -r --argjson m "$MAX0" '.[] | select(.vmid > $m) | "\(.vmid) \(.name)"'` lists exactly four guests: `student-zz-a-srv01`, `student-zz-a-dc01`, `student-zz-b-srv01` and `student-zz-b-dc01`.
 
@@ -708,12 +781,12 @@ Run this before the new roster is seeded. Sub-steps a-h run in order.
 - From A's `dc01`, B's machines do not answer, and the J2 drop counter rises.
 
 **h. Cleanup, on a pass and on a failure alike:**
-1. Run Procedure R with the path recorded in 10e. Expected: `restored`.
-2. Run the access check. It must match the Step 5 baseline. If it does not, stop, keep the staging state for diagnosis, and escalate. Production students are locked out until this passes.
+1. Run Procedure R with the `BACKUP_REF` recorded in 10e. Expected: `files-ok`, then `restored`.
+2. Run the access check. Expected: exit 0, with `N`, `K` and `L` exactly the baseline's. If not, stop, keep the staging state for diagnosis, and escalate: production students are locked out until this passes.
 3. Destroy both deployments through the staging portal. The 10f query must then list nothing above `MAX0`.
 4. Stop the staging portal.
 5. Delete the test nodes, then the test users, in Headscale.
-6. Start production: `docker compose -f <PORTAL_COMPOSE> start vm-automation`.
+6. Start production: `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> start vm-automation`. Verify that within 90 s `docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' <PORTAL_APP_CONTAINER>` prints `healthy` (the probe `scripts/term_changeover.sh:413-422` uses), and that `/auth/health` answers.
 
 If 10g failed, continue with Step 12.
 
@@ -723,14 +796,14 @@ Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Its stage 4 applie
 Verify:
 - The dry run of `scripts/apply_headscale_policy.sh` reports nothing to do.
 - The Step 5 audit, re-run, prints `ok`.
-- The access check shows no regression from the baseline for the devices it covers.
+- The access check exits 0 with `LOST own /24: 0`.
 
 - [ ] **Step 12 (operator): Rollback, if any check fails**
 
 Undo the steps already done, newest first, in this order. Skip any item whose step never ran.
 
 1. **Headscale policy.**
-   - If the staging policy is still installed, run Procedure R with the 10e path.
+   - If the staging policy is still installed, run Procedure R with the 10e `BACKUP_REF`.
    - If Step 11 has run, then after item 4 below, run `scripts/apply_headscale_policy.sh --apply` from the previous release's checkout. It re-renders the new roster with entry-only grants.
 2. **J2.**
    ```bash
