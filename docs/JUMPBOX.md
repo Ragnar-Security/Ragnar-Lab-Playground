@@ -17,6 +17,7 @@ student laptop ──tailnet── Headscale (vpn.example.edu)
                  ├─ net0  management: vmbr0, VLAN 1, DHCP
                  └─ net1  trunk: vmbr0, untagged, firewall on
                      ├─ vlan100  10.100.0.1/24  ─ student entry network
+                     ├─ vlan200  10.100.1.1/24  ─ student internal network
                      ├─ vlan300  10.100.2.1/24  ─ group entry network
                      └─ vlan400  10.100.4.1/24  ─ group internal network …
 ```
@@ -41,19 +42,20 @@ dnsmasq leases `.50` to `.254` for 12 hours:
 
 | Band | VLANs | Network | Portal pool |
 |------|-------|---------|-------------|
-| `entry` | 100–200 | `10.<N>.0.0/24` | per-student entry VLAN (`app/vlan_allocator.py`) |
+| `entry` | 100–199 | `10.<N>.0.0/24` | per-student entry VLAN (`app/vlan_allocator.py`) |
+| `internal` | 200–299 | `10.<N-100>.1.0/24` | per-student internal VLAN (`app/vlan_allocator.py`) |
 | `group-entry` | 300–399 | `10.<N-200>.2.0/24` | group entry VLAN (`GROUP_ENTRY_VLAN_MIN/MAX`) |
 | `group-internal` | 400–500 | `10.<N-300>.4.0/24` | group internal VLAN (`GROUP_INTERNAL_VLAN_MIN/MAX`) |
 
 The bands must cover every VLAN the portal can assign. The portal's bounds
 are inclusive, so group-internal includes VLAN 500, and
 `tests/test_jumpbox_scripts.py` fails if the defaults stop covering the
-allocator's pools. Per-student internal VLANs (200–300) are not served by the
-jumpbox. If you change the portal's `GROUP_*_VLAN_*` settings, set
-`JUMPBOX_VLAN_BANDS` to match:
+allocator's pools. A student's two networks share the second octet: entry VLAN
+142 is `10.142.0.0/24` and internal VLAN 242 is `10.142.1.0/24`. If you change
+the portal's `GROUP_*_VLAN_*` settings, set `JUMPBOX_VLAN_BANDS` to match:
 
 ```
-JUMPBOX_VLAN_BANDS="entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
+JUMPBOX_VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 #                   name:first-last:offset:third  ->  VLAN N = 10.<N-offset>.<third>.1/24
 ```
 

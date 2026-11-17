@@ -15,12 +15,12 @@ portal's VLAN allocator can hand out (app/vlan_allocator.py; the group pools
 come from GROUP_ENTRY_VLAN_* / GROUP_INTERNAL_VLAN_* in app/config.py, and
 allocator bounds are inclusive):
 
-    entry           100-200 -> 10.100.0.1 .. 10.200.0.1   per-student entry networks
+    entry           100-199 -> 10.100.0.1 .. 10.199.0.1   per-student entry networks
+    internal        200-299 -> 10.100.1.1 .. 10.199.1.1   per-student internal networks
     group-entry     300-399 -> 10.100.2.1 .. 10.199.2.1   group entry networks
     group-internal  400-500 -> 10.100.4.1 .. 10.200.4.1   group internal networks
 
-Per-student internal VLANs (200-300) are not served by the jumpbox. If the
-portal's pools change, set JUMPBOX_VLAN_BANDS to match them.
+If the portal's pools change, set JUMPBOX_VLAN_BANDS to match them.
 
 Used by jumpbox_configure.sh; standard library only, so it runs on a stock
 Ubuntu jumpbox.
@@ -33,7 +33,8 @@ import re
 import sys
 
 DEFAULT_BANDS = (
-    "entry:100-200:0:0 "
+    "entry:100-199:0:0 "
+    "internal:200-299:100:1 "
     "group-entry:300-399:200:2 "
     "group-internal:400-500:300:4"
 )

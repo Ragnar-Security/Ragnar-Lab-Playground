@@ -208,7 +208,7 @@ def aws_client_cidrs():
 # policy export grants exactly the Proxmox networks the jumpbox routes.
 JUMPBOX_VLAN_BANDS = _env_text(
     'JUMPBOX_VLAN_BANDS',
-    'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
+    'entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4')
 
 # ============ ORPHAN REAPER CONFIGURATION ============
 # A fallback for clones whose VMRecord was never committed because the app

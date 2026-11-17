@@ -318,6 +318,16 @@ def reload_valid_cloud_config(monkeypatch, **overrides):
         'ENABLED_BACKENDS': 'aws,gcp', **AWS_VALUES, **GCP_VALUES, **overrides})
 
 
+def _netgen():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "scripts" / "jumpbox_netgen.py"
+    spec = importlib.util.spec_from_file_location("jumpbox_netgen", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # Catches the contract's defaults drifting, or an unset ENABLED_BACKENDS
 # no longer meaning the Proxmox-only portal every existing site runs.
 def test_backend_defaults_match_the_contract(monkeypatch):
@@ -329,8 +339,9 @@ def test_backend_defaults_match_the_contract(monkeypatch):
     assert (cfg.AWS_ROUTER_IDLE_MINUTES, cfg.GCP_ROUTER_IDLE_MINUTES) == (30, 30)
     assert (cfg.AWS_LAUNCH_TIMEOUT_SECONDS, cfg.AWS_TERMINATE_TIMEOUT_SECONDS,
             cfg.GCP_OPERATION_TIMEOUT_SECONDS) == (600, 600, 600)
-    assert cfg.JUMPBOX_VLAN_BANDS == (
-        'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
+    assert cfg.JUMPBOX_VLAN_BANDS.split() == _netgen().DEFAULT_BANDS.split() == [
+        "entry:100-199:0:0", "internal:200-299:100:1",
+        "group-entry:300-399:200:2", "group-internal:400-500:300:4"]
 
 
 # Catches a list that keeps case, whitespace or duplicates, which every

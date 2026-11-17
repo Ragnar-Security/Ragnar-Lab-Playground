@@ -92,11 +92,13 @@ def _run(script: Path, args, env, input=None, stdin=None):
 
 @pytest.mark.parametrize("tag, gateway, first, last", [
     (100, "10.100.0.1/24", "10.100.0.50", "10.100.0.254"),
-    (200, "10.200.0.1/24", "10.200.0.50", "10.200.0.254"),
+    (199, "10.199.0.1/24", "10.199.0.50", "10.199.0.254"),
+    (200, "10.100.1.1/24", "10.100.1.50", "10.100.1.254"),
+    (299, "10.199.1.1/24", "10.199.1.50", "10.199.1.254"),
     (300, "10.100.2.1/24", "10.100.2.50", "10.100.2.254"),
     (399, "10.199.2.1/24", "10.199.2.50", "10.199.2.254"),
     (400, "10.100.4.1/24", "10.100.4.50", "10.100.4.254"),
-    (499, "10.199.4.1/24", "10.199.4.50", "10.199.4.254"),
+    (500, "10.200.4.1/24", "10.200.4.50", "10.200.4.254"),
 ])
 def test_vlan_gateway_and_dhcp_pool_follow_the_lab_address_plan(tag, gateway, first, last):
     ng = _netgen()
@@ -105,7 +107,7 @@ def test_vlan_gateway_and_dhcp_pool_follow_the_lab_address_plan(tag, gateway, fi
     assert ng.dhcp_pool(tag, bands) == (first, last)
 
 
-@pytest.mark.parametrize("tag", [99, 201, 250, 299, 501])
+@pytest.mark.parametrize("tag", [99, 501, 600])
 def test_vlans_outside_the_routed_bands_get_no_gateway(tag):
     ng = _netgen()
     bands = ng.parse_bands(ng.DEFAULT_BANDS)
@@ -114,21 +116,32 @@ def test_vlans_outside_the_routed_bands_get_no_gateway(tag):
         ng.gateway(tag, bands)
 
 
-def test_jumpbox_routes_every_vlan_the_portal_hands_out_for_entry_and_group_networks():
+def test_jumpbox_routes_every_vlan_the_portal_hands_out():
     # A VLAN the portal assigns but the jumpbox does not serve leaves that
     # student's VMs without DHCP or a route; the allocator bounds are inclusive.
     from app import vlan_allocator
 
     ng = _netgen()
     bands = ng.parse_bands(ng.DEFAULT_BANDS)
-    (user_lo, user_hi), _user_internal = vlan_allocator._pool_for("user")
+    (user_lo, user_hi), (ui_lo, ui_hi) = vlan_allocator._pool_for("user")
     (ge_lo, ge_hi), (gi_lo, gi_hi) = vlan_allocator._pool_for("group")
-    portal = (set(range(user_lo, user_hi + 1)) | set(range(ge_lo, ge_hi + 1))
-              | set(range(gi_lo, gi_hi + 1)))
+    portal = (set(range(user_lo, user_hi + 1)) | set(range(ui_lo, ui_hi + 1))
+              | set(range(ge_lo, ge_hi + 1)) | set(range(gi_lo, gi_hi + 1)))
     served = set(ng.vlan_tags(bands))
     assert sorted(portal - served) == []
     gateways = [ng.gateway(t, bands) for t in served]
     assert len(set(gateways)) == len(gateways)
+
+
+# Catches VLAN 200 (or any tag) belonging to the entry and internal bands at once.
+def test_each_student_pool_sits_in_its_own_band():
+    from app import vlan_allocator
+    ng = _netgen()
+    bands = ng.parse_bands(ng.DEFAULT_BANDS)
+    (e_lo, e_hi), (i_lo, i_hi) = vlan_allocator._pool_for("user")
+    assert {ng._band_for(t, bands).name for t in range(e_lo, e_hi + 1)} == {"entry"}
+    assert {ng._band_for(t, bands).name for t in range(i_lo, i_hi + 1)} == {"internal"}
+    assert (ng.gateway(142, bands), ng.gateway(242, bands)) == ("10.142.0.1/24", "10.142.1.1/24")
 
 
 def test_overlapping_or_out_of_range_bands_are_rejected():
@@ -152,6 +165,7 @@ def test_generated_netplan_is_valid_yaml_with_a_gateway_on_every_lab_vlan():
     vlans = net["vlans"]
     assert set(vlans) == {f"vlan{t}" for t in ng.vlan_tags(bands)}
     assert vlans["vlan100"] == {"id": 100, "link": "ens19", "addresses": ["10.100.0.1/24"]}
+    assert vlans["vlan200"] == {"id": 200, "link": "ens19", "addresses": ["10.100.1.1/24"]}
     assert vlans["vlan399"] == {"id": 399, "link": "ens19", "addresses": ["10.199.2.1/24"]}
     assert vlans["vlan499"] == {"id": 499, "link": "ens19", "addresses": ["10.199.4.1/24"]}
     with pytest.raises(ValueError):
@@ -171,6 +185,8 @@ def test_dnsmasq_serves_twelve_hour_leases_on_lab_vlans_and_never_on_management(
     ranges = [l for l in lines if l.startswith("dhcp-range=")]
     assert len(ranges) == len(ng.vlan_tags(bands))
     assert "dhcp-range=10.100.0.50,10.100.0.254,255.255.255.0,12h" in ranges
+    assert "dhcp-range=10.100.1.50,10.100.1.254,255.255.255.0,12h" in ranges
+    assert not any(r.startswith("dhcp-range=10.200.0.") for r in ranges)
     assert "dhcp-range=10.100.2.50,10.100.2.254,255.255.255.0,12h" in ranges
     assert "dhcp-range=10.199.4.50,10.199.4.254,255.255.255.0,12h" in ranges
     hosts = [l for l in lines if l.startswith("dhcp-host=")]

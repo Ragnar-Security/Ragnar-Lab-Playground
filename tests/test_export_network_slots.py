@@ -9,7 +9,7 @@ from app.models import KothGame, StudentGroup, StudentGroupMember, StudentWhitel
 from scripts import export_network_slots
 from scripts.export_network_slots import collect_network_slots
 
-DEFAULT_BANDS = "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
+DEFAULT_BANDS = "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 
 
 @pytest.fixture

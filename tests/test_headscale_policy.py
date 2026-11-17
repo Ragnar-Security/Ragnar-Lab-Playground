@@ -22,7 +22,7 @@ from scripts.headscale_policy import (
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "scripts" / "headscale_policy.py"
-DEFAULT_BANDS = "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
+DEFAULT_BANDS = "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 BASE = json.loads((ROOT / "config" / "headscale-acl.example.json").read_text())
 CLOUDS = {"aws": "172.20.0.0/16", "gcp": "172.21.0.0/16"}
 SLOTS = {
@@ -123,7 +123,7 @@ def test_every_roster_login_gets_non_ended_koth_blocks_on_proxmox_only():
 # A login whose only routed blocks are KOTH's gets the forward rule and no
 # reverse rule (an empty src would be an invalid policy).
 def test_a_login_with_only_koth_blocks_gets_no_reverse_rule():
-    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
+    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": [], "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*", "10.150.4.0/24:*"]
@@ -261,7 +261,7 @@ def test_group_membership_grants_only_that_groups_blocks():
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
 def test_student_with_no_routed_block_gets_no_rule():
-    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
+    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": []}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
     assert policy["acls"] == [BASE["acls"][0], SELF_RULE]

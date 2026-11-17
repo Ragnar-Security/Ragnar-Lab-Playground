@@ -302,7 +302,7 @@ POLICY_SLOTS = {
         "enabled_backends": ["proxmox", "aws"],
         "aws_lab_cidr": "172.20.0.0/16",
         "gcp_lab_cidr": "172.21.0.0/16",
-        "jumpbox_vlan_bands": "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4",
+        "jumpbox_vlan_bands": "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4",
     },
     "users": [
         {"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
