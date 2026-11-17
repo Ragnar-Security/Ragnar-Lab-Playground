@@ -4,7 +4,7 @@
 
 **Goal:** Make an individual-mode deployment of two machines (one entry point, one single-homed machine on the student's internal VLAN) work over the course VPN: the jumpbox serves DHCP on each student's internal VLAN, the Headscale policy grants each student their own internal VLAN, and no student's VLANs are renumbered.
 
-**Architecture:** The per-student pools end at 199 (entry) and 299 (internal). That is exactly what the importers already assign to a roster of up to 100 students (`100+i`, `200+i`), so no stored tag changes and no database migration is needed. A row numbered by today's importers past the 100th student (a legacy `200/300` pair) is not renumbered; a new pre-rollout audit refuses it. The jumpbox gains a band `internal:200-299:100:1` (VLAN *N* → `10.<N-100>.1.0/24`) and the entry band ends at 199, so VLAN 200 is no longer in two bands. The Headscale renderer grants each login its own internal VLAN next to its entry VLAN, on Proxmox and on every enabled cloud, and still only where a band routes it. No NIC code changes: the portal already gives a plain machine one NIC on the internal VLAN, and already lets an entry point drop its second NIC; a regression test pins the two-machine shape.
+**Architecture:** The per-student pools end at 199 (entry) and 299 (internal). That is exactly what the importers already assign to a roster of up to 100 students (`100+i`, `200+i`), so no stored tag changes and no database migration is needed. A row numbered by today's importers past the 100th student (a legacy `200/300` pair) is not renumbered; a new pre-rollout audit refuses it. The jumpbox gains a band `internal:200-299:100:1` (VLAN *N* → `10.<N-100>.1.0/24`) and the entry band ends at 199, so VLAN 200 is no longer in two bands. The Headscale renderer grants each login its own internal VLAN next to its entry VLAN, on Proxmox and on every enabled cloud, and still only where a band routes it. No NIC code changes: the portal already gives a plain machine one NIC on the internal VLAN, and already lets an entry point drop its second NIC; a regression test pins the two-machine shape. Two optional settings, `LAB_BRIDGE` and `VMID_RANGE`, let a portal run beside production on an isolated bridge in its own VMID range; unset, the portal behaves exactly as today. They carry a **permanent staging stack**: an isolated bridge, a staging jumpbox, a staging Headscale with two client containers, and a staging portal. The two-client acceptance test runs there, any time and repeatably, and gates the merge. Production never has a policy swapped or a portal frozen for testing.
 
 **Tech Stack:** Python 3.12, Flask + SQLAlchemy, pytest through `uv`; bash and stdlib-only Python for the jumpbox and changeover scripts; netplan and dnsmasq on Ubuntu 24.04; Headscale v0.27 policy files.
 
@@ -20,15 +20,22 @@
    The portal rewrites `net0` and deletes only `net1`, so the AD templates must be built with a single NIC. Task 5 documents this.
 3. **Internal address plan:** `10.<N-100>.1.0/24`. A student's two networks share the second octet: VLANs 142 and 242 are `10.142.0.0/24` and `10.142.1.0/24`. Third octet 1 is unused by every existing band.
 4. **A roster of more than 100 students is refused.** Today a 101st student gets entry VLAN 200, which is student #0's internal VLAN: two students on one layer-2 network. Every importer now refuses such a roster atomically (`init_db.py`, `import_students.py`, and `migrate_add_vlan.py`, whose assignment loops today commit a partial numbering), and so does `scripts/term_changeover.sh`, before anything changes. Rows that already exist are checked by a new stdlib audit (`scripts/audit_vlan_pairs.py`) before the rollout and after the changeover.
-5. **The production jumpbox is hand-built.** Serving a new band means replacing its netplan and dnsmasq files. Task 6 adopts it with `jumpbox_configure.sh` at the changeover, using `docs/JUMPBOX.md:143-163`, which also clears the stale DHCP ranges recorded on that box. The operator's earlier rule "never `--apply` on that box" was made for a mid-term window. **The instructor must confirm** that adoption at the changeover is acceptable.
-6. **There is no staging jumpbox or staging Headscale.** A second jumpbox on the same VLAN trunk would duplicate every gateway address. So Task 6's acceptance test runs a staging portal (its own database, orphan reaper off) against the production jumpbox and Headscale. It runs in the changeover window, before the new roster is seeded, and it temporarily replaces the outgoing term's Headscale policy. **The instructor must confirm** the window.
+5. **The production jumpbox is hand-built.** Serving a new band means replacing its netplan and dnsmasq files. Task 8 adopts it with `jumpbox_configure.sh` at the changeover, using `docs/JUMPBOX.md:143-163`, which also clears the stale DHCP ranges recorded on that box. The operator's earlier rule "never `--apply` on that box" was made for a mid-term window. **The instructor must confirm** that adoption at the changeover is acceptable. The staging jumpbox (Task 7) is built fresh with the same two scripts. It rehearses every configure, Tailscale and isolation step, but not the move of hand-built files aside, which exists only on the production box.
+6. **Permanent isolated staging stack (instructor ruling, 2026-11-17).** It replaces the earlier plan to test against the production jumpbox and Headscale in the changeover window. Its parts:
+   - an isolated Linux bridge with no physical ports, on one Proxmox node;
+   - a staging jumpbox, whose trunk is on that bridge and whose management NIC is on the management VLAN;
+   - a dedicated staging VM running its own Headscale (its own tailnet) and two Tailscale client containers that act as two students;
+   - a staging portal: a local test instance (`docs/LOCAL_TEST_INSTANCE.md`) with its own database, `FIXED_NODE` set to that node, `LAB_BRIDGE` set to the isolated bridge, and its own `VMID_RANGE`.
+
+   Because the bridge has no uplink, staging can reuse VLAN tags that production uses without touching production's networks. The concrete node, VMIDs, management VLAN, VMID range and portal host are site identity (`CLAUDE.md` rule 13). This plan and `docs/STAGING.md` use the placeholders `<STAGING_NODE>`, `<STAGING_BRIDGE>`, `<STAGING_JUMPBOX_VMID>`, `<STAGING_VPN_VMID>`, `<MGMT_VLAN>`, `<STAGING_VMID_RANGE>` and `<STAGING_PORTAL_HOST>`. The instructor's values live in the operator's private notes. The staging VPN VM must not be a host already on the production tailnet.
 7. **Found, out of scope:** `GROUP_ENTRY_VLAN_MAX` defaults to 400 (`app/config.py:262`). The allocator treats it as inclusive (`app/vlan_allocator.py:61-66`), and 400 is also the first group-internal tag: the same defect as VLAN 200, at the group edge. This plan does not change it.
 
 ## Global Constraints
 
 - Ship at a term changeover, never mid-term (spec: "It ships at the term changeover with the isolation work below, never mid-term").
 - Phase 1 is Proxmox only. AWS and GCP keep working unchanged: no backend code changes. The only cloud effect is that the policy also grants the internal slot's `/26`.
-- No other portal change (spec: "No portal changes beyond the one this design needs").
+- No other portal change (spec: "No portal changes beyond the one this design needs"). The one exception is `LAB_BRIDGE` and `VMID_RANGE` (Task 6), which the instructor ruled on 2026-11-17 to carry the staging stack. Unset, they must leave production's behaviour unchanged, which Task 6's tests prove.
+- Staging never touches production: no production VLAN on the staging bridge's uplink (it has none), no production Headscale, no production portal database. The staging portal's orphan reaper stays off (`ORPHAN_REAPER_ENABLED=false`, `docs/LOCAL_TEST_INSTANCE.md:13-19`).
 - The AD labs do not ship until the per-student policy (P2) and the jumpbox inter-VLAN drop (J2) are live and the acceptance test shows one student's VPN client cannot reach another student's machines (spec "Prerequisite: per-student isolation").
 - The band string, exactly: `entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4`.
 - Tracked files carry no site identity (`CLAUDE.md` rule 13): no real host or node names, addresses, VMIDs or usernames. Scratch VMIDs and hosts come from the dispatch, never from this repo.
@@ -37,11 +44,12 @@
 
 ## Review Focus
 
-1. **A single-machine individual lab whose entry point keeps the default `internal_nic: true`.** Once the internal band is served, its VM gets a second lease, a second default route and a second address in the UI. A reasonable operator expects their existing labs to look the same. Task 5 pins every committed single-machine example to `internal_nic: false`, and Task 6 audits the operator's `templates.yaml`.
-2. **The portal's `.env` and the jumpbox's `site.env` disagree on the bands** because one was updated and the other was not. VLAN 200 would then be granted as one subnet and served as another. Task 3 pins the portal default to the jumpbox default, and Task 6 compares the two live values.
+1. **A single-machine individual lab whose entry point keeps the default `internal_nic: true`.** Once the internal band is served, its VM gets a second lease, a second default route and a second address in the UI. A reasonable operator expects their existing labs to look the same. Task 5 pins every committed single-machine example to `internal_nic: false`, and Task 8 audits the operator's `templates.yaml`.
+2. **The portal's `.env` and the jumpbox's `site.env` disagree on the bands** because one was updated and the other was not. VLAN 200 would then be granted as one subnet and served as another. Task 3 pins the portal default to the jumpbox default, and Task 8 compares the two live values.
 3. **A roster of more than 100 students, or a legacy `200/300` pair already in the database.** Expected: a new roster is refused before any change and never numbered into a shared VLAN; an existing out-of-rule pair or a tag held by two owners stops the rollout. Tasks 1 and 2.
 4. **One tag held by two owners across kinds**: an internal tag equal to another student's entry or internal tag, or a KOTH tag typed into 200-299. Expected: the policy render refuses. Task 4.
 5. **A cloud-enabled portal.** Expected: the internal slot's `/26` is granted on AWS and GCP exactly when a band routes it, and the reverse rule lets the student's own machines connect back (coercion and relay need this). Task 4.
+6. **A staging `VMID_RANGE` above another portal's highest VMID, or a `LAB_BRIDGE` value carrying Proxmox options.** Expected: the range never pulls the production portal's VMIDs upward, and a bridge like `vmbr9,firewall=0` is refused at startup instead of being spliced into a `netN` string. Task 6 pins the range's high-water behaviour and the bridge validation; Task 7's preconditions check the range against the cluster.
 
 ---
 
@@ -616,21 +624,327 @@ git commit -m "Pin single-homed plain machines in two-machine individual labs; d
 
 ---
 
-### Task 6: Release notes, merge, and the changeover rollout
+### Task 6: `LAB_BRIDGE` and `VMID_RANGE`: a portal beside production on an isolated bridge
+
+Unset, both settings must leave behaviour unchanged. Every existing NIC and allocator test keeps passing unedited, and that is the proof.
+
+**Files:**
+- Modify: `app/config.py:140-146` (add `LAB_BRIDGE`, `parse_vmid_range`, `VMID_RANGE` and `VMID_RANGE_ERROR` directly after `_env_optional_int`, because `_env_text` at `:135` must already be defined), `:483-498` (`_backend_errors`)
+- Modify: `app/routes/vm_creation.py:162-246` (`create_lxc_container`, `create_qemu_vm`: the five `bridge=vmbr0` literals at `:177-180`, `:229-244`)
+- Modify: `app/proxmox_service.py:639-711` (`get_next_available_vmid`); add `VMIDRangeExhausted`
+- Modify: `docker-compose.prod.yml:32` and `docker-compose.yml:25` (pass `LAB_BRIDGE=${LAB_BRIDGE:-}` and `VMID_RANGE=${VMID_RANGE:-}` after `FIXED_NODE`)
+- Modify: `.env.example:98-102` (both settings, empty, with one comment each); `README.md:305` (two table rows); `docs/LOCAL_TEST_INSTANCE.md:35-37` (the VMIDs bullet names `VMID_RANGE` and its rule below)
+- Test: `tests/test_config.py` (add both names to `BACKEND_ENV_KEYS`, `:257-265`), `tests/backends/test_vm_provisioning.py`, `tests/test_vmid_allocator.py`
+
+**Interfaces:**
+- Produces: `app.config.LAB_BRIDGE: str`, which is `_env_text('LAB_BRIDGE', 'vmbr0')`.
+- Produces: `app.config.parse_vmid_range(text: str) -> Optional[Tuple[int, int]]`. Blank text gives `None`. Otherwise the stripped text must match `^(\d+)-(\d+)$` with `100 <= min <= max <= 999999999`, or it raises `ValueError`.
+- Produces: `app.config.VMID_RANGE: Optional[Tuple[int, int]]` and `app.config.VMID_RANGE_ERROR: Optional[str]`, both parsed at import. An invalid value leaves `VMID_RANGE = None` and keeps the message in `VMID_RANGE_ERROR`.
+- `_backend_errors` reports two new problems:
+  - `VMID_RANGE_ERROR`, always;
+  - with Proxmox enabled, a `LAB_BRIDGE` not matching `^[A-Za-z][A-Za-z0-9_.-]{0,14}$`. The value is spliced into Proxmox `netN` strings, where a comma would add options.
+- `create_lxc_container` and `create_qemu_vm` keep their signatures. Each reads `importlib.import_module('app.config').LAB_BRIDGE` per call (`CLAUDE.md` rule 14), so tests monkeypatch `app.config`.
+- Produces: `app.proxmox_service.VMIDRangeExhausted(RuntimeError)`. `get_next_available_vmid` keeps its signature and reads `VMID_RANGE` and `VMID_RANGE_ERROR` per call.
+  - It raises `ValueError` if `VMID_RANGE_ERROR` is set.
+  - With `VMID_RANGE = (lo, hi)`, every source of the high-water value (cluster inventory, stored mark, `VMRecord` maximum, reservation maximum) counts only values inside `[lo, hi]`, and `base = max(lo - 1, those) + 1`. It raises `VMIDRangeExhausted` before reserving anything when `base + count - 1 > hi`.
+  - The stored mark becomes `max(previous mark, base + count - 1)` in both modes. Unset, that equals today's write, because `base` is already above the mark.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_config.py
+# Catches a staging-only setting changing what production does when unset.
+def test_lab_bridge_and_vmid_range_defaults_are_todays_behaviour(monkeypatch):
+    cfg = reload_config(monkeypatch)
+    assert (cfg.LAB_BRIDGE, cfg.VMID_RANGE, cfg.VMID_RANGE_ERROR) == ('vmbr0', None, None)
+
+@pytest.mark.parametrize('text, parsed', [('', None), ('7000-7999', (7000, 7999)), (' 100-100 ', (100, 100))])
+def test_parse_vmid_range_accepts_min_dash_max(monkeypatch, text, parsed):
+    assert reload_config(monkeypatch).parse_vmid_range(text) == parsed
+
+@pytest.mark.parametrize('text', ['7000', '7999-7000', '99-200', '7000-1000000000', 'a-b', '7000-7999,8000-8999'])
+def test_parse_vmid_range_rejects_anything_else(monkeypatch, text):
+    with pytest.raises(ValueError):
+        reload_config(monkeypatch).parse_vmid_range(text)
+
+def test_invalid_vmid_range_is_refused_at_startup(monkeypatch):
+    cfg = reload_config(monkeypatch, VMID_RANGE='7999-7000')
+    assert cfg.VMID_RANGE is None and 'VMID_RANGE' in cfg.VMID_RANGE_ERROR
+    with pytest.raises(ValueError, match='VMID_RANGE'):
+        cfg.validate_config()
+
+# Catches a bridge value that injects options into a Proxmox net string.
+@pytest.mark.parametrize('bridge', ['vmbr9,firewall=0', 'vmbr 9', '9vmbr', 'a' * 16])
+def test_invalid_lab_bridge_is_refused_at_startup(monkeypatch, bridge):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS='proxmox', LAB_BRIDGE=bridge)
+    with pytest.raises(ValueError, match='LAB_BRIDGE'):
+        cfg.validate_config()
+```
+
+```python
+# tests/backends/test_vm_provisioning.py
+# Catches a NIC left on vmbr0 when the portal runs on an isolated bridge.
+def test_lab_bridge_replaces_vmbr0_on_every_nic(app, proxmox_portal, monkeypatch):
+    monkeypatch.setattr(config, 'LAB_BRIDGE', 'vmbr9')
+    records = _deploy(app, [_qemu('srv01', entry_point=True), _qemu('dc01'), _lxc('ct')])
+    nets = [value for r in records
+            for key, value in proxmox_portal.guests[r.vmid]['config'].items() if key.startswith('net')]
+    assert len(nets) == 4
+    assert all('bridge=vmbr9' in v for v in nets) and not any('vmbr0' in v for v in nets)
+```
+
+```python
+# tests/test_vmid_allocator.py (module-level, beside :445-466). Add `import importlib`, `import pytest`
+# and `config = importlib.import_module('app.config')` to the module imports.
+def _get(proxmox, count, rid):
+    return proxmox_service.get_next_available_vmid(proxmox, count=count, reservation_id=rid)
+
+# Catches a staging portal following production's VMIDs upward.
+def test_range_ignores_cluster_guests_above_it(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(9500, 'production-guest')
+    proxmox.add_guest(7004, 'in-range-guest')
+    monkeypatch.setattr(config, 'VMID_RANGE', (7000, 7999))
+    with app.app_context():
+        assert (_get(proxmox, 2, 'r1'), _get(proxmox, 1, 'r2')) == (7005, 7007)
+
+def test_range_starts_at_its_minimum_whatever_the_database_holds(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE', (7000, 7999))
+    with app.app_context():
+        db.session.add(VMRecord(vmid=9000, vm_name='student-x-vm', vm_type='qemu', node='n',
+                                template_name='Lab/vm', student_name='x',
+                                expires_at=datetime.now() + timedelta(hours=1)))
+        db.session.commit()
+        assert _get(ContractFakeProxmox(), 1, 'r') == 7000
+
+# Catches a range silently spilling past its maximum.
+def test_range_refuses_when_exhausted_and_reserves_nothing(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(7001, 'in-range-guest')
+    monkeypatch.setattr(config, 'VMID_RANGE', (7000, 7002))
+    with app.app_context():
+        with pytest.raises(proxmox_service.VMIDRangeExhausted):
+            _get(proxmox, 2, 'r')
+        assert VMIDReservation.query.count() == 0
+
+# Catches range mode lowering the high-water mark an unranged portal relies on.
+def test_range_never_lowers_the_stored_high_water_mark(app, monkeypatch):
+    proxmox = ContractFakeProxmox()
+    proxmox.add_guest(9600, 'guest')
+    with app.app_context():
+        assert _get(proxmox, 1, 'a') == 9601
+        proxmox_service.release_vmid_reservation('a')
+        monkeypatch.setattr(config, 'VMID_RANGE', (7000, 7999))
+        assert _get(ContractFakeProxmox(), 1, 'b') == 7000
+        proxmox_service.release_vmid_reservation('b')
+        monkeypatch.setattr(config, 'VMID_RANGE', None)
+        assert _get(ContractFakeProxmox(), 1, 'c') == 9602
+
+def test_an_invalid_range_refuses_to_allocate(app, monkeypatch):
+    monkeypatch.setattr(config, 'VMID_RANGE_ERROR', 'VMID_RANGE must be <min>-<max>')
+    with app.app_context(), pytest.raises(ValueError):
+        _get(ContractFakeProxmox(), 1, 'r')
+```
+
+- [ ] **Step 2: Run the tests and confirm they fail**
+
+Run: `uv run python -m pytest tests/test_config.py tests/backends/test_vm_provisioning.py tests/test_vmid_allocator.py -q`
+Expected: FAIL. `LAB_BRIDGE`, `VMID_RANGE`, `parse_vmid_range` and `VMIDRangeExhausted` do not exist. Every pre-existing test in these files still passes.
+
+- [ ] **Step 3: Implement to the Interfaces block**
+
+- In `get_next_available_vmid`, clip inside `allocate(conn)` (`:675-706`), so the range check and the insert share the locked transaction.
+- In `README.md`, the `VMID_RANGE` row and the `.env.example` comment both carry this rule: *choose a range below the cluster's highest VMID; a guest above another portal's high-water mark raises that portal's next VMIDs for good* (`proxmox_service.py:664-692`).
+- The `LAB_BRIDGE` row says: "Proxmox bridge for every lab NIC; default `vmbr0`; only a staging portal on an isolated bridge changes it (`docs/STAGING.md`)".
+
+- [ ] **Step 4: Run the tests and confirm they pass, then the full suite**
+
+Run: `uv run python -m pytest tests/test_config.py tests/backends/test_vm_provisioning.py tests/test_vmid_allocator.py -q && uv run python -m pytest tests/ --ignore=tests/integration -q`
+Expected: PASS, with no existing test edited apart from the `BACKEND_ENV_KEYS` addition.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add app/config.py app/routes/vm_creation.py app/proxmox_service.py docker-compose.prod.yml docker-compose.yml .env.example README.md docs/LOCAL_TEST_INSTANCE.md tests/test_config.py tests/backends/test_vm_provisioning.py tests/test_vmid_allocator.py
+git commit -m "LAB_BRIDGE and VMID_RANGE: run a portal on an isolated bridge in its own VMID range"
+```
+
+---
+
+### Task 7: The permanent staging stack and the two-client acceptance test
+
+Steps 1-5 are done by the implementer. Step 6 builds the stack once. Step 7 is the acceptance test, which can be re-run at any time; **a pass at the PR head gates the merge (Task 8 Step 4)**. None of these steps touches production. The stack is permanent: Step 3's "Stop, start, reset, remove" section is how it is retained.
+
+**Files:**
+- Create: `docs/STAGING.md` (the runbook; placeholders only, `CLAUDE.md` rule 13)
+- Modify: `docs/LOCAL_TEST_INSTANCE.md:1-10` (one sentence pointing at `docs/STAGING.md` for the permanent staging portal), `docs/JUMPBOX.md` (one line under "1. Create the VM": a staging jumpbox puts `JUMPBOX_TRUNK_BRIDGE` on an isolated bridge, see `docs/STAGING.md`)
+- Test: `tests/test_cloud_docs.py`
+
+**Interfaces:**
+- Consumes: `LAB_BRIDGE` and `VMID_RANGE` (Task 6); the band string (Task 3); the internal grant (Task 4); `jumpbox_provision.sh` (`JUMPBOX_BRIDGE`, `JUMPBOX_MGMT_VLAN`, `JUMPBOX_TRUNK_BRIDGE`, `:31-45`); `apply_headscale_policy.sh` through `SITE_ENV_FILE` (`:10`).
+- Produces: `docs/STAGING.md` with the sections 1-7 listed in Step 3, and the placeholder names from decision 6.
+
+- [ ] **Step 1: Write the failing test**
+
+```python
+# tests/test_cloud_docs.py
+STAGING = ROOT / "docs" / "STAGING.md"
+
+# Catches the staging runbook losing a setting that keeps staging off production.
+def test_staging_runbook_keeps_its_safety_settings_and_placeholders():
+    text = STAGING.read_text()
+    for required in ("ORPHAN_REAPER_ENABLED=false", "FIXED_NODE=<STAGING_NODE>",
+                     "LAB_BRIDGE=<STAGING_BRIDGE>", "VMID_RANGE=<STAGING_VMID_RANGE>",
+                     "bridge-ports none", "--accept-routes", "SITE_ENV_FILE="):
+        assert required in text, required
+    assert not REAL_ID_PATTERNS.search(text)
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run: `uv run python -m pytest "tests/test_cloud_docs.py::test_staging_runbook_keeps_its_safety_settings_and_placeholders" -q`
+Expected: FAIL, `docs/STAGING.md` does not exist.
+
+- [ ] **Step 3: Write `docs/STAGING.md`**
+
+It holds these sections. Commands are given exactly; prose is the implementer's.
+
+1. **Values.** A table of the decision 6 placeholders, plus `<STAGING_VPN_ADDR>` (the VPN VM's DHCP address), `<STORAGE>` and `<CLOUD_IMAGE>`. It notes that the real values live in the operator's notes, never in the repo.
+2. **The isolated bridge**, on `<STAGING_NODE>` as root:
+   ```bash
+   cp -a /etc/network/interfaces /root/interfaces.before-staging-bridge
+   ip -br link | grep -E '^vmbr0' > /root/vmbr0-link.before; ip -br addr | grep -E '^vmbr0' > /root/vmbr0-addr.before
+   cat >> /etc/network/interfaces <<'EOF'
+
+   # Staging lab trunk: no physical port, never uplinked (docs/STAGING.md).
+   auto <STAGING_BRIDGE>
+   iface <STAGING_BRIDGE> inet manual
+   	bridge-ports none
+   	bridge-stp off
+   	bridge-fd 0
+   	bridge-vlan-aware yes
+   	bridge-vids 2-4094
+   EOF
+   ifreload -a
+   diff <(ip -br link | grep -E '^vmbr0') /root/vmbr0-link.before \
+     && diff <(ip -br addr | grep -E '^vmbr0') /root/vmbr0-addr.before && echo vmbr0-unchanged
+   ip -br link show <STAGING_BRIDGE>; bridge link show | grep -c 'master <STAGING_BRIDGE>'
+   ```
+   Expected: `vmbr0-unchanged`, the bridge listed, and `0` member ports before any staging VM starts. Any other `vmbr0*` difference means: restore the backup, `ifreload -a`, and stop. To remove the bridge (only with no VM attached): restore the backup, `ifreload -a`, then `ip link del <STAGING_BRIDGE> 2>/dev/null`.
+3. **The staging VPN VM**, on `<STAGING_NODE>`. It has one NIC on the management VLAN and is never on the lab trunk. The `qm` lines mirror `scripts/jumpbox_provision.sh:113-123`:
+   ```bash
+   qm create <STAGING_VPN_VMID> --name staging-vpn --ostype l26 --cores 2 --memory 2048 --agent enabled=1 --onboot 1 \
+     --scsihw virtio-scsi-single --serial0 socket --vga serial0 --net0 virtio,bridge=vmbr0,tag=<MGMT_VLAN>
+   qm set <STAGING_VPN_VMID> --scsi0 <STORAGE>:0,import-from=<CLOUD_IMAGE>,discard=on --boot order=scsi0
+   qm resize <STAGING_VPN_VMID> scsi0 32G
+   qm set <STAGING_VPN_VMID> --ide2 <STORAGE>:cloudinit --ciuser ubuntu --sshkeys <PUBKEY_FILE> --ipconfig0 ip=dhcp
+   qm start <STAGING_VPN_VMID>
+   ```
+   - **Headscale.** A Docker Compose project in `/opt/headscale` whose service is named `headscale` (the name `scripts/apply_headscale_policy.sh:114` uses), pinned to the **same Headscale version as production**. Config:
+     - `server_url: http://<STAGING_VPN_ADDR>:8080` and `listen_addr: 0.0.0.0:8080`;
+     - policy `mode: file`, `path: /etc/headscale/acl.json`, with `/etc/headscale` a **directory** bind mount;
+     - the default DERP map, or the embedded DERP server if the management VLAN has no internet.
+
+     Create the users `staging-infra`, `zz-a` and `zz-b`. The staging base policy is a copy of `config/headscale-acl.example.json` with `tag:jumpbox` owned by `staging-infra@` and no staff members. It is kept in the operator's notes, never in the repo. [Verify on first build that Tailscale clients accept a plain-HTTP login server; if they do not, front Headscale with TLS and trust its CA in the clients.]
+   - **Two students**, as two containers, each with its own network namespace and its own `tailscaled`. The auth key is written by the shell builtin `printf`, so it never appears in a process's argv:
+     ```bash
+     for s in zz-a zz-b; do
+       read -rs -p "pre-auth key for $s: " KEY; echo
+       install -m 600 /dev/null /root/$s.env && printf 'TS_AUTHKEY=%s\n' "$KEY" > /root/$s.env; unset KEY
+       docker run -d --name $s --hostname $s --restart unless-stopped --cap-add NET_ADMIN --device /dev/net/tun \
+         -v $s-state:/var/lib/tailscale --env-file /root/$s.env -e TS_STATE_DIR=/var/lib/tailscale -e TS_USERSPACE=false \
+         -e TS_EXTRA_ARGS="--login-server=http://<STAGING_VPN_ADDR>:8080 --accept-routes" tailscale/tailscale:<PINNED>
+     done
+     ```
+     Once `headscale nodes list` shows both, run `shred -u /root/zz-a.env /root/zz-b.env`. The state volumes keep the nodes.
+4. **The staging jumpbox: the production adoption's rehearsal.** Use an operator-owned staging `site.env` kept outside the checkout (for example `~/staging/site.env`, passed as `SITE_ENV_FILE=`). It sets:
+   - `JUMPBOX_NODE=<STAGING_NODE>`, `JUMPBOX_VMID=<STAGING_JUMPBOX_VMID>`, `JUMPBOX_NAME=staging-jumpbox`;
+   - `JUMPBOX_BRIDGE=vmbr0`, `JUMPBOX_MGMT_VLAN=<MGMT_VLAN>`, `JUMPBOX_TRUNK_BRIDGE=<STAGING_BRIDGE>`;
+   - `HEADSCALE_URL=http://<STAGING_VPN_ADDR>:8080`, `JUMPBOX_VLAN_BANDS="<band string>"`;
+   - the policy keys of section 6.
+
+   Then follow `docs/JUMPBOX.md` §1-3 exactly: `jumpbox_provision.sh` dry run then `--apply`; `jumpbox_configure.sh` dry run then `--apply`; `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`); `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`; then `--apply --no-try --isolate-vlans`. The checks after `--apply` are Task 8 Step 7's: 401 VLAN interfaces, 401 `dhcp-range` lines, `vlan200` = `10.100.1.1/24`, dnsmasq and tailscaled active. Task 8 Step 8's J2 check also applies. **Record every difference from the docs.** A generic error is fixed in this repo; a site-specific one goes in the operator's notes.
+5. **The staging portal.** Follow `docs/LOCAL_TEST_INSTANCE.md` (development stack, local override, dedicated short-lived token, reaper proven off), but check out the **branch or release under test**. Its `.env` adds:
+   `FIXED_NODE=<STAGING_NODE>`, `ENABLE_LOAD_BALANCING=false`, `LAB_BRIDGE=<STAGING_BRIDGE>`, `VMID_RANGE=<STAGING_VMID_RANGE>`, `JUMPBOX_VLAN_BANDS="<band string>"`, `ENABLED_BACKENDS=proxmox`, `VPN_LOGIN_SERVER=http://<STAGING_VPN_ADDR>:8080`, `ORPHAN_REAPER_ENABLED=false`.
+
+   That guide's step 2 (clearing a VLAN pair against production) and step 8 (setting the pair by SQL) do not apply: the isolated bridge carries no production VLAN. `data/students_merged.csv` holds `zz-a` and `zz-b`, which are seeded as 100/200 and 101/201. `templates.yaml` has one enabled individual group, `staging-two-machine`, with two distinct entries:
+   - `srv01` (`entry_point: true`) and `dc01` (plain);
+   - both point at a small Linux template on `<STAGING_NODE>` that has `sshd` and the QEMU guest agent;
+   - `template_locations` names `<STAGING_NODE>` only.
+
+   **Precondition, on a node:** both of these hold, otherwise choose another range with the instructor:
+   - `pvesh get /cluster/resources --type vm --output-format json | jq --argjson lo <min> --argjson hi <max> '[.[] | select(.vmid >= $lo and .vmid <= $hi)] | length'` prints `0`;
+   - `jq 'map(.vmid) | max'` on the same output is above `<max>`.
+
+   A staging guest that became the cluster's highest VMID would raise production's next VMIDs for good. The same reasoning applies to the two staging VMIDs.
+6. **The staging policy.** The staging `site.env` also sets:
+   - `PORTAL_HOST=<STAGING_PORTAL_HOST>`, `PORTAL_APP_CONTAINER=proxmox-vm-automation` (`docker-compose.yml:4`);
+   - `HEADSCALE_HOST=<staging VPN VM ssh>`, `HEADSCALE_DIR=/opt/headscale`;
+   - `HEADSCALE_BASE_POLICY=<staging base policy path>`, `HEADSCALE_POLICY_FILE=/etc/headscale/acl.json`.
+
+   Run `SITE_ENV_FILE=~/staging/site.env scripts/apply_headscale_policy.sh`, then the same with `--apply`. Expected: `verified: the policy file Headscale serves matches the rendered one.` Re-run after every staging roster or VLAN change.
+7. **The acceptance test** (repeatable). Then **Stop, start, reset, remove**:
+   - **Stop:** destroy staging deployments through the portal; `docker compose -f docker-compose.yml -f docker-compose.local.yml stop` on the portal host; `qm shutdown <STAGING_JUMPBOX_VMID>` and `qm shutdown <STAGING_VPN_VMID>`. The bridge stays.
+   - **Start:** `qm start` both VMs; `docker compose ... start`; section 6's dry run reports nothing to do.
+   - **Reset:**
+     1. Destroy the staging deployments, and check the section 5 range query lists no `student-zz-*` guest.
+     2. Run `docker compose ... down -v`, which wipes the staging database and with it the in-range high-water mark. Destroyed records keep their VMIDs, so a range of *n* VMIDs refuses with `VMIDRangeExhausted` after *n* deployments' worth of VMs; reset then.
+     3. Run `docker compose ... up -d` (`init_db.py` reseeds `zz-a`/`zz-b`), then section 6 again.
+     4. On the jumpbox, `jumpbox_configure.sh --apply` must report every file unchanged.
+   - **Remove** (instructor decision only): `qm destroy` both VMs, then remove the bridge as in section 2.
+
+   The acceptance test itself:
+   1. Record `git -C <checkout> rev-parse HEAD` on the portal host. Section 6's dry run reports nothing to do.
+   2. `zz-a` and `zz-b` each register (first use) and deploy `staging-two-machine`.
+   3. `pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.name // "" | test("^student-zz-(a|b)-")) | "\(.vmid) \(.name) \(.node)"'` lists exactly four guests, each inside `<STAGING_VMID_RANGE>` and on `<STAGING_NODE>`. `qm config <vmid> | grep ^net` shows `bridge=<STAGING_BRIDGE>` on every NIC:
+      - `srv01`: `net0` on the entry tag and `net1` on the internal tag;
+      - `dc01`: `net0` on the internal tag and no `net1`.
+   4. In `/var/lib/misc/dnsmasq.leases` on the staging jumpbox, each `srv01` holds two leases and each `dc01` one (match the MACs from step 3). A's addresses are in `10.100.0.0/24` and `10.100.1.0/24`; B's in `10.101.0.0/24` and `10.101.1.0/24`.
+   5. For each of A's three addresses, `docker exec zz-a ping -c2 -W2 <addr>` and `docker exec zz-a nc -w3 <addr> 22 </dev/null` both succeed. Both fail for each of B's three. Then the same with the roles reversed.
+   6. Read the J2 counter (`sudo nft list table inet jumpbox_vlan_isolation` on the staging jumpbox). From A's `dc01` (`qm guest exec <vmid> -- ping -c2 -W2 <B srv01 internal addr>`), there is no reply, and the counter rises.
+   7. Record the date, commit, four VMIDs and each result in the operator's staging log. Then destroy both deployments; step 3's query prints nothing.
+
+- [ ] **Step 4: Run the test and confirm it passes**
+
+Run: `uv run python -m pytest tests/test_cloud_docs.py -q`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add docs/STAGING.md docs/LOCAL_TEST_INSTANCE.md docs/JUMPBOX.md tests/test_cloud_docs.py
+git commit -m "Staging runbook: isolated bridge, staging jumpbox, Headscale and two-client acceptance"
+```
+
+- [ ] **Step 6 (operator, once): Build the stack**
+
+Build `docs/STAGING.md` sections 2-6 in order, with that section's expected outputs at each one. Run section 5's VMID precondition **before** section 3, because it covers the two staging VMIDs too. Record the rehearsal differences (section 4). This needs no production window. Nothing here touches production's VLANs, jumpbox, Headscale or database.
+
+- [ ] **Step 7 (operator, repeatable): Run the acceptance test**
+
+Run `docs/STAGING.md` section 7's acceptance test with the staging portal at the PR head. Expected: every line passes and is recorded. On any failure, fix it on the branch, redeploy the staging portal, and run again. The pass recorded at the final PR head is Task 8 Step 4's merge gate.
+
+---
+
+### Task 8: Release notes, merge, and the changeover rollout
 
 Steps 1-4 are done by the implementer. Steps 5-12 are **operator steps at the term changeover**, after the merge and never mid-term. The implementing agent does not run them.
 
 **Files:**
-- Modify: `CHANGELOG.md:13-70` (`[Unreleased]`: `### Changed` and `### Upgrade notes`)
+- Modify: `CHANGELOG.md:13-70` (`[Unreleased]`: `### Added`, `### Changed` and `### Upgrade notes`)
 
 - [ ] **Step 1: Write the CHANGELOG entries**
+
+Under `### Added`:
+- `LAB_BRIDGE` (default `vmbr0`) and `VMID_RANGE` (unset: unchanged allocation), which let a staging portal run on an isolated bridge in its own VMID range.
+- `docs/STAGING.md`, the permanent staging stack and its two-client acceptance test.
+- `scripts/audit_vlan_pairs.py`, which checks the exported VLAN pairs.
 
 Under `### Changed`:
 - The jumpbox serves each student's internal VLAN (200-299, `10.<N-100>.1.0/24`), and the entry band ends at 199.
 - The Headscale policy grants each student their own internal VLAN on every enabled backend.
 - The per-student pools are 100-199 and 200-299.
 - The importers, `migrate_add_vlan.py` and `term_changeover.sh` refuse a roster of more than 100 students before changing anything.
-- New `scripts/audit_vlan_pairs.py` checks the exported VLAN pairs.
 
 Under `### Upgrade notes`, **replace** the current first bullet (`CHANGELOG.md:65-67`, "No action. `VPN_MODE` defaults to …"). Its facts stay, but without "No action", because this release does need action: "`VPN_MODE` defaults to `headscale`, … existing security groups already match the default rule set." Keep the compose bullet (`:68-70`). Then add:
 - **Apply this release only at a term changeover.** Before deploying, run `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`. It must print `ok`.
@@ -638,6 +952,7 @@ Under `### Upgrade notes`, **replace** the current first bullet (`CHANGELOG.md:6
 - Re-run `jumpbox_configure.sh`; a hand-built jumpbox is adopted first (`docs/JUMPBOX.md`).
 - Set `internal_nic: false` on every single-machine individual entry point.
 - Re-run `scripts/apply_headscale_policy.sh`.
+- Leave `LAB_BRIDGE` and `VMID_RANGE` unset on production; `docker-compose.prod.yml` passes them through empty.
 - No database migration: stored tags do not change.
 
 - [ ] **Step 2: Check the CHANGELOG and run the full suite on Linux**
@@ -654,27 +969,37 @@ Expected: `unreleased-ok`, then PASS. This check is a one-off: a permanent test 
 
 - [ ] **Step 3: Cross-family review**
 
-Run a Codex review of the branch diff. Point it at `scripts/headscale_policy.py:139-205`, `scripts/jumpbox_netgen.py:35-115`, `app/vlan_allocator.py`, `scripts/init_db.py:230-299`, `scripts/migrate_add_vlan.py:182-249`, `scripts/build_students_merged.py:40-61` and `scripts/audit_vlan_pairs.py`, and ask for Critical/Important/Minor findings with file:line. Fix every Critical and Important finding, then repeat Step 2.
+Run a Codex review of the branch diff. Point it at:
+- `scripts/headscale_policy.py:139-205`, `scripts/jumpbox_netgen.py:35-115`;
+- `app/vlan_allocator.py`, `scripts/init_db.py:230-299`, `scripts/migrate_add_vlan.py:182-249`, `scripts/build_students_merged.py:40-61`, `scripts/audit_vlan_pairs.py`;
+- `app/proxmox_service.py:639-711`, `app/routes/vm_creation.py:162-246`, the `LAB_BRIDGE`/`VMID_RANGE` code in `app/config.py`, and `docs/STAGING.md`.
 
-- [ ] **Step 4: Commit, push, open the PR, and wait for green CI**
+Ask for Critical/Important/Minor findings with file:line. Fix every Critical and Important finding, then repeat Step 2.
+
+- [ ] **Step 4: Commit, push, open the PR, and wait for green CI and the staging pass**
 
 ```bash
 git add CHANGELOG.md
-git commit -m "Changelog: per-student internal VLANs"
+git commit -m "Changelog: per-student internal VLANs, staging settings"
 git push -u origin feature/individual-internal-vlans
 ```
-Open the PR against `main`. CI runs from the PR event (push CI does not cover `feature/*`). Expected: the "Unit Tests" and "Integration Tests" checks pass. Squash-merge after the instructor approves.
+Open the PR against `main`. CI runs from the PR event (push CI does not cover `feature/*`). Expected: the "Unit Tests" and "Integration Tests" checks pass, **and** Task 7 Step 7 has a recorded pass at the PR head. Squash-merge after the instructor approves.
 
 #### Operator rules for Steps 5-12
 
-- **Access check after every change.** The operator's student-access check (`check_student_access.py`, kept with the changeover isolation ticket) prints `student nodes: N; reach own /24: K; LOST own /24: L; also reach a foreign /24: F; filter entries on jumpbox: E`. It exits 1 when `L > 0`. It counts only Headscale nodes of roster logins: users without nodes, staff and `zz-*` are skipped. It also tests only each student's **entry** /24, so 10g, not this check, proves the internal VLANs.
+- **Access check after every change.** The operator's student-access check (`check_student_access.py`, kept with the changeover isolation ticket) prints `student nodes: N; reach own /24: K; LOST own /24: L; also reach a foreign /24: F; filter entries on jumpbox: E`.
+  - It exits 1 when `L > 0`.
+  - It counts only Headscale nodes of roster logins: users without nodes, staff and `zz-*` are skipped.
+  - It tests only each student's **entry** /24. Internal VLANs are proven by the staging test (Task 7) and the smoke test (Step 11).
+
+  The expected results:
   - **Baseline (Step 5):** exit 0 and `L = 0`. Record `N` and `K`. A red baseline stops the rollout before anything changes.
-  - **After Steps 6, 7 and 8, and after the restore in 10h:** exit 0, and `N`, `K`, `L` exactly equal the baseline.
-  - **At 10e:** expected exit 1 with `reach own /24: 0` and `LOST own /24` equal to `student nodes`, which equals the baseline `N`.
-  - **After Step 11** (new roster, so `N` changes): exit 0 and `L = 0`.
+  - **After Steps 6, 7 and 8:** exit 0, and `N`, `K`, `L` exactly equal the baseline.
+  - **After Step 10** (new roster, so `N` changes): exit 0 and `L = 0`. Record `N` and `K` as the post-changeover baseline.
+  - **After Step 11's policy applies (11c and 11g):** exit 0 with the post-changeover counts.
 
   **At the first result that differs, stop and run Step 12 for every step done so far.**
-- **Procedure R: restore a Headscale policy file.** Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used (from the operator config). The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix (`:138-140`). Record `BACKUP_REF` and `BACKUP` in the changeover notes.
+- **Procedure R: restore a Headscale policy backup (rollback only).** Only Step 12 uses it, when the instructor wants the exact pre-changeover policy back rather than a re-render. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used. The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix (`:138-140`). `BACKUP_REF` is the `backup:` value that Step 10's policy stage printed.
   ```bash
   BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"; HOST_FILE="${BACKUP%.*}"
   STAMP=$(date -u +%Y%m%dT%H%M%SZ); printf 'ref=%s\nbackup=%s\nlive=%s\n' "$BACKUP_REF" "$BACKUP" "$HOST_FILE"
@@ -691,20 +1016,21 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
   python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' \
       "$HOST_FILE.$STAMP.readback" "$BACKUP" && echo restored
   ```
-  Expected: `restored`. If the read-back differs (a single-file bind mount keeps showing the old file), run `docker compose restart headscale` once, wait until `headscale policy get` answers, and repeat the read-back. If it still differs, stop and escalate: Headscale is not serving the restored file. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md:1042-1051`). The access check that follows is the proof of what is enforced.
+  Expected: `restored`. If the read-back differs (a single-file bind mount keeps showing the old file), run `docker compose restart headscale` once, wait until `headscale policy get` answers, and repeat the read-back. If it still differs, stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md:1042-1051`). The access check that follows is the proof of what is enforced.
 
 - [ ] **Step 5 (operator): Preconditions and pre-change records**
 
 All of these must hold before continuing:
-- The instructor has approved the window and decisions 5 and 6 at the top of this plan.
-- The term is over. The admin dashboard shows no live VM record, and the cluster holds no portal guest: on a Proxmox node, `pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.name // "" | test("^(student|group)-")) | "\(.vmid) \(.name)"'` prints nothing.
+- The instructor has approved the window and decision 5 at the top of this plan.
+- Task 7 Step 7 has a recorded pass at the merged commit.
+- The term is over. The admin dashboard shows no live VM record, and the cluster holds no production portal guest: on a Proxmox node, `pvesh get /cluster/resources --type vm --output-format json | jq -r '.[] | select(.name // "" | test("^(student|group)-")) | select(.name | test("^student-zz-") | not) | "\(.vmid) \(.name)"'` prints nothing. Staging's own `student-zz-*` guests are excluded; destroy them anyway before the changeover.
 - **J2 gate.** All three must hold:
   - J1 has been read after at least 7 days (counters and `journalctl -k --grep jb-xvlan`), and every cross-VLAN flow maps to staff or test traffic, with zero legitimate student or group flows.
   - The instructor has accepted that reading in the changeover isolation ticket.
   - The `--allow-vlans` list for KOTH or staff VLANs is decided, possibly empty.
 
   Otherwise stop the rollout here. Nothing has changed yet. Without J2 the AD labs do not ship (Global Constraints).
-- **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop. Either remove or renumber the offending rows, or run the term purge first: Step 11, then this audit again, then Steps 6-10 before the new term's students are told the VPN is open. Only after that may the jumpbox or the policy change.
+- **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop. Either remove or renumber the offending rows, or run the term purge first: Step 10, then this audit again, then Steps 6-9 before the new term's students are told the VPN is open. Only after that may the jumpbox or the policy change.
 - **Lab subnets clear of the management side.** On the jumpbox, with `jumpbox_netgen.py` copied to `jumpbox/`:
   ```bash
   ip -4 -j route show table all | python3 -c '
@@ -725,12 +1051,12 @@ All of these must hold before continuing:
 
 - [ ] **Step 6 (operator): Deploy the portal**
 
-Deploy the merged release, with `JUMPBOX_VLAN_BANDS` set to the new string in `.env` (or the line removed), and recreate `vm-automation`.
+Deploy the merged release, with `JUMPBOX_VLAN_BANDS` set to the new string in `.env` (or the line removed), and `LAB_BRIDGE`/`VMID_RANGE` absent. Recreate `vm-automation`.
 Verify: `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | jq -r .config.jumpbox_vlan_bands` prints the Global Constraints string. Then run the access check.
 
 - [ ] **Step 7 (operator): Adopt the jumpbox**
 
-Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an interactive console session, with `scripts/site.env` carrying the same band string. Never start `nftables.service`.
+Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an interactive console session, with `scripts/site.env` carrying the same band string. Never start `nftables.service`. Read the rehearsal differences recorded in Task 7 Step 6 first.
 - Before moving the hand-built files aside, compare them with the rendered netplan (`python3 jumpbox/jumpbox_netgen.py netplan --bands "<band string>" --mgmt-if <mgmt> --trunk-if <trunk>`). The only VLAN differences must be `vlan200` moving from `10.200.0.1/24` to `10.100.1.1/24`, the new `vlan201`-`vlan299`, and `vlan500`.
 - After `--apply`:
   - `ip -br addr show vlan200` lists only `10.100.1.1/24`. If `10.200.0.1/24` is still there, run `sudo ip addr del 10.200.0.1/24 dev vlan200`, then `ip -br addr show vlan200` again; it must list only `10.100.1.1/24`.
@@ -752,60 +1078,60 @@ Then run the access check. **If J2 is not applied, the AD labs do not ship** (Gl
 
 Every enabled individual group with a single machine sets `internal_nic: false` on its entry point.
 
-- [ ] **Step 10 (operator): Staging acceptance**
+- [ ] **Step 10 (operator): Run the changeover**
 
-Run this before the new roster is seeded. Sub-steps a-h run in order.
-
-**a. Freeze production.** On the portal host, run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> stop vm-automation`. Verify that `docker inspect --format '{{.State.Status}}' <PORTAL_APP_CONTAINER>` prints `exited`. Do not record `MAX0` until it does. Nothing can deploy or allocate a VMID while the container is stopped, and it stays stopped until 10h.6.
-
-**b. Record the cluster.** On a Proxmox node:
-- `MAX0=$(pvesh get /cluster/resources --type vm --output-format json | jq 'map(.vmid) | max')`. Write the value down.
-- `pvesh get /cluster/resources --type vm --output-format json | jq -r '.[].name // empty' | grep -E '^student-zz-(a|b)-'` prints nothing.
-
-**c. Set up the staging portal:**
-- Run `docker-compose.prod.yml` on a non-production host with its own MySQL, and an `.env` with `ENABLED_BACKENDS=proxmox`, `ORPHAN_REAPER_ENABLED=false` (it must never sweep production's guests), the new bands, and the production Proxmox API credentials.
-- Its `data/students_merged.csv` holds two test logins, `zz-a` and `zz-b`. They are seeded as 100/200 and 101/201, which are free because Step 5 found no portal guest.
-- Its `templates.yaml` has one enabled individual group with **two distinct template entries**, `srv01` (`entry_point: true`) and `dc01` (plain). They may point at the same small Linux source VMID. `template_locations` names only the node that does **not** host the jumpbox, so the traffic crosses the inter-node trunk.
-- Its `scripts/site.env` copy points `PORTAL_HOST` and `PORTAL_APP_CONTAINER` at the staging portal.
-
-**d. VPN clients.** Create Headscale users `zz-a` and `zz-b`, and join one VPN client as each.
-
-**e. Apply the staging policy.** Run `SITE_ENV_FILE=<staging site.env> scripts/apply_headscale_policy.sh --apply`. **Record the whole `backup:` value it prints** (`<HEADSCALE_HOST>:<path>`) as Procedure R's `BACKUP_REF`. That file is the production policy as it was before staging. Run the access check. Expected, exactly: exit 1, `reach own /24: 0`, and `LOST own /24` equal to `student nodes`, equal to the baseline `N`. That proves the staging policy is the one enforced. Any other result: run Procedure R with that value, then 10h's cleanup, and stop.
-
-**f. Deploy.** Each test student registers and deploys the group. Verify on a Proxmox node: `pvesh get /cluster/resources --type vm --output-format json | jq -r --argjson m "$MAX0" '.[] | select(.vmid > $m) | "\(.vmid) \(.name)"'` lists exactly four guests: `student-zz-a-srv01`, `student-zz-a-dc01`, `student-zz-b-srv01` and `student-zz-b-dc01`.
-
-**g. Pass criteria.** Pass only if all of these hold:
-- Each `srv01` holds two leases and each `dc01` one: check the MACs in `/var/lib/misc/dnsmasq.leases`.
-- Client A reaches (ping and tcp/22) all three of A's addresses: `srv01` on `10.100.0.0/24` and `10.100.1.0/24`, and `dc01` on `10.100.1.0/24`. Client B likewise reaches all three of B's addresses on `10.101.0.0/24` and `10.101.1.0/24`.
-- Neither client reaches any address of the other student.
-- From A's `dc01`, B's machines do not answer, and the J2 drop counter rises.
-
-**h. Cleanup, on a pass and on a failure alike.** A failure can come before 10e, so each item runs only if its step happened; item 6 always runs.
-1. Only if 10e installed the staging policy: run Procedure R with the `BACKUP_REF` recorded in 10e. Expected: `files-ok`, then `restored`.
-2. Only if item 1 ran: run the access check. Expected: exit 0, with `N`, `K` and `L` exactly the baseline's. If not, stop, keep the staging state for diagnosis, and escalate: production students are locked out until this passes.
-3. Only if deployments were created: destroy them through the staging portal. The 10f query must then list nothing above `MAX0`.
-4. Stop the staging portal if it was started.
-5. Delete whichever test nodes, then test users, were created in Headscale.
-6. Start production: `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> start vm-automation`. Verify that within 90 s `docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' <PORTAL_APP_CONTAINER>` prints `healthy` (the probe `scripts/term_changeover.sh:413-422` uses), and that `/auth/health` answers.
-
-If 10g failed, continue with Step 12.
-
-- [ ] **Step 11 (operator): Run the changeover**
-
-Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Its stage 4 applies the production policy (P2) for the new roster.
+Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Its stage 4 applies the production policy (P2) for the new roster. **Record the `backup:` value that stage prints** (Procedure R's `BACKUP_REF`). If it scrolled away, use the newest `<policy file>.<YYYYmmddTHHMMSSZ>` on the Headscale host, prefixed with `<HEADSCALE_HOST>:`.
 Verify:
 - The dry run of `scripts/apply_headscale_policy.sh` reports nothing to do.
 - The Step 5 audit, re-run, prints `ok`.
 - The access check exits 0 with `LOST own /24: 0`.
 
+- [ ] **Step 11 (operator): Production smoke test with one `zz-` user**
+
+Run this after Step 10, before students are told the VPN is open. It uses the normal policy apply; nothing is swapped.
+
+**a. A two-machine group.** Use an enabled individual group with an entry point and a plain machine, if production has one. Otherwise add a temporary enabled group `zz-internal-vlan-smoke`, shaped like `templates.example.yaml`'s `two-machine-individual-example`, with a small Linux template present on the production nodes. Then run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> restart vm-automation` and wait for `healthy` (the probe at `scripts/term_changeover.sh:413-422`).
+
+**b. The test login.**
+1. Write `data/zz-smoke.csv` (`SIS User ID,SIS Login ID` / `0,zz-smoke`) into the portal's `data/` directory.
+2. Run `docker exec <PORTAL_APP_CONTAINER> python scripts/import_students.py /app/data/zz-smoke.csv`. Note the pair it prints, `<E>/<E+100>`.
+3. Re-run the Step 5 audit. It must print `ok`.
+
+**c. Policy.** `scripts/apply_headscale_policy.sh` (dry run) shows only the `zz-smoke@` forward and reverse rules added. Then run `--apply`, followed by the access check.
+
+**d. VPN client.** On production Headscale, create the user `zz-smoke` and a one-hour pre-auth key. Join one client with `--accept-routes`, from a machine that is not on the staging tailnet.
+
+**e. Deploy.** Register `zz-smoke` at `/register` and deploy the group.
+
+**f. Pass criteria.** Pass only if all of these hold:
+- The production jumpbox's lease file holds the entry machine's two leases and the plain machine's one.
+- The client reaches (ping and tcp/22) the entry machine on `10.<E>.0.0/24` and both machines on `10.<E>.1.0/24`, and both gateways `10.<E>.0.1` and `10.<E>.1.1` answer ping.
+- For another roster student with entry `<X>`, neither `10.<X>.0.1` nor `10.<X>.1.1` answers.
+
+**g. Cleanup, on a pass and on a failure alike.** Skip any item whose step never ran.
+1. Destroy the deployment through the portal.
+2. Delete the `zz-smoke` node, then the user, in Headscale.
+3. Run:
+   ```bash
+   docker exec <MYSQL_CONTAINER> sh -c 'MYSQL_PWD="$MYSQL_PASSWORD" mysql -u"$MYSQL_USER" "$MYSQL_DATABASE" -e "
+     DELETE FROM student_whitelist WHERE login_id=\"zz-smoke\";
+     UPDATE users SET entry_vlan_tag=NULL, internal_vlan_tag=NULL, disabled=1 WHERE login_id=\"zz-smoke\";"'
+   ```
+   The user row is kept, disabled and untagged: its destroyed VM records reference it, and a tagged leftover would collide with the next student given that pair.
+4. Run `scripts/apply_headscale_policy.sh --apply`. Its diff removes only the `zz-smoke@` rules. Then run the access check.
+5. Re-run the Step 5 audit. It must print `ok`.
+6. If 11a added the temporary group, remove it and restart `vm-automation` as in 11a.
+7. `scripts/term_changeover.sh <canvas-export>.csv` (dry run) reports every stage complete.
+
+If 11f failed, continue with Step 12.
+
 - [ ] **Step 12 (operator): Rollback, if any check fails**
 
 Undo the steps already done, newest first, in this order. Skip any item whose step never ran.
 
-1. **Headscale policy.**
-   - If the staging policy is still installed, run Procedure R with the 10e `BACKUP_REF`.
-   - If Step 11 has run, then after item 4 below, run `scripts/apply_headscale_policy.sh --apply` from the previous release's checkout. It re-renders the new roster with entry-only grants.
-2. **J2.**
+1. **Smoke test.** Run 11g in full.
+2. **Headscale policy.** If Step 10 has run, then after item 5 below, run `scripts/apply_headscale_policy.sh --apply` from the previous release's checkout. It re-renders the new roster with entry-only grants. If the instructor wants the exact pre-changeover policy file back instead, use Procedure R with Step 10's `BACKUP_REF`.
+3. **J2.**
    ```bash
    sudo systemctl disable --now jumpbox-vlan-isolation.service   # ExecStop deletes the table
    sudo rm -f /etc/nftables.d/jumpbox-vlan-isolation.nft /etc/systemd/system/jumpbox-vlan-isolation.service
@@ -813,7 +1139,7 @@ Undo the steps already done, newest first, in this order. Skip any item whose st
    sudo nft list table inet jumpbox_vlan_isolation   # must fail: no such table
    ```
    If J1 existed in Step 5, restore it with `sudo nft -f /root/j1-before-j2.nft`. Then `sudo nft list table inet jumpbox_vlan_isolation` shows J1's log-only rules and no drop rule. J1 is transient, as it was before.
-3. **Jumpbox network files.** From the console:
+4. **Jumpbox network files.** From the console:
    ```bash
    sudo rm /etc/netplan/60-jumpbox-vlans.yaml /etc/dnsmasq.d/jumpbox.conf /etc/sysctl.d/90-jumpbox-router.conf
    sudo cp -a /root/jumpbox-before/netplan/. /etc/netplan/
@@ -837,7 +1163,7 @@ Undo the steps already done, newest first, in this order. Skip any item whose st
    - the cause of the failure cannot be attributed to the files above.
 
    A VM restore reboots the jumpbox, which clears J1 (reload it from `/root/j1-before-j2.nft`, which the backup contains) and the current DHCP leases.
-4. **Portal.** Redeploy the previous release with the old `JUMPBOX_VLAN_BANDS`, recreate `vm-automation`, and check that the export prints the old band string.
-5. Run the access check. It must match the Step 5 baseline.
+5. **Portal.** Redeploy the previous release with the old `JUMPBOX_VLAN_BANDS`, recreate `vm-automation`, and check that the export prints the old band string.
+6. Run the access check. It must match the Step 5 baseline, or the post-changeover baseline if Step 10 ran.
 
 No database rollback is needed: stored tags never changed. A half-rolled-back state, where the portal and the jumpbox use different bands, only leaves internal VLANs unreachable; no student can reach another student's networks.
