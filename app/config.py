@@ -539,7 +539,7 @@ def validate_config():
     if errors:
         raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
 
-    # Validate that group VLAN pools don't overlap user VLAN pools (100-200 entry, 200-300 internal).
+    # Validate that group VLAN pools don't overlap user VLAN pools (100-199 entry, 200-299 internal).
     # Treat MAX as exclusive (MIN == MAX is invalid, so [MIN, MAX) is the effective range).
     group_ranges_errors = []
     if GROUP_ENTRY_VLAN_MIN >= GROUP_ENTRY_VLAN_MAX:
@@ -548,11 +548,11 @@ def validate_config():
         group_ranges_errors.append("GROUP_INTERNAL_VLAN_MAX must be > GROUP_INTERNAL_VLAN_MIN")
     # Overlap with user entry pool [100, 200): non-overlap requires MIN >= 200 or MAX <= 100.
     if not (GROUP_ENTRY_VLAN_MIN >= 200 or GROUP_ENTRY_VLAN_MAX <= 100):
-        logger.warning("GROUP_ENTRY_VLAN range overlaps the user entry VLAN pool (100-200). "
+        logger.warning("GROUP_ENTRY_VLAN range overlaps the user entry VLAN pool (100-199). "
                        "Collisions will be rejected at allocation time.")
     # Overlap with user internal pool [200, 300): non-overlap requires MIN >= 300 or MAX <= 200.
     if not (GROUP_INTERNAL_VLAN_MIN >= 300 or GROUP_INTERNAL_VLAN_MAX <= 200):
-        logger.warning("GROUP_INTERNAL_VLAN range overlaps the user internal VLAN pool (200-300). "
+        logger.warning("GROUP_INTERNAL_VLAN range overlaps the user internal VLAN pool (200-299). "
                        "Collisions will be rejected at allocation time.")
     if group_ranges_errors:
         raise ValueError("Group VLAN config errors:\n  - " + "\n  - ".join(group_ranges_errors))

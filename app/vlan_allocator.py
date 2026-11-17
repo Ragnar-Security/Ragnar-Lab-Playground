@@ -2,7 +2,8 @@
 Centralized VLAN allocation for users and student groups.
 
 Scopes:
-    'user'  — entry 100-200, internal 200-300 (existing user pool)
+    'user'  — entry 100-199, internal 200-299. Student index i (0-99) gets
+             100+i / 200+i, so the pool holds 100 students.
     'group' — entry GROUP_ENTRY_VLAN_MIN-MAX, internal GROUP_INTERNAL_VLAN_MIN-MAX
              (from app.config, default 300-400 / 400-500)
 
@@ -18,8 +19,8 @@ from .config import (
     GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX,
 )
 
-USER_ENTRY_MIN, USER_ENTRY_MAX = 100, 200
-USER_INTERNAL_MIN, USER_INTERNAL_MAX = 200, 300
+USER_ENTRY_MIN, USER_ENTRY_MAX = 100, 199
+USER_INTERNAL_MIN, USER_INTERNAL_MAX = 200, 299
 
 
 class VlanPoolExhausted(Exception):
@@ -64,6 +65,17 @@ def _first_free(lo: int, hi: int, used: set) -> int:
         if tag not in used:
             return tag
     raise VlanPoolExhausted(f"No free VLAN in range {lo}-{hi}")
+
+
+def user_pair_for_index(index: int) -> Tuple[int, int]:
+    """Return the (entry, internal) pair of the student at `index` in the pool."""
+    if index < 0:
+        raise ValueError(f"Student index must not be negative: {index}")
+    if index > USER_ENTRY_MAX - USER_ENTRY_MIN:
+        raise VlanPoolExhausted(
+            f"Student index {index} is past the per-student pool of "
+            f"{USER_ENTRY_MAX - USER_ENTRY_MIN + 1}")
+    return USER_ENTRY_MIN + index, USER_INTERNAL_MIN + index
 
 
 def validate_vlan_free(tag: int, exclude_group_id: Optional[int] = None) -> None:

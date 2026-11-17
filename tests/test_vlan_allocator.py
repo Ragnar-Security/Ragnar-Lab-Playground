@@ -1,10 +1,15 @@
 """Tests for app.vlan_allocator — user and group VLAN allocation."""
 
 import unittest
+
+import pytest
+
 from app import create_app
 from app.models import db, User, StudentWhitelist, StudentGroup
 from app.vlan_allocator import (
     allocate_pair, validate_vlan_free, VlanPoolExhausted, VlanInUse,
+    USER_ENTRY_MIN, USER_ENTRY_MAX, USER_INTERNAL_MIN, USER_INTERNAL_MAX,
+    user_pair_for_index,
 )
 
 
@@ -51,6 +56,14 @@ class AutoAllocateTestCase(unittest.TestCase):
         entry, internal = allocate_pair(scope='user')
         self.assertEqual(entry, 102)
         self.assertEqual(internal, 202)
+
+    def test_auto_allocate_user_is_exhausted_after_one_hundred(self):
+        for i in range(100):
+            db.session.add(StudentWhitelist(login_id=f's{i}', entry_vlan_tag=100 + i,
+                                            internal_vlan_tag=200 + i))
+        db.session.commit()
+        with self.assertRaises(VlanPoolExhausted):
+            allocate_pair(scope='user')
 
     def test_pool_exhausted_raises(self):
         # Fill the group entry pool (300-400 inclusive = 101 slots)
@@ -172,3 +185,20 @@ class KothVlanCollisionTestCase(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_user_pools_are_disjoint_and_hold_one_hundred_students():
+    assert (USER_ENTRY_MIN, USER_ENTRY_MAX) == (100, 199)
+    assert (USER_INTERNAL_MIN, USER_INTERNAL_MAX) == (200, 299)
+
+
+@pytest.mark.parametrize('index, pair', [(0, (100, 200)), (42, (142, 242)), (99, (199, 299))])
+def test_user_pair_for_index_pairs_entry_with_internal(index, pair):
+    assert user_pair_for_index(index) == pair
+
+
+def test_user_pair_for_index_refuses_outside_the_pool():
+    with pytest.raises(VlanPoolExhausted):
+        user_pair_for_index(100)
+    with pytest.raises(ValueError):
+        user_pair_for_index(-1)
