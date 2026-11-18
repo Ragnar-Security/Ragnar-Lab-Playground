@@ -181,6 +181,17 @@ class VlanLayout:
         """Whether the jumpbox serves `tag`: it lies in some band."""
         return any(tag in band for band in self.bands)
 
+    @property
+    def canonical(self) -> str:
+        """The layout as one normalised string, bands ordered by first tag:
+        two specs that number and address every tag alike compare equal."""
+        return canonical_vlan_bands(self.bands)
+
+
+def canonical_vlan_bands(bands: Sequence[VlanBand]) -> str:
+    return " ".join(f"{b.name}:{b.first}-{b.last}:{b.offset}:{b.third}"
+                    for b in sorted(bands, key=lambda band: band.first))
+
 
 @functools.lru_cache(maxsize=8)
 def parse_vlan_layout(spec: str) -> VlanLayout:

@@ -207,4 +207,4 @@ def test_user_pair_for_index_refuses_outside_the_pool():
 def test_changeover_roster_cap_equals_the_user_vlan_pool():
     from scripts.build_students_merged import roster_max
     layout = vlan_layout()
-    assert roster_max() == layout.entry.size == layout.internal.size == 100
+    assert roster_max("") == layout.entry.size == layout.internal.size == 100

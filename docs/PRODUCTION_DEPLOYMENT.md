@@ -446,6 +446,13 @@ restart before this release.
 loop writes deletion-failure and orphan-reaped alerts there and delivers them
 from it, so the table must exist before the new code's first expiry pass.
 
+`migrate_add_vlan_layout_record.py` adds the `vlan_layout_record` table,
+which holds the `VLAN_BANDS` layout the stored student pairs were numbered
+under. The old code never reads it; the new code creates it at startup too
+and records the configured layout on its first start, after which startup
+refuses a changed layout while student pairs are stored
+(`docs/JUMPBOX.md`, "Address plan").
+
 `migrate_add_vm_backend.py` adds `backend`, `provider_id`, `deployment_id`
 and `network_slot` to `vm_records`, plus an index on `deployment_id`.
 Existing rows become `backend='proxmox'` through the column default. The new

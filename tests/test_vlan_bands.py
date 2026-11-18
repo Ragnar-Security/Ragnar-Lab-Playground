@@ -43,8 +43,10 @@ def _config():
 
 @pytest.fixture
 def custom(monkeypatch):
+    # The portal reads app.config.VLAN_BANDS. The environment is cleared so
+    # no standalone script can pass by reading it instead of its own input.
     monkeypatch.setattr(_config(), "VLAN_BANDS", CUSTOM)
-    monkeypatch.setenv("VLAN_BANDS", CUSTOM)
+    monkeypatch.delenv("VLAN_BANDS", raising=False)
 
 
 def _roster(path, count):
@@ -136,12 +138,44 @@ def test_a_custom_layout_drives_the_group_yaml_plan(app, custom):
         assert plan["vlan_allocations"]["red"] == (1100, 1150)
 
 
-def test_a_custom_layout_caps_the_changeover_roster(tmp_path, custom):
+def test_a_custom_layout_caps_the_changeover_roster(tmp_path, monkeypatch):
     from scripts.build_students_merged import read_canvas, roster_max
-    assert roster_max() == 50
-    assert len(read_canvas(_roster(tmp_path / "fifty.csv", 50))) == 50
+    monkeypatch.delenv("VLAN_BANDS", raising=False)
+    assert roster_max(CUSTOM) == 50 and roster_max("") == 100
+    assert len(read_canvas(_roster(tmp_path / "fifty.csv", 50), CUSTOM)) == 50
     with pytest.raises(SystemExit, match="51 students.*at most 50"):
-        read_canvas(_roster(tmp_path / "fifty-one.csv", 51))
+        read_canvas(_roster(tmp_path / "fifty-one.csv", 51), CUSTOM)
+
+
+def _keys(path, count):
+    path.write_text("".join(f"s{n:03d},s{n:03d}@example.test,key-{n}\n" for n in range(count)))
+    return str(path)
+
+
+# Catches the roster cap ignoring a layout set only in scripts/site.env: the
+# operator's shell does not export it, so only the file names it.
+def test_the_merge_tool_reads_the_cap_from_the_site_file_it_is_given(tmp_path):
+    import os
+    import subprocess
+    import sys
+    site = tmp_path / "site.env"
+    site.write_text(f'PORTAL_HOST=portal-host\nVLAN_BANDS="{CUSTOM}"\n')
+    env = {k: v for k, v in os.environ.items() if k != "VLAN_BANDS"}
+    tool = [sys.executable, str(ROOT / "scripts" / "build_students_merged.py")]
+
+    def merge(count, *layout):
+        return subprocess.run(
+            [*tool, *layout, _roster(tmp_path / f"c{count}.csv", count),
+             _keys(tmp_path / f"k{count}.csv", count), str(tmp_path / "out.csv")],
+            env=env, capture_output=True, text=True, timeout=30)
+
+    over = merge(51, "--site-env", str(site))
+    assert over.returncode != 0 and "51 students" in over.stderr and "at most 50" in over.stderr
+    assert not (tmp_path / "out.csv").exists()
+    assert merge(50, "--site-env", str(site)).returncode == 0
+    assert merge(51, "--bands", "").returncode == 0            # empty: the default 100
+    unnamed = merge(1)
+    assert unnamed.returncode != 0 and "--site-env" in unnamed.stderr
 
 
 def test_a_custom_layout_drives_the_seed(app, tmp_path, custom):
@@ -382,3 +416,96 @@ def test_startup_skips_the_check_before_the_tables_exist(app, monkeypatch, custo
     _start(app, monkeypatch)
     with app.app_context():
         db.create_all()
+
+
+# ---- the recorded layout: a change under stored pairs needs acceptance -----
+
+SHIFTED = ("entry:100-199:50:0 internal:200-299:100:1 "
+           "group-entry:300-399:200:2 group-internal:400-500:300:4")
+
+
+def _recorded(app):
+    from app.models import VlanLayoutRecord
+    with app.app_context():
+        row = db.session.get(VlanLayoutRecord, 1)
+        return row.bands if row is not None else None
+
+
+def test_the_first_start_records_the_layout(app, monkeypatch):
+    assert _recorded(app) is None
+    _start(app, monkeypatch)
+    assert _recorded(app) == parse_vlan_layout(DEFAULT).canonical == DEFAULT
+
+
+def test_an_offset_change_under_stored_pairs_refuses(app, monkeypatch):
+    _start(app, monkeypatch)
+    with app.app_context():
+        db.session.add(_student(StudentWhitelist, "alice", 100, 200))
+        db.session.commit()
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)  # every tag still in its band
+    with pytest.raises(ValueError, match=(r"(?s)recorded: " + re.escape(DEFAULT)
+                                          + r".*VLAN_BANDS: " + re.escape(SHIFTED)
+                                          + r".*accept_vlan_layout.py")):
+        _start(app, monkeypatch)
+    assert _recorded(app) == DEFAULT
+
+
+def test_a_layout_change_with_no_stored_pair_is_recorded(app, monkeypatch):
+    _start(app, monkeypatch)
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)
+    _start(app, monkeypatch)
+    assert _recorded(app) == SHIFTED
+
+
+def _accept(app, monkeypatch, *args):
+    from scripts import accept_vlan_layout
+    monkeypatch.setattr(accept_vlan_layout, "create_app", lambda **_: app)
+    return accept_vlan_layout.main(list(args))
+
+
+def test_accepting_a_layout_between_terms_records_it(app, monkeypatch, capsys):
+    _start(app, monkeypatch)
+    with app.app_context():
+        db.session.add(_student(StudentWhitelist, "alice", 100, 200))
+        db.session.commit()
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)
+    assert _accept(app, monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert "alice: entry VLAN 100: 10.100.0.0/24 -> 10.50.0.0/24" in out
+    assert "internal VLAN 200" not in out  # its subnet does not move
+    assert _recorded(app) == DEFAULT       # the dry run records nothing
+    assert _accept(app, monkeypatch, "--apply") == 0
+    assert _recorded(app) == SHIFTED
+    _start(app, monkeypatch)
+
+
+def test_accepting_a_layout_refuses_while_a_vm_is_live(app, monkeypatch, capsys):
+    from datetime import datetime
+    from app.models import VMRecord
+    _start(app, monkeypatch)
+    with app.app_context():
+        db.session.add_all([
+            _student(StudentWhitelist, "alice", 100, 200),
+            VMRecord(vmid=7000, vm_name="student-alice-srv01", vm_type="qemu", node="node-a",
+                     template_name="t", student_name="alice", expires_at=datetime.now())])
+        db.session.commit()
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)
+    assert _accept(app, monkeypatch, "--apply") == 1
+    assert "1 VM record(s) are live" in capsys.readouterr().err
+    assert _recorded(app) == DEFAULT
+
+
+def test_the_layout_migration_creates_the_model_table_and_is_idempotent(tmp_path):
+    from sqlalchemy import create_engine, inspect
+    from app.models import VlanLayoutRecord
+    spec = importlib.util.spec_from_file_location(
+        "migrate_add_vlan_layout_record", ROOT / "scripts" / "migrate_add_vlan_layout_record.py")
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    url = f"sqlite:///{tmp_path / 'm.db'}"
+    migration.run_migration(url)
+    migration.run_migration(url)
+    columns = {c["name"]: (str(c["type"]), c["nullable"])
+               for c in inspect(create_engine(url)).get_columns("vlan_layout_record")}
+    model = {c.name: (str(c.type), c.nullable) for c in VlanLayoutRecord.__table__.columns}
+    assert columns == model

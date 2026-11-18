@@ -143,7 +143,7 @@ HEADSCALE_SUMMARY_PY='import base64,contextlib,csv,hashlib,io,json,sys
 sys.path.insert(0, sys.argv[2])
 from scripts.build_students_merged import read_canvas
 with contextlib.redirect_stdout(sys.stderr):
-    students = read_canvas(sys.argv[1])
+    students = read_canvas(sys.argv[1], sys.argv[4])
 if not students:
     raise SystemExit("Canvas export has no real students")
 logins = [login for _, login in students]
@@ -185,7 +185,7 @@ DB_SUMMARY_PY='import base64,contextlib,csv,io,sys
 sys.path.insert(0, sys.argv[2])
 from scripts.build_students_merged import read_canvas
 with contextlib.redirect_stdout(io.StringIO()):
-    students = read_canvas(sys.argv[1])
+    students = read_canvas(sys.argv[1], sys.argv[3])
 lines = sys.stdin.buffer.read().splitlines()
 if len(lines) != 2:
     raise SystemExit("Portal inventory returned an invalid payload")
@@ -244,7 +244,7 @@ fetch_headscale_keys_b64() {
 read_headscale_summary() {
     local summary
     summary="$(fetch_headscale_payload | "$PYTHON" -c "$HEADSCALE_SUMMARY_PY" \
-        "$CANVAS" "$REPO_ROOT" "$HEADSCALE_KEEP_USER,$HEADSCALE_STAFF")" \
+        "$CANVAS" "$REPO_ROOT" "$HEADSCALE_KEEP_USER,$HEADSCALE_STAFF" "${VLAN_BANDS:-}")" \
         || die "Could not compare the Canvas and Headscale rosters."
     IFS=$'\t' read -r ROSTER_COUNT USERS_REMOVE USERS_CREATE KEYS_MISSING KEYS_EXTRA DESIRED_HASH <<< "$summary"
 }
@@ -349,7 +349,7 @@ fetch_portal_whitelist_b64() {
 read_db_summary() {
     local summary
     summary="$({ fetch_headscale_keys_b64; fetch_portal_whitelist_b64; } \
-        | "$PYTHON" -c "$DB_SUMMARY_PY" "$CANVAS" "$REPO_ROOT")" \
+        | "$PYTHON" -c "$DB_SUMMARY_PY" "$CANVAS" "$REPO_ROOT" "${VLAN_BANDS:-}")" \
         || die "Could not compare the portal whitelist with the roster."
     IFS=$'\t' read -r WHITELIST_CURRENT WHITELIST_DELETE WHITELIST_SEED WHITELIST_EXACT <<< "$summary"
 }
@@ -367,7 +367,9 @@ build_merged_file() {
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/term-changeover.XXXXXX")"
     ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "cat '$HEADSCALE_DIR/students_with_keys.csv'" > "$TMP_DIR/students_with_keys.csv"
     chmod 600 "$TMP_DIR/students_with_keys.csv"
-    "$PYTHON" "$BUILD_MERGED" "$CANVAS" "$TMP_DIR/students_with_keys.csv" "$TMP_DIR/students_merged.csv"
+    # VLAN_BANDS as load_site_env resolved it (environment, else site.env);
+    # empty means the default bands, as jumpbox_configure.sh reads it.
+    "$PYTHON" "$BUILD_MERGED" --bands "${VLAN_BANDS:-}" "$CANVAS" "$TMP_DIR/students_with_keys.csv" "$TMP_DIR/students_merged.csv"
     local count
     count="$("$PYTHON" -c 'import csv,sys; print(sum(1 for _ in csv.DictReader(open(sys.argv[1], encoding="utf-8"))))' "$TMP_DIR/students_merged.csv")"
     [[ "$count" == "$ROSTER_COUNT" ]] || die "The merged file has $count rows, not $ROSTER_COUNT."

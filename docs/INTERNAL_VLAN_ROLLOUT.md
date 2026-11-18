@@ -126,11 +126,12 @@ All of these must hold before continuing:
   --preflight` on its own must end with `preflight passed`.
 - **A free pair for the smoke test.** Section 6 imports one test login, and
   `scripts/import_students.py` gives it the pair after the current highest
-  roster pair. So the new roster must leave one pair free; from the repository
-  root, with `scripts/site.env` carrying the release's `VLAN_BANDS`:
+  roster pair. So the new roster must leave one pair free. From the repository
+  root, read the cap from the production `scripts/site.env` (the tool never
+  falls back to the shell's environment; name the file explicitly):
 
   ```bash
-  python3 -c 'import sys; sys.path.insert(0, "."); from scripts.build_students_merged import read_canvas, roster_max; n = len(read_canvas(sys.argv[1])); print(n, roster_max()); sys.exit(n >= roster_max())' <canvas-export>.csv
+  python3 -c 'import sys; sys.path.insert(0, "."); from scripts.build_students_merged import bands_from_site_env, read_canvas, roster_max; b = bands_from_site_env(sys.argv[2]); n = len(read_canvas(sys.argv[1], b)); print(n, roster_max(b)); sys.exit(n >= roster_max(b))' <canvas-export>.csv scripts/site.env
   ```
 
   It prints the roster size `n` and the pool size, and exits 0.
@@ -186,12 +187,17 @@ Deploy the release with `VLAN_BANDS` in `.env`: rename an existing
 `JUMPBOX_VLAN_BANDS` line to `VLAN_BANDS`, or remove it to take the default,
 and delete any `GROUP_ENTRY_VLAN_*` / `GROUP_INTERNAL_VLAN_*` line. Make the
 same change in `scripts/site.env`. Leave `LAB_BRIDGE` and `VMID_RANGE`
-absent. Recreate `vm-automation`.
+absent. Run the release's migrations first (`docs/PRODUCTION_DEPLOYMENT.md`
+step 3), including `migrate_add_vlan_layout_record.py`. Recreate
+`vm-automation`.
 
 Verify: `docker exec <PORTAL_APP_CONTAINER> python
 scripts/export_network_slots.py | jq -r .config.vlan_bands` prints the band
-string, and the portal started (it refuses to start while a stored student
-pair lies outside the bands). Then run the access check.
+string, and the portal started. On its first start it records that layout
+in the database; later starts refuse while a stored student pair lies
+outside the bands, or while `VLAN_BANDS` differs from the recorded layout
+and any student pair is stored (`docs/JUMPBOX.md`, "Address plan"). Then run
+the access check.
 
 ## 3. Adopt the jumpbox
 
@@ -349,25 +355,32 @@ with `--accept-routes`, from a machine that is not on the staging tailnet.
 
 **g. Deploy.** Register `$S` at `/register` and deploy the group.
 
-**h. Pass criteria.** Pass only if all of these hold. With the default bands
-the entry network is `10.<E>.0.0/24` and the internal one `10.<E>.1.0/24`;
-with another layout use the addresses `docs/JUMPBOX.md` derives for `<E>` and
-`<I>`.
+**h. Pass criteria.** Pass only if all of these hold. Derive the networks
+and gateways of `<E>` and `<I>` (and of another roster student's pair
+`<X>`/`<Y>`) from the layout, on the operator machine:
+
+```bash
+python3 -c 'import sys; sys.path.insert(0, "scripts"); import jumpbox_netgen as ng; b = ng.parse_bands(sys.argv[1]); [print(t, ng.gateway(t, b)) for t in map(int, sys.argv[2:])]' '<VLAN_BANDS value>' <E> <I> <X> <Y>
+```
+
+Each line is a tag and its gateway `<address>/24`: call them `<E-gw>`,
+`<I-gw>`, `<X-gw>` and `<Y-gw>`, and the /24s they lie in the entry,
+internal and foreign networks (with the default bands, `<E-gw>` is
+`10.<E>.0.1` and `<I-gw>` is `10.<E>.1.1`).
 
 - The production jumpbox's lease file holds the entry machine's two leases
   and the plain machine's one.
 - The client reaches (ping and tcp/22) the entry machine on the entry
   network and both machines on the internal network, and both gateways
-  (`10.<E>.0.1` and `10.<E>.1.1`) answer ping.
-- For another roster student with entry `<X>`, neither `10.<X>.0.1` nor
-  `10.<X>.1.1` answers.
+  `<E-gw>` and `<I-gw>` answer ping.
+- Neither `<X-gw>` nor `<Y-gw>` answers.
 - **No egress, no jumpbox SSH.** From the plain machine, on its Proxmox
   node, `qm guest exec <plain-machine-vmid> --timeout 20 -- sh -c 'ping -c2
   -W2 <mgmt-gateway>; nc -w3 -z <proxmox-node-mgmt-address> 8006'` gets no
   reply and no connection, and the counter in `sudo nft list table inet
   jumpbox_lab_egress` rises. `qm guest exec <plain-machine-vmid> --timeout
-  20 -- sh -c 'nc -w3 -z 10.<E>.1.1 22'` fails too (staff-only SSH), and the
-  `jumpbox_ssh` drop counter rises.
+  20 -- sh -c 'nc -w3 -z <I-gw> 22'` (the address, without `/24`) fails too
+  (staff-only SSH), and the `jumpbox_ssh` drop counter rises.
 
 **i. Cleanup, on a pass and on a failure alike.** Skip any item whose part
 never ran; the verification in item 8 always runs.

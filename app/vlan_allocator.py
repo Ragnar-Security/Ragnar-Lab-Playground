@@ -14,12 +14,14 @@ considered used.
 """
 
 import importlib
+from datetime import datetime
 import logging
 from typing import List, Literal, Optional, Tuple
 
 from sqlalchemy import inspect
+from sqlalchemy.exc import IntegrityError
 
-from .models import db, User, StudentWhitelist, StudentGroup, KothGame
+from .models import db, User, StudentWhitelist, StudentGroup, KothGame, VlanLayoutRecord
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +207,70 @@ def stored_vlan_problems() -> Tuple[List[str], List[str]]:
     return refusals, warnings
 
 
+def recorded_vlan_layout() -> Optional[str]:
+    """The canonical VLAN_BANDS the database records, or None when none is
+    recorded (or the table does not exist yet)."""
+    if not inspect(db.engine).has_table(VlanLayoutRecord.__tablename__):
+        return None
+    row = db.session.get(VlanLayoutRecord, 1)
+    return row.bands if row is not None else None
+
+
+def record_vlan_layout(bands: str) -> None:
+    """Record `bands` (canonical) as the layout of the stored pairs."""
+    row = db.session.get(VlanLayoutRecord, 1)
+    if row is None:
+        db.session.add(VlanLayoutRecord(id=1, bands=bands))
+    else:
+        row.bands, row.recorded_at = bands, datetime.now()
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # Another worker recorded it first; startup re-reads and compares.
+        db.session.rollback()
+
+
+def has_student_pairs() -> bool:
+    for model, _kind in _STUDENT_TABLES:
+        if _has_columns(model, 'entry_vlan_tag', 'internal_vlan_tag') and db.session.query(
+                model.id).filter((model.entry_vlan_tag.isnot(None))
+                                 | (model.internal_vlan_tag.isnot(None))).first():
+            return True
+    return False
+
+
+def check_vlan_layout_record() -> None:
+    """Compare VLAN_BANDS with the layout the database records. None
+    recorded: record it. Equal: nothing to do. Different: refuse while any
+    student pair is stored, because the same tags would then lie on other
+    subnets; with no stored pair, record the new layout."""
+    if not inspect(db.engine).has_table(VlanLayoutRecord.__tablename__):
+        return  # created by db.create_all / the migration; checked next start
+    current = vlan_layout().canonical
+    recorded = recorded_vlan_layout()
+    if recorded is None:
+        record_vlan_layout(current)
+        recorded = recorded_vlan_layout()
+    if recorded == current:
+        return
+    if has_student_pairs():
+        raise ValueError(
+            "VLAN_BANDS differs from the layout the stored student VLAN pairs were numbered "
+            f"under.\n  recorded: {recorded}\n  VLAN_BANDS: {current}\nEither restore the "
+            "recorded VLAN_BANDS, or, between terms with no live VM, review and accept the "
+            "new layout: python scripts/accept_vlan_layout.py (dry run, lists every student "
+            "network that moves), then python scripts/accept_vlan_layout.py --apply.")
+    logger.warning("VLAN_BANDS changed with no stored student pair; recording %s (was %s)",
+                   current, recorded)
+    record_vlan_layout(current)
+
+
 def check_stored_vlan_tags() -> None:
-    """Refuse to start when a stored student pair lies outside VLAN_BANDS,
-    so a changed layout cannot silently cut students off their labs; log
-    each group or KOTH VLAN outside every band."""
+    """Refuse to start when VLAN_BANDS changed under stored student pairs,
+    or a stored pair lies outside it, so a changed layout cannot silently
+    cut students off their labs; log each group or KOTH VLAN outside every
+    band."""
+    check_vlan_layout_record()
     refusals, warnings = stored_vlan_problems()
     for warning in warnings:
         logger.warning("%s", warning)

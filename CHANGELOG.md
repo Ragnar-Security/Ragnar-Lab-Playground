@@ -107,9 +107,17 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   than `group-entry` (each group takes one tag of each), a tag outside
   2-4094 or an invalid address, or, with `aws` or `gcp` enabled, a tag above
   cloud slot 500. It also refuses while a stored user or whitelist pair lies
-  outside the `entry`/`internal` bands, so a changed layout cannot cut
-  students off their labs. A group or KOTH game with an explicit VLAN outside
-  every band still starts, with a warning naming it.
+  outside the `entry`/`internal` bands, and while `VLAN_BANDS` differs from
+  the layout recorded in the new `vlan_layout_record` table and any student
+  pair is stored (a new offset can move in-band tags to other subnets); the
+  message names both layouts. The first start records the layout.
+  `scripts/accept_vlan_layout.py` (dry run by default) lists every student
+  network that moves and, with `--apply`, records the new layout; it refuses
+  while any VM record is live. A group or KOTH game with an explicit VLAN
+  outside every band still starts, with a warning naming it.
+- `scripts/build_students_merged.py` takes the VLAN layout explicitly,
+  `--site-env <path>` or `--bands <VLAN_BANDS>`, and refuses to run without
+  one; `term_changeover.sh` passes the `VLAN_BANDS` it loaded.
 - `scripts/apply_headscale_policy.sh` (every mode) refuses on a Proxmox site
   while the portal's exported `VLAN_BANDS` differs from `VLAN_BANDS` in
   `scripts/site.env` (else the default), the layout the jumpbox routes.
@@ -196,11 +204,16 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   names are no longer read. `docker-compose.prod.yml` (and the development
   `docker-compose.yml`, which passed no band setting before) now pass `VLAN_BANDS`;
   a site with its own compose file must pass it instead of
-  `JUMPBOX_VLAN_BANDS`. Startup refuses while a stored student pair lies
-  outside the configured `entry`/`internal` bands: change the layout only
-  between terms, or restore the old value. Update the portal and the
-  operator checkout together: the export's band key is now `vlan_bands`, and
-  `apply_headscale_policy.sh` refuses an export without it.
+  `JUMPBOX_VLAN_BANDS`. Run `scripts/migrate_add_vlan_layout_record.py` with
+  the other migrations (`docs/PRODUCTION_DEPLOYMENT.md` step 3); the first
+  start records the configured layout. Startup then refuses while a stored
+  student pair lies outside the `entry`/`internal` bands, or while
+  `VLAN_BANDS` differs from the recorded layout with student pairs stored:
+  change the layout between terms with `scripts/accept_vlan_layout.py`
+  (`docs/JUMPBOX.md`, "Address plan"), or restore the old value. Callers of
+  `build_students_merged.py` must add `--site-env` or `--bands`. Update the
+  portal and the operator checkout together: the export's band key is now
+  `vlan_bands`, and `apply_headscale_policy.sh` refuses an export without it.
 
 ## [1.1.0] - 2026-11-14
 

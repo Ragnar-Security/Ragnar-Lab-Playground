@@ -78,19 +78,36 @@ because something depends on it:
 - With `aws` or `gcp` enabled, no tag is above 500: a cloud gives each VLAN
   tag its own network slot, and slot 500 is the highest.
 - Every stored student pair (users and the whitelist) lies in the `entry`
-  and `internal` bands. Changing the layout while a term's roster is seeded
-  therefore refuses to start instead of cutting students off their labs:
-  change it between terms, or put the old value back.
+  and `internal` bands.
+- `VLAN_BANDS` equals the layout recorded in the database while any student
+  pair is stored. The portal records its layout on its first start (and
+  again whenever it changes with no pair stored). A changed layout can keep
+  every tag inside its band yet move it to another subnet (a new offset or
+  third octet), so startup refuses it, naming the recorded and the new
+  layout, instead of cutting students off their labs.
 
 The bands describe what the jumpbox serves. A group or KOTH game given an
 explicit VLAN outside every band is allowed, and startup names each one in
 a warning, but the jumpbox and the Headscale policy do not route it; that
 VLAN is the operator's to route.
 
-After changing `VLAN_BANDS`, set the same value in both files, restart the
-portal, re-run `jumpbox_configure.sh --apply` on the jumpbox, and re-run
-`scripts/apply_headscale_policy.sh --apply`, which refuses while the
-portal's exported bands and `scripts/site.env` differ.
+To change `VLAN_BANDS` while students are stored, do it between terms:
+
+1. Destroy every lab; the next step refuses while any VM record is live,
+   because a running lab keeps its old addresses.
+2. Set the new value in the portal's `.env` (it refuses to start until
+   step 4) and in `scripts/site.env`.
+3. The portal now refuses to start, so run the tool in a one-off container:
+   `docker compose -f <PORTAL_COMPOSE> run --rm vm-automation python
+   scripts/accept_vlan_layout.py`. This dry run prints the recorded and new
+   layouts and every student network that moves, `old subnet -> new subnet`.
+4. Re-run it with `--apply` to record the new layout, then restart the
+   portal, re-run `jumpbox_configure.sh --apply` on the jumpbox, and
+   re-run `scripts/apply_headscale_policy.sh --apply`, which refuses while
+   the portal's exported bands and `scripts/site.env` differ.
+
+With no student pair stored, setting the same value in both files and
+following step 4 from the restart is enough.
 
 Templates with a `static_mac` can get a fixed address on every network of
 one band, for example a domain controller at `.10` on each group-internal

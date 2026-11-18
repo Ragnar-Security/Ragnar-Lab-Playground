@@ -950,3 +950,16 @@ class PasswordResetFailure(db.Model):
         Index('ix_password_reset_failures_key', 'scope', 'key_hash', 'failed_at'),
         Index('ix_password_reset_failures_failed_at', 'failed_at'),
     )
+
+
+class VlanLayoutRecord(db.Model):
+    """The VLAN_BANDS layout the stored student pairs were numbered under:
+    one row (id 1), holding the canonical band string. Startup compares it
+    with the configured VLAN_BANDS, so a layout change that would move a
+    student's networks cannot take effect silently;
+    scripts/accept_vlan_layout.py records a new one between terms."""
+    __tablename__ = 'vlan_layout_record'
+
+    id = db.Column(db.Integer, primary_key=True)
+    bands = db.Column(db.String(1024), nullable=False)
+    recorded_at = db.Column(db.DateTime, nullable=False, default=datetime.now)

@@ -27,13 +27,18 @@ SIS User ID. The real example is "Student, Test", whose login is a 40-character
 hex digest. Such rows are dropped, and the script says how many it dropped.
 
 Usage:
-    python scripts/build_students_merged.py CANVAS KEYS OUT_CSV
+    python scripts/build_students_merged.py (--site-env PATH | --bands SPEC) CANVAS KEYS OUT_CSV
+
+The roster may hold at most as many students as the entry band of the VLAN
+layout has tags. Name the layout explicitly: --site-env reads VLAN_BANDS
+from that file (scripts/site.env; no VLAN_BANDS line means the default
+bands), --bands gives the string itself (empty means the default bands).
 """
 
 import argparse
 import csv
 import importlib.util
-import os
+import re
 import sys
 from pathlib import Path
 
@@ -52,11 +57,11 @@ def _load(name, path):
     return module
 
 
-def roster_max():
-    """How many students the portal can number: one VLAN pair each, so the
-    size of the entry band of VLAN_BANDS (from the environment or
-    scripts/site.env, else the jumpbox default)."""
-    spec = (os.environ.get('VLAN_BANDS') or '').strip()
+def roster_max(bands):
+    """How many students the portal can number under the VLAN layout `bands`
+    (a VLAN_BANDS string; empty means the default): one VLAN pair each, so
+    the size of its entry band."""
+    spec = (bands or '').strip()
     if not spec:
         spec = _load('_jumpbox_netgen', SCRIPTS / 'jumpbox_netgen.py').DEFAULT_BANDS
     slots = _load('_lab_network_slots', SCRIPTS.parent / 'app' / 'backends' / 'network_slots.py')
@@ -66,8 +71,31 @@ def roster_max():
         sys.exit(f"Error: VLAN_BANDS {error}")
 
 
-def read_canvas(path):
-    """Return [(uid, login)] for the real students in a Canvas export."""
+_SITE_BANDS = re.compile(r'\s*(?:export\s+)?VLAN_BANDS=(.*)')
+
+
+def bands_from_site_env(path):
+    """VLAN_BANDS as the site.env file at `path` sets it ('' when it has no
+    VLAN_BANDS line, which means the default bands)."""
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            lines = handle.read().splitlines()
+    except OSError as error:
+        sys.exit(f"Error: cannot read the site settings {path}: {error.strerror}")
+    bands = ''
+    for line in lines:
+        match = _SITE_BANDS.fullmatch(line)
+        if match:
+            value = match.group(1).strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
+                value = value[1:-1]
+            bands = value
+    return bands
+
+
+def read_canvas(path, bands):
+    """Return [(uid, login)] for the real students in a Canvas export, refusing
+    more than the VLAN layout `bands` can number (see roster_max)."""
     with open(path, 'r', encoding='utf-8-sig', newline='') as handle:
         reader = csv.DictReader(handle)
         have = set(reader.fieldnames or [])
@@ -87,7 +115,7 @@ def read_canvas(path):
 
     if dropped:
         print(f"Dropped {len(dropped)} row(s) with no SIS User ID: {', '.join(dropped)}")
-    cap = roster_max()
+    cap = roster_max(bands)
     if len(students) > cap:
         sys.exit(f"Error: {path} has {len(students)} students; the portal numbers "
                  f"at most {cap} (one VLAN pair each, from the entry band of VLAN_BANDS)")
@@ -114,12 +142,16 @@ def read_keys(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    layout = parser.add_mutually_exclusive_group(required=True)
+    layout.add_argument('--site-env', help='site.env whose VLAN_BANDS sets the roster cap')
+    layout.add_argument('--bands', help='the VLAN_BANDS string (empty: the default bands)')
     parser.add_argument('canvas', help='Canvas gradebook export')
     parser.add_argument('keys', help='headscale key file: login,email,key')
     parser.add_argument('out_csv', help='where to write students_merged.csv')
     args = parser.parse_args()
 
-    students = read_canvas(args.canvas)
+    bands = args.bands if args.bands is not None else bands_from_site_env(args.site_env)
+    students = read_canvas(args.canvas, bands)
     if not students:
         sys.exit(f"Error: {args.canvas} holds no student with a SIS User ID")
     keys = read_keys(args.keys)
