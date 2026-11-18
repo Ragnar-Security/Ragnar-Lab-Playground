@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -821,6 +822,25 @@ def test_watchdog_fails_loudly_and_restarts_at_most_once_per_interval(tmp_path):
     env["HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL"] = "0"
     later = _watchdog(env)
     assert later.returncode != 0 and _restarts(env) == 2
+
+
+# Catches a fresh fault left unrepaired for half an hour because an earlier
+# restart (which worked) is still inside the interval. Measured on staging: a
+# jumpbox reboot 24 minutes after a successful recovery left every student
+# without labs while the watchdog refused to restart. The limit is for faults
+# a restart does not fix; a healthy run in between ends it.
+def test_watchdog_healthy_run_ends_the_restart_interval(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path)
+    state = Path(env["HEADSCALE_WATCHDOG_STATE"])
+    state.parent.mkdir(parents=True)
+    state.write_text(f"{int(time.time()) - 60}\n")  # a restart one minute ago
+    healthy = _watchdog(env)
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    assert not state.exists()
+    env["PEERS"] = "after-restart"
+    fault = _watchdog(env)
+    assert fault.returncode == 0, fault.stdout + fault.stderr
+    assert _restarts(env) == 1
 
 
 # Catches a restart for a jumpbox whose own Tailscale is down, which no

@@ -14,7 +14,9 @@
 #   - devices are missing: restart Headscale once, check again, exit 0 if they
 #     are back. At most one restart per HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL
 #     seconds (default 1800): within it, a still-missing device only logs and
-#     exits 1, so a fault Headscale cannot fix never becomes a restart loop.
+#     exits 1, so a fault Headscale cannot fix never becomes a restart loop. A
+#     healthy run ends the interval, so a new fault after a recovery is repaired
+#     at once.
 # A portal without the proxmox backend has no jumpbox: the check is skipped.
 #
 # Settings come from scripts/site.env, as for apply_headscale_policy.sh:
@@ -85,6 +87,7 @@ fetch_nodes > "$TMP_DIR/nodes.json" || die "Could not list Headscale's nodes."
 
 missing=""
 if wait_for_peers; then
+    rm -f -- "$STATE_FILE"
     log "ok: the jumpbox lists every roster device as a peer."
     exit 0
 fi

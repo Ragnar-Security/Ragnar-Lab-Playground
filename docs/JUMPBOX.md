@@ -279,8 +279,9 @@ runs the same check on a timer and never writes or reloads the policy:
   It restarts at most once per `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL`
   seconds (default 1800). Within that interval a still-missing device only
   logs an error and exits 1, so a fault that a restart cannot fix never turns
-  into a restart loop. The time of the last restart is kept in
-  `HEADSCALE_WATCHDOG_STATE` (default
+  into a restart loop. A healthy run ends the interval, so a new fault after
+  a recovery (a jumpbox reboot, say) is repaired at the next run. The time of
+  the last restart is kept in `HEADSCALE_WATCHDOG_STATE` (default
   `~/.local/state/headscale-peer-watchdog/last-restart`).
 - Without the proxmox backend it logs that the check is skipped.
 

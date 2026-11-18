@@ -62,8 +62,9 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   minutes (`docs/JUMPBOX.md`, "Headscale peer watchdog"): the same peer check,
   with no policy write. When the jumpbox is Running but roster devices are
   missing, it restarts Headscale once, at most once per
-  `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL` (default 1800 seconds), and fails
-  loudly when that does not help or the jumpbox's Tailscale is down.
+  `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL` (default 1800 seconds) unless a
+  healthy run came in between, and fails loudly when that does not help or the
+  jumpbox's Tailscale is down.
 - `jumpbox_configure.sh` writes a dnsmasq drop-in,
   `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf`
   (`LimitNOFILE=65536`): with all 401 lab VLANs dnsmasq holds about 1,600
