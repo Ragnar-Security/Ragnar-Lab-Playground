@@ -62,9 +62,11 @@ The default dry run reads both hosts, prints the change, and writes nothing.
 Use --apply to check the policy inside the Headscale container, back up the
 current file, install the new one atomically, signal Headscale to reload it,
 and verify the read-back (restarting the headscale service once if it differs).
---apply then checks over SSH (JUMPBOX_SSH) that the jumpbox lists every
-roster device as a peer, waiting up to JUMPBOX_PEER_WAIT seconds; if any is
-missing it restarts Headscale once and checks again, and fails if one still is.
+With the proxmox backend enabled, --apply then checks over SSH (JUMPBOX_SSH,
+required) that the jumpbox lists every roster device as a peer, waiting up to
+JUMPBOX_PEER_WAIT seconds; if any is missing it restarts Headscale once and
+checks again, and fails if one still is. A portal without the proxmox backend
+has no jumpbox, and the check is skipped.
 EOF
 }
 
@@ -90,7 +92,6 @@ while (($#)); do
 done
 
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
-((APPLY == 0)) || require_site_var JUMPBOX_SSH
 [[ -f "$POLICY_TOOL" ]] || die "Policy renderer not found: $POLICY_TOOL"
 [[ -f "$HEADSCALE_BASE_POLICY" ]] || die "Base policy not found: $HEADSCALE_BASE_POLICY"
 
@@ -227,6 +228,10 @@ wait_for_peers() {
 
 verify_jumpbox_peers() {
     local missing=""
+    if ((PROXMOX_ENABLED == 0)); then
+        printf '  Proxmox jumpbox peer check skipped: proxmox backend not enabled.\n'
+        return 0
+    fi
     fetch_nodes > "$TMP_DIR/nodes.json" || die "Could not list Headscale's nodes."
     if ! wait_for_peers; then
         printf '  the jumpbox does not list these roster devices as peers; restarting Headscale once:\n'
@@ -247,6 +252,13 @@ printf 'Headscale policy: %s\n' "$([[ "$APPLY" == 1 ]] && printf APPLY || printf
 fetch_slots > "$TMP_DIR/slots.json" || die "Could not export network slots from the portal."
 "$PYTHON" "$POLICY_TOOL" render "$HEADSCALE_BASE_POLICY" "$TMP_DIR/slots.json" > "$TMP_DIR/desired.json" \
     || die "Could not render the Headscale policy."
+# The jumpbox serves only the Proxmox labs; a cloud-only portal has none to check.
+# The render above has already validated config.enabled_backends.
+PROXMOX_ENABLED="$("$PYTHON" -c 'import json, sys
+print(int("proxmox" in json.load(open(sys.argv[1]))["config"]["enabled_backends"]))' "$TMP_DIR/slots.json")" \
+    || die "Could not read the enabled backends from the portal's export."
+# Before any change: with Proxmox, a reload nothing can check is never applied.
+((APPLY == 0 || PROXMOX_ENABLED == 0)) || require_site_var JUMPBOX_SSH
 
 changes="$(policy_changes)"
 if [[ -z "$changes" ]]; then

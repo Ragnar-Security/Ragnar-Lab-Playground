@@ -1018,7 +1018,7 @@ Headscale host is an instructor step, not part of a deployment.
 
 `scripts/apply_headscale_policy.sh` reads `scripts/site.env`
 (`PORTAL_HOST`, `PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`;
-`JUMPBOX_SSH` for `--apply`; optional `HEADSCALE_BASE_POLICY`, default
+`JUMPBOX_SSH` for `--apply` with the proxmox backend; optional `HEADSCALE_BASE_POLICY`, default
 `config/headscale-acl.json`, `HEADSCALE_POLICY_FILE`, default
 `/etc/headscale/acl.json`, and `JUMPBOX_PEER_WAIT`, default 60 seconds):
 
@@ -1044,7 +1044,9 @@ knows must be one of its peers, because a device that is not cannot reach
 any lab. Headscale v0.27.1 has reloaded a policy and left the jumpbox with
 no peers at all. The script waits up to `JUMPBOX_PEER_WAIT` seconds,
 restarts Headscale once if a device is still missing, and fails, naming the
-devices, if one is missing after that.
+devices, if one is missing after that. Without the proxmox backend there is no
+jumpbox: the check is skipped, and says so (`Proxmox jumpbox peer check
+skipped: proxmox backend not enabled`), and `JUMPBOX_SSH` is not needed.
 
 **In file mode `headscale policy get` returns the policy file, not the
 policy Headscale has loaded.** A match therefore proves only that the file

@@ -663,16 +663,41 @@ def test_apply_policy_accepts_a_jumpbox_without_peers_when_no_student_has_a_devi
 
 
 # Catches --apply reloading Headscale with nothing able to check the result.
-def test_apply_policy_requires_the_jumpbox_ssh_target_only_to_apply(tmp_path):
+def test_apply_policy_requires_the_jumpbox_ssh_target_to_apply_with_proxmox(tmp_path):
     env, policy, original, _ = _policy_rig(tmp_path)
     env.pop("JUMPBOX_SSH")
     result = _apply_policy(env, "--apply")
     assert result.returncode != 0
     assert "JUMPBOX_SSH" in result.stderr
-    assert _log(env, "SSH_LOG") == ""
-    assert policy.read_text() == original
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
     dry = _apply_policy(env)
     assert dry.returncode == 0, dry.stderr
+
+
+CLOUD_ONLY_SLOTS = {**POLICY_SLOTS, "config": {**POLICY_SLOTS["config"], "enabled_backends": ["aws"]}}
+PEER_CHECK_SKIPPED = "  Proxmox jumpbox peer check skipped: proxmox backend not enabled."
+
+
+# Catches a cloud-only portal, which has no Proxmox jumpbox, being unable to
+# apply its policy at all.
+def test_apply_policy_skips_the_jumpbox_peer_check_without_proxmox(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert PEER_CHECK_SKIPPED in result.stdout.splitlines()
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, CLOUD_ONLY_SLOTS,
+                                                  *policy_inputs(CLOUD_ONLY_SLOTS)))
+    docker = _log(env, "DOCKER_LOG")
+    assert "nodes list" not in docker and "jumpbox status" not in docker and "restart" not in docker
+    # The matching-file path signals a reload too, and skips the same way.
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert PEER_CHECK_SKIPPED in again.stdout.splitlines()
 
 
 # ---- scripts/term_changeover.sh, fourth stage -------------------------------
@@ -867,3 +892,50 @@ def test_term_changeover_policy_stage_keeps_exported_policy_paths(tmp_path, expo
 
     assert result.returncode == 0, result.stderr
     assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected]
+
+
+# The policy stage's remote commands, which the combined rig runs against the
+# policy rig's docker and tailscale stubs; everything else is a stage 1-3 command.
+POLICY_STAGE_MARKERS = ("export_network_slots", "headscale policy", "ps -q headscale",
+                        "kill -s HUP", "restart headscale", "nodes list -o json", "tailscale status")
+
+
+# Catches the changeover's last stage failing on a cloud-only site, which has
+# no Proxmox jumpbox to check, after the roster has already been replaced.
+def test_term_changeover_stage_4_applies_a_cloud_only_policy_without_a_jumpbox(tmp_path):
+    (tmp_path / "policy").mkdir()
+    (tmp_path / "term").mkdir()
+    policy_env, policy, _, _ = _policy_rig(tmp_path / "policy", PEERS="never")
+    Path(policy_env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    repo, env, config, roster = _term_rig(tmp_path / "term")
+    # The real policy stage, reached through the path term_changeover.sh runs.
+    _executable(repo / "scripts" / "apply_headscale_policy.sh",
+                f'#!/usr/bin/env bash\nexec bash "{APPLY_POLICY}" "$@"\n')
+    term_bin = Path(env["PATH"].split(":", 1)[0])
+    (term_bin / "term_ssh.py").write_text(TERM_SSH_STUB)
+    _executable(term_bin / "ssh", f"""#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+while args and args[0] == "-o":
+    args = args[2:]
+command = " ".join(args[1:])
+if any(marker in command for marker in {POLICY_STAGE_MARKERS!r}):
+    with open(os.environ["SSH_LOG"], "a") as log:
+        log.write("ssh " + args[0] + " " + command + "\\n=====\\n")
+    os.execv("/bin/sh", ["sh", "-c", command])
+os.execv(sys.executable, [sys.executable, {str(term_bin / "term_ssh.py")!r}, *sys.argv[1:]])
+""")
+    policy_bin = policy_env["PATH"].split(":", 1)[0]
+    stage_env = {name: policy_env[name] for name in (
+        "HEADSCALE_DIR", "HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "HOST_POLICY", "HOST_DATA",
+        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK", "PEERS")}
+    env.update(stage_env, PATH=f"{term_bin}:{policy_bin}:{os.environ['PATH']}")
+    result = subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env, capture_output=True, text=True, timeout=120)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.index("[4/4] Headscale policy") < result.stdout.index(PEER_CHECK_SKIPPED)
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, CLOUD_ONLY_SLOTS,
+                                                  *policy_inputs(CLOUD_ONLY_SLOTS)))
+    assert "jumpbox status" not in _log(env, "DOCKER_LOG")
