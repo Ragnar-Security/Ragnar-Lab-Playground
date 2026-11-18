@@ -44,13 +44,14 @@ There is no dedicated staging node; the instructor approved the isolated bridge 
 production node. So staging is **network-isolated, not resource-isolated**:
 
 - **Isolated:** lab traffic. The staging bridge has no physical port, so a staging lab VM's only
-  router is the staging jumpbox, and the jumpbox's VLAN isolation (`--isolate-vlans`, section 4)
-  lets traffic routed from a lab VLAN leave only through `tailscale0`, toward the students'
-  devices. It drops what a lab VM routes toward another lab VLAN, the management VLAN, the
-  Proxmox API or the internet: without that table, the jumpbox forwarded a staging lab VM's
-  packets out of its management NIC (section 7 step 7 checks this). A lab VM can still reach
-  the jumpbox itself: DHCP and DNS, and SSH on its addresses. Staging uses its own Headscale and
-  its own portal database.
+  router is the staging jumpbox. The jumpbox's lab egress table (installed by every
+  `jumpbox_configure.sh --apply`, section 4) lets traffic routed from a lab VLAN leave only
+  through `tailscale0`, toward the students' devices. It drops what a lab VM routes toward the
+  management VLAN, the Proxmox API or the internet: without that table, the jumpbox forwarded a
+  staging lab VM's packets out of its management NIC (section 7 step 8 checks this). VLAN
+  isolation (`--isolate-vlans`) drops what a lab VM routes toward another lab VLAN (step 7).
+  Staff-only SSH closes the jumpbox's own SSH to lab VMs (step 8). Staging uses its own
+  Headscale and its own portal database.
 - **Shared with production:** `<STAGING_NODE>`'s CPU, memory and storage (production's admission
   sees staging guests as used memory); the cluster's VMID namespace; the Proxmox task log and
   cluster API; and the management VLAN, where the staging jumpbox and VPN VM have their management
@@ -262,7 +263,11 @@ each host the scripts run on:
 3. `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale
    (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`).
 4. `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`.
-5. `--apply --no-try --isolate-vlans`.
+5. `--apply --ssh-staff-only`, so a lab VM cannot SSH to the jumpbox. Staging has no staff
+   devices, so `JUMPBOX_SSH_STAFF_IPS` stays empty and SSH answers only on the management NIC and
+   loopback. Run it from an SSH session on the management address (its lockout guard keeps that
+   session).
+6. `--apply --no-try --isolate-vlans`.
 
 After `--apply`:
 
@@ -273,8 +278,13 @@ After `--apply`:
   1,600 sockets for 401 VLANs and does not start under the default 1,024;
 - `systemctl is-active dnsmasq snap.tailscale.tailscaled` prints `active` twice (the script installs
   Tailscale as a snap, so there is no `tailscaled` unit);
-- `sudo nft list table inet jumpbox_vlan_isolation` shows the drop rule, and
-  `systemctl is-enabled jumpbox-vlan-isolation.service` prints `enabled`.
+- `sudo nft list table inet jumpbox_lab_egress` shows `iifname "vlan*" oifname "vlan*" return` and
+  `iifname "vlan*" oifname != "tailscale0" counter drop`;
+- `sudo nft list table inet jumpbox_ssh` ends with `counter drop`;
+- `sudo nft list table inet jumpbox_vlan_isolation` shows `iifname "vlan*" oifname "vlan*" counter
+  drop`;
+- `systemctl is-enabled jumpbox-lab-egress.service jumpbox-ssh-filter.service
+  jumpbox-vlan-isolation.service` prints `enabled` three times.
 
 **Record every difference from the docs.** A generic error is fixed in this repository; a
 site-specific one goes in the operator's notes.
@@ -386,7 +396,8 @@ The staging `site.env` also sets:
   on the portal host itself, so that host must accept the operator's key;
 - `HEADSCALE_HOST=<staging VPN VM ssh>`, `HEADSCALE_DIR=/opt/headscale`;
 - `HEADSCALE_BASE_POLICY=<staging base policy path>`, `HEADSCALE_POLICY_FILE=/etc/headscale/acl.json`;
-- `JUMPBOX_SSH=ubuntu@<STAGING_JUMPBOX_ADDR>`, where `--apply` checks the jumpbox's peers.
+- `JUMPBOX_SSH=ubuntu@<STAGING_JUMPBOX_ADDR>`, where `--apply`, its `--preflight` and the watchdog
+  check the jumpbox's peers.
 
 ```bash
 SITE_ENV_FILE=~/staging/site.env scripts/apply_headscale_policy.sh            # dry run
@@ -409,6 +420,16 @@ So also run `--apply` after the jumpbox reboots or its Tailscale restarts. A sto
 none. To check by hand on the jumpbox:
 `tailscale status --json | python3 -c 'import json, sys; print(sorted(p["HostName"] for p in (json.load(sys.stdin).get("Peer") or {}).values()))'`
 lists `zz-a` and `zz-b`, and `tailscale status --json` shows `"BackendState": "Running"`.
+
+### Headscale peer watchdog
+
+Install `scripts/headscale_peer_watchdog.sh` as in `docs/JUMPBOX.md` "Headscale peer watchdog",
+on `<STAGING_PORTAL_HOST>`, the host that runs the policy script, with
+`SITE_ENV_FILE=<staging site.env>`. Its journal shows `ok: the jumpbox lists every roster device
+as a peer.` every 5 minutes. To prove it, restart the staging jumpbox's Tailscale
+(`sudo snap restart tailscale`). Within one timer interval the journal shows either `ok`, or the
+missing devices, one Headscale restart and `recovered: the jumpbox lists every roster device as a
+peer after one Headscale restart.`; the section 7 step 5 checks then pass again.
 
 ## 7. The acceptance test
 
@@ -451,23 +472,24 @@ VPN VM, and the lease and `nft` lines on the staging jumpbox.
       `reverse-ok-zz-a` in `out-data`. The same command against `<TB>` must return nothing.
    4. From B's `dc01`, `<TB>` must return `reverse-ok-zz-b` and `<TA>` nothing.
    5. Stop both listeners: `docker exec zz-a pkill -f 'nc -l -p 18080'`, and the same for `zz-b`.
-7. Read the J2 counters (`sudo nft list table inet jumpbox_vlan_isolation` on the staging jumpbox).
+7. Read the J2 counter (`sudo nft list table inet jumpbox_vlan_isolation` on the staging jumpbox).
    From A's `dc01` (`qm guest exec <vmid> -- ping -c2 -W2 <B srv01 internal addr>`), there is no
-   reply, and the first counter (`oifname "vlan*"`) rises.
-8. **No egress except the tailnet.** From A's `dc01`, each of these must fail:
+   reply, and the counter rises.
+8. **No egress except the tailnet, and no jumpbox SSH.** From A's `dc01`, each of these must fail:
 
    ```bash
    qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'ping -c2 -W2 <MGMT_GATEWAY>'
    qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'nc -w3 -z <STAGING_NODE_ADDR> 8006'
    qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'nc -w3 -z <STAGING_VPN_ADDR> 8080'
    qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'ping -c2 -W2 1.1.1.1; nc -w3 -z 1.1.1.1 443'
+   qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'nc -w3 -z 10.100.1.1 22; nc -w3 -z <STAGING_JUMPBOX_ADDR> 22'
    ```
 
-   and the second counter (`oifname != "tailscale0"`) rises by at least the probes' packets. A
-   failure alone proves nothing here: the jumpbox does no NAT, so before the table existed these
-   probes also failed for want of a return route, while `tcpdump -ni <jumpbox mgmt NIC> src <dc01
-   addr>` on the jumpbox showed every packet leaving. The counter is the evidence; so is a capture
-   that stays empty.
+   The counter in `sudo nft list table inet jumpbox_lab_egress` must rise by at least the first four
+   probes' packets, and the `jumpbox_ssh` drop counter by the last one's. A failure alone proves
+   nothing here: the jumpbox does no NAT, so before the table existed these probes also failed for
+   want of a return route, while `tcpdump -ni <jumpbox mgmt NIC> src <dc01 addr>` on the jumpbox
+   showed every packet leaving. The counter is the evidence; so is a capture that stays empty.
 9. Record the date, commit, four VMIDs, `TA`, `TB` and each result in the operator's staging log.
    Then destroy both deployments; step 3's query prints nothing.
 

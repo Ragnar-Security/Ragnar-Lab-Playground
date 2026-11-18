@@ -119,6 +119,7 @@ It writes:
 | `/etc/dnsmasq.d/jumpbox.conf` | `interface=vlan*` with `bind-dynamic`; `no-dhcp-interface` for the management NIC; `no-resolv` plus `JUMPBOX_DNS_UPSTREAM`; one `dhcp-range` per VLAN |
 | `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf` | `LimitNOFILE=65536`: dnsmasq opens a UDP and a TCP DNS socket for each VLAN's IPv4 and IPv6 link-local address, about 1,600 for the full band string, and fails with "Too many open files" at systemd's default soft limit of 1,024 |
 | `/etc/sysctl.d/90-jumpbox-router.conf` | `net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`, `rp_filter=2` |
+| `/etc/nftables.d/jumpbox-lab-egress.nft`, `/etc/systemd/system/jumpbox-lab-egress.service` | the lab egress table, enabled and started before forwarding is switched on (below) |
 
 Behaviour to know:
 
@@ -144,6 +145,49 @@ Behaviour to know:
 - **DNS is not exposed.** dnsmasq answers only on lab VLAN interfaces, so it
   is not a resolver on the management LAN or the tailnet, and it leaves
   systemd-resolved's stub listener alone.
+
+### Lab egress: routed lab traffic leaves only to the tailnet
+
+The jumpbox forwards whatever a lab VM hands it, and it does no NAT. Without a
+filter, a lab VM can send packets through the jumpbox's management NIC into
+the management LAN, the Proxmox API and the internet. Their replies usually
+find no way back, but the packets arrive: on staging, a lab VM's SYNs to the
+Proxmox API port and its NTP and HTTPS traffic were captured leaving the
+jumpbox. The Headscale policy cannot stop this, since the traffic never
+touches the tailnet.
+
+So every `--apply` installs `inet jumpbox_lab_egress`, with its own oneshot
+unit `jumpbox-lab-egress.service`, loaded before the network. It needs `nft`:
+`--apply` refuses without it, and the dry run notes it. The table has a
+forward hook at priority -10, policy accept, and two rules:
+
+```
+iifname "vlan*" oifname "vlan*" return
+iifname "vlan*" oifname != "tailscale0" counter drop
+```
+
+Routed lab traffic may go only to the tailnet; everything else that enters on
+a lab VLAN is counted and dropped. Lab VMs have no egress except the student's
+tailnet: no lab needs outbound internet during a lab session, and build-time
+package installs happen in the image builder, not in a lab session. Name
+lookups still work, because dnsmasq on the jumpbox answers them (input, not
+forwarding). VLAN-to-VLAN traffic is not this table's business: `return` ends
+its chain, and the separate VLAN isolation table below (`--isolate-vlans`, J2)
+decides it. From `tailscale0` to a VLAN, and the jumpbox's own DHCP and DNS,
+are untouched.
+
+**Verify:** from a lab VM, a ping to the management gateway gets no reply,
+and the counter in `sudo nft list table inet jumpbox_lab_egress` rises.
+Because the jumpbox does no NAT, a missing reply alone proves nothing; the
+counter does, as does an empty `sudo tcpdump -ni <mgmt-if> src <lab-vm-address>`.
+
+A lab VM can still reach the jumpbox itself (ping, and SSH on any of its
+addresses), which is input, not forwarding. `--ssh-staff-only` (below) closes
+SSH to everyone but staff; a changeover turns it on.
+
+**Reload, never restart** the unit (as for VLAN isolation below). Rolling it
+back is `sudo systemctl disable --now jumpbox-lab-egress.service` (ExecStop
+deletes the table), but the next `--apply` installs it again.
 
 ### Adopting a jumpbox that was built by hand
 
@@ -214,6 +258,71 @@ jumpbox is approved without a manual step:
 ```json
 "autoApprovers": { "routes": { "10.0.0.0/8": ["tag:jumpbox"] } }
 ```
+
+### Headscale peer watchdog
+
+Headscale v0.27.1 can leave the jumpbox with no peers: once after a policy
+reload and once after the jumpbox's Tailscale reconnected (staging). The
+jumpbox then routes for nobody, and no student reaches any lab, until Headscale
+restarts. `scripts/apply_headscale_policy.sh --apply` checks for this after
+every reload. A reconnect can happen at any time, though: a jumpbox reboot,
+a Tailscale upgrade, or a network blip. `scripts/headscale_peer_watchdog.sh`
+runs the same check on a timer and never writes or reloads the policy:
+
+- If every roster device is a peer of the jumpbox, it logs `ok` and exits 0.
+- If the jumpbox's Tailscale is not `Running`, it logs that and exits 1
+  without touching Headscale, since a restart cannot fix it.
+- If roster devices are missing, it restarts Headscale once and checks again.
+  It restarts at most once per `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL`
+  seconds (default 1800). Within that interval a still-missing device only
+  logs an error and exits 1, so a fault that a restart cannot fix never turns
+  into a restart loop. The time of the last restart is kept in
+  `HEADSCALE_WATCHDOG_STATE` (default
+  `~/.local/state/headscale-peer-watchdog/last-restart`).
+- Without the proxmox backend it logs that the check is skipped.
+
+It reads the same `scripts/site.env` as the policy script (`PORTAL_HOST`,
+`PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`, `JUMPBOX_SSH`), so
+run it on the operator host that runs that script. As a systemd timer every
+5 minutes, with `<checkout>` the repository checkout and `<user>` the account
+whose SSH key reaches the three hosts:
+
+```ini
+# /etc/systemd/system/headscale-peer-watchdog.service
+[Unit]
+Description=Restart Headscale once if the jumpbox has lost its roster peers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=<user>
+Environment=SITE_ENV_FILE=<checkout>/scripts/site.env
+ExecStart=<checkout>/scripts/headscale_peer_watchdog.sh
+```
+
+```ini
+# /etc/systemd/system/headscale-peer-watchdog.timer
+[Unit]
+Description=Check the jumpbox's Headscale peers every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now headscale-peer-watchdog.timer
+systemctl list-timers headscale-peer-watchdog.timer       # next run within 5 minutes
+journalctl -u headscale-peer-watchdog.service -n 20        # "ok: the jumpbox lists every roster device as a peer."
+```
+
+A failed run leaves the service `failed`, which `systemctl --failed` and any
+unit-failure alerting the host has will show. Treat it as "no student can
+reach a lab".
 
 ## Recommended security settings
 
@@ -340,15 +449,11 @@ a password.
 
 ### VLAN isolation
 
-The jumpbox is every lab VLAN's gateway, and it forwards whatever it is
-handed. Without this step a lab VM can reach another student's lab VM on
-another VLAN by routing through it, and it can send packets through the
-jumpbox's management NIC into the management LAN, the Proxmox API and the
-internet. The jumpbox does no NAT, so those packets arrive with the lab
-address and their replies usually find no way back, but they do arrive: a
-staging lab VM's SYNs to the Proxmox API port and its NTP and HTTPS to the
-internet were captured leaving the jumpbox. The Headscale policy cannot stop
-any of this: the traffic never touches the tailnet.
+The jumpbox is every lab VLAN's gateway, so without this step a lab VM can
+reach another student's lab VM on another VLAN by routing through it. The
+Headscale policy cannot stop that: the traffic never leaves the jumpbox.
+Traffic from a lab VLAN to anything else is the lab egress table's business
+(section 2), which every `--apply` installs.
 
 ```bash
 sudo jumpbox/jumpbox_configure.sh --isolate-vlans                         # dry run: shows the diff
@@ -360,26 +465,21 @@ This writes `/etc/nftables.d/jumpbox-vlan-isolation.nft` and
 `/etc/systemd/system/jumpbox-vlan-isolation.service` (a oneshot that loads the
 file before the network) and enables the unit. The file is its own table,
 `inet jumpbox_vlan_isolation`, with a forward hook at priority -10 and policy
-accept, holding two rules, each with its own counter: drop what enters on a
-`vlan*` interface and leaves on a `vlan*` interface, then drop what enters on
-a `vlan*` interface and leaves on anything but `tailscale0`. So routed lab
-traffic may go only to the tailnet. Traffic from `tailscale0` to a VLAN
-(students, staff), the jumpbox's own services (DHCP and DNS on the lab VLANs
-are input, not forwarding) and traffic inside one VLAN, which never crosses
-the jumpbox, are untouched. Lab VMs have no egress except the student's
-tailnet: no lab needs outbound internet during a lab session, and build-time
-package installs happen in the image builder, not in a lab session. Name
-lookups still work, since dnsmasq on the jumpbox answers
-them. A group's entry and internal networks are joined by the entry machine's
-second NIC, not by jumpbox routing, so group labs keep working. The ruleset is
-checked with `nft -c -f` first, and the script refuses when `nft` is missing.
-Have console or recovery access before the first `--apply`; `--no-try`
-applies a pending netplan change without the interactive `netplan try`.
+accept, holding one rule: count and drop what enters **and** leaves through a
+`vlan*` interface. Traffic between `tailscale0` and a VLAN (students, staff),
+the jumpbox's own traffic, and traffic inside one VLAN, which never crosses
+the jumpbox, are untouched. A group's entry and internal networks are joined
+by the entry machine's second NIC, not by jumpbox routing, so group labs keep
+working. The ruleset is checked with `nft -c -f` first, and the script
+refuses when `nft` is missing. Have console or recovery access before the
+first `--apply`; `--no-try` applies a pending netplan change without the
+interactive `netplan try`.
 
 **`--allow-vlans LIST`** (comma-separated tags and `first-last` ranges, tags
-2-4094; only with `--isolate-vlans`) exempts those VLANs from the
-VLAN-to-VLAN drop in both directions: an exempt VLAN may exchange traffic with
-every lab VLAN. It never opens the management side or the internet.
+2-4094; only with `--isolate-vlans`) exempts those VLANs from the drop in
+both directions: an exempt VLAN may exchange traffic with every lab VLAN. It
+never opens the management side or the internet, which the lab egress table
+keeps closed.
 KOTH players arrive over the tailnet, which the table never touches, so set
 it to the KOTH VLAN range only if KOTH boxes must reach each other across
 VLANs, or team VLANs must reach the KOTH VLANs. Re-run with the new list
@@ -387,9 +487,8 @@ whenever the KOTH tags change; a run without `--allow-vlans` removes every
 exemption.
 
 **Verify:** from a student device, your own lab VM still answers; from a lab
-VM, a VM on another VLAN does not, and the first drop counter in
-`sudo nft list table inet jumpbox_vlan_isolation` rises; a ping from a lab VM
-to the management gateway gets no reply, and the second counter rises.
+VM, a VM on another VLAN does not, and the drop counter in
+`sudo nft list table inet jumpbox_vlan_isolation` rises.
 
 **Reload, never restart.** The script swaps a changed table with
 `reload-or-restart` on the active unit (ExecReload loads the new table in one

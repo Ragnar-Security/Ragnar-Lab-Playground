@@ -1,6 +1,8 @@
 # Term changeover
 
-This procedure replaces one semester roster across Headscale and the production portal.
+This procedure replaces one semester roster across Headscale and the production portal, then
+applies the Headscale policy for the new roster. It runs four stages, in order: Headscale users and
+keys, the mounted roster file, the production database, and the Headscale policy.
 
 The script changes no Proxmox VM or template.
 
@@ -14,7 +16,12 @@ The script never touches a dojo repository.
 4. Set `PORTAL_HOST`, `PORTAL_DIR`, `PORTAL_COMPOSE`,
    `PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`,
    `HEADSCALE_KEEP_USER`, `HEADSCALE_STAFF`, `EMAIL_DOMAIN`, and
-   `REMOTE_BACKUP_DIR`.
+   `REMOTE_BACKUP_DIR`. **On a site with the proxmox backend, also set
+   `JUMPBOX_SSH`** (for example `ubuntu@<jumpbox-mgmt-address>`) and check
+   that `ssh -o BatchMode=yes <JUMPBOX_SSH> tailscale status --json` works from this
+   shell. Stage 4 checks the jumpbox's peers there, and `--apply` refuses
+   before stage 1 without it. A cloud-only site needs neither `JUMPBOX_SSH`
+   nor `JUMPBOX_PEER_WAIT`.
 5. Run the script from this repository root.
 6. Confirm that SSH reaches both production hosts.
 7. The roster holds at most 100 students, because each student gets one VLAN
@@ -81,6 +88,14 @@ Review every count before applying the change.
 ```bash
 scripts/term_changeover.sh --apply <canvas-export>.csv
 ```
+
+Before it changes anything, `--apply` runs the policy stage's preflight,
+`scripts/apply_headscale_policy.sh --preflight`. The preflight reads the portal's export. With the
+proxmox backend enabled, it also checks that `JUMPBOX_SSH` is set, answers over SSH, and reports
+`"BackendState": "Running"` (`[preflight] ... ready: the jumpbox (<JUMPBOX_SSH>) answers and its
+Tailscale is Running.`); a cloud-only site prints `Proxmox jumpbox peer check skipped: proxmox
+backend not enabled.` A failed preflight ends the run with `The policy stage's preflight failed;
+nothing was changed.` before stage 1 runs a single command.
 
 Run the dry command again after the apply command.
 
@@ -197,6 +212,23 @@ The script waits for a healthy container.
 
 It then compares every whitelist login, SIS ID, and Headscale key.
 
+### 4. Apply the Headscale policy
+
+The script runs `scripts/apply_headscale_policy.sh --apply` (`docs/CLOUD_BACKENDS.md`, "Apply the
+Headscale policy") against the roster stage 3 just seeded. It renders the per-student policy from the
+portal, checks it inside the Headscale container, and backs up the current policy file. The backup is
+printed as `backup: <HEADSCALE_HOST>:<policy-file>.<YYYYmmddTHHMMSSZ>`; record that line. It then
+installs the new file atomically, signals Headscale to reload it, and reads it back.
+
+With the proxmox backend, it then checks that the jumpbox lists every roster device as a peer. If
+any is missing, it restarts Headscale once and checks again. It must end with `verified: the jumpbox
+lists every roster device as a peer.` If a device is still missing, the stage fails, and no student
+can reach a lab until that is fixed. Headscale v0.27.1 has left the jumpbox peerless after a reload.
+Without the proxmox backend it prints the skip line instead.
+
+The dry run of this stage renders the policy from the roster the portal holds *now*. Before an
+apply that is the outgoing roster, so its diff is not the final one.
+
 ## Four failure traps
 
 ### Trap 1: A database purge is not a roster change
@@ -258,6 +290,18 @@ A second completed apply also skips every destructive stage.
 
 Use only the backup paths printed by the failed apply run. Replace each angle-bracket placeholder below with the corresponding value from `scripts/site.env`.
 
+Restore what the stages that ran changed, and nothing else. Stage 1 prints the Headscale database
+and key-file backups. Stage 2 prints the roster-file backups. Stage 3 prints the MySQL dump. Stage 4
+prints the policy backup (`backup:`). A stage that printed no backup changed nothing. Restore, in
+this order: Headscale, the roster files, MySQL (only if stage 3 purged or seeded), and then the
+policy. The policy goes last because it must match the roster you restored: an old policy with the
+new roster, or the reverse, names identities Headscale does not have. After the restore, the dry
+run with the *outgoing* term's export must report every stage `nothing to do`.
+
+If you instead finish the changeover forward, fix the cause (for example `JUMPBOX_SSH`) and run
+`--apply` again with the *incoming* export. A completed stage is a no-op on a re-run. The dry run
+with the incoming export must then report every stage, including stage 4, `nothing to do`.
+
 ### Restore Headscale
 
 Stop Headscale before restoring its SQLite database.
@@ -309,6 +353,28 @@ docker compose -f docker-compose.prod.yml restart vm-automation
 Wait for the portal health check.
 
 Run the dry command with the restored term export.
+
+### Restore the policy
+
+Only after Headscale and the roster files (and MySQL, if it was restored) match the roster you
+restored. Either re-render from the restored portal, which runs the same peer check:
+
+```bash
+scripts/apply_headscale_policy.sh --apply
+```
+
+or restore the exact file stage 4 backed up, on the Headscale host in `<headscale-dir>`, with
+`<backup>` the path after `backup: <headscale-host>:`:
+
+```bash
+docker compose exec -T headscale headscale policy check --file /dev/stdin < <backup>   # must exit 0
+cp -p <backup> <policy-file>.restoring && mv -f <policy-file>.restoring <policy-file>
+docker compose kill -s HUP headscale
+```
+
+After a restored file, check the jumpbox by hand. `tailscale status --json` there must show
+`"BackendState": "Running"` and the roster's devices among its peers. If it has none, run
+`docker compose restart headscale` once on the Headscale host.
 
 ## Mid-term or end-of-term key rotation
 

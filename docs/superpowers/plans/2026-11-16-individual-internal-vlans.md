@@ -936,7 +936,7 @@ It holds these sections. Commands are given exactly; prose is the implementer's.
    - `HEADSCALE_URL=http://<STAGING_VPN_ADDR>:8080`, `JUMPBOX_VLAN_BANDS="<band string>"`;
    - the policy keys of section 6.
 
-   Then follow `docs/JUMPBOX.md` §1-3 exactly: `jumpbox_provision.sh` dry run then `--apply`; `jumpbox_configure.sh` dry run then `--apply`; `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`); `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`; then `--apply --no-try --isolate-vlans`. The checks after `--apply` are Task 8 Step 7's: 401 VLAN interfaces, 401 `dhcp-range` lines, `vlan200` = `10.100.1.1/24`, dnsmasq and tailscaled active. Task 8 Step 8's J2 check also applies. **Record every difference from the docs.** A generic error is fixed in this repo; a site-specific one goes in the operator's notes.
+   Then follow `docs/JUMPBOX.md` §1-3 exactly: `jumpbox_provision.sh` dry run then `--apply`; `jumpbox_configure.sh` dry run then `--apply`; `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`); `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`; then `--apply --no-try --isolate-vlans`. The checks after `--apply` are Task 8 Step 7's: 401 VLAN interfaces, 401 `dhcp-range` lines, `vlan200` = `10.100.1.1/24`, dnsmasq and tailscaled active, and the lab egress table. Task 8 Step 11's J2 check also applies. **Record every difference from the docs.** A generic error is fixed in this repo; a site-specific one goes in the operator's notes.
 5. **The staging portal.** Follow `docs/LOCAL_TEST_INSTANCE.md` (development stack, local override, reaper proven off), but check out the **branch or release under test**, and use the token below instead of that guide's step 5 token.
 
    **Least-privilege API token**, on a node as root. Each role grants only what its path needs. The template is in a staging pool, so the token can clone it but cannot change or delete it.
@@ -1114,16 +1114,16 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
 - **Access check after every change.** The operator's student-access check (`check_student_access.py`, kept with the changeover isolation ticket) prints `student nodes: N; reach own /24: K; LOST own /24: L; also reach a foreign /24: F; filter entries on jumpbox: E`.
   - It exits 1 when `L > 0`.
   - It counts only Headscale nodes of roster logins: users without nodes, staff and `zz-*` are skipped.
-  - It tests only each student's **entry** /24. Internal VLANs are proven by the staging test (Task 7) and the smoke test (Step 11).
+  - It tests only each student's **entry** /24. Internal VLANs are proven by the staging test (Task 7) and the smoke test (Step 10).
 
   The expected results:
   - **Baseline (Step 5):** exit 0 and `L = 0`. Record `N` and `K`. A red baseline stops the rollout before anything changes.
-  - **After Steps 6, 7 and 8:** exit 0, and `N`, `K`, `L` exactly equal the baseline.
-  - **After Step 10** (new roster, so `N` changes): exit 0 and `L = 0`. Record `N` and `K` as the post-changeover baseline.
-  - **After Step 11's policy applies (11c and 11g):** exit 0 with the post-changeover counts.
+  - **After Steps 6 and 7:** exit 0, and `N`, `K`, `L` exactly equal the baseline.
+  - **After Step 9** (new roster, so `N` changes): exit 0 and `L = 0`. Record `N` and `K` as the post-changeover baseline.
+  - **After Step 10's policy applies (10e and 10i.4) and after Step 11:** exit 0 with the post-changeover counts.
 
   **At the first result that differs, stop and run Step 12 for every step done so far.**
-- **Procedure R: restore a Headscale policy backup (rollback only).** Only Step 12 uses it, when the instructor wants the exact pre-changeover policy back rather than a re-render. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used. The apply script prints `backup: <HEADSCALE_HOST>:<path>` (`scripts/apply_headscale_policy.sh:159`), so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix (`:138-140`). `BACKUP_REF` is the `backup:` value that Step 10's policy stage printed.
+- **Procedure R: restore a Headscale policy backup (rollback only).** Only Step 12 item 3 uses it, and only after the same run's Headscale and roster restore: the backup is the outgoing roster's policy, and with the incoming roster still in Headscale and the portal it names identities that no longer exist. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used. The apply script prints `backup: <HEADSCALE_HOST>:<path>`, so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix. `BACKUP_REF` is the `backup:` value that Step 9's policy stage printed.
   ```bash
   BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"; HOST_FILE="${BACKUP%.*}"
   STAMP=$(date -u +%Y%m%dT%H%M%SZ); printf 'ref=%s\nbackup=%s\nlive=%s\n' "$BACKUP_REF" "$BACKUP" "$HOST_FILE"
@@ -1140,7 +1140,7 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
   python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' \
       "$HOST_FILE.$STAMP.readback" "$BACKUP" && echo restored
   ```
-  Expected: `restored`. If the read-back differs (a single-file bind mount keeps showing the old file), run `docker compose restart headscale` once, wait until `headscale policy get` answers, and repeat the read-back. If it still differs, stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md:1042-1051`). The access check that follows is the proof of what is enforced.
+  Expected: `restored`. If the read-back differs (a single-file bind mount keeps showing the old file), run `docker compose restart headscale` once, wait until `headscale policy get` answers, and repeat the read-back. If it still differs, stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md`, "Apply the Headscale policy"). Then check the jumpbox's peers by hand, since Procedure R signals Headscale without the apply script's peer check: on the jumpbox, `tailscale status --json | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("BackendState"), len(d.get("Peer") or {}))'` must print `Running` and a count that includes the roster's devices; if it prints `Running 0`, restart Headscale once as above. The access check that follows is the proof of what is enforced.
 
 - [ ] **Step 5 (operator): Preconditions and pre-change records**
 
@@ -1156,17 +1156,11 @@ All of these must hold before continuing:
       if re.match(r"(student|group)-", name) and not name.startswith("student-zz-"): print(r["vmid"], name)'
   ```
   It prints nothing. Staging's own `student-zz-*` guests are excluded; destroy them anyway before the changeover.
-- **`JUMPBOX_SSH` is set** in production's `scripts/site.env` (`ubuntu@<jumpbox-mgmt-address>` or equivalent), and from the operator machine `ssh -o BatchMode=yes <JUMPBOX_SSH> tailscale status --json` prints JSON with `"BackendState": "Running"`. Step 10's policy stage runs `apply_headscale_policy.sh --apply`, which refuses to apply on a Proxmox site without it and then checks the jumpbox's peers.
-- **J2 gate.** All three must hold:
-  - J1 has been read after at least 7 days (counters and `journalctl -k --grep jb-xvlan`), and every cross-VLAN flow maps to staff or test traffic, with zero legitimate student or group flows.
-  - The instructor has accepted that reading in the changeover isolation ticket.
-  - The `--allow-vlans` list for KOTH or staff VLANs is decided, possibly empty.
-
-  Otherwise stop the rollout here. Nothing has changed yet. Without J2 the AD labs do not ship (Global Constraints).
-- **Free-slot gate for the smoke test.** Step 11 imports one test login, and `scripts/import_students.py` gives it the pair after the current highest roster pair (`:106-109`). So the new roster must leave one pair free: `python3 -c 'import sys; sys.path.insert(0, "."); from scripts.build_students_merged import read_canvas; n = len(read_canvas(sys.argv[1])); print(n); sys.exit(n > 99)' <canvas-export>.csv` prints at most `99`.
-  - **The reservation:** pair `100+n / 200+n` belongs to the smoke test from Step 11b until its cleanup (11i). **No late roster import may run while the smoke test holds that pair**; `import_students.py` and the admin roster tools wait until 11i's item 8 verification has passed. After cleanup the released pair is free again, and the next import takes it.
-  - If the roster has 100 students, no pair is free. Stop and let the instructor choose: skip Step 11 (the staging pass then stands alone), or run it before seeding the full roster.
-- **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop. Either remove or renumber the offending rows, or run the term purge first: Step 10, then this audit again, then Steps 6-9 before the new term's students are told the VPN is open. Only after that may the jumpbox or the policy change.
+- **`JUMPBOX_SSH` is set** in production's `scripts/site.env` (`ubuntu@<jumpbox-mgmt-address>` or equivalent), and from the operator machine `ssh -o BatchMode=yes <JUMPBOX_SSH> tailscale status --json` prints JSON with `"BackendState": "Running"`. Step 9's `term_changeover.sh --apply` runs the policy preflight (`apply_headscale_policy.sh --preflight`) before its first stage and refuses without this; `scripts/apply_headscale_policy.sh --preflight` on its own must end with `preflight passed`.
+- **Free-slot gate for the smoke test.** Step 10 imports one test login, and `scripts/import_students.py` gives it the pair after the current highest roster pair (`:106-109`). So the new roster must leave one pair free: `python3 -c 'import sys; sys.path.insert(0, "."); from scripts.build_students_merged import read_canvas; n = len(read_canvas(sys.argv[1])); print(n); sys.exit(n > 99)' <canvas-export>.csv` prints at most `99`.
+  - **The reservation:** pair `100+n / 200+n` belongs to the smoke test from Step 10b until its cleanup (10i). **No late roster import may run while the smoke test holds that pair**; `import_students.py` and the admin roster tools wait until 10i's item 8 verification has passed. After cleanup the released pair is free again, and the next import takes it.
+  - If the roster has 100 students, no pair is free. Stop and let the instructor choose: skip Step 10 (the staging pass then stands alone), or run it before seeding the full roster.
+- **VLAN pair audit:** `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py > slots.json && python3 scripts/audit_vlan_pairs.py slots.json` prints `ok`. On any problem, stop before any rollout change (ruling C6). Fix the offending rows: remove them, or renumber them to free pairs, with the audit's output naming each one. Then run the audit again; it must print `ok`. If the rows cannot be corrected, stop and escalate to the instructor. There is no purge-first path: `term_changeover.sh` cannot stop before its policy stage.
 - **Lab subnets clear of the management side.** On the jumpbox, with `jumpbox_netgen.py` copied to `jumpbox/`:
   ```bash
   ip -4 -j route show table all | python3 -c '
@@ -1192,7 +1186,7 @@ Verify: `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.
 
 - [ ] **Step 7 (operator): Adopt the jumpbox**
 
-Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an interactive console session, with `scripts/site.env` carrying the same band string. Never start `nftables.service`. Read the rehearsal differences recorded in Task 7 Step 6 first (the staging operator log). The dry run lists the new dnsmasq open-file drop-in (`/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf`): without it dnsmasq does not start with 401 VLANs. It does not list the `apt-get install` it runs if dnsmasq or the guest agent is missing.
+Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an interactive console session, with `scripts/site.env` carrying the same band string. Never start `nftables.service`. Read the rehearsal differences recorded in Task 7 Step 6 first (the staging operator log). The dry run lists the new dnsmasq open-file drop-in (`/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf`): without it dnsmasq does not start with 401 VLANs. It does not list the `apt-get install` it runs if dnsmasq or the guest agent is missing. It also lists the lab egress table (`/etc/nftables.d/jumpbox-lab-egress.nft` and `jumpbox-lab-egress.service`), which every `--apply` installs. That table removes any egress the hand-built jumpbox gave lab VMs toward the management network or the internet. The instructor confirmed that no lab needs outbound internet during a session, since package installs happen in the image builder. The table needs `nft`.
 - Before moving the hand-built files aside, compare them with the rendered netplan (`python3 jumpbox/jumpbox_netgen.py netplan --bands "<band string>" --mgmt-if <mgmt> --trunk-if <trunk>`). The only VLAN differences must be `vlan200` moving from `10.200.0.1/24` to `10.100.1.1/24`, the new `vlan201`-`vlan299`, and `vlan500`.
 - After `--apply`:
   - `ip -br addr show vlan200` lists only `10.100.1.1/24`. If `10.200.0.1/24` is still there, run `sudo ip addr del 10.200.0.1/24 dev vlan200`, then `ip -br addr show vlan200` again; it must list only `10.100.1.1/24`.
@@ -1200,40 +1194,37 @@ Follow `docs/JUMPBOX.md` "Adopting a jumpbox that was built by hand" from an int
   - `ip -br addr | grep -c '^vlan'` and `grep -c '^dhcp-range=' /etc/dnsmasq.d/jumpbox.conf` both print `401`.
   - `systemctl show dnsmasq -p LimitNOFILESoft` prints `LimitNOFILESoft=65536`.
   - dnsmasq and the Tailscale daemon are active. The unit name depends on how Tailscale was installed: `tailscaled` (apt) or `snap.tailscale.tailscaled` (the snap that `jumpbox_configure.sh --tailscale` installs). `systemctl is-active dnsmasq; systemctl is-active tailscaled || systemctl is-active snap.tailscale.tailscaled` prints `active` twice, the second from whichever unit exists.
-  - **Recommended:** `sudo jumpbox/jumpbox_configure.sh --apply --ssh-staff-only` (`docs/JUMPBOX.md`, "Staff-only SSH"), so a lab VM cannot SSH to the jumpbox itself. Staging measured that a lab VM reaches the jumpbox's own SSH, which is input to the jumpbox, not forwarding, so J2 does not cover it. Test a staff login from a listed device before closing the console.
+  - `sudo nft list table inet jumpbox_lab_egress` shows `iifname "vlan*" oifname "vlan*" return` and `iifname "vlan*" oifname != "tailscale0" counter drop`, and `systemctl is-enabled jumpbox-lab-egress.service` prints `enabled`.
+- **Staff-only SSH (required).** `sudo jumpbox/jumpbox_configure.sh --apply --ssh-staff-only` (`docs/JUMPBOX.md`, "Staff-only SSH"), with `JUMPBOX_SSH_STAFF_IPS` listing the staff devices. Staging measured that a lab VM reaches the jumpbox's own SSH; that traffic is input to the jumpbox, not forwarding, so neither the egress table nor J2 covers it. Verify:
+  - `sudo nft list table inet jumpbox_ssh` shows the final `counter drop` rule, and `systemctl is-enabled jumpbox-ssh-filter.service` prints `enabled`;
+  - a staff login from a listed device works, and so does the operator machine's `ssh <JUMPBOX_SSH> true` over the management NIC; test both before closing the console;
+  - no lab VM exists at this point, so Step 10h proves that a lab VM cannot SSH to the jumpbox.
 - Run the access check.
 
-- [ ] **Step 8 (operator): Inter-VLAN drop (J2)**
-
-Install J2 as the isolation ticket says, with the `--allow-vlans` list decided at the Step 5 J2 gate. On the now-converged jumpbox, the dry run of `sudo jumpbox/jumpbox_configure.sh --isolate-vlans [--allow-vlans <list>]` must report netplan and dnsmasq unchanged before `--apply --no-try --isolate-vlans [--allow-vlans <list>]`. If it does not, install the table by hand as the ticket describes.
-
-J2 holds two counted drops: VLAN to VLAN, and lab VLAN to anything but `tailscale0`. The second removes any egress the hand-built jumpbox gave lab VMs toward the management network or the internet. The instructor confirmed that no lab needs outbound internet during a session. `--allow-vlans` exempts only VLAN-to-VLAN traffic.
-Verify:
-- `sudo nft list table inet jumpbox_vlan_isolation` shows both drop rules, `iifname "vlan*" oifname "vlan*" counter drop` and `iifname "vlan*" oifname != "tailscale0" counter drop`.
-- `systemctl is-enabled jumpbox-vlan-isolation.service` prints `enabled`.
-- If `--ssh-staff-only` was not applied in Step 7, apply it now (recommended, as above).
-
-Then run the access check. **If J2 is not applied, the AD labs do not ship** (Global Constraints).
-
-- [ ] **Step 9 (operator): Audit the live `templates.yaml`**
+- [ ] **Step 8 (operator): Audit the live `templates.yaml`**
 
 Every enabled individual group with a single machine sets `internal_nic: false` on its entry point.
 
-- [ ] **Step 10 (operator): Run the changeover**
+- [ ] **Step 9 (operator): Run the changeover**
 
-Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Its stage 4 applies the production policy (P2) for the new roster. **Record the `backup:` value that stage prints** (Procedure R's `BACKUP_REF`). If it scrolled away, use the newest `<policy file>.<YYYYmmddTHHMMSSZ>` on the Headscale host, prefixed with `<HEADSCALE_HOST>:`.
+Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Before stage 1 it runs the policy preflight. On a Proxmox site it must print `ready: the jumpbox (<JUMPBOX_SSH>) answers and its Tailscale is Running.`; a failed preflight stops with `nothing was changed`. Then its four stages run (`docs/TERM_CHANGEOVER.md`), and stage 4 applies the production policy (P2) for the new roster. **Record every backup path the run prints**, for Step 12:
+- stage 1: the Headscale database and key-file backups;
+- stage 2: the local and production roster CSV backups;
+- stage 3: the MySQL dump (`pre-term-changeover-*.sql`);
+- stage 4: the policy `backup:` line (Procedure R's `BACKUP_REF`). If it scrolled away, use the newest `<policy file>.<YYYYmmddTHHMMSSZ>` on the Headscale host, prefixed with `<HEADSCALE_HOST>:`.
+
 Verify:
 - Stage 4 printed `verified: the jumpbox lists every roster device as a peer.` That line is required: without it the stage failed, and no student may be told the VPN is open. If the stage restarted Headscale once and then verified, that is a pass; record it.
-- The dry run of `scripts/apply_headscale_policy.sh` reports nothing to do.
+- The dry run of `scripts/term_changeover.sh <canvas-export>.csv` reports every stage, including stage 4, `nothing to do`.
 - The Step 5 audit, re-run, prints `ok`.
 - The access check exits 0 with `LOST own /24: 0`.
-- Headscale 0.27.1 can leave the jumpbox without peers after the jumpbox's Tailscale reconnects (measured once on staging). After any later jumpbox reboot or Tailscale restart, re-run `scripts/apply_headscale_policy.sh --apply` and require the same line.
+- **Install the Headscale peer watchdog** on the operator host (`docs/JUMPBOX.md`, "Headscale peer watchdog"): the service and timer units, then `systemctl enable --now headscale-peer-watchdog.timer`. Its first run logs `ok: the jumpbox lists every roster device as a peer.` (`journalctl -u headscale-peer-watchdog.service`). Headscale 0.27.1 can leave the jumpbox without peers after the jumpbox's Tailscale reconnects (measured on staging); the watchdog restarts Headscale once when that happens. After a jumpbox reboot or Tailscale restart, `scripts/apply_headscale_policy.sh --apply` runs the same check at once.
 
-- [ ] **Step 11 (operator): Production smoke test with one `zz-` user**
+- [ ] **Step 10 (operator): Production smoke test with one `zz-` user**
 
-Run this after Step 10, before students are told the VPN is open. It uses the normal policy apply; nothing is swapped.
+Run this after Step 9, before students are told the VPN is open. It uses the normal policy apply; nothing is swapped.
 
-**a. A two-machine group.** Use an enabled individual group with an entry point and a plain machine, if production has one. Otherwise add a temporary enabled group `zz-internal-vlan-smoke`, shaped like `templates.example.yaml`'s `two-machine-individual-example`, with a small Linux template present on the production nodes. Then run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> restart vm-automation` and wait for `healthy` (the probe at `scripts/term_changeover.sh:413-422`).
+**a. A two-machine group.** Use an enabled individual group with an entry point and a plain machine, if production has one. Otherwise add a temporary enabled group `zz-internal-vlan-smoke`, shaped like `templates.example.yaml`'s `two-machine-individual-example`, with a small Linux template (with the QEMU guest agent) present on the production nodes. Then run `cd <PORTAL_DIR> && docker compose -f <PORTAL_COMPOSE> restart vm-automation` and wait for `healthy` (the probe at `scripts/term_changeover.sh:413-422`).
 
 **b. A unique login and its slot.** Every run uses a fresh login, so a rerun never meets a leftover.
 1. Set `S=zz-smoke-$(date -u +%m%d%H%M%S)-$RANDOM` and record it. Then check that it is absent everywhere before using it. All of these must hold, and any hit means pick a new `S`:
@@ -1249,7 +1240,7 @@ Run this after Step 10, before students are told the VPN is open. It uses the no
 3. `rm <PORTAL_DIR>/data/$S.csv`.
 4. Re-run the Step 5 audit. It must print `ok`.
 
-**e. Policy.** `scripts/apply_headscale_policy.sh` (dry run): the diff removes nothing and adds exactly two rules, one with `"src": ["$S@"]` and one with `"dst": ["$S@:*"]`. Any other change means stop and go to 11i. Then run `--apply`; it must end with `verified: the jumpbox lists every roster device as a peer.` Then run the access check.
+**e. Policy.** `scripts/apply_headscale_policy.sh` (dry run): the diff removes nothing and adds exactly two rules, one with `"src": ["$S@"]` and one with `"dst": ["$S@:*"]`. Any other change means stop and go to 10i. Then run `--apply`; it must end with `verified: the jumpbox lists every roster device as a peer.` Then run the access check.
 
 **f. VPN client.** Create a one-hour pre-auth key for `$S`. Join one client with `--accept-routes`, from a machine that is not on the staging tailnet.
 
@@ -1259,6 +1250,7 @@ Run this after Step 10, before students are told the VPN is open. It uses the no
 - The production jumpbox's lease file holds the entry machine's two leases and the plain machine's one.
 - The client reaches (ping and tcp/22) the entry machine on `10.<E>.0.0/24` and both machines on `10.<E>.1.0/24`, and both gateways `10.<E>.0.1` and `10.<E>.1.1` answer ping.
 - For another roster student with entry `<X>`, neither `10.<X>.0.1` nor `10.<X>.1.1` answers.
+- **No egress, no jumpbox SSH.** From the plain machine, on its Proxmox node, `qm guest exec <plain-machine-vmid> --timeout 20 -- sh -c 'ping -c2 -W2 <mgmt-gateway>; nc -w3 -z <proxmox-node-mgmt-address> 8006'` gets no reply and no connection, and the counter in `sudo nft list table inet jumpbox_lab_egress` rises. `qm guest exec <plain-machine-vmid> --timeout 20 -- sh -c 'nc -w3 -z 10.<E>.1.1 22'` fails too (staff-only SSH), and the `jumpbox_ssh` drop counter rises.
 
 **i. Cleanup, on a pass and on a failure alike.** Skip any item whose step never ran; the verification in item 8 always runs.
 1. Destroy the deployment through the portal.
@@ -1272,7 +1264,7 @@ Run this after Step 10, before students are told the VPN is open. It uses the no
    The user row is kept, disabled and untagged, because its destroyed VM records reference it. Each run leaves one such row, which is not on the roster and so is never exported or granted.
 4. Run `scripts/apply_headscale_policy.sh --apply`. Its diff removes exactly the two `$S` rules and adds nothing, and it ends with `verified: the jumpbox lists every roster device as a peer.` Then run the access check.
 5. Re-run the Step 5 audit. It must print `ok`.
-6. If 11a added the temporary group, remove it and restart `vm-automation` as in 11a.
+6. If 10a added the temporary group, remove it and restart `vm-automation` as in 10a.
 7. `rm -f <PORTAL_DIR>/data/zz-smoke*.csv`.
 8. **Verify nothing remains.** All of these must hold:
    - `SELECT COUNT(*) FROM student_whitelist WHERE login_id LIKE 'zz-smoke%'` is `0`;
@@ -1284,23 +1276,48 @@ Run this after Step 10, before students are told the VPN is open. It uses the no
    - `grep -c zz-internal-vlan-smoke <PORTAL_DIR>/templates.yaml` prints `0`.
 9. `scripts/term_changeover.sh <canvas-export>.csv` (dry run) reports every stage complete.
 
-If 11h failed, continue with Step 12.
+If 10h failed, continue with Step 12.
+
+- [ ] **Step 11 (operator): Inter-VLAN drop (J2), only after the J1 evidence gate**
+
+J2 comes after the changeover. It is gated on evidence, not on the window, so it may follow days later. **The J1 evidence gate**, all three of which must hold:
+- J1 has been read after at least 7 days (counters and `journalctl -k --grep jb-xvlan`), and every cross-VLAN flow maps to staff or test traffic, with zero legitimate student or group flows.
+- The instructor has accepted that reading in the changeover isolation ticket.
+- The `--allow-vlans` list for KOTH or staff VLANs is decided, possibly empty.
+
+Until all three hold, J2 is not installed, and **no AD lab (two-machine lab that relies on J2) is enabled** (Global Constraints). The lab egress table from Step 7 is already in place either way.
+
+Record J1 first: `sudo sh -c 'nft list table inet jumpbox_vlan_isolation > /root/j1-before-j2.nft'` if the J1 table exists, otherwise "no J1". Then install J2 as the isolation ticket says, with the agreed `--allow-vlans` list. On the converged jumpbox, the dry run of `sudo jumpbox/jumpbox_configure.sh --isolate-vlans [--allow-vlans <list>]` must report netplan, dnsmasq and the lab egress table unchanged before `--apply --no-try --isolate-vlans [--allow-vlans <list>]`. If it does not, install the table by hand as the ticket describes.
+
+J2 holds one counted drop, VLAN to VLAN. `--allow-vlans` exempts the listed VLANs from it in both directions, and never opens the management side or the internet, which the lab egress table keeps closed.
+Verify:
+- `sudo nft list table inet jumpbox_vlan_isolation` shows `iifname "vlan*" oifname "vlan*" counter drop` (after any `--allow-vlans` accept rules).
+- `systemctl is-enabled jumpbox-vlan-isolation.service` prints `enabled`.
+
+Then run the access check. **Only after J2 is applied and the access check shows no student reaching another student's networks may the AD labs be enabled.**
 
 - [ ] **Step 12 (operator): Rollback, if any check fails**
 
-Undo the steps already done, newest first, in this order. Skip any item whose step never ran.
+First establish what ran: which of Steps 6-11, and for Step 9 which changeover stages completed and which backups it printed. Stage 1 printed Headscale backups only if it changed Headscale, stage 2 roster backups only if it replaced a roster file, stage 3 a MySQL dump only if it purged and seeded, and stage 4 a `backup:` line only if it installed a policy. Then undo, newest first, in this order, skipping any item whose step never ran.
 
-1. **Smoke test.** Run 11i in full, including its item 8 verification.
-2. **Headscale policy.** If Step 10 has run, then after item 5 below, run `scripts/apply_headscale_policy.sh --apply` from the previous release's checkout. It re-renders the new roster with entry-only grants. If the instructor wants the exact pre-changeover policy file back instead, use Procedure R with Step 10's `BACKUP_REF`. Neither path checks the jumpbox's peers (the previous release has no peer check; Procedure R signals Headscale by hand). So afterwards, on the jumpbox, `tailscale status --json | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("BackendState"), len(d.get("Peer") or {}))'` must print `Running` and a non-zero count that includes the roster's devices. If it prints `Running 0`, run `docker compose restart headscale` on the Headscale host once, wait until `headscale policy get` answers, and check again.
-3. **J2.**
+1. **Smoke test.** Run 10i in full, including its item 8 verification.
+2. **J2.** If Step 11 ran:
    ```bash
    sudo systemctl disable --now jumpbox-vlan-isolation.service   # ExecStop deletes the table
    sudo rm -f /etc/nftables.d/jumpbox-vlan-isolation.nft /etc/systemd/system/jumpbox-vlan-isolation.service
    sudo systemctl daemon-reload
    sudo nft list table inet jumpbox_vlan_isolation   # must fail: no such table
    ```
-   If J1 existed in Step 5, restore it with `sudo nft -f /root/j1-before-j2.nft`. Then `sudo nft list table inet jumpbox_vlan_isolation` shows J1's log-only rules and no drop rule. J1 is transient, as it was before.
-4. **Jumpbox network files.** From the console:
+   If J1 existed in Step 11, restore it with `sudo nft -f /root/j1-before-j2.nft`. Then `sudo nft list table inet jumpbox_vlan_isolation` shows J1's log-only rules and no drop rule. J1 is transient, as it was before.
+3. **The changeover (Step 9), if any stage of it ran.** Choose one direction, and record which in the changeover isolation ticket:
+   - **Back to the outgoing roster.** Follow `docs/TERM_CHANGEOVER.md` "Rollback" with every backup path Step 9 printed, in its order:
+     1. Restore the Headscale database and key file (stage 1), then start Headscale and check `headscale users list` and the staff and infrastructure nodes.
+     2. Restore the local and production roster CSVs (stage 2).
+     3. Restore MySQL from the dump, but only if stage 3 purged and seeded. Restart `vm-automation` and wait for `healthy`.
+
+     Then restore a policy that matches the restored roster. Either use Procedure R with Step 9's `BACKUP_REF`, or re-render from the previous release's checkout after item 5 (`scripts/apply_headscale_policy.sh --apply` there, then the manual peer check from Procedure R). Procedure R is valid only here, after the Headscale and roster restore. Verify: the new release's `scripts/term_changeover.sh <outgoing-canvas-export>.csv` dry run reports stages 1-3 `nothing to do`, and the access check matches the Step 5 baseline.
+   - **Forward to the incoming roster.** Fix the cause, then run `scripts/term_changeover.sh --apply <canvas-export>.csv` again. Completed stages are no-ops, the preflight runs first, and stage 4 must end with the verified peer line. Verify all four stages: the dry run reports every stage, including stage 4, `nothing to do`; the Step 5 audit prints `ok`; and the access check matches the post-changeover baseline. Nothing else in this list is undone in this direction unless the failure was in Steps 6-7.
+4. **Jumpbox network files.** If Step 7 ran, from the console:
    ```bash
    sudo rm /etc/netplan/60-jumpbox-vlans.yaml /etc/dnsmasq.d/jumpbox.conf /etc/sysctl.d/90-jumpbox-router.conf
    sudo cp -a /root/jumpbox-before/netplan/. /etc/netplan/
@@ -1311,6 +1328,7 @@ Undo the steps already done, newest first, in this order. Skip any item whose st
    sudo ip addr del 10.100.1.1/24 dev vlan200 2>/dev/null
    sudo systemctl restart dnsmasq
    ```
+   The lab egress table, the staff-only SSH filter and the dnsmasq open-file drop-in stay. They do not depend on the bands, and the instructor ruled lab egress closed.
    Verify:
    - `ip -br addr | grep -c '^vlan'` equals `/root/vlan-count-before`.
    - `ip -br addr show vlan200` lists only `10.200.0.1/24`.
@@ -1320,11 +1338,18 @@ Undo the steps already done, newest first, in this order. Skip any item whose st
    **Restore the Step 5 Proxmox backup instead** if any of these happens:
    - management access cannot be regained from the console;
    - any check above fails after one retry;
-   - `nft list tables` shows a table other than Tailscale's, `jumpbox_ssh` and `jumpbox_vlan_isolation`;
+   - `nft list tables` shows a table other than Tailscale's, `jumpbox_ssh`, `jumpbox_lab_egress` and `jumpbox_vlan_isolation`;
    - the cause of the failure cannot be attributed to the files above.
 
-   A VM restore reboots the jumpbox, which clears J1 (reload it from `/root/j1-before-j2.nft`, which the backup contains) and the current DHCP leases.
-5. **Portal.** Redeploy the previous release with the old `JUMPBOX_VLAN_BANDS`, recreate `vm-automation`, and check that the export prints the old band string.
-6. Run the access check. It must match the Step 5 baseline, or the post-changeover baseline if Step 10 ran.
+   A VM restore reboots the jumpbox, which clears J1 (reload it from `/root/j1-before-j2.nft`, which the backup contains) and the current DHCP leases. It also removes the lab egress table and the staff-only SSH filter, which postdate the backup. `jumpbox_configure.sh` refuses the restored hand-built box, so load the egress table on its own, from the console:
+   ```bash
+   python3 jumpbox/jumpbox_netgen.py lab-egress | sudo tee /etc/nftables.d/jumpbox-lab-egress.nft >/dev/null
+   python3 jumpbox/jumpbox_netgen.py lab-egress-unit | sudo tee /etc/systemd/system/jumpbox-lab-egress.service >/dev/null
+   sudo nft -c -f /etc/nftables.d/jumpbox-lab-egress.nft && sudo systemctl daemon-reload \
+     && sudo systemctl enable --now jumpbox-lab-egress.service
+   ```
+   Whether to restore the SSH filter by hand before the next attempt is the instructor's decision.
+5. **Portal.** If Step 6 ran, redeploy the previous release with the old `JUMPBOX_VLAN_BANDS`, recreate `vm-automation`, and check that the export prints the old band string. If item 3 re-renders the policy from the previous release, do it now.
+6. Run the access check. It must match the Step 5 baseline after a backward rollback, or the post-changeover baseline after a forward recovery.
 
-No database rollback is needed: stored tags never changed. A half-rolled-back state, where the portal and the jumpbox use different bands, only leaves internal VLANs unreachable; no student can reach another student's networks.
+The release itself needs no database rollback: stored tags never change. Only the changeover (Step 9) changes the database, and item 3 restores it. A half-rolled-back state, where the portal and the jumpbox use different bands, only leaves internal VLANs unreachable; no student can reach another student's networks.

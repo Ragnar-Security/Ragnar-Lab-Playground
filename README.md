@@ -338,6 +338,9 @@ any required value that is missing.
 | `EMAIL_DOMAIN` | Student email domain used while building the roster |
 | `REMOTE_BACKUP_DIR` | Remote directory for changeover backups |
 | `KEY_DAYS` | Lifetime of new student pre-auth keys (for example `150d`), used by changeover and key rotation |
+| `JUMPBOX_SSH` | SSH destination of the jumpbox (for example `ubuntu@<jumpbox-mgmt-address>`). With the proxmox backend, `apply_headscale_policy.sh --apply`, its `--preflight` (which `term_changeover.sh --apply` runs before stage 1) and `headscale_peer_watchdog.sh` read `tailscale status --json` there to check that every roster device is a jumpbox peer. Required on a Proxmox site; a cloud-only site needs neither this nor `JUMPBOX_PEER_WAIT` |
+| `JUMPBOX_PEER_WAIT` | Seconds to wait for the jumpbox to list every roster device after a reload, before restarting Headscale once (default `60`) |
+| `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL`, `HEADSCALE_WATCHDOG_STATE` | `headscale_peer_watchdog.sh`: at most one Headscale restart per this many seconds (default `1800`), and the file recording the last one (`docs/JUMPBOX.md`, "Headscale peer watchdog") |
 | `HEADSCALE_URL` | Login-server URL the jumpbox joins |
 | `JUMPBOX_NODE` | Proxmox node on which to create the jumpbox |
 | `JUMPBOX_STORAGE` | Proxmox storage for the jumpbox |

@@ -37,6 +37,10 @@ Each student is assigned **two unique VLAN tags** during database initialization
 
 ## Network Configuration Applied
 
+The examples show the production default bridge, `vmbr0`. Every lab NIC uses
+`LAB_BRIDGE` (default `vmbr0`), which only a staging portal on an isolated
+bridge changes (`docs/STAGING.md`).
+
 - **LXC (entry point)**: `net0=name=eth0,bridge=vmbr0,tag={entry_vlan},ip=dhcp` and `net1=name=eth1,bridge=vmbr0,tag={internal_vlan},ip=dhcp`
 - **LXC (plain machine)**: `net0=name=eth0,bridge=vmbr0,tag={internal_vlan},ip=dhcp` only
 - **QEMU (entry point)**: `net0=virtio,bridge=vmbr0,tag={entry_vlan}` and `net1=virtio,bridge=vmbr0,tag={internal_vlan}`; with `internal_nic: false`, `net1` is deleted instead

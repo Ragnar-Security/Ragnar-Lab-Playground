@@ -312,11 +312,39 @@ def test_jumpbox_doc_documents_vlan_isolation():
     assert "### VLAN isolation" in headings
     section = "\n".join(_section((ROOT / "docs" / "JUMPBOX.md").read_text(), "### VLAN isolation"))
     for needle in ("--isolate-vlans", "--allow-vlans", "systemctl disable --now "
-                   "jumpbox-vlan-isolation.service", "nft list table inet jumpbox_vlan_isolation",
-                   # Lab VLANs forward only to the tailnet (instructor, 2026-11-18).
-                   "leaves on anything but `tailscale0`",
-                   "Lab VMs have no egress except the student's"):
+                   "jumpbox-vlan-isolation.service", "nft list table inet jumpbox_vlan_isolation"):
         assert needle in section, needle
+    # J2 is VLAN to VLAN only; the egress drop does not wait for it.
+    assert 'oifname != "tailscale0"' not in section
+
+
+# Catches the lab egress drop (every --apply, its own table) or the peer
+# watchdog losing its documentation.
+def test_jumpbox_doc_documents_lab_egress_and_the_peer_watchdog():
+    text = (ROOT / "docs" / "JUMPBOX.md").read_text()
+    egress = "\n".join(_section(text, "### Lab egress: routed lab traffic leaves only to the tailnet"))
+    for needle in ("every `--apply` installs `inet jumpbox_lab_egress`",
+                   'iifname "vlan*" oifname != "tailscale0" counter drop',
+                   # Instructor, 2026-11-18.
+                   "Lab VMs have no egress except the student's",
+                   "nft list table inet jumpbox_lab_egress"):
+        assert needle in egress, needle
+    watchdog = "\n".join(_section(text, "### Headscale peer watchdog"))
+    for needle in ("scripts/headscale_peer_watchdog.sh", "OnUnitActiveSec=5min",
+                   "HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL", "never writes or reloads the policy"):
+        assert needle in watchdog, needle
+
+
+# Catches the canonical changeover runbook losing stage 4, the pre-mutation
+# preflight, or the order of a rollback that restores the policy last.
+def test_term_changeover_doc_documents_stage_4_preflight_and_rollback():
+    text = (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
+    for needle in ("### 4. Apply the Headscale policy", "apply_headscale_policy.sh --preflight",
+                   "nothing was changed", "JUMPBOX_SSH", "### Restore the policy",
+                   "verified: the jumpbox\nlists every roster device as a peer."):
+        assert needle in text, needle
+    readme = (ROOT / "README.md").read_text()
+    assert "| `JUMPBOX_SSH` |" in readme and "| `JUMPBOX_PEER_WAIT` |" in readme
 
 
 STAGING = ROOT / "docs" / "STAGING.md"
