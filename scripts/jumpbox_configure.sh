@@ -16,6 +16,8 @@
 #   - netplan: management NIC on DHCP, one vlan<N> gateway per lab VLAN
 #   - dnsmasq: DHCP and DNS forwarding on the lab VLANs only
 #   - sysctl: IPv4/IPv6 forwarding, loose reverse-path filtering
+#   - lab egress: an nftables table (its own unit) that lets traffic routed
+#     from a lab VLAN leave only to tailscale0 or another VLAN; needs nft
 # Options:
 #   --tailscale       join Headscale as the 10.0.0.0/8 subnet router. The
 #                     auth key comes from JUMPBOX_TS_AUTHKEY in the
@@ -31,12 +33,10 @@
 #                     provably covered by the rules, unless --i-have-console.
 #                     Filters every port sshd/ssh.socket listen on; re-run after
 #                     changing the SSH port.
-#   --isolate-vlans   nftables table that lets traffic routed from a lab VLAN
-#                     leave only through tailscale0: vlan* to vlan* is dropped
-#                     (lab VMs cannot route to each other), and so is vlan* to
-#                     the management NIC or anything else. tailscale0 -> VLAN
-#                     traffic and the jumpbox's own DHCP/DNS are untouched.
-#                     Refuses when nft is missing.
+#   --isolate-vlans   nftables table that drops forwarded traffic between lab
+#                     VLANs (vlan* to vlan*), so lab VMs cannot route to each
+#                     other through the jumpbox. tailscale0 <-> VLAN traffic is
+#                     untouched. Refuses when nft is missing.
 #   --allow-vlans LIST  with --isolate-vlans: exempt these VLAN tags (comma
 #                     separated tags and first-last ranges, e.g. 300-310) from
 #                     the VLAN-to-VLAN drop, for KOTH ranges whose team VLANs
@@ -80,6 +80,9 @@ SSH_UNIT_FILE=/etc/systemd/system/jumpbox-ssh-filter.service
 VLAN_NFT_FILE=/etc/nftables.d/jumpbox-vlan-isolation.nft
 VLAN_UNIT_NAME=jumpbox-vlan-isolation.service
 VLAN_UNIT_FILE=/etc/systemd/system/jumpbox-vlan-isolation.service
+EGRESS_NFT_FILE=/etc/nftables.d/jumpbox-lab-egress.nft
+EGRESS_UNIT_NAME=jumpbox-lab-egress.service
+EGRESS_UNIT_FILE=/etc/systemd/system/jumpbox-lab-egress.service
 TRY_TIMEOUT="${JUMPBOX_NETPLAN_TRY_TIMEOUT:-120}"
 TS_ROUTES="${JUMPBOX_TS_ROUTES:-10.0.0.0/8}"
 TS_TAG="${JUMPBOX_TS_TAG:-tag:jumpbox}"
@@ -478,46 +481,69 @@ apply_ssh_filter() {
     ssh_filter_activate
 }
 
+# --- nftables tables loaded by their own oneshot unit --------------------------
+
+# plan_nft_table LABEL NFT_FILE UNIT_FILE STAGED_NFT STAGED_UNIT
+plan_nft_table() {
+    local label="$1"
+    if ! command -v nft >/dev/null; then
+        if [ "$APPLY" -eq 1 ]; then
+            block "$label: nft is not installed, so the ruleset cannot be validated or loaded. Install the nftables package first."
+            return 0
+        fi
+        say "note: nft not installed; the $label ruleset below is unvalidated. Install the nftables package before --apply."
+    elif ! nft -c -f "$4"; then
+        block "$label: nft -c -f rejected the generated ruleset"
+        return 0
+    fi
+    stage "$2" 644 "$4"
+    stage "$3" 644 "$5"
+}
+
+# nft_table_activate NFT_FILE UNIT_FILE UNIT_NAME
+# Same rule as the SSH filter: never restart an active unit, reload swaps atomically.
+nft_table_activate() {
+    if changed "$1" || changed "$2"; then
+        run systemctl daemon-reload
+    fi
+    if [ "$(systemctl is-enabled "$3" 2>/dev/null)" != "enabled" ]; then
+        run systemctl enable "$3"
+    fi
+    if ! systemctl is-active --quiet "$3"; then
+        run systemctl start "$3"
+    elif changed "$1" || changed "$2"; then
+        run systemctl reload-or-restart "$3"
+    fi
+}
+
+# install_nft_table NFT_FILE UNIT_FILE UNIT_NAME STAGED_NFT STAGED_UNIT
+install_nft_table() {
+    changed "$1" && install_file "$1" 644 "$4"
+    changed "$2" && install_file "$2" 644 "$5"
+    nft_table_activate "$1" "$2" "$3"
+}
+
+# --- lab egress (every run) ----------------------------------------------------
+
+# Routed lab traffic may leave only to the tailnet: the jumpbox does no NAT and
+# would otherwise forward a lab VM's packets into the management LAN, the
+# Proxmox API and the internet. VLAN to VLAN is --isolate-vlans' business.
+plan_lab_egress() {
+    python3 "$NETGEN" lab-egress > "$TMP/lab-egress.nft"
+    python3 "$NETGEN" lab-egress-unit --nft-file "$EGRESS_NFT_FILE" > "$TMP/lab-egress.service"
+    plan_nft_table "lab egress" "$EGRESS_NFT_FILE" "$EGRESS_UNIT_FILE" \
+        "$TMP/lab-egress.nft" "$TMP/lab-egress.service"
+}
+
 # --- VLAN isolation ------------------------------------------------------------
 
 plan_vlan_isolation() {
     python3 "$NETGEN" isolate-vlans --allow-vlans "$ALLOW_VLANS" > "$TMP/vlan-isolation.nft" \
         || { block "--isolate-vlans: could not render the ruleset"; return 0; }
     python3 "$NETGEN" isolate-vlans-unit --nft-file "$VLAN_NFT_FILE" > "$TMP/vlan-isolation.service"
-    if ! command -v nft >/dev/null; then
-        if [ "$APPLY" -eq 1 ]; then
-            block "--isolate-vlans: nft is not installed, so the ruleset cannot be validated or loaded. Install the nftables package first."
-            return 0
-        fi
-        say "note: nft not installed; the ruleset below is unvalidated. Install the nftables package before --apply."
-    elif ! nft -c -f "$TMP/vlan-isolation.nft"; then
-        block "--isolate-vlans: nft -c -f rejected the generated ruleset"
-        return 0
-    fi
     [ -z "$ALLOW_VLANS" ] || say "vlans:     inter-VLAN forwarding stays allowed for tags $ALLOW_VLANS"
-    stage "$VLAN_NFT_FILE" 644 "$TMP/vlan-isolation.nft"
-    stage "$VLAN_UNIT_FILE" 644 "$TMP/vlan-isolation.service"
-}
-
-# Same rule as the SSH filter: never restart an active unit, reload swaps atomically.
-vlan_isolation_activate() {
-    if changed "$VLAN_NFT_FILE" || changed "$VLAN_UNIT_FILE"; then
-        run systemctl daemon-reload
-    fi
-    if [ "$(systemctl is-enabled "$VLAN_UNIT_NAME" 2>/dev/null)" != "enabled" ]; then
-        run systemctl enable "$VLAN_UNIT_NAME"
-    fi
-    if ! systemctl is-active --quiet "$VLAN_UNIT_NAME"; then
-        run systemctl start "$VLAN_UNIT_NAME"
-    elif changed "$VLAN_NFT_FILE" || changed "$VLAN_UNIT_FILE"; then
-        run systemctl reload-or-restart "$VLAN_UNIT_NAME"
-    fi
-}
-
-apply_vlan_isolation() {
-    changed "$VLAN_NFT_FILE" && install_file "$VLAN_NFT_FILE" 644 "$TMP/vlan-isolation.nft"
-    changed "$VLAN_UNIT_FILE" && install_file "$VLAN_UNIT_FILE" 644 "$TMP/vlan-isolation.service"
-    vlan_isolation_activate
+    plan_nft_table "--isolate-vlans" "$VLAN_NFT_FILE" "$VLAN_UNIT_FILE" \
+        "$TMP/vlan-isolation.nft" "$TMP/vlan-isolation.service"
 }
 
 # --- monitoring ----------------------------------------------------------------
@@ -591,6 +617,7 @@ plan_root_growth
 detect_interfaces
 render_network
 check_foreign_config
+plan_lab_egress
 stage "$SYSCTL_FILE" 644 "$TMP/sysctl"
 stage "$DNSMASQ_FILE" 644 "$TMP/dnsmasq"
 stage "$DNSMASQ_LIMITS_FILE" 644 "$TMP/dnsmasq-limits"
@@ -610,6 +637,7 @@ fi
 
 if [ "$APPLY" -ne 1 ]; then
     [ -n "$GROW_ROOT" ] && run lvextend -r -l +100%FREE "$GROW_ROOT"
+    nft_table_activate "$EGRESS_NFT_FILE" "$EGRESS_UNIT_FILE" "$EGRESS_UNIT_NAME"
     changed "$SYSCTL_FILE" && run sysctl -p "$SYSCTL_FILE"
     if changed "$NETPLAN_FILE"; then
         if [ "$NO_TRY" -eq 1 ]; then run netplan apply; else run netplan try --timeout "$TRY_TIMEOUT"; fi
@@ -621,7 +649,7 @@ if [ "$APPLY" -ne 1 ]; then
     [ "$DO_TS" -eq 1 ] && apply_tailscale
     if [ "$DO_SSH" -eq 1 ] && changed "$SSHD_DROPIN"; then run systemctl try-reload-or-restart ssh; fi
     [ "$DO_SSHF" -eq 1 ] && ssh_filter_activate
-    [ "$DO_ISO" -eq 1 ] && vlan_isolation_activate
+    [ "$DO_ISO" -eq 1 ] && nft_table_activate "$VLAN_NFT_FILE" "$VLAN_UNIT_FILE" "$VLAN_UNIT_NAME"
     say ""
     say "Dry run only. Re-run with --apply to make these changes."
     exit 0
@@ -630,6 +658,10 @@ fi
 # --- apply ---------------------------------------------------------------------
 
 [ -n "$GROW_ROOT" ] && run lvextend -r -l +100%FREE "$GROW_ROOT"
+
+# Before forwarding is switched on, so no lab VLAN ever routes off the jumpbox.
+install_nft_table "$EGRESS_NFT_FILE" "$EGRESS_UNIT_FILE" "$EGRESS_UNIT_NAME" \
+    "$TMP/lab-egress.nft" "$TMP/lab-egress.service"
 
 if changed "$SYSCTL_FILE"; then
     install_file "$SYSCTL_FILE" 644 "$TMP/sysctl"
@@ -689,7 +721,8 @@ fi
 [ "$DO_TS" -eq 1 ] && apply_tailscale
 [ "$DO_SSH" -eq 1 ] && apply_ssh_keys_only
 [ "$DO_SSHF" -eq 1 ] && apply_ssh_filter
-[ "$DO_ISO" -eq 1 ] && apply_vlan_isolation
+[ "$DO_ISO" -eq 1 ] && install_nft_table "$VLAN_NFT_FILE" "$VLAN_UNIT_FILE" "$VLAN_UNIT_NAME" \
+    "$TMP/vlan-isolation.nft" "$TMP/vlan-isolation.service"
 [ "$DO_MON" -eq 1 ] && apply_monitoring
 
 say ""

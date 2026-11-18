@@ -242,7 +242,9 @@ SSH_UNIT_NAME = "jumpbox-ssh-filter.service"
 SSH_STAFF_IF = "tailscale0"
 VLAN_TABLE = "jumpbox_vlan_isolation"
 VLAN_NFT_FILE = "/etc/nftables.d/jumpbox-vlan-isolation.nft"
-# The only interface routed lab traffic may leave through.
+EGRESS_TABLE = "jumpbox_lab_egress"
+EGRESS_NFT_FILE = "/etc/nftables.d/jumpbox-lab-egress.nft"
+# The only interface routed lab traffic may leave through, other than a VLAN.
 TAILNET_IF = "tailscale0"
 
 
@@ -379,18 +381,14 @@ def parse_vlan_list(spec):
 
 
 def render_vlan_isolation(allow_vlans=()):
-    """nftables table that confines routed lab traffic to the tailnet.
+    """nftables table that stops lab VMs routing to each other through the jumpbox.
 
-    A packet that enters on a vlan* interface may leave only on tailscale0:
-    vlan* to vlan* is dropped (lab VMs cannot route to each other), and so is
-    vlan* to anything else (the management NIC, docker0), because the jumpbox
-    would otherwise forward a lab VM's packets into the management LAN, the
-    Proxmox API and the internet. Two counters keep the two cases apart.
-    tailscale0 -> vlan* and the jumpbox's own traffic (DHCP and DNS to it, on
-    the input hook) are untouched; same-VLAN traffic is switched on the trunk
-    and never reaches the forward hook. A KOTH range needs team VLANs to reach
-    the KOTH VLAN, so each tag in allow_vlans is accepted ahead of the drops,
-    in either direction, between VLANs only.
+    Only packets entering AND leaving through vlan* interfaces are dropped;
+    traffic from a lab VLAN to anything else is render_lab_egress's business,
+    and tailscale0 -> vlan* and the jumpbox's own traffic are untouched.
+    Same-VLAN traffic is switched on the trunk and never reaches the forward
+    hook. A KOTH range needs team VLANs to reach the KOTH VLAN, so each tag in
+    allow_vlans is accepted ahead of the drop in either direction.
     """
     tags = sorted({int(t) for t in allow_vlans})
     for tag in tags:
@@ -407,19 +405,45 @@ def render_vlan_isolation(allow_vlans=()):
         lines += [f'        iifname "vlan*" oifname {names} accept',
                   f'        iifname {names} oifname "vlan*" accept']
     lines += ['        iifname "vlan*" oifname "vlan*" counter drop',
-              f'        iifname "vlan*" oifname != "{TAILNET_IF}" counter drop',
               "    }",
               "}"]
     return "\n".join(lines) + "\n"
 
 
-def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
+def render_lab_egress():
+    """nftables table that lets routed lab traffic leave only to the tailnet.
+
+    The jumpbox forwards whatever a lab VM hands it and does no NAT, so without
+    this table a lab VM's packets leave through the management NIC into the
+    management LAN, the Proxmox API and the internet (measured on staging).
+    Every jumpbox_configure.sh --apply installs it. A packet that enters on a
+    vlan* interface and leaves on anything but tailscale0 or another vlan* is
+    counted and dropped. VLAN to VLAN is left to render_vlan_isolation
+    (--isolate-vlans) and its KOTH exemptions: `return` ends this chain with its
+    accept policy, and the other table still sees the packet. tailscale0 -> vlan*
+    and the jumpbox's own DHCP and DNS (the input hook) are untouched.
+    """
+    return "\n".join([
+        f"# {HEADER}",
+        f"table inet {EGRESS_TABLE}",
+        f"delete table inet {EGRESS_TABLE}",
+        f"table inet {EGRESS_TABLE} {{",
+        "    chain forward {",
+        "        type filter hook forward priority -10; policy accept;",
+        '        iifname "vlan*" oifname "vlan*" return',
+        f'        iifname "vlan*" oifname != "{TAILNET_IF}" counter drop',
+        "    }",
+        "}",
+    ]) + "\n"
+
+
+def _nft_table_unit(description, nft_file, table):
     if not re.match(r"^/[A-Za-z0-9_./-]+$", nft_file):
         raise ValueError(f"invalid nft file path {nft_file!r}")
     return "\n".join([
         f"# {HEADER}",
         "[Unit]",
-        "Description=Confine routed lab VLAN traffic to the tailnet on the jumpbox (nftables)",
+        f"Description={description}",
         "DefaultDependencies=no",
         "Wants=network-pre.target",
         "Before=network-pre.target",
@@ -429,13 +453,23 @@ def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
         "RemainAfterExit=yes",
         f"ExecStart=/usr/sbin/nft -f {nft_file}",
         # Reload swaps the table in one transaction; a restart would run ExecStop first
-        # and leave the VLANs unisolated until ExecStart.
+        # and leave the table missing until ExecStart.
         f"ExecReload=/usr/sbin/nft -f {nft_file}",
-        f"ExecStop=-/usr/sbin/nft delete table inet {VLAN_TABLE}",
+        f"ExecStop=-/usr/sbin/nft delete table inet {table}",
         "",
         "[Install]",
         "WantedBy=multi-user.target",
     ]) + "\n"
+
+
+def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
+    return _nft_table_unit("Isolate routed lab VLANs from each other on the jumpbox (nftables)",
+                           nft_file, VLAN_TABLE)
+
+
+def render_lab_egress_unit(nft_file=EGRESS_NFT_FILE):
+    return _nft_table_unit("Let routed lab VLAN traffic leave the jumpbox only to the tailnet (nftables)",
+                           nft_file, EGRESS_TABLE)
 
 
 def unified_diff(path, current, generated):
@@ -452,8 +486,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
         "netplan", "dnsmasq", "dnsmasq-limits", "sysctl", "zeek-node", "zeek-networks", "vlans",
-        "ssh-filter", "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "staff-has",
-        "ssh-source", "diff"])
+        "ssh-filter", "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "lab-egress",
+        "lab-egress-unit", "staff-has", "ssh-source", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -507,6 +541,10 @@ def main(argv=None):
             out = render_vlan_isolation(parse_vlan_list(args.allow_vlans))
         elif args.what == "isolate-vlans-unit":
             out = render_vlan_isolation_unit(args.nft_file or VLAN_NFT_FILE)
+        elif args.what == "lab-egress":
+            out = render_lab_egress()
+        elif args.what == "lab-egress-unit":
+            out = render_lab_egress_unit(args.nft_file or EGRESS_NFT_FILE)
         elif args.what == "zeek-node":
             out = render_zeek_node(args.trunk_if)
         elif args.what == "zeek-networks":
