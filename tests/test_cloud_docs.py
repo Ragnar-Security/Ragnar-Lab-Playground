@@ -326,8 +326,10 @@ def test_staging_runbook_keeps_its_safety_settings_and_placeholders():
                      "LAB_BRIDGE=<STAGING_BRIDGE>", "VMID_RANGE=<STAGING_VMID_RANGE>",
                      "bridge-ports none", "ifup <STAGING_BRIDGE>", "--accept-routes",
                      "SITE_ENV_FILE=", "pveum user token add", "network-isolated, not resource-isolated",
-                     # ifupdown2's parse-only check and dry run, as measured on Proxmox VE 9.2.
-                     "ifup -a --syntax-check", "ifup -n <STAGING_BRIDGE>",
+                     # ifupdown2's parse-only check and dry run, as measured on Proxmox VE 9.2:
+                     # the check exits 1 on a stock node (bridge-fd 0), so it is diffed against
+                     # a baseline, and `ifup -n` prints nothing without -v.
+                     "ifup -a --syntax-check", "/root/syntax-check.before", "ifup -n -v <STAGING_BRIDGE>",
                      # VMIDs are checked against the whole cluster, never one node's `qm list`.
                      "pvesh get /cluster/resources --type vm"):
         assert required in text, required

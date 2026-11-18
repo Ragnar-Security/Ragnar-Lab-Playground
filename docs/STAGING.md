@@ -99,6 +99,7 @@ would re-apply every production interface.
 cp -a /etc/network/interfaces /root/interfaces.before-staging-bridge
 ip -br link | grep -E '^vmbr0' > /root/vmbr0-link.before; ip -br addr | grep -E '^vmbr0' > /root/vmbr0-addr.before
 cat /root/vmbr0-link.before /root/vmbr0-addr.before            # record every vmbr0* line
+ifup -a --syntax-check > /root/syntax-check.before 2>&1; cat /root/syntax-check.before   # baseline, before the change
 cat >> /etc/network/interfaces <<'EOF'
 
 # Staging lab trunk: no physical port, never uplinked (docs/STAGING.md).
@@ -110,8 +111,8 @@ iface <STAGING_BRIDGE> inet manual
 	bridge-vlan-aware yes
 	bridge-vids 2-4094
 EOF
-ifup -a --syntax-check && ifquery <STAGING_BRIDGE>             # parse only; changes nothing
-ifup -n <STAGING_BRIDGE>                                       # dry run: prints what ifup would do
+diff <(ifup -a --syntax-check 2>&1) /root/syntax-check.before; ifquery <STAGING_BRIDGE>   # parse only
+ifup -n -v <STAGING_BRIDGE> 2>&1 | grep -E 'DRY-RUN|running ops'                        # dry run
 ifup <STAGING_BRIDGE>
 ifquery --check <STAGING_BRIDGE>                               # running state matches the stanza
 diff <(ip -br link | grep -E '^vmbr0') /root/vmbr0-link.before \
@@ -121,15 +122,22 @@ ip -br link show <STAGING_BRIDGE>; bridge link show | grep -c 'master <STAGING_B
 
 Expected:
 
-- the syntax check passes, and `ifquery` prints exactly the stanza;
-- the dry run names only `<STAGING_BRIDGE>`;
-- `ifquery --check` reports the bridge `[pass]`;
+- the syntax-check diff shows exactly one new line,
+  `< warning: <STAGING_BRIDGE>: bridge-fd: value of out range "0": valid attribute range: 2-255`,
+  and `ifquery` prints exactly the stanza;
+- every dry-run line that names an interface names only `<STAGING_BRIDGE>`
+  (`ip link add dev <STAGING_BRIDGE> type bridge`);
+- `ifquery --check` reports the bridge and each `bridge-*` line `[pass]` (`bridge-vids` shows `[]`,
+  as it does for `vmbr0`);
 - `vmbr0-unchanged`, the bridge listed, and `0` member ports before any staging VM starts.
 
 ifupdown2's parse-only check is `ifup -a --syntax-check` (`-s`); `ifquery` has no such option, and
-its `-s` means `--syntax-help`. If the syntax check fails, restore the backup file before running
-anything else. If any `vmbr0*` line differs after `ifup`, run `ifdown <STAGING_BRIDGE>`, restore the
-backup file, compare again, and stop.
+its `-s` means `--syntax-help`. **The check exits 1 on an unmodified Proxmox node**: Proxmox writes
+`bridge-fd 0` on every bridge, and ifupdown2 warns that 0 is out of range although it applies it
+(`ifquery --check vmbr0` shows `bridge-fd 0 [pass]`). So compare against the baseline instead of
+trusting the exit code. If the diff shows anything but the one new warning, restore the backup file
+before running anything else. If any `vmbr0*` line differs after `ifup`, run
+`ifdown <STAGING_BRIDGE>`, restore the backup file, compare again, and stop.
 
 To remove the bridge (instructor decision, only with no VM attached): `ifdown <STAGING_BRIDGE>`,
 restore `/root/interfaces.before-staging-bridge`, then repeat the two `vmbr0*` diffs.
@@ -148,11 +156,14 @@ qm set <STAGING_VPN_VMID> --ide2 <STORAGE>:cloudinit --ciuser ubuntu --sshkeys <
 qm start <STAGING_VPN_VMID>
 ```
 
-Its address, `<STAGING_VPN_ADDR>`, comes from the management VLAN's DHCP server. On the VM, as root:
+Its address, `<STAGING_VPN_ADDR>`, comes from the management VLAN's DHCP server; the VM keeps it
+while it runs and renews. If it ever changes, every `http://<STAGING_VPN_ADDR>:8080` below changes
+with it. On the VM, as root:
 
 ```bash
 apt-get update && apt-get install -y docker.io docker-compose-v2 qemu-guest-agent
 systemctl enable --now qemu-guest-agent
+usermod -aG docker ubuntu        # section 6 runs the policy script as this user (HEADSCALE_HOST)
 ```
 
 ### Headscale
@@ -163,7 +174,7 @@ A Docker Compose project in `/opt/headscale` whose service is named `headscale` 
 container.
 
 ```bash
-mkdir -p /opt/headscale/config /opt/headscale/lib && cd /opt/headscale
+mkdir -p /opt/headscale/config /opt/headscale/lib && chown -R ubuntu:ubuntu /opt/headscale && cd /opt/headscale
 cat > docker-compose.yml <<'EOF'
 services:
   headscale:
@@ -197,7 +208,8 @@ docker compose exec -T headscale headscale users create zz-b
 docker compose exec -T headscale headscale users list
 ```
 
-The clients log in over plain HTTP: a Tailscale client accepts an `http://` login server.
+The clients log in over plain HTTP: measured with Headscale v0.27.1 and Tailscale v1.104.7 (the
+client containers below) and v1.102.3 (the jumpbox's snap), all without TLS.
 
 ### Two students
 
@@ -211,13 +223,14 @@ for s in zz-a zz-b; do
   install -m 600 /dev/null /root/$s.env && printf 'TS_AUTHKEY=%s\n' "$KEY" > /root/$s.env; unset KEY
   docker run -d --name $s --hostname $s --restart unless-stopped --cap-add NET_ADMIN --device /dev/net/tun \
     -v $s-state:/var/lib/tailscale --env-file /root/$s.env -e TS_STATE_DIR=/var/lib/tailscale -e TS_USERSPACE=false \
-    -e TS_EXTRA_ARGS="--login-server=http://<STAGING_VPN_ADDR>:8080 --accept-routes" tailscale/tailscale:<PINNED>
+    -e TS_EXTRA_ARGS="--login-server=http://<STAGING_VPN_ADDR>:8080 --accept-routes" tailscale/tailscale:v1.104.7
 done
 ```
 
-`<PINNED>` is a fixed client version tag, recorded in the operator's notes; never `latest`. Once
+The client tag is pinned, never `latest`; change it deliberately and re-run section 7. Once
 `headscale nodes list` shows both, run `shred -u /root/zz-a.env /root/zz-b.env`. The state volumes
-keep the nodes.
+keep the nodes. The two clients cannot reach each other: the staging policy gives a student only
+`autogroup:self` on the tailnet.
 
 ## 4. The staging jumpbox: the production adoption's rehearsal
 
@@ -235,7 +248,9 @@ Then follow `docs/JUMPBOX.md` sections 1-3 exactly, with `SITE_ENV_FILE=` pointi
 each host the scripts run on:
 
 1. `jumpbox_provision.sh` dry run, then `--apply`.
-2. `jumpbox_configure.sh` dry run, then `--apply`.
+2. `jumpbox_configure.sh` dry run, then `--apply`, confirming `netplan try` with ENTER from the same
+   SSH session on the management address. On a fresh VM the dry run does not list the
+   `apt-get install dnsmasq qemu-guest-agent` that `--apply` runs.
 3. `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale
    (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`).
 4. `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`.
@@ -246,7 +261,10 @@ After `--apply`:
 - `ip -br addr | grep -c '^vlan'` and `grep -c '^dhcp-range=' /etc/dnsmasq.d/jumpbox.conf` both
   print `401`;
 - `ip -br addr show vlan200` lists only `10.100.1.1/24`;
-- `systemctl is-active dnsmasq tailscaled` prints `active` twice;
+- `systemctl show dnsmasq -p LimitNOFILESoft` prints `LimitNOFILESoft=65536`: dnsmasq holds about
+  1,600 sockets for 401 VLANs and does not start under the default 1,024;
+- `systemctl is-active dnsmasq snap.tailscale.tailscaled` prints `active` twice (the script installs
+  Tailscale as a snap, so there is no `tailscaled` unit);
 - `sudo nft list table inet jumpbox_vlan_isolation` shows the drop rule, and
   `systemctl is-enabled jumpbox-vlan-isolation.service` prints `enabled`.
 
@@ -356,7 +374,8 @@ Staging B,zz-b,zz-b
 The staging `site.env` also sets:
 
 - `PORTAL_HOST=<STAGING_PORTAL_HOST>`, `PORTAL_APP_CONTAINER=proxmox-vm-automation`
-  (`docker-compose.yml`, `container_name`);
+  (`docker-compose.yml`, `container_name`). The script reaches the portal over SSH even when it runs
+  on the portal host itself, so that host must accept the operator's key;
 - `HEADSCALE_HOST=<staging VPN VM ssh>`, `HEADSCALE_DIR=/opt/headscale`;
 - `HEADSCALE_BASE_POLICY=<staging base policy path>`, `HEADSCALE_POLICY_FILE=/etc/headscale/acl.json`.
 
@@ -368,13 +387,20 @@ SITE_ENV_FILE=~/staging/site.env scripts/apply_headscale_policy.sh --apply
 Expected: `verified: the policy file Headscale serves matches the rendered one.` Re-run after every
 staging roster or VLAN change.
 
+Then check that the jumpbox received both students as peers:
+`sudo tailscale debug netmap | python3 -c 'import json, sys; print(sorted(p["Name"] for p in json.load(sys.stdin).get("Peers") or []))'`
+on the jumpbox lists `zz-a` and `zz-b`. On the first build it listed none: the jumpbox's packet filter
+already held both students' rules, every client's traffic to the lab went unanswered, and only
+`docker compose restart headscale` on the VPN VM gave the jumpbox its peers. Three later reloads did
+not reproduce it. If the list is empty, restart Headscale once and check again.
+
 ## 7. The acceptance test
 
 Repeatable. Every `pvesh` and `qm` line runs on `<STAGING_NODE>` as root, `docker exec zz-*` on the
 VPN VM, and the lease and `nft` lines on the staging jumpbox.
 
 1. Record `git -C <checkout> rev-parse HEAD` on the portal host. Section 6's dry run reports nothing
-   to do.
+   to do, and section 6's peer check on the jumpbox lists `zz-a` and `zz-b`.
 2. `zz-a` and `zz-b` each register (first use) and deploy `staging-two-machine`.
 3. List the staging guests:
 
@@ -385,7 +411,9 @@ VPN VM, and the lease and `nft` lines on the staging jumpbox.
        if re.match(r"student-zz-(a|b)-", r.get("name") or ""): print(r["vmid"], r["name"], r["node"])'
    ```
 
-   It lists exactly four guests, each inside `<STAGING_VMID_RANGE>` and on `<STAGING_NODE>`.
+   It lists exactly four guests, each inside `<STAGING_VMID_RANGE>` and on `<STAGING_NODE>`. For about
+   10 s after a clone, `/cluster/resources` reports a new guest without its name, so run it again if
+   a guest is missing right after the deploy.
    `qm config <vmid> | grep ^net` shows `bridge=<STAGING_BRIDGE>` on every NIC:
    - `srv01`: `net0` on the entry tag and `net1` on the internal tag;
    - `dc01`: `net0` on the internal tag and no `net1`.
