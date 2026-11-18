@@ -227,6 +227,13 @@ def test_policy_inputs_refuse_a_malformed_config(config):
         policy_inputs({**SLOTS, "config": config})
 
 
+# Catches an empty backend list rendering a policy, which the apply script would
+# then read as "no Proxmox" and skip the jumpbox peer check for.
+def test_policy_inputs_refuse_an_empty_backend_list():
+    with pytest.raises(ValueError, match="enabled_backends is empty"):
+        policy_inputs({**SLOTS, "config": {**SLOTS["config"], "enabled_backends": []}})
+
+
 # Catches the policy churning (and Headscale restarting) because input order changed.
 def test_output_order_is_deterministic():
     shuffled = {**SLOTS, "users": list(reversed(SLOTS["users"])),

@@ -700,6 +700,23 @@ def test_apply_policy_skips_the_jumpbox_peer_check_without_proxmox(tmp_path):
     assert PEER_CHECK_SKIPPED in again.stdout.splitlines()
 
 
+# Catches an export with no backend at all taking the cloud-only skip path and
+# reloading a policy nothing checks.
+def test_apply_policy_refuses_an_export_with_no_enabled_backend(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(
+        {**POLICY_SLOTS, "config": {**POLICY_SLOTS["config"], "enabled_backends": []}}) + "\n")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "enabled_backends is empty" in result.stderr
+    assert PEER_CHECK_SKIPPED not in result.stdout
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
+
+
 # ---- scripts/term_changeover.sh, fourth stage -------------------------------
 
 TERM_SSH_STUB = """#!/usr/bin/env python3

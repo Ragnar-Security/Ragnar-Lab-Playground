@@ -97,6 +97,8 @@ def policy_inputs(slots: Mapping[str, Any]) -> Tuple[PolicyBands, Dict[str, str]
     enabled = config.get("enabled_backends")
     if not isinstance(enabled, list) or not all(isinstance(b, str) for b in enabled):
         raise ValueError("config.enabled_backends must be a list of backend names")
+    if not enabled:
+        raise ValueError("config.enabled_backends is empty: the portal exports at least one backend")
     unknown = sorted(set(enabled) - set(KNOWN_BACKENDS))
     if unknown:
         raise ValueError(f"config.enabled_backends names unknown backend(s) {', '.join(unknown)}")
