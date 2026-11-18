@@ -47,7 +47,7 @@ POLICY_REQUIRED = [
     "HEADSCALE_DIR",
 ]
 POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW", "CHECK_FAIL",
-                 "RELOAD_FAIL"]
+                 "RELOAD_FAIL", "JUMPBOX_SSH", "JUMPBOX_PEER_WAIT", "PEERS"]
 # term_changeover.sh reads this exact line from the policy stage's dry run.
 POLICY_FILE_CURRENT = "  nothing to do: the policy file Headscale serves matches the rendered one."
 
@@ -365,12 +365,34 @@ elif args == ["compose", "kill", "-s", "HUP", "headscale"]:
         shutil.copy(policy, loaded)
 elif args == ["compose", "restart", "headscale"]:
     event("restart headscale")
+    open(os.environ["RESTART_MARK"], "a").close()
     if view == "stale":
         shutil.copy(policy, loaded)
+elif args == ["compose", "exec", "-T", "headscale", "headscale", "nodes", "list", "-o", "json"]:
+    event("nodes list")
+    sys.stdout.write(open(os.environ["NODES_FILE"]).read())
 else:
     event("unexpected " + " ".join(args))
     sys.exit(97)
 """
+# `tailscale status --json` on the jumpbox. PEERS: "present" lists every node,
+# "after-restart" only once Headscale has restarted, "never" none of them.
+TAILSCALE_STUB = """#!/usr/bin/env python3
+import json, os, sys
+assert sys.argv[1:] == ["status", "--json"], sys.argv
+with open(os.environ["DOCKER_LOG"], "a") as log:
+    log.write("jumpbox status\\n")
+mode = os.environ.get("PEERS", "present")
+shown = mode == "present" or (mode == "after-restart" and os.path.exists(os.environ["RESTART_MARK"]))
+nodes = json.load(open(os.environ["NODES_FILE"])) if shown else []
+print(json.dumps({"Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
+"""
+POLICY_NODES = [
+    {"id": 1, "given_name": "alice-laptop", "user": {"name": "alice"},
+     "ip_addresses": ["100.64.0.1"], "expiry": {"seconds": -62135596800}},
+    {"id": 2, "given_name": "bob-laptop", "user": {"name": "bob"},
+     "ip_addresses": ["100.64.0.2"], "expiry": {"seconds": -62135596800}},
+]
 
 
 def _executable(path: Path, body: str) -> None:
@@ -384,6 +406,9 @@ def _policy_rig(tmp_path: Path, **extra: str):
     _executable(bin_dir / "ssh", SSH_STUB)
     _executable(bin_dir / "scp", SCP_STUB)
     _executable(bin_dir / "docker", DOCKER_STUB)
+    _executable(bin_dir / "tailscale", TAILSCALE_STUB)
+    nodes = tmp_path / "nodes.json"
+    nodes.write_text(json.dumps(POLICY_NODES))
     headscale_dir = tmp_path / "headscale"
     config_dir = headscale_dir / "config"
     config_dir.mkdir(parents=True)
@@ -407,6 +432,10 @@ def _policy_rig(tmp_path: Path, **extra: str):
         HEADSCALE_DIR=str(headscale_dir),
         HEADSCALE_BASE_POLICY=str(base),
         HEADSCALE_POLICY_FILE="/etc/headscale/acl.json",
+        JUMPBOX_SSH="jumpbox-host",
+        JUMPBOX_PEER_WAIT="0",
+        NODES_FILE=str(nodes),
+        RESTART_MARK=str(tmp_path / "restarted"),
         HOST_POLICY=str(policy),
         HOST_DATA=str(headscale_dir / "data"),
         LOADED_POLICY=str(loaded),
@@ -483,7 +512,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     docker = _log(env, "DOCKER_LOG").splitlines()
     check = docker.index(f"policy check while-installed={original_digest}")
     assert check < docker.index("reload headscale") < len(docker) - 1
-    assert docker[-1] == "policy get"
+    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
     assert not any("restart" in line for line in docker)
     assert "verified: the policy file Headscale serves matches the rendered one." in result.stdout
     assert Path(env["LOADED_POLICY"]).read_text() == desired
@@ -499,7 +528,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     assert not any("restart" in line for line in rerun)
     rechecks = [i for i, line in enumerate(rerun) if line.startswith("policy check")]
     assert len(rechecks) == 1 and rechecks[0] < len(rerun) - 1
-    assert rerun[-1] == "reload headscale"
+    assert rerun[-3:] == ["reload headscale", "nodes list", "jumpbox status"]
 
     dry = _apply_policy(env)
     assert dry.returncode == 0, dry.stderr
@@ -554,7 +583,7 @@ def test_apply_policy_restarts_headscale_once_when_the_read_back_is_stale(tmp_pa
     assert docker.count("reload headscale") == 1
     assert docker.count("restart headscale") == 1
     assert docker.index("reload headscale") < docker.index("restart headscale")
-    assert docker[-1] == "policy get"
+    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
     assert Path(env["LOADED_POLICY"]).read_text() == desired
     assert policy.read_text() == desired
 
@@ -578,6 +607,71 @@ def test_apply_policy_failed_check_leaves_the_policy_and_backups_unchanged(tmp_p
     assert policy.read_text() == original
     assert sorted(p.name for p in policy.parent.iterdir()) == ["acl.json"]
     assert "restart" not in _log(env, "DOCKER_LOG")
+
+
+# Catches a reload that leaves the subnet router without the students it serves
+# being reported as success: on staging, Headscale v0.27.1 did exactly that once,
+# and every student lost every lab until Headscale was restarted.
+def test_apply_policy_checks_the_jumpbox_peers_without_a_restart_when_present(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path)
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+    assert "restart headscale" not in _log(env, "DOCKER_LOG")
+    assert "ssh jumpbox-host tailscale status --json" in _log(env, "SSH_LOG")
+
+
+def test_apply_policy_restarts_headscale_once_when_the_jumpbox_lacks_peers(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="after-restart")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    docker = _log(env, "DOCKER_LOG").splitlines()
+    assert docker.count("restart headscale") == 1
+    assert docker.index("reload headscale") < docker.index("jumpbox status") < docker.index("restart headscale")
+    assert docker[-1] == "jumpbox status"
+    assert "alice-laptop (alice)" in result.stdout
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+
+    # The matching-file path signals a reload too, so it checks the same way.
+    Path(env["RESTART_MARK"]).unlink()
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert _log(env, "DOCKER_LOG").splitlines().count("restart headscale") == 2
+
+
+def test_apply_policy_fails_closed_when_peers_are_still_missing_after_one_restart(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="never")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "alice-laptop (alice)" in result.stderr and "bob-laptop (bob)" in result.stderr
+    assert "cannot reach their labs" in result.stderr
+    assert "verified: the jumpbox" not in result.stdout
+    assert _log(env, "DOCKER_LOG").splitlines().count("restart headscale") == 1
+
+
+# Catches a fail-closed check that fails a tailnet with no student device yet
+# (the start of a term), restarting Headscale for nothing.
+def test_apply_policy_accepts_a_jumpbox_without_peers_when_no_student_has_a_device(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="never")
+    Path(env["NODES_FILE"]).write_text(json.dumps([
+        {"id": 3, "given_name": "jumpbox", "user": {"name": "term-infrastructure"},
+         "ip_addresses": ["100.64.0.3"], "expiry": {"seconds": -62135596800}}]))
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "restart headscale" not in _log(env, "DOCKER_LOG")
+
+
+# Catches --apply reloading Headscale with nothing able to check the result.
+def test_apply_policy_requires_the_jumpbox_ssh_target_only_to_apply(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path)
+    env.pop("JUMPBOX_SSH")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "JUMPBOX_SSH" in result.stderr
+    assert _log(env, "SSH_LOG") == ""
+    assert policy.read_text() == original
+    dry = _apply_policy(env)
+    assert dry.returncode == 0, dry.stderr
 
 
 # ---- scripts/term_changeover.sh, fourth stage -------------------------------

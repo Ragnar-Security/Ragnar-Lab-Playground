@@ -28,6 +28,9 @@ the privilege names in section 5 after a Proxmox upgrade.
 | `<MGMT_VLAN>` | the management VLAN on `vmbr0`, where the jumpbox and the VPN VM have their management NICs |
 | `<STAGING_PORTAL_HOST>` | the host running the staging portal |
 | `<STAGING_VPN_ADDR>` | the VPN VM's DHCP address on the management VLAN |
+| `<STAGING_JUMPBOX_ADDR>` | the staging jumpbox's DHCP address on the management VLAN |
+| `<MGMT_GATEWAY>` | the management VLAN's gateway |
+| `<STAGING_NODE_ADDR>` | `<STAGING_NODE>`'s own address, where its API listens on port 8006 |
 | `<STAGING_POOL>` | the Proxmox pool that holds the staging template |
 | `<STORAGE>` | the Proxmox storage for the staging VMs' disks |
 | `<CLOUD_IMAGE>` | the Ubuntu 24.04 cloud image on the node (`scripts/site.env.example`, `JUMPBOX_CLOUD_IMAGE`) |
@@ -40,9 +43,14 @@ The real values live in the operator's notes, never in this repository.
 There is no dedicated staging node; the instructor approved the isolated bridge on an existing
 production node. So staging is **network-isolated, not resource-isolated**:
 
-- **Isolated:** lab traffic. The staging bridge has no physical port, so a staging lab VM can reach
-  only the staging jumpbox, never a production VLAN, and staging uses its own Headscale and its own
-  portal database.
+- **Isolated:** lab traffic. The staging bridge has no physical port, so a staging lab VM's only
+  router is the staging jumpbox, and the jumpbox's VLAN isolation (`--isolate-vlans`, section 4)
+  lets traffic routed from a lab VLAN leave only through `tailscale0`, toward the students'
+  devices. It drops what a lab VM routes toward another lab VLAN, the management VLAN, the
+  Proxmox API or the internet: without that table, the jumpbox forwarded a staging lab VM's
+  packets out of its management NIC (section 7 step 7 checks this). A lab VM can still reach
+  the jumpbox itself: DHCP and DNS, and SSH on its addresses. Staging uses its own Headscale and
+  its own portal database.
 - **Shared with production:** `<STAGING_NODE>`'s CPU, memory and storage (production's admission
   sees staging guests as used memory); the cluster's VMID namespace; the Proxmox task log and
   cluster API; and the management VLAN, where the staging jumpbox and VPN VM have their management
@@ -377,22 +385,26 @@ The staging `site.env` also sets:
   (`docker-compose.yml`, `container_name`). The script reaches the portal over SSH even when it runs
   on the portal host itself, so that host must accept the operator's key;
 - `HEADSCALE_HOST=<staging VPN VM ssh>`, `HEADSCALE_DIR=/opt/headscale`;
-- `HEADSCALE_BASE_POLICY=<staging base policy path>`, `HEADSCALE_POLICY_FILE=/etc/headscale/acl.json`.
+- `HEADSCALE_BASE_POLICY=<staging base policy path>`, `HEADSCALE_POLICY_FILE=/etc/headscale/acl.json`;
+- `JUMPBOX_SSH=ubuntu@<STAGING_JUMPBOX_ADDR>`, where `--apply` checks the jumpbox's peers.
 
 ```bash
 SITE_ENV_FILE=~/staging/site.env scripts/apply_headscale_policy.sh            # dry run
 SITE_ENV_FILE=~/staging/site.env scripts/apply_headscale_policy.sh --apply
 ```
 
-Expected: `verified: the policy file Headscale serves matches the rendered one.` Re-run after every
-staging roster or VLAN change.
+Expected: `verified: the policy file Headscale serves matches the rendered one.`, then
+`verified: the jumpbox lists every roster device as a peer.` Re-run after every staging roster or
+VLAN change.
 
-Then check that the jumpbox received both students as peers:
-`sudo tailscale debug netmap | python3 -c 'import json, sys; print(sorted(p["Name"] for p in json.load(sys.stdin).get("Peers") or []))'`
-on the jumpbox lists `zz-a` and `zz-b`. On the first build it listed none: the jumpbox's packet filter
-already held both students' rules, every client's traffic to the lab went unanswered, and only
-`docker compose restart headscale` on the VPN VM gave the jumpbox its peers. Three later reloads did
-not reproduce it. If the list is empty, restart Headscale once and check again.
+The second line is `--apply` checking, with `tailscale status --json` on the jumpbox, that every
+roster device Headscale knows is one of the jumpbox's peers. On the first build it listed none after
+the reload: the jumpbox's packet filter already held both students' rules, yet every client's
+traffic to the lab went unanswered until `docker compose restart headscale` on the VPN VM. So when a
+device is missing, the script restarts Headscale once, checks again, and fails, naming the devices,
+if one is still missing. To check by hand on the jumpbox:
+`tailscale status --json | python3 -c 'import json, sys; print(sorted(p["HostName"] for p in (json.load(sys.stdin).get("Peer") or {}).values()))'`
+lists `zz-a` and `zz-b`.
 
 ## 7. The acceptance test
 
@@ -400,7 +412,7 @@ Repeatable. Every `pvesh` and `qm` line runs on `<STAGING_NODE>` as root, `docke
 VPN VM, and the lease and `nft` lines on the staging jumpbox.
 
 1. Record `git -C <checkout> rev-parse HEAD` on the portal host. Section 6's dry run reports nothing
-   to do, and section 6's peer check on the jumpbox lists `zz-a` and `zz-b`.
+   to do, and section 6's peer check by hand on the jumpbox lists `zz-a` and `zz-b`.
 2. `zz-a` and `zz-b` each register (first use) and deploy `staging-two-machine`.
 3. List the staging guests:
 
@@ -435,10 +447,24 @@ VPN VM, and the lease and `nft` lines on the staging jumpbox.
       `reverse-ok-zz-a` in `out-data`. The same command against `<TB>` must return nothing.
    4. From B's `dc01`, `<TB>` must return `reverse-ok-zz-b` and `<TA>` nothing.
    5. Stop both listeners: `docker exec zz-a pkill -f 'nc -l -p 18080'`, and the same for `zz-b`.
-7. Read the J2 counter (`sudo nft list table inet jumpbox_vlan_isolation` on the staging jumpbox).
+7. Read the J2 counters (`sudo nft list table inet jumpbox_vlan_isolation` on the staging jumpbox).
    From A's `dc01` (`qm guest exec <vmid> -- ping -c2 -W2 <B srv01 internal addr>`), there is no
-   reply, and the counter rises.
-8. Record the date, commit, four VMIDs, `TA`, `TB` and each result in the operator's staging log.
+   reply, and the first counter (`oifname "vlan*"`) rises.
+8. **No egress except the tailnet.** From A's `dc01`, each of these must fail:
+
+   ```bash
+   qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'ping -c2 -W2 <MGMT_GATEWAY>'
+   qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'nc -w3 -z <STAGING_NODE_ADDR> 8006'
+   qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'nc -w3 -z <STAGING_VPN_ADDR> 8080'
+   qm guest exec <A dc01 vmid> --timeout 20 -- sh -c 'ping -c2 -W2 1.1.1.1; nc -w3 -z 1.1.1.1 443'
+   ```
+
+   and the second counter (`oifname != "tailscale0"`) rises by at least the probes' packets. A
+   failure alone proves nothing here: the jumpbox does no NAT, so before the table existed these
+   probes also failed for want of a return route, while `tcpdump -ni <jumpbox mgmt NIC> src <dc01
+   addr>` on the jumpbox showed every packet leaving. The counter is the evidence; so is a capture
+   that stays empty.
+9. Record the date, commit, four VMIDs, `TA`, `TB` and each result in the operator's staging log.
    Then destroy both deployments; step 3's query prints nothing.
 
 ### Stop, start, reset, remove

@@ -1018,8 +1018,9 @@ Headscale host is an instructor step, not part of a deployment.
 
 `scripts/apply_headscale_policy.sh` reads `scripts/site.env`
 (`PORTAL_HOST`, `PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`;
-optional `HEADSCALE_BASE_POLICY`, default `config/headscale-acl.json`, and
-`HEADSCALE_POLICY_FILE`, default `/etc/headscale/acl.json`):
+`JUMPBOX_SSH` for `--apply`; optional `HEADSCALE_BASE_POLICY`, default
+`config/headscale-acl.json`, `HEADSCALE_POLICY_FILE`, default
+`/etc/headscale/acl.json`, and `JUMPBOX_PEER_WAIT`, default 60 seconds):
 
 ```bash
 scripts/apply_headscale_policy.sh            # dry run: prints the diff, writes nothing
@@ -1037,7 +1038,13 @@ inside the Headscale container (`headscale policy check`), backs up the
 current file as `<policy-file>.<YYYYmmddTHHMMSSZ>` (mode 0600), installs the
 new one atomically, signals Headscale (`SIGHUP`) to reload it, and reads it
 back; only if the read-back differs does it restart the headscale service
-once, and it fails if it still differs.
+once, and it fails if it still differs. Last, it checks the jumpbox over SSH
+(`JUMPBOX_SSH`, `tailscale status --json`): every roster device Headscale
+knows must be one of its peers, because a device that is not cannot reach
+any lab. Headscale v0.27.1 has reloaded a policy and left the jumpbox with
+no peers at all. The script waits up to `JUMPBOX_PEER_WAIT` seconds,
+restarts Headscale once if a device is still missing, and fails, naming the
+devices, if one is missing after that.
 
 **In file mode `headscale policy get` returns the policy file, not the
 policy Headscale has loaded.** A match therefore proves only that the file

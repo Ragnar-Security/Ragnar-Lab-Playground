@@ -10,13 +10,17 @@ source "$SCRIPT_DIR/site_env.sh"
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR \
-    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT
 for name in PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR; do
     require_site_var "$name"
 done
 
 HEADSCALE_BASE_POLICY="${HEADSCALE_BASE_POLICY:-config/headscale-acl.json}"
 HEADSCALE_POLICY_FILE="${HEADSCALE_POLICY_FILE:-/etc/headscale/acl.json}"
+# Seconds to wait for the jumpbox to list every roster device after a reload.
+JUMPBOX_PEER_WAIT="${JUMPBOX_PEER_WAIT:-60}"
+[[ "$JUMPBOX_PEER_WAIT" =~ ^[0-9]+$ ]] \
+    || { printf 'ERROR: JUMPBOX_PEER_WAIT must be a number of seconds\n' >&2; exit 1; }
 [[ "$HEADSCALE_BASE_POLICY" == /* ]] || HEADSCALE_BASE_POLICY="$REPO_ROOT/$HEADSCALE_BASE_POLICY"
 for name in HEADSCALE_DIR HEADSCALE_POLICY_FILE; do
     [[ "${!name}" == /* ]] \
@@ -58,6 +62,9 @@ The default dry run reads both hosts, prints the change, and writes nothing.
 Use --apply to check the policy inside the Headscale container, back up the
 current file, install the new one atomically, signal Headscale to reload it,
 and verify the read-back (restarting the headscale service once if it differs).
+--apply then checks over SSH (JUMPBOX_SSH) that the jumpbox lists every
+roster device as a peer, waiting up to JUMPBOX_PEER_WAIT seconds; if any is
+missing it restarts Headscale once and checks again, and fails if one still is.
 EOF
 }
 
@@ -83,6 +90,7 @@ while (($#)); do
 done
 
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
+((APPLY == 0)) || require_site_var JUMPBOX_SSH
 [[ -f "$POLICY_TOOL" ]] || die "Policy renderer not found: $POLICY_TOOL"
 [[ -f "$HEADSCALE_BASE_POLICY" ]] || die "Base policy not found: $HEADSCALE_BASE_POLICY"
 
@@ -189,6 +197,49 @@ restart_headscale() {
         exit 1" || die "Headscale did not come back after the restart."
 }
 
+# Headscale v0.27.1 once reloaded a policy and left the jumpbox, the subnet
+# router for every lab, with no peers: its packet filter held every student's
+# rules, yet no student reached any lab until Headscale was restarted. So a
+# reload is not done until the jumpbox lists every roster device as a peer.
+fetch_nodes() {
+    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" \
+        "cd '$HEADSCALE_DIR' && docker compose exec -T headscale headscale nodes list -o json"
+}
+
+# Prints the roster devices the jumpbox does not list as peers, one per line.
+missing_peers() {
+    ssh "${SSH_OPTIONS[@]}" "$JUMPBOX_SSH" "tailscale status --json" > "$TMP_DIR/jumpbox-status.json" \
+        || die "Could not read tailscale status on the jumpbox ($JUMPBOX_SSH)."
+    "$PYTHON" "$POLICY_TOOL" missing-peers "$TMP_DIR/nodes.json" "$TMP_DIR/slots.json" \
+        "$TMP_DIR/jumpbox-status.json" || die "Could not compare the jumpbox's peers with Headscale's nodes."
+}
+
+# Polls for up to JUMPBOX_PEER_WAIT seconds; leaves the last result in $missing.
+wait_for_peers() {
+    local deadline=$((SECONDS + JUMPBOX_PEER_WAIT))
+    while :; do
+        missing="$(missing_peers)" || exit 1
+        [[ -z "$missing" ]] && return 0
+        ((SECONDS < deadline)) || return 1
+        sleep 3
+    done
+}
+
+verify_jumpbox_peers() {
+    local missing=""
+    fetch_nodes > "$TMP_DIR/nodes.json" || die "Could not list Headscale's nodes."
+    if ! wait_for_peers; then
+        printf '  the jumpbox does not list these roster devices as peers; restarting Headscale once:\n'
+        sed 's/^/    /' <<< "$missing"
+        restart_headscale
+        wait_for_peers || die "After one Headscale restart the jumpbox ($JUMPBOX_SSH) still does not list" \
+            "these roster devices as peers, so their students cannot reach their labs:" \
+            "${missing//$'\n'/; }." \
+            "Check 'headscale nodes list-routes' and 'tailscale debug netmap' on the jumpbox."
+    fi
+    printf '  verified: the jumpbox lists every roster device as a peer.\n'
+}
+
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/headscale-policy.XXXXXX")"
 chmod 700 "$TMP_DIR"
 
@@ -210,6 +261,7 @@ if [[ -z "$changes" ]]; then
     check_policy
     reload_headscale
     printf '  signalled Headscale to reload that file.\n'
+    verify_jumpbox_peers
     exit 0
 fi
 printf '%s\n' "$changes"
@@ -230,3 +282,4 @@ if [[ -n "$readback" ]]; then
     [[ -z "$readback" ]] || die "The policy file Headscale serves still differs after one restart."
 fi
 printf '  verified: the policy file Headscale serves matches the rendered one.\n'
+verify_jumpbox_peers

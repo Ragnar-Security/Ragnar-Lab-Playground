@@ -312,8 +312,11 @@ def test_jumpbox_doc_documents_vlan_isolation():
     assert "### VLAN isolation" in headings
     section = "\n".join(_section((ROOT / "docs" / "JUMPBOX.md").read_text(), "### VLAN isolation"))
     for needle in ("--isolate-vlans", "--allow-vlans", "systemctl disable --now "
-                   "jumpbox-vlan-isolation.service", "nft list table inet jumpbox_vlan_isolation"):
-        assert needle in section
+                   "jumpbox-vlan-isolation.service", "nft list table inet jumpbox_vlan_isolation",
+                   # Lab VLANs forward only to the tailnet (instructor, 2026-11-18).
+                   "leaves on anything but `tailscale0`",
+                   "Lab VMs have no egress except the student's"):
+        assert needle in section, needle
 
 
 STAGING = ROOT / "docs" / "STAGING.md"
@@ -331,7 +334,12 @@ def test_staging_runbook_keeps_its_safety_settings_and_placeholders():
                      # a baseline, and `ifup -n` prints nothing without -v.
                      "ifup -a --syntax-check", "/root/syntax-check.before", "ifup -n -v <STAGING_BRIDGE>",
                      # VMIDs are checked against the whole cluster, never one node's `qm list`.
-                     "pvesh get /cluster/resources --type vm"):
+                     "pvesh get /cluster/resources --type vm",
+                     # The acceptance test proves a lab VM has no route out but the tailnet,
+                     # and the policy apply checks the jumpbox's peers after the reload.
+                     "No egress except the tailnet", 'oifname != "tailscale0"',
+                     "nc -w3 -z <STAGING_NODE_ADDR> 8006", "JUMPBOX_SSH=",
+                     "verified: the jumpbox lists every roster device as a peer."):
         assert required in text, required
     # The bridge is brought up alone (the runbook may warn against `ifreload`, but never
     # run `ifreload -a`), and the staging portal never runs with root's API rights.

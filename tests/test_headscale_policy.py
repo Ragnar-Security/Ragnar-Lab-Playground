@@ -13,6 +13,7 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
+    missing_peers,
     normalize_login,
     parse_vlan_bands,
     policy_diff,
@@ -369,3 +370,55 @@ def test_cli_diff_is_empty_when_equal_and_errors_go_to_stderr(tmp_path):
     assert result.returncode != 0
     assert result.stdout == ""
     assert "desired.json" in result.stderr
+
+
+# ---- missing-peers: the jumpbox's view after a reload ----------------------
+
+def _node(name, user, ip, expiry=-62135596800):
+    """One `headscale nodes list -o json` entry (v0.27), trimmed to what is read."""
+    return {"given_name": name, "user": {"name": user}, "ip_addresses": [ip, "fd7a:115c:a1e0::9"],
+            "expiry": {"seconds": expiry}}
+
+
+NODES = [_node("alice-laptop", "alice", "100.64.0.1"), _node("bob-laptop", "bob", "100.64.0.2"),
+         _node("jumpbox", "term-infrastructure", "100.64.0.3"), _node("prof", "instructor", "100.64.0.4")]
+
+
+def _status(*ips):
+    """`tailscale status --json` on the jumpbox, listing these peer addresses."""
+    return {"Peer": {f"nodekey:{i}": {"HostName": f"h{i}", "TailscaleIPs": [ip]} for i, ip in enumerate(ips)}}
+
+
+# Catches a Headscale reload that leaves the subnet router without the students
+# the policy grants (measured on staging with v0.27.1: every student lost every lab).
+def test_missing_peers_names_roster_devices_the_jumpbox_does_not_list():
+    assert missing_peers(NODES, SLOTS, _status("100.64.0.1", "100.64.0.2", "100.64.0.4")) == []
+    assert missing_peers(NODES, SLOTS, _status("100.64.0.4")) == [
+        "alice-laptop (alice)", "bob-laptop (bob)"]
+    assert missing_peers(NODES, SLOTS, {"Peer": None}) == ["alice-laptop (alice)", "bob-laptop (bob)"]
+
+
+# Catches a false alarm (and a needless Headscale restart) for devices the
+# jumpbox is not meant to list: staff and infrastructure users, and expired nodes.
+def test_missing_peers_ignores_non_roster_and_expired_nodes():
+    nodes = [_node("jumpbox", "term-infrastructure", "100.64.0.3"),
+             _node("old", "alice", "100.64.0.8", expiry=1_000_000_000),
+             _node("Alice-Phone", "ALICE", "100.64.0.9")]
+    assert missing_peers(nodes, SLOTS, _status()) == ["Alice-Phone (ALICE)"]
+    assert missing_peers(nodes[:2], SLOTS, _status()) == []
+
+
+def test_missing_peers_refuses_malformed_input():
+    with pytest.raises(ValueError):
+        missing_peers({"nodes": NODES}, SLOTS, _status())
+    with pytest.raises(ValueError):
+        missing_peers(NODES, SLOTS, ["not", "a", "status"])
+
+
+def test_cli_missing_peers_prints_one_device_per_line(tmp_path):
+    paths = {}
+    for name, value in (("nodes", NODES), ("slots", SLOTS), ("status", _status("100.64.0.2"))):
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(value))
+    result = _cli("missing-peers", str(paths["nodes"]), str(paths["slots"]), str(paths["status"]))
+    assert (result.returncode, result.stdout) == (0, "alice-laptop (alice)\n")
