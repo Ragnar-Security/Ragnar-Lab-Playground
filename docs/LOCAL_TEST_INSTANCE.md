@@ -3,7 +3,8 @@
 A throwaway copy of the portal, run with the development stack on a workstation or a lab VM, that
 deploys real VMs on the same Proxmox cluster as production. Use it to try a new template, test a
 `templates.yaml` change, or develop against real infrastructure without touching the production
-portal.
+portal. For the permanent staging portal on an isolated bridge, with its own jumpbox and Headscale,
+see `docs/STAGING.md`.
 
 It shares the cluster with production, so three things must be true **before** it gets real
 credentials. Everything else in this guide is convenience.

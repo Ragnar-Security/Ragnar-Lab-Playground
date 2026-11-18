@@ -72,6 +72,8 @@ The Proxmox bridge must carry these VLANs (`bridge-vlan-aware yes`, with
 
 ## 1. Create the VM
 
+A staging jumpbox puts `JUMPBOX_TRUNK_BRIDGE` on an isolated bridge; see `docs/STAGING.md`.
+
 Set the provisioning values in `scripts/site.env`: `JUMPBOX_NODE`,
 `JUMPBOX_STORAGE`, `JUMPBOX_VMID`, `JUMPBOX_SSH_PUBKEY`, and if they differ
 from the defaults, the bridge, the management VLAN, the cloud image and the VM

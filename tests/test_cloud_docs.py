@@ -316,6 +316,29 @@ def test_jumpbox_doc_documents_vlan_isolation():
         assert needle in section
 
 
+STAGING = ROOT / "docs" / "STAGING.md"
+
+
+# Catches the staging runbook losing a setting that keeps staging off production.
+def test_staging_runbook_keeps_its_safety_settings_and_placeholders():
+    text = STAGING.read_text()
+    for required in ("ORPHAN_REAPER_ENABLED=false", "FIXED_NODE=<STAGING_NODE>",
+                     "LAB_BRIDGE=<STAGING_BRIDGE>", "VMID_RANGE=<STAGING_VMID_RANGE>",
+                     "bridge-ports none", "ifup <STAGING_BRIDGE>", "--accept-routes",
+                     "SITE_ENV_FILE=", "pveum user token add", "network-isolated, not resource-isolated",
+                     # ifupdown2's parse-only check and dry run, as measured on Proxmox VE 9.2.
+                     "ifup -a --syntax-check", "ifup -n <STAGING_BRIDGE>",
+                     # VMIDs are checked against the whole cluster, never one node's `qm list`.
+                     "pvesh get /cluster/resources --type vm"):
+        assert required in text, required
+    # The bridge is brought up alone (the runbook may warn against `ifreload`, but never
+    # run `ifreload -a`), and the staging portal never runs with root's API rights.
+    # ifquery has no syntax check; that spelling fails on the node.
+    for forbidden in ("ifreload -a", "root@pam", "ifquery -a --syntax-check"):
+        assert forbidden not in text, forbidden
+    assert not REAL_ID_PATTERNS.search(text)
+
+
 # ---- migrations and changelog ----------------------------------------------
 
 def _migration_loops(text):
