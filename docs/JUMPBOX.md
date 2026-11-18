@@ -157,7 +157,10 @@ jumpbox. The Headscale policy cannot stop this, since the traffic never
 touches the tailnet.
 
 So every `--apply` installs `inet jumpbox_lab_egress`, with its own oneshot
-unit `jumpbox-lab-egress.service`, loaded before the network. It needs `nft`:
+unit `jumpbox-lab-egress.service`. At boot the unit loads the table before
+`systemd-sysctl.service` switches IP forwarding on, and before the network
+(`Before=systemd-sysctl.service network-pre.target`; it needs only `nft` and
+the rule file mounted), so lab traffic is never forwarded unfiltered. It needs `nft`:
 `--apply` refuses without it, and the dry run notes it. The table has a
 forward hook at priority -10, policy accept, and two rules:
 
@@ -463,7 +466,8 @@ sudo jumpbox/jumpbox_configure.sh --apply --no-try --isolate-vlans --allow-vlans
 
 This writes `/etc/nftables.d/jumpbox-vlan-isolation.nft` and
 `/etc/systemd/system/jumpbox-vlan-isolation.service` (a oneshot that loads the
-file before the network) and enables the unit. The file is its own table,
+file before IP forwarding is switched on and before the network, like the lab
+egress unit) and enables the unit. The file is its own table,
 `inet jumpbox_vlan_isolation`, with a forward hook at priority -10 and policy
 accept, holding one rule: count and drop what enters **and** leaves through a
 `vlan*` interface. Traffic between `tailscale0` and a VLAN (students, staff),

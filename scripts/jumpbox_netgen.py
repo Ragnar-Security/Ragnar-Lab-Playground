@@ -444,9 +444,13 @@ def _nft_table_unit(description, nft_file, table):
         f"# {HEADER}",
         "[Unit]",
         f"Description={description}",
+        # Before systemd-sysctl.service, which switches IP forwarding on
+        # (90-jumpbox-router.conf), so lab traffic is never forwarded unfiltered;
+        # and before the network. It needs only nft and its rule file mounted.
         "DefaultDependencies=no",
+        f"RequiresMountsFor=/usr/sbin/nft {nft_file}",
         "Wants=network-pre.target",
-        "Before=network-pre.target",
+        "Before=systemd-sysctl.service network-pre.target",
         "",
         "[Service]",
         "Type=oneshot",

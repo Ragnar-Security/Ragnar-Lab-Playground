@@ -1082,8 +1082,16 @@ def test_nft_table_units_are_persistent_and_reloadable(render, nft_file, table):
     assert service["ExecReload"] == f"/usr/sbin/nft -f {nft_file}"
     assert service["ExecStop"] == f"-/usr/sbin/nft delete table inet {table}"
     assert parser["Install"]["WantedBy"] == "multi-user.target"
-    assert parser["Unit"]["Before"] == "network-pre.target"
-    assert parser["Unit"]["Wants"] == "network-pre.target"
+    # Catches a boot that switches IP forwarding on (systemd-sysctl applies
+    # 90-jumpbox-router.conf) before the table that filters forwarded lab
+    # traffic is loaded, which would forward lab traffic unfiltered for a moment.
+    unit = parser["Unit"]
+    assert unit["DefaultDependencies"] == "no"
+    assert unit["Before"].split() == ["systemd-sysctl.service", "network-pre.target"]
+    assert unit["Wants"] == "network-pre.target"
+    # nft and the rule file must be mounted, and nothing later than that.
+    assert unit["RequiresMountsFor"].split() == ["/usr/sbin/nft", nft_file]
+    assert "After" not in unit
 
 
 def test_netgen_cli_emits_the_isolation_table_and_unit():
