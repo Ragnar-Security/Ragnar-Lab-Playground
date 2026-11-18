@@ -201,6 +201,15 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `term_changeover.sh` keeps exported `HEADSCALE_BASE_POLICY` and
   `HEADSCALE_POLICY_FILE` values over `scripts/site.env`, as
   `apply_headscale_policy.sh` already did.
+- `term_changeover.sh` reports every file it replaces as `backup: <path>` or,
+  when there was no old file, `absent-before: <path>`. It used to print a
+  key-file and a portal-roster backup path even when no backup was written,
+  and nothing for a local roster created from nothing, so a rollback either
+  failed on a missing backup or left the incoming file behind.
+  `docs/TERM_CHANGEOVER.md` "Rollback" now undoes each line with one
+  `undo_file` function (copy back, or delete); the operator plan's
+  Procedure R uses it. The other lines changed form too: the database and
+  MySQL dump lines are now `backup:`.
 - A destroy, expiry or failed-deploy cleanup in the first ~10 s after a
   Proxmox clone is no longer refused with "guest identity could not be
   verified". The cluster listing reports a fresh guest's name empty (or the

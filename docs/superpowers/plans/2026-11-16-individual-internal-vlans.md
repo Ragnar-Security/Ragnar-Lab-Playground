@@ -1123,28 +1123,29 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
   - **After Step 10's policy applies (10e and 10i.4) and after Step 11:** exit 0 with the post-changeover counts.
 
   **At the first result that differs, stop and run Step 12 for every step done so far.**
-- **Procedure R: restore Headscale as one set (rollback only).** Only Step 12 item 3 uses it. It puts back, **with Headscale stopped**, the database and key file that Step 9's stage 1 backed up together with the policy file that stage 4 backed up. Headscale checks that every user the policy names exists, so the outgoing database must never start under the incoming policy, or the reverse. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used.
-  - `BACKUP_REF` is the `backup:` value that Step 9's policy stage printed. The apply script prints `backup: <HEADSCALE_HOST>:<path>`, so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix. Leave `BACKUP_REF` empty if stage 4 printed none.
-  - `DB_BACKUP` and `KEYS_BACKUP` are the two paths stage 1 printed. Leave both empty if stage 1 printed none.
+- **Procedure R: restore Headscale as one set (rollback only).** Only Step 12 item 3 uses it. It puts back, **with Headscale stopped**, the database and key file that Step 9's stage 1 replaced together with the policy file that stage 4 replaced. Headscale checks that every user the policy names exists, so the outgoing database must never start under the incoming policy, or the reverse. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used and pasting `undo_file` from `docs/TERM_CHANGEOVER.md` "Undo one file".
+  - Every replaced file was printed as `backup: <path>` (a copy exists; it is copied back) or `absent-before: <path>` (there was no file; the one the stage created is deleted). Remote paths carry the `<HEADSCALE_HOST>:` prefix, which `undo_file` strips exactly (IPv6-safe).
+  - `DB_LINE` and `KEYS_LINE` are the database and key-file lines stage 1 printed; `POLICY_LINE` is stage 4's `backup:` line. Leave a line empty if its stage printed none: `undo_file` leaves that file alone.
   ```bash
-  BACKUP_REF='<everything after "backup: ", or empty>'; DB_BACKUP='<stage 1 db path, or empty>'; KEYS_BACKUP='<stage 1 key-file path, or empty>'
-  HOST_FILE='<host policy file>'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"
-  [[ -z "$BACKUP_REF" || ( "${BACKUP##*.}" =~ ^[0-9]{8}T[0-9]{6}Z$ && "${BACKUP%.*}" == "$HOST_FILE" && -f "$BACKUP" ) ]] \
-    && [[ ( -z "$DB_BACKUP" && -z "$KEYS_BACKUP" ) || ( -f "$DB_BACKUP" && -f "$KEYS_BACKUP" ) ]] && test -f "$HOST_FILE" && echo files-ok
-  [[ -n "$BACKUP_REF" ]] || sha256sum "$HOST_FILE"   # no stage-4 backup: must equal Step 5's record
+  DB_LINE='<stage 1 database line, or empty>'; KEYS_LINE='<stage 1 key-file line, or empty>'; POLICY_LINE='<stage 4 line, or empty>'
+  HOST_FILE='<host policy file>'
+  undo_file check "$DB_LINE" "$PWD/headscale/data/db.sqlite" "$HEADSCALE_HOST" \
+    && undo_file check "$KEYS_LINE" "$PWD/students_with_keys.csv" "$HEADSCALE_HOST" \
+    && undo_file check "$POLICY_LINE" "$HOST_FILE" "$HEADSCALE_HOST" && test -f "$HOST_FILE" && echo lines-ok
+  [[ -n "$POLICY_LINE" ]] || sha256sum "$HOST_FILE"   # no stage-4 backup: must equal Step 5's record
   ```
-  Expected: `files-ok`, and without a stage-4 backup a hash equal to Step 5's record. Otherwise stop: nothing has been modified. Then:
+  Expected: `lines-ok`, and without a stage-4 backup a hash equal to Step 5's record. Otherwise stop: nothing has been modified. Then:
   ```bash
   docker compose stop headscale
-  [[ -z "$DB_BACKUP" ]] || { cp "$DB_BACKUP" headscale/data/db.sqlite && cp "$KEYS_BACKUP" students_with_keys.csv \
-    && chmod 600 headscale/data/db.sqlite students_with_keys.csv; }
-  [[ -z "$BACKUP_REF" ]] || { cp -p "$BACKUP" "$HOST_FILE.restoring" && mv -f "$HOST_FILE.restoring" "$HOST_FILE"; }
+  undo_file apply "$DB_LINE" "$PWD/headscale/data/db.sqlite" "$HEADSCALE_HOST"
+  undo_file apply "$KEYS_LINE" "$PWD/students_with_keys.csv" "$HEADSCALE_HOST"
+  undo_file apply "$POLICY_LINE" "$HOST_FILE" "$HEADSCALE_HOST"
   docker compose start headscale
   for i in $(seq 1 30); do docker compose exec -T headscale headscale policy get > /dev/null 2>&1 && break; sleep 1; done
   docker compose exec -T headscale headscale policy check --file '<HEADSCALE_POLICY_FILE>'   # must exit 0
   docker compose exec -T headscale headscale users list                                      # the outgoing roster, staff, infrastructure
-  [[ -z "$BACKUP_REF" ]] || { docker compose exec -T headscale headscale policy get > /tmp/policy.readback \
-    && python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' /tmp/policy.readback "$BACKUP" \
+  [[ -z "$POLICY_LINE" ]] || { docker compose exec -T headscale headscale policy get > /tmp/policy.readback \
+    && python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' /tmp/policy.readback "$HOST_FILE" \
     && echo restored; }
   ```
   Expected: Headscale starts, `policy check` exits 0, the user list is the outgoing roster plus the staff and infrastructure users, and (with a stage-4 backup) `restored`. If Headscale does not start, `docker compose logs headscale` names the user the policy lacks: the set is mixed, so stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md`, "Apply the Headscale policy"). The peer check comes after the roster and portal restore (Step 12 item 3). The access check that follows is the proof of what is enforced.
@@ -1215,11 +1216,11 @@ Every enabled individual group with a single machine sets `internal_nic: false` 
 
 - [ ] **Step 9 (operator): Run the changeover**
 
-Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Before stage 1 it runs the policy preflight. On a Proxmox site it must print `ready: the jumpbox (<JUMPBOX_SSH>) answers and its Tailscale is Running.`; a failed preflight stops with `nothing was changed`. Then its four stages run (`docs/TERM_CHANGEOVER.md`), and stage 4 applies the production policy (P2) for the new roster. **Record every backup path the run prints**, for Step 12:
-- stage 1: the Headscale database and key-file backups;
-- stage 2: the local and production roster CSV backups;
-- stage 3: the MySQL dump (`pre-term-changeover-*.sql`);
-- stage 4: the policy `backup:` line (Procedure R's `BACKUP_REF`). If it scrolled away, use the newest `<policy file>.<YYYYmmddTHHMMSSZ>` on the Headscale host, prefixed with `<HEADSCALE_HOST>:`.
+Run `scripts/term_changeover.sh --apply <canvas-export>.csv`. Before stage 1 it runs the policy preflight. On a Proxmox site it must print `ready: the jumpbox (<JUMPBOX_SSH>) answers and its Tailscale is Running.`; a failed preflight stops with `nothing was changed`. Then its four stages run (`docs/TERM_CHANGEOVER.md`), and stage 4 applies the production policy (P2) for the new roster. **Record every `backup:` and `absent-before:` line the run prints, verbatim**, for Step 12:
+- stage 1: the Headscale database (`backup:`) and key file (`backup:`, or `absent-before:` when there was none) — Procedure R's `DB_LINE` and `KEYS_LINE`;
+- stage 2: the local and production roster CSVs (each `backup:` or `absent-before:`);
+- stage 3: the MySQL dump (`backup:`, a `pre-term-changeover-*.sql`);
+- stage 4: the policy `backup:` line (Procedure R's `POLICY_LINE`). If it scrolled away, use the newest `<policy file>.<YYYYmmddTHHMMSSZ>` on the Headscale host, as `backup: <HEADSCALE_HOST>:<that path>`.
 
 Verify:
 - Stage 4 printed `verified: the jumpbox lists every roster device as a peer.` That line is required: without it the stage failed, and no student may be told the VPN is open. If the stage restarted Headscale once and then verified, that is a pass; record it.
@@ -1306,7 +1307,7 @@ Then run the access check. **Only after J2 is applied and the access check shows
 
 - [ ] **Step 12 (operator): Rollback, if any check fails**
 
-First establish what ran: which of Steps 6-11, and for Step 9 which changeover stages completed and which backups it printed. Stage 1 printed Headscale backups only if it changed Headscale, stage 2 roster backups only if it replaced a roster file, stage 3 a MySQL dump only if it purged and seeded, and stage 4 a `backup:` line only if it installed a policy. Then undo, newest first, in this order, skipping any item whose step never ran.
+First establish what ran: which of Steps 6-11, and for Step 9 which changeover stages completed and which lines they printed. Each file a stage replaced was printed as `backup:` (copied back on rollback) or `absent-before:` (the file the stage created is deleted on rollback). Stage 1 printed lines only if it changed Headscale, stage 2 only for a roster file it replaced, stage 3 a MySQL dump only if it purged and seeded, and stage 4 a `backup:` line only if it installed a policy. Then undo, newest first, in this order, skipping any item whose step never ran.
 
 1. **Smoke test.** Run 10i in full, including its item 8 verification.
 2. **J2.** If Step 11 ran:
@@ -1318,9 +1319,9 @@ First establish what ran: which of Steps 6-11, and for Step 9 which changeover s
    ```
    If J1 existed in Step 11, restore it with `sudo nft -f /root/j1-before-j2.nft`. Then `sudo nft list table inet jumpbox_vlan_isolation` shows J1's log-only rules and no drop rule. J1 is transient, as it was before.
 3. **The changeover (Step 9), if any stage of it ran.** Choose one direction, and record which in the changeover isolation ticket:
-   - **Back to the outgoing roster.** Follow `docs/TERM_CHANGEOVER.md` "Rollback" with every backup path Step 9 printed, in its order:
-     1. Restore Headscale as one set with Procedure R: the database and key file (stage 1) and the policy file (stage 4), all with Headscale stopped. Then start Headscale, run `policy check`, and read `headscale users list` and the staff and infrastructure nodes. If stage 4 printed no backup, Procedure R checks that the live policy file matches Step 5's record instead.
-     2. Restore the local and production roster CSVs (stage 2).
+   - **Back to the outgoing roster.** Follow `docs/TERM_CHANGEOVER.md` "Rollback" with every `backup:` and `absent-before:` line Step 9 printed, in its order:
+     1. Restore Headscale as one set with Procedure R: the database and key file (stage 1) and the policy file (stage 4), all with Headscale stopped. A key file printed `absent-before:` is deleted, not left behind. Then start Headscale, run `policy check`, and read `headscale users list` and the staff and infrastructure nodes. If stage 4 printed no backup, Procedure R checks that the live policy file matches Step 5's record instead.
+     2. Undo the local and production roster CSVs (stage 2) with `undo_file`, each from its own line: `backup:` copies the old file back, `absent-before:` deletes the incoming one.
      3. Restore MySQL from the dump, but only if stage 3 purged and seeded. Restart `vm-automation` and wait for `healthy`.
      4. Check. Run `scripts/headscale_peer_watchdog.sh` once: it reads the restored portal and logs `ok`, or restarts Headscale once and logs `recovered`. The new release's `scripts/term_changeover.sh <outgoing-canvas-export>.csv` dry run reports stages 1-3 `nothing to do`, and after item 5 the access check matches the Step 5 baseline.
 

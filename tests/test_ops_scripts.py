@@ -209,6 +209,7 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
         f"  *\"base64 -w0 && printf\"*) printf '%s\\n%s\\n' '{users}' '{keys}' ;;\n"
         f"  *\"base64 -w0 students_with_keys.csv\"*) printf '%s' '{keys}' ;;\n"
         f"  *\"cat '\"*) printf '%s' '{key_line}' ;;\n"
+        "  *\"echo absent\"*) printf 'absent\\n' ;;\n"
         "  *sha256sum*) printf 'missing' ;;\n"
         "esac\n"
         "exit 0\n"
@@ -1172,3 +1173,177 @@ def test_term_changeover_runs_every_stage_after_a_passing_proxmox_preflight(tmp_
     assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
     assert policy.read_text() == canonical(render(EXAMPLE_POLICY, POLICY_SLOTS,
                                                   *policy_inputs(POLICY_SLOTS)))
+
+
+# ---- scripts/term_changeover.sh, backup: and absent-before: lines ----------
+
+# Runs every file-handling remote command for real against two local
+# directories standing in for the Headscale and portal hosts; answers the
+# Headscale helper and the MySQL calls like TERM_SSH_STUB.
+LOCAL_HOSTS_SSH_STUB = """#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+while args and args[0] == "-o":
+    args = args[2:]
+command = " ".join(args[1:])
+state = os.environ["TERM_STATE"]
+def flag(name):
+    return os.path.exists(os.path.join(state, name))
+def set_flag(name):
+    open(os.path.join(state, name), "w").close()
+reads_sql = "exec mysql " in command
+sql = sys.stdin.read() if reads_sql else ""
+out = sys.stdout.write
+if "python3 -c" in command:
+    sys.stdin.read()
+    if command.rstrip().endswith("--apply"):
+        with open(os.path.join(os.environ["HS_DIR"], "students_with_keys.csv"), "w") as keys:
+            keys.write("student1,student1@example.edu,new-key\\n")
+        set_flag("hs-applied")
+    else:
+        out("to remove: 1 users\\n")
+elif "mysqldump" in command:
+    pass
+elif "restart vm-automation" in command:
+    if flag("purged"):
+        set_flag("seeded")
+elif "docker inspect --format" in command:
+    out("healthy")
+elif reads_sql:
+    if "DELETE FROM" in sql:
+        set_flag("purged")
+    elif "SELECT login_id, sis_user_id" in sql:
+        out("student1\\t1001\\tnew-key\\n" if flag("seeded") else "olduser\\t999\\told-key\\n")
+    elif "SELECT (SELECT COUNT(*)" in sql:
+        out("0\\t0\\t1\\t0\\t0\\t0\\t0\\n")
+else:
+    sys.exit(subprocess.run(["bash", "-c", command]).returncode)
+"""
+LOCAL_DOCKER_STUB = """#!/usr/bin/env python3
+import json, os, sys
+if "users list" in " ".join(sys.argv[1:]):
+    applied = os.path.exists(os.path.join(os.environ["TERM_STATE"], "hs-applied"))
+    names = ["keep-user", "student1" if applied else "olduser"]
+    print(json.dumps([{"name": name} for name in names]))
+"""
+
+
+def _undo_file_function() -> str:
+    doc = (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
+    section = doc[doc.index("### Undo one file"):]
+    start = section.index("```bash\n") + len("```bash\n")
+    return section[start:section.index("```", start)]
+
+
+def _undo(line: str, live: Path, host: str = "") -> subprocess.CompletedProcess:
+    script = _undo_file_function() + '\nundo_file check "$1" "$2" "$3" && undo_file apply "$1" "$2" "$3"\n'
+    return subprocess.run(["bash", "-c", script, "undo", line, str(live), host],
+                          capture_output=True, text=True, timeout=30)
+
+
+# The outgoing term's files. The key file must parse: the script reads it.
+OUTGOING = {"keys": "olduser,olduser@example.edu,old-key\n", "local": "outgoing local roster\n",
+            "portal": "outgoing portal roster\n"}
+
+
+def _changeover_with_local_hosts(tmp_path: Path, prior: str):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "data").mkdir()
+    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
+        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _executable(repo / "scripts" / "apply_headscale_policy.sh", POLICY_STAGE_STUB)
+    hs, portal = tmp_path / "headscale-host", tmp_path / "portal-host"
+    (hs / "headscale" / "data").mkdir(parents=True)
+    (hs / "headscale" / "data" / "db.sqlite").write_text("outgoing-db\n")
+    _executable(hs / "headscale_term_changeover.sh", "#!/bin/sh\n")
+    (portal / "data").mkdir(parents=True)
+    (portal / "docker-compose.prod.yml").write_text("services: {}\n")
+    live = {"keys": hs / "students_with_keys.csv", "local": repo / "data" / "students_merged.csv",
+            "portal": portal / "data" / "students_merged.csv"}
+    if prior == "present":
+        for name, path in live.items():
+            path.write_text(OUTGOING[name])
+    config = tmp_path / "site.env"
+    config.write_text("\n".join([
+        "PORTAL_HOST=portal-host", f"PORTAL_DIR={portal}", "PORTAL_COMPOSE=docker-compose.prod.yml",
+        "PORTAL_APP_CONTAINER=lab-playground", "HEADSCALE_HOST=headscale-host", f"HEADSCALE_DIR={hs}",
+        "HEADSCALE_KEEP_USER=keep-user", "HEADSCALE_STAFF=staff-one", "EMAIL_DOMAIN=example.edu",
+        f"REMOTE_BACKUP_DIR={tmp_path / 'backups'}", "KEY_DAYS=45d",
+    ]) + "\n")
+    roster = tmp_path / "roster.csv"
+    roster.write_text("SIS User ID,SIS Login ID\n1001,student1\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(bin_dir / "ssh", LOCAL_HOSTS_SSH_STUB)
+    _executable(bin_dir / "docker", LOCAL_DOCKER_STUB)
+    _executable(bin_dir / "chgrp", "#!/bin/sh\nexit 0\n")  # the app group need not exist here
+    _executable(bin_dir / "scp", "#!/usr/bin/env python3\nimport shutil, sys\n"
+                "src, dest = [a for a in sys.argv[1:] if a != '-o' and '=' not in a][-2:]\n"
+                "shutil.copy(src, dest.split(':', 1)[1])\n")
+    _executable(bin_dir / "base64", "#!/usr/bin/env python3\nimport base64, sys\n"
+                "assert sys.argv[1] == '-w0', sys.argv\n"
+                "data = open(sys.argv[2], 'rb').read() if len(sys.argv) > 2 else sys.stdin.buffer.read()\n"
+                "sys.stdout.write(base64.b64encode(data).decode())\n")
+    (tmp_path / "state").mkdir()
+    env = _clean_env(tmp_path, PATH=f"{bin_dir}:{os.environ['PATH']}", SITE_ENV_FILE=str(config),
+                     TERM_STATE=str(tmp_path / "state"), EVENT_LOG=str(tmp_path / "events.log"),
+                     HS_DIR=str(hs))
+    result = subprocess.run(["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines()
+             if line.strip().startswith(("backup: ", "absent-before: "))]
+    return lines, live, hs
+
+
+# Catches a rollback that cannot tell "there was no file" from "here is the
+# old file": a backup path printed for a file that never existed fails the
+# rollback's check, and a file created from nothing but not reported is left
+# behind as the incoming roster's credentials.
+def test_term_changeover_reports_absent_files_and_the_documented_rollback_deletes_them(tmp_path):
+    lines, live, hs = _changeover_with_local_hosts(tmp_path, "absent")
+    absent = {"keys": f"absent-before: headscale-host:{live['keys']}",
+              "local": f"absent-before: {live['local']}",
+              "portal": f"absent-before: portal-host:{live['portal']}"}
+    assert sorted(line for line in lines if line.startswith("absent-before: ")) == sorted(absent.values())
+    backups = [line for line in lines if line.startswith("backup: ")]
+    assert len(backups) == 2, lines  # the Headscale database and the MySQL dump, nothing else
+    assert not any("students_" in line for line in backups), backups
+    for name, host in (("keys", "headscale-host"), ("local", ""), ("portal", "portal-host")):
+        assert live[name].exists()
+        undone = _undo(absent[name], live[name], host)
+        assert undone.returncode == 0, undone.stderr
+        assert not live[name].exists(), name
+    database = next(line for line in backups if "headscale-db-" in line)
+    (hs / "headscale" / "data" / "db.sqlite").write_text("incoming-db\n")
+    assert _undo(database, hs / "headscale" / "data" / "db.sqlite", "headscale-host").returncode == 0
+    assert (hs / "headscale" / "data" / "db.sqlite").read_text() == "outgoing-db\n"
+
+
+# Catches the other half: a file that existed is backed up, reported as
+# backup:, and the documented rollback puts its content back while the live
+# roster keeps the mode the app container needs.
+def test_term_changeover_backs_up_present_files_and_the_documented_rollback_restores_them(tmp_path):
+    lines, live, _ = _changeover_with_local_hosts(tmp_path, "present")
+    assert not [line for line in lines if line.startswith("absent-before: ")], lines
+    hosts = {"keys": "headscale-host", "local": "", "portal": "portal-host"}
+    patterns = {"keys": "headscale-keys-", "local": "term-changeover-backups", "portal": "students_merged-"}
+    assert live["portal"].stat().st_mode & 0o777 == 0o640
+    for name, path in live.items():
+        line = next(line for line in lines if patterns[name] in line)
+        assert path.read_text() != OUTGOING[name], name
+        undone = _undo(line, path, hosts[name])
+        assert undone.returncode == 0, undone.stderr
+        assert path.read_text() == OUTGOING[name], name
+    assert live["portal"].stat().st_mode & 0o777 == 0o640
+
+
+# Catches the rollback acting on a line meant for another file.
+def test_documented_undo_refuses_an_absent_before_line_for_another_file(tmp_path):
+    live = tmp_path / "students_merged.csv"
+    live.write_text("incoming\n")
+    undone = _undo(f"absent-before: {tmp_path / 'other.csv'}", live)
+    assert undone.returncode != 0 and live.exists()
+    assert _undo(f"backup: {tmp_path / 'missing.csv'}", live).returncode != 0
+    assert live.read_text() == "incoming\n"

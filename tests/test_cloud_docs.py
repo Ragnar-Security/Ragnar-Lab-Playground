@@ -348,8 +348,8 @@ def test_term_changeover_doc_documents_stage_4_preflight_and_rollback():
     restore = "\n".join(_section(text, "### Restore Headscale: database, key file and policy together"))
     block = _fenced_blocks(restore, "bash")[0]
     order = [block.index(step) for step in (
-        "docker compose stop headscale", "headscale/data/db.sqlite", "students_with_keys.csv",
-        "mv -f <host-policy-file>.restoring <host-policy-file>", "docker compose start headscale",
+        "&& echo lines-ok", "docker compose stop headscale", 'undo_file apply "$DB_LINE"',
+        'undo_file apply "$KEYS_LINE"', 'undo_file apply "$POLICY_LINE"', "docker compose start headscale",
         "headscale policy check --file", "headscale users list")]
     assert order == sorted(order), order
     rollback = "\n".join(_section(text, "## Rollback"))
@@ -364,11 +364,14 @@ def test_plan_procedure_r_restores_headscale_as_one_stopped_set():
     start = plan.index("- **Procedure R: restore Headscale as one set")
     procedure = plan[start:plan.index("- [ ] **Step 5 (operator)", start)]
     order = [procedure.index(step) for step in (
-        "docker compose stop headscale", "headscale/data/db.sqlite",
-        'mv -f "$HOST_FILE.restoring" "$HOST_FILE"', "docker compose start headscale",
+        "&& echo lines-ok", "docker compose stop headscale", 'undo_file apply "$DB_LINE"',
+        'undo_file apply "$KEYS_LINE"', 'undo_file apply "$POLICY_LINE"', "docker compose start headscale",
         "headscale policy check --file", "headscale users list")]
     assert order == sorted(order), order
     assert "kill -s HUP" not in procedure
+    assert 'docs/TERM_CHANGEOVER.md` "Undo one file"' in procedure
+    for line in ("absent-before:", "backup:"):
+        assert line in plan[plan.index("- [ ] **Step 9 (operator)"):plan.index("- [ ] **Step 10")], line
 
 
 STAGING = ROOT / "docs" / "STAGING.md"

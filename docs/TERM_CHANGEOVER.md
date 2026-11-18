@@ -125,7 +125,9 @@ It also copies the existing student key file.
 
 The script starts Headscale before making roster changes.
 
-It prints both backup paths.
+It prints `backup: <headscale-host>:<path>` for the database copy. For the key
+file it prints `backup:` with the copy's path, or, when there was no key file,
+`absent-before: <headscale-host>:<headscale-dir>/students_with_keys.csv`.
 
 After the change, it reads all users and keys again.
 
@@ -143,9 +145,10 @@ It also rejects keys that do not belong to the roster.
 
 The script verifies the row count and file hash.
 
-It backs up the local file under `.git/term-changeover-backups/`.
-
-It backs up the production file under `REMOTE_BACKUP_DIR`.
+It backs up the local file under `.git/term-changeover-backups/`, and the
+production file under `REMOTE_BACKUP_DIR`. Each prints `backup: <path>` (the
+production one with a `<portal-host>:` prefix), or `absent-before: <path>` when
+that file did not exist before.
 
 It then replaces `data/students_merged.csv` locally and on the portal.
 
@@ -189,8 +192,8 @@ A mismatch means the database still represents another roster.
 The script prints the delete count and seed count.
 
 Before the purge, the script creates a MySQL dump under
-`REMOTE_BACKUP_DIR`. It prints the dump path and verifies that the file is
-not empty.
+`REMOTE_BACKUP_DIR`. It prints the dump path as `backup: <portal-host>:<path>`
+and verifies that the file is not empty.
 
 The production `scripts/backup-database.sh` also dumps MySQL and verifies the
 completion trailer. The term-changeover orchestrator creates its own
@@ -291,16 +294,22 @@ A second completed apply also skips every destructive stage.
 
 ## Rollback
 
-Use only the backup paths printed by the failed apply run. Replace each angle-bracket placeholder below with the corresponding value from `scripts/site.env`.
+Use only the lines printed by the failed apply run. Replace each angle-bracket placeholder below with the corresponding value from `scripts/site.env`.
 
-Restore what the stages that ran changed, and nothing else:
+Every file a stage replaces is reported in exactly one of two forms:
 
-- Stage 1 prints the Headscale database and key-file backups.
-- Stage 2 prints the roster-file backups.
-- Stage 3 prints the MySQL dump.
-- Stage 4 prints the policy backup (`backup: <headscale-host>:<host-policy-file>.<YYYYmmddTHHMMSSZ>`).
+- `backup: <path>`: the old file was copied to `<path>`. Rollback copies it back.
+- `absent-before: <path>`: there was no old file at `<path>`. Rollback deletes the file the stage
+  created there.
 
-A stage that printed no backup changed nothing.
+A remote path carries a `<host>:` prefix. Restore what the stages that ran changed, and nothing else:
+
+- Stage 1: the Headscale database (`backup:`) and the key file (`backup:` or `absent-before:`).
+- Stage 2: the local and the production roster file (each `backup:` or `absent-before:`).
+- Stage 3: the MySQL dump (`backup:`).
+- Stage 4: the policy file (`backup: <headscale-host>:<host-policy-file>.<YYYYmmddTHHMMSSZ>`).
+
+A stage that printed neither line for a file did not change it.
 
 The Headscale database and the policy file must go back **together, while Headscale is
 stopped**. Headscale checks that every user the policy names exists. Starting the outgoing database
@@ -319,62 +328,105 @@ If you instead finish the changeover forward, fix the cause (for example `JUMPBO
 `--apply` again with the *incoming* export. A completed stage is a no-op on a re-run. The dry run
 with the incoming export must then report every stage, including stage 4, `nothing to do`.
 
+### Undo one file
+
+Paste this function into the shell on each host you restore on. `undo_file check` only validates
+a line; `undo_file apply` copies the backup back over the live file (keeping the live file's owner
+and mode) or deletes a file that was absent before. An empty line is a file its stage did not
+print, and is left alone. Give the live file as an absolute path, and the host exactly as the
+script printed it (none for the local roster).
+
+```bash
+undo_file() {   # undo_file check|apply '<printed line>' <live-file> [<host>]
+    local mode="$1" line="$2" live="$3" host="${4:-}" path
+    case "$line" in
+        "") return 0 ;;
+        "backup: "*) path="${line#backup: }" ;;
+        "absent-before: "*) path="${line#absent-before: }" ;;
+        *) echo "undo_file: not a backup: or absent-before: line: $line" >&2; return 1 ;;
+    esac
+    [[ -z "$host" ]] || path="${path#"$host:"}"
+    if [[ "$line" == "absent-before: "* ]]; then
+        [[ "$path" == "$live" ]] || { echo "undo_file: $path is not $live" >&2; return 1; }
+        [[ "$mode" == check ]] || rm -f -- "$live"
+    else
+        [[ -f "$path" ]] || { echo "undo_file: no backup at $path" >&2; return 1; }
+        [[ "$mode" == check ]] && return 0
+        if [[ -e "$live" ]]; then
+            cp -p -- "$live" "$live.restoring" && cat -- "$path" > "$live.restoring"
+        else
+            cp -- "$path" "$live.restoring"
+        fi && mv -f -- "$live.restoring" "$live"
+    fi
+}
+```
+
 ### Restore Headscale: database, key file and policy together
 
-On the Headscale host, in `<headscale-dir>`, with Headscale stopped. Copy back each file whose
-backup the run printed: the database and key file from stage 1, the policy file from stage 4.
-`<host-policy-file>` is the `backup:` path without its `.<stamp>` suffix.
+On the Headscale host, in `<headscale-dir>`. Check every line first; nothing is changed until all
+three pass. Then stop Headscale, undo the stage 1 and stage 4 files, and start it. Leave a line
+empty if its stage printed none. `<host-policy-file>` is the stage 4 `backup:` path without its
+`.<stamp>` suffix.
 
 ```bash
 ssh <headscale-host>
 cd <headscale-dir>
+DB_LINE='<stage 1 database line>'; KEYS_LINE='<stage 1 key-file line>'; POLICY_LINE='<stage 4 line>'
+undo_file check "$DB_LINE" <headscale-dir>/headscale/data/db.sqlite <headscale-host> \
+  && undo_file check "$KEYS_LINE" <headscale-dir>/students_with_keys.csv <headscale-host> \
+  && undo_file check "$POLICY_LINE" <host-policy-file> <headscale-host> && echo lines-ok
 docker compose stop headscale
-cp <remote-backup-dir>/headscale-db-YYYYMMDD-HHMMSS.sqlite headscale/data/db.sqlite        # stage 1
-cp <remote-backup-dir>/headscale-keys-YYYYMMDD-HHMMSS.csv students_with_keys.csv           # stage 1
-chmod 600 headscale/data/db.sqlite students_with_keys.csv
-cp -p <host-policy-file>.<YYYYmmddTHHMMSSZ> <host-policy-file>.restoring \
-  && mv -f <host-policy-file>.restoring <host-policy-file>                                   # stage 4
+undo_file apply "$DB_LINE" <headscale-dir>/headscale/data/db.sqlite <headscale-host>    # stage 1
+undo_file apply "$KEYS_LINE" <headscale-dir>/students_with_keys.csv <headscale-host>   # stage 1
+undo_file apply "$POLICY_LINE" <host-policy-file> <headscale-host>                     # stage 4
 docker compose start headscale
 docker compose exec -T headscale headscale policy check --file <policy-file>   # must exit 0
 docker compose exec -T headscale headscale users list
 ```
 
-`<policy-file>` is `HEADSCALE_POLICY_FILE`, the path inside the container. If stage 4 printed no
-`backup:` line, it installed nothing. Check that the live policy file is the one recorded before
-the changeover ("Before you start"): `sha256sum <host-policy-file>` must match. If it does not
-match, stop and find out why before restoring anything else.
+Stop if `lines-ok` is missing: nothing has been changed yet. `<policy-file>` is
+`HEADSCALE_POLICY_FILE`, the path inside the container. If stage 4 printed no `backup:` line, it
+installed nothing. Check that the live policy file is the one recorded before the changeover
+("Before you start"): `sha256sum <host-policy-file>` must match. If it does not match, stop and
+find out why before restoring anything else.
 
 Read the user list after the start. Confirm that the configured infrastructure and staff users
 still own their expected nodes. If Headscale does not start, read `docker compose logs headscale`:
-a user the policy names but the database lacks means the set is mixed. Copy back the backup that
-belongs with the other one, and start it again.
+a user the policy names but the database lacks means the set is mixed. Undo the line that belongs
+with the other one, and start it again.
 
 ### Restore the roster files
 
-Restore the production CSV before restarting the portal.
+Restore the production CSV before restarting the portal. An undone `backup:` keeps the live file's
+mode `0640` and group `1000`.
 
 ```bash
 ssh <portal-host>
-cp <remote-backup-dir>/students_merged-YYYYMMDD-HHMMSS.csv \
-  /opt/lab-playground/data/students_merged.csv
-chgrp 1000 /opt/lab-playground/data/students_merged.csv
-chmod 640 /opt/lab-playground/data/students_merged.csv
+LINE='<stage 2 production roster line>'
+undo_file check "$LINE" /opt/lab-playground/data/students_merged.csv <portal-host> \
+  && undo_file apply "$LINE" /opt/lab-playground/data/students_merged.csv <portal-host>
 ```
 
-Restore the local CSV from the printed `.git/term-changeover-backups/` path.
+In the operator checkout, the same for the local CSV, with no host:
+
+```bash
+LINE='<stage 2 local roster line>'
+undo_file check "$LINE" "$PWD/data/students_merged.csv" && undo_file apply "$LINE" "$PWD/data/students_merged.csv"
+```
 
 Keep the restored roster and key set untracked.
 
 ### Restore MySQL
 
-Restore the dump only when the purge or seed was wrong.
+Restore the dump only when the purge or seed was wrong. `<dump>` is the stage 3 `backup:` path
+without its `<portal-host>:` prefix.
 
 ```bash
 ssh <portal-host>
 cd /opt/lab-playground
 docker compose -f docker-compose.prod.yml exec -T db sh -c \
   'exec mysql -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"' \
-  < <remote-backup-dir>/pre-term-changeover-YYYYMMDD-HHMMSS.sql
+  < <dump>
 docker compose -f docker-compose.prod.yml restart vm-automation
 ```
 
