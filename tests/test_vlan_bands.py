@@ -641,3 +641,89 @@ def test_the_accept_waits_for_the_admission_lock(app, monkeypatch):
         assert _recorded(app) == DEFAULT
     worker.join(timeout=10)
     assert not worker.is_alive() and _recorded(app) == SHIFTED
+
+
+# ---- group VLAN changes are serialized with admission and the accept -------
+
+def _admin_client(app):
+    with app.app_context():
+        admin = User(login_id="admin", is_admin=True)
+        admin.set_password("placeholder")
+        db.session.add(admin)
+        db.session.commit()
+    client = app.test_client()
+    assert client.post("/auth/login", data={"login_id": "admin", "password": "placeholder"}
+                       ).status_code in (200, 302)
+    return client
+
+
+def _groups(app):
+    with app.app_context():
+        return sorted((g.name, g.display_name, g.entry_vlan_tag, g.internal_vlan_tag)
+                      for g in StudentGroup.query.all())
+
+
+def _yaml_apply(client, blob):
+    import hashlib
+    import io
+    return client.post("/admin/groups/yaml/apply",
+                       data={"file": (io.BytesIO(blob.encode()), "groups.yaml"),
+                             "plan_token": hashlib.sha256(blob.encode()).hexdigest()},
+                       content_type="multipart/form-data")
+
+
+GROUP_YAML = "groups:\n  - name: blue\n    display_name: Blue\n"
+
+
+# Catches a portal left on the old layout committing group pairs from its old
+# group bands after an accept.
+def test_group_changes_refuse_under_a_stale_layout_and_write_nothing(app):
+    client = _admin_client(app)
+    with app.app_context():
+        db.session.add(StudentGroup(name="red", display_name="Red",
+                                    entry_vlan_tag=300, internal_vlan_tag=400))
+        db.session.commit()
+        red_id = StudentGroup.query.filter_by(name="red").one().id
+    _seed(app, SHIFTED)  # another process accepted SHIFTED; this one runs DEFAULT
+    before = _groups(app)
+    for response in (
+            client.post("/admin/groups", json={"name": "green", "display_name": "Green"}),
+            client.put(f"/admin/groups/{red_id}", json={"display_name": "Renamed",
+                                                       "entry_vlan_tag": 301,
+                                                       "internal_vlan_tag": 401}),
+            _yaml_apply(client, GROUP_YAML)):
+        assert response.status_code == 409, response.data
+        assert "restart required" in response.get_json()["error"]
+    assert _groups(app) == before
+
+
+def test_group_changes_under_the_current_layout_are_unchanged(app):
+    client = _admin_client(app)
+    _seed(app, DEFAULT)
+    created = client.post("/admin/groups", json={"name": "green", "display_name": "Green"})
+    assert created.status_code == 201, created.data
+    green_id = created.get_json()["group"]["id"]
+    assert client.put(f"/admin/groups/{green_id}", json={
+        "entry_vlan_tag": 310, "internal_vlan_tag": 410}).status_code == 200
+    assert _yaml_apply(client, GROUP_YAML).status_code == 200
+    assert _groups(app) == [("blue", "Blue", 300, 400), ("green", "Green", 310, 410)]
+
+
+# Catches a group change skipping the admission lock.
+def test_group_creation_waits_for_the_admission_lock(app):
+    import threading
+    from app import coordination
+    client = _admin_client(app)
+    result = {}
+
+    def create():
+        result["status"] = client.post("/admin/groups", json={
+            "name": "green", "display_name": "Green"}).status_code
+
+    with coordination._process_locks[coordination.NODE_ADMISSION]:
+        worker = threading.Thread(target=create)
+        worker.start()
+        worker.join(timeout=1)
+        assert worker.is_alive() and _groups(app) == []
+    worker.join(timeout=10)
+    assert result["status"] == 201 and [g[0] for g in _groups(app)] == ["green"]

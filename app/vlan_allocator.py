@@ -14,6 +14,7 @@ considered used.
 """
 
 import importlib
+from contextlib import contextmanager
 from datetime import datetime
 import logging
 from typing import List, Literal, Optional, Tuple
@@ -350,3 +351,16 @@ def accept_vlan_layout_locked(canonical: str) -> None:
             conn.execute(insert(table).values(id=1, bands=canonical, recorded_at=datetime.now()))
 
     coordination.run_locked(coordination.current_engine(), coordination.NODE_ADMISSION, accept)
+
+
+@contextmanager
+def group_vlans_locked():
+    """Run a group VLAN change (allocate, write, commit with db.session)
+    under the deployment admission lock, after checking that the recorded
+    layout is this process's own. Raises VlanLayoutStale, having written
+    nothing, when it is not: a portal still on the old layout must not
+    commit group pairs from its old group bands after an accept."""
+    from . import coordination
+    with coordination.session_locked(coordination.NODE_ADMISSION) as conn:
+        check_layout_current(conn)
+        yield

@@ -16,7 +16,10 @@ from ..models import db, User, StudentGroup, StudentGroupMember, StudentWhitelis
 from ..backends import get_backend
 from ..backends.base import BACKEND_PROXMOX, VMRef
 from ..template_manager import load_template_config
-from ..vlan_allocator import allocate_pair, vlan_layout, VlanPoolExhausted, VlanInUse
+from ..vlan_allocator import (
+    allocate_pair, group_vlans_locked, vlan_layout, VlanInUse, VlanLayoutStale,
+    VlanPoolExhausted,
+)
 from .. import vm_provisioning
 from .vm_creation import cleanup_vms, named_instances, _expected_vm_names
 
@@ -58,6 +61,15 @@ def create_group():
     if not display_name:
         return jsonify({'error': 'display_name is required'}), 400
 
+    try:
+        with group_vlans_locked():
+            return _create_group_locked(name, display_name, description,
+                                        explicit_entry, explicit_internal)
+    except VlanLayoutStale as e:
+        return jsonify({'error': str(e)}), 409
+
+
+def _create_group_locked(name, display_name, description, explicit_entry, explicit_internal):
     if StudentGroup.query.filter_by(name=name).first():
         return jsonify({'error': f'group slug {name!r} already exists'}), 409
 
@@ -109,10 +121,18 @@ def get_group(group_id):
 @login_required
 @admin_required
 def update_group(group_id):
+    data = request.get_json(silent=True) or {}
+    try:
+        with group_vlans_locked():
+            return _update_group_locked(group_id, data)
+    except VlanLayoutStale as e:
+        return jsonify({'error': str(e)}), 409
+
+
+def _update_group_locked(group_id, data):
     group = db.session.get(StudentGroup, group_id)
     if not group:
         return jsonify({'error': 'group not found'}), 404
-    data = request.get_json(silent=True) or {}
 
     # slug is immutable — silently ignore any attempt to change it
     if 'display_name' in data:
@@ -512,6 +532,14 @@ def apply_yaml():
     except ValueError as e:
         return jsonify({'error': str(e)}), 400
 
+    try:
+        with group_vlans_locked():
+            return _apply_plan_locked(groups)
+    except VlanLayoutStale as e:
+        return jsonify({'error': str(e)}), 409
+
+
+def _apply_plan_locked(groups):
     plan, errors, warnings = _build_plan(groups)
     if errors:
         return jsonify({'errors': errors, 'warnings': warnings}), 400

@@ -165,6 +165,28 @@ def run_locked(engine: Engine, name: str,
     raise RuntimeError(f'Coordination row {name!r} could not be created')
 
 
+@contextmanager
+def session_locked(name: str):
+    """Hold row `name` for db.session's own transaction, as run_locked does
+    for a fresh connection, so ORM work can read, write and commit under the
+    lock. Whatever the session held before is rolled back first (so no
+    earlier read snapshot survives), and whatever the block leaves
+    uncommitted is rolled back on exit; the row lock ends with the commit."""
+    with _process_locks[name]:
+        try:
+            for _attempt in range(2):
+                db.session.rollback()
+                if _lock_row(db.session.connection(), name):
+                    break
+                db.session.rollback()
+                _create_row(db.engine, name)
+            else:
+                raise RuntimeError(f'Coordination row {name!r} could not be created')
+            yield db.session.connection()
+        finally:
+            db.session.rollback()
+
+
 def read_state(conn: Connection, name: str) -> int:
     return int(conn.execute(
         select(_STATE.c.value).where(_STATE.c.name == name)).scalar_one())
