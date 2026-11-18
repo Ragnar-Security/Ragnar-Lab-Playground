@@ -1347,3 +1347,61 @@ def test_documented_undo_refuses_an_absent_before_line_for_another_file(tmp_path
     assert undone.returncode != 0 and live.exists()
     assert _undo(f"backup: {tmp_path / 'missing.csv'}", live).returncode != 0
     assert live.read_text() == "incoming\n"
+
+
+def _tree(root: Path) -> dict[str, tuple[int, bytes]]:
+    return {str(path.relative_to(root)): (path.stat().st_mode, path.read_bytes())
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+# Catches undo_file mutating on a line it should refuse. Each case runs one
+# undo_file call straight (apply's own checks, not a check run before it).
+# Measured before the fix: a local absent-before: line given with the portal
+# host matched the portal's live path and deleted it, and so did the typo
+# mode "aply"; a backup: line without a live file was restored with plain cp.
+@pytest.mark.parametrize("mode,line,host,live_exists", [
+    ("apply", "absent-before: portal-host:{live}", "other-host", True),     # wrong host
+    ("apply", "absent-before: {live}", "portal-host", True),                # missing host prefix
+    ("apply", "absent-before: portal-host:{live}", "", True),               # host carrier, no host
+    ("aply", "absent-before: {live}", "", True),                            # typo mode
+    ("Apply", "backup: {backup}", "", True),                                # wrong-case mode
+    ("apply", "backup: {backup}", "", False),                               # no live target
+    ("apply", "backup: portal-host:{backup}", "other-host", True),          # backup on another host
+    ("apply", "backup: {backup}", "portal-host", True),                     # backup, missing prefix
+], ids=["wrong-host", "missing-prefix", "carrier-without-host", "typo-mode", "wrong-case-mode",
+        "backup-without-live", "backup-wrong-host", "backup-missing-prefix"])
+def test_documented_undo_refuses_and_changes_nothing(tmp_path, mode, line, host, live_exists):
+    live = tmp_path / "srv" / "data" / "students_merged.csv"
+    backup = tmp_path / "backups" / "students_merged-20261118-000000.csv"
+    live.parent.mkdir(parents=True)
+    backup.parent.mkdir()
+    backup.write_text("outgoing\n")
+    if live_exists:
+        live.write_text("incoming\n")
+        live.chmod(0o640)
+    before = _tree(tmp_path)
+    script = _undo_file_function() + '\nundo_file "$@"\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "undo", mode, line.format(live=live, backup=backup), str(live), host],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "undo_file:" in result.stderr
+    assert _tree(tmp_path) == before
+
+
+# The positive cases the refusals must not break, one call each.
+def test_documented_undo_accepts_exact_host_lines_and_keeps_owner_and_mode(tmp_path):
+    live = tmp_path / "srv" / "students_merged.csv"
+    backup = tmp_path / "backups" / "students_merged-20261118-000000.csv"
+    live.parent.mkdir()
+    backup.parent.mkdir()
+    backup.write_text("outgoing\n")
+    backup.chmod(0o600)
+    live.write_text("incoming\n")
+    live.chmod(0o640)
+    assert _undo(f"backup: portal-host:{backup}", live, "portal-host").returncode == 0
+    assert live.read_text() == "outgoing\n" and live.stat().st_mode & 0o777 == 0o640
+    assert not (live.parent / "students_merged.csv.restoring").exists()
+    assert _undo(f"absent-before: [2001:db8::1]:{live}", live, "[2001:db8::1]").returncode == 0
+    assert not live.exists()
+    assert _undo("", live, "portal-host").returncode == 0

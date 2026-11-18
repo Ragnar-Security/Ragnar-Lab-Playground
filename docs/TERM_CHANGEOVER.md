@@ -331,32 +331,43 @@ with the incoming export must then report every stage, including stage 4, `nothi
 ### Undo one file
 
 Paste this function into the shell on each host you restore on. `undo_file check` only validates
-a line; `undo_file apply` copies the backup back over the live file (keeping the live file's owner
-and mode) or deletes a file that was absent before. An empty line is a file its stage did not
-print, and is left alone. Give the live file as an absolute path, and the host exactly as the
-script printed it (none for the local roster).
+a line; `undo_file apply` validates it the same way and then copies the backup back over the live
+file (keeping the live file's owner and mode) or deletes a file that was absent before. An empty
+line is a file its stage did not print, and is left alone. Give the live file as an absolute
+path, and the host exactly as the script printed it: a line printed with a `<host>:` prefix needs
+that host, and a local line (the operator checkout's roster) needs none. It refuses, changing
+nothing, when the mode is not exactly `check` or `apply`, when the line's host is not the one
+given, when an `absent-before:` path is not the live file, or when a `backup:` line's backup or
+live file is missing. A missing live file behind a `backup:` line means something else changed it:
+stop and find out what before restoring.
 
 ```bash
 undo_file() {   # undo_file check|apply '<printed line>' <live-file> [<host>]
     local mode="$1" line="$2" live="$3" host="${4:-}" path
+    [[ "$mode" == check || "$mode" == apply ]] \
+        || { echo "undo_file: the mode must be check or apply, not '$mode'" >&2; return 1; }
+    [[ "$live" == /* ]] || { echo "undo_file: $live is not an absolute path" >&2; return 1; }
     case "$line" in
         "") return 0 ;;
         "backup: "*) path="${line#backup: }" ;;
         "absent-before: "*) path="${line#absent-before: }" ;;
         *) echo "undo_file: not a backup: or absent-before: line: $line" >&2; return 1 ;;
     esac
-    [[ -z "$host" ]] || path="${path#"$host:"}"
+    if [[ -n "$host" ]]; then
+        [[ "$path" == "$host:/"* ]] || { echo "undo_file: $path is not on $host" >&2; return 1; }
+        path="${path#"$host:"}"
+    else
+        [[ "$path" == /* ]] || { echo "undo_file: $path names a host; give it" >&2; return 1; }
+    fi
     if [[ "$line" == "absent-before: "* ]]; then
         [[ "$path" == "$live" ]] || { echo "undo_file: $path is not $live" >&2; return 1; }
         [[ "$mode" == check ]] || rm -f -- "$live"
     else
         [[ -f "$path" ]] || { echo "undo_file: no backup at $path" >&2; return 1; }
+        [[ -f "$live" ]] || { echo "undo_file: no live file at $live to restore over" >&2; return 1; }
         [[ "$mode" == check ]] && return 0
-        if [[ -e "$live" ]]; then
-            cp -p -- "$live" "$live.restoring" && cat -- "$path" > "$live.restoring"
-        else
-            cp -- "$path" "$live.restoring"
-        fi && mv -f -- "$live.restoring" "$live"
+        cp -p -- "$live" "$live.restoring" && cat -- "$path" > "$live.restoring" \
+            && mv -f -- "$live.restoring" "$live"
     fi
 }
 ```
