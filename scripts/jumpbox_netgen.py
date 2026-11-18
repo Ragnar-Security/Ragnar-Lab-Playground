@@ -207,6 +207,18 @@ def render_sysctl():
     ]) + "\n"
 
 
+def render_dnsmasq_limits():
+    return "\n".join([
+        f"# {HEADER}",
+        "# With bind-dynamic, dnsmasq opens a UDP and a TCP DNS socket for every",
+        "# address, and each lab VLAN has an IPv4 and an IPv6 link-local one: the full",
+        "# band string needs about 1,600 descriptors, over systemd's default soft",
+        "# limit of 1,024, and dnsmasq then fails with \"Too many open files\".",
+        "[Service]",
+        "LimitNOFILE=65536",
+    ]) + "\n"
+
+
 def render_zeek_node(trunk_if):
     return "\n".join([
         f"# {HEADER}",
@@ -431,8 +443,9 @@ def _split(value, separators=r"[\s,]+"):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("what", choices=[
-        "netplan", "dnsmasq", "sysctl", "zeek-node", "zeek-networks", "vlans", "ssh-filter",
-        "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "staff-has", "ssh-source", "diff"])
+        "netplan", "dnsmasq", "dnsmasq-limits", "sysctl", "zeek-node", "zeek-networks", "vlans",
+        "ssh-filter", "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "staff-has",
+        "ssh-source", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -468,6 +481,8 @@ def main(argv=None):
             return 0
         if args.what == "sysctl":
             out = render_sysctl()
+        elif args.what == "dnsmasq-limits":
+            out = render_dnsmasq_limits()
         elif args.what == "ssh-filter":
             out = render_ssh_filter(args.mgmt_if, _split(args.staff_ips), _split(args.ports))
         elif args.what == "staff-has":

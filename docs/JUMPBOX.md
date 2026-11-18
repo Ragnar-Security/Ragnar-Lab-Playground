@@ -117,6 +117,7 @@ It writes:
 |------|---------|
 | `/etc/netplan/60-jumpbox-vlans.yaml` | management NIC on DHCP; trunk NIC unaddressed; one `vlan<N>` per lab VLAN with its `.1/24` |
 | `/etc/dnsmasq.d/jumpbox.conf` | `interface=vlan*` with `bind-dynamic`; `no-dhcp-interface` for the management NIC; `no-resolv` plus `JUMPBOX_DNS_UPSTREAM`; one `dhcp-range` per VLAN |
+| `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf` | `LimitNOFILE=65536`: dnsmasq opens a UDP and a TCP DNS socket for each VLAN's IPv4 and IPv6 link-local address, about 1,600 for the full band string, and fails with "Too many open files" at systemd's default soft limit of 1,024 |
 | `/etc/sysctl.d/90-jumpbox-router.conf` | `net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`, `rp_filter=2` |
 
 Behaviour to know:

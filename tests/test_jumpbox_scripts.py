@@ -268,6 +268,35 @@ def test_configure_apply_converges_and_a_second_run_changes_nothing(tmp_path):
     assert _mutations(_calls(tmp_path)) == []
 
 
+DNSMASQ_LIMITS = "etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf"
+
+
+# Catches dnsmasq failing to start on a full band string. With bind-dynamic it opens a
+# UDP and a TCP DNS socket per address, and every VLAN interface has an IPv4 and an IPv6
+# link-local address: 401 VLANs took 1,617 descriptors on a staging jumpbox, over
+# systemd's default soft limit of 1,024 ("Too many open files").
+def test_configure_raises_dnsmasq_open_file_limit_above_its_vlan_sockets(tmp_path):
+    env, sysroot = _configure_env(tmp_path)
+    dry = _run(CONFIGURE, [], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert f"changes:   /{DNSMASQ_LIMITS} (mode 644)" in dry.stdout
+    assert "would run: systemctl daemon-reload" in dry.stdout
+
+    result = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    limits = sysroot / DNSMASQ_LIMITS
+    assert stat.S_IMODE(limits.stat().st_mode) == 0o644
+    lines = limits.read_text().splitlines()
+    assert "[Service]" in lines
+    limit = int(next(l for l in lines if l.startswith("LimitNOFILE=")).split("=", 1)[1])
+    vlans = sum(1 for l in (sysroot / DNSMASQ).read_text().splitlines() if l.startswith("dhcp-range="))
+    assert vlans == 401
+    assert limit >= 4 * vlans + 1024
+    # The new limit reaches dnsmasq only through a daemon-reload before the restart.
+    calls = _calls(tmp_path).splitlines()
+    assert calls.index("systemctl daemon-reload") < calls.index("systemctl restart dnsmasq")
+
+
 def test_configure_uses_netplan_try_so_a_bad_change_reverts_itself(tmp_path):
     env, sysroot = _configure_env(tmp_path)
     controller, terminal = pty.openpty()

@@ -69,6 +69,7 @@ NETGEN="$SCRIPT_DIR/jumpbox_netgen.py"
 R="${JUMPBOX_SYSROOT:-}"
 NETPLAN_FILE="${JUMPBOX_NETPLAN_FILE:-/etc/netplan/60-jumpbox-vlans.yaml}"
 DNSMASQ_FILE="${JUMPBOX_DNSMASQ_FILE:-/etc/dnsmasq.d/jumpbox.conf}"
+DNSMASQ_LIMITS_FILE=/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf
 SYSCTL_FILE=/etc/sysctl.d/90-jumpbox-router.conf
 SSHD_DROPIN=/etc/ssh/sshd_config.d/10-jumpbox-keys-only.conf
 SSH_NFT_FILE=/etc/nftables.d/jumpbox-ssh.nft
@@ -226,6 +227,7 @@ render_network() {
         --dhcp-start "${JUMPBOX_DHCP_START:-50}" --dhcp-end "${JUMPBOX_DHCP_END:-254}" \
         --lease "${JUMPBOX_DHCP_LEASE:-12h}" > "$TMP/dnsmasq"
     python3 "$NETGEN" sysctl > "$TMP/sysctl"
+    python3 "$NETGEN" dnsmasq-limits > "$TMP/dnsmasq-limits"
 }
 
 # A second definition of the same VLANs (the hand-built 01-vlans.yaml or
@@ -589,6 +591,7 @@ render_network
 check_foreign_config
 stage "$SYSCTL_FILE" 644 "$TMP/sysctl"
 stage "$DNSMASQ_FILE" 644 "$TMP/dnsmasq"
+stage "$DNSMASQ_LIMITS_FILE" 644 "$TMP/dnsmasq-limits"
 stage "$NETPLAN_FILE" 600 "$TMP/netplan"
 if changed "$NETPLAN_FILE" && [ "$NO_TRY" -eq 0 ] && [ "$APPLY" -eq 1 ] && [ ! -t 0 ]; then
     block "netplan try needs a terminal to confirm the new network config (it reverts on its own if you lose access). Run from an interactive shell, or pass --no-try to apply without the safety net."
@@ -609,7 +612,10 @@ if [ "$APPLY" -ne 1 ]; then
     if changed "$NETPLAN_FILE"; then
         if [ "$NO_TRY" -eq 1 ]; then run netplan apply; else run netplan try --timeout "$TRY_TIMEOUT"; fi
     fi
-    if changed "$DNSMASQ_FILE" || changed "$NETPLAN_FILE"; then run systemctl restart dnsmasq; fi
+    changed "$DNSMASQ_LIMITS_FILE" && run systemctl daemon-reload
+    if changed "$DNSMASQ_FILE" || changed "$DNSMASQ_LIMITS_FILE" || changed "$NETPLAN_FILE"; then
+        run systemctl restart dnsmasq
+    fi
     [ "$DO_TS" -eq 1 ] && apply_tailscale
     if [ "$DO_SSH" -eq 1 ] && changed "$SSHD_DROPIN"; then run systemctl try-reload-or-restart ssh; fi
     [ "$DO_SSHF" -eq 1 ] && ssh_filter_activate
@@ -635,6 +641,11 @@ if changed "$DNSMASQ_FILE"; then
         dnsmasq --test --conf-file="$TMP/dnsmasq" || die "dnsmasq rejected the generated configuration"
     fi
     install_file "$DNSMASQ_FILE" 644 "$TMP/dnsmasq"
+fi
+# Before the package too: its first start may already see every VLAN.
+if changed "$DNSMASQ_LIMITS_FILE"; then
+    install_file "$DNSMASQ_LIMITS_FILE" 644 "$TMP/dnsmasq-limits"
+    run systemctl daemon-reload
 fi
 
 missing=""
@@ -668,7 +679,7 @@ if changed "$NETPLAN_FILE"; then
     fi
 fi
 
-if changed "$DNSMASQ_FILE" || changed "$NETPLAN_FILE"; then
+if changed "$DNSMASQ_FILE" || changed "$DNSMASQ_LIMITS_FILE" || changed "$NETPLAN_FILE"; then
     run systemctl enable dnsmasq
     run systemctl restart dnsmasq
 fi
