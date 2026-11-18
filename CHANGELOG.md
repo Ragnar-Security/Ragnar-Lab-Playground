@@ -39,6 +39,23 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `scripts/preflight_env.py --summary` prints the active VPN mode and, per
   enabled backend, its router and the client networks its labs admit.
   Without the flag its output is unchanged.
+- `LAB_BRIDGE` (default `vmbr0`) and `VMID_RANGE` (unset: unchanged
+  allocation), which let a staging portal run on an isolated bridge in its own
+  VMID range.
+- `docs/STAGING.md`, the permanent staging stack and its two-client acceptance
+  test.
+- `scripts/audit_vlan_pairs.py`, which checks the exported VLAN pairs.
+- `scripts/apply_headscale_policy.sh --apply` checks, after the reload, that
+  the jumpbox lists every roster device as a peer (`tailscale status --json`
+  over SSH to the new `JUMPBOX_SSH`; `JUMPBOX_PEER_WAIT`, default 60 seconds).
+  If one is missing it restarts Headscale once, checks again, and fails closed,
+  naming the devices. Without the `proxmox` backend there is no jumpbox: the
+  check is skipped with a message and `JUMPBOX_SSH` is not needed. An export
+  whose `enabled_backends` is empty is refused.
+- `jumpbox_configure.sh` writes a dnsmasq drop-in,
+  `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf`
+  (`LimitNOFILE=65536`): with all 401 lab VLANs dnsmasq holds about 1,600
+  sockets and would not start under systemd's default limit of 1,024.
 
 ### Changed
 
@@ -48,6 +65,17 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   longer carry `headscale_key`.
 - The release bundle also carries `app/backends/network_slots.py`, which
   `scripts/preflight_env.py` now loads for the client-network checks.
+- The jumpbox serves each student's internal VLAN (200-299,
+  `10.<N-100>.1.0/24`), and the entry band ends at 199.
+- The Headscale policy grants each student their own internal VLAN on every
+  enabled backend.
+- The per-student pools are 100-199 and 200-299.
+- The importers, `migrate_add_vlan.py` and `term_changeover.sh` refuse a
+  roster of more than 100 students before changing anything.
+- `jumpbox_configure.sh --isolate-vlans`: lab VLANs may forward only to the
+  tailnet (`tailscale0`). Traffic from a lab VLAN to the management NIC or any
+  other interface is dropped and counted, as VLAN-to-VLAN traffic already was.
+  `--allow-vlans` (KOTH) still exempts VLAN-to-VLAN traffic only.
 
 ### Removed
 
@@ -62,12 +90,37 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 
 ### Upgrade notes
 
-- No action. `VPN_MODE` defaults to `headscale`, `AWS_CLIENT_CIDRS` to the
-  tailnet, and a configured router behaves exactly as before; existing
-  security groups already match the default rule set.
+- `VPN_MODE` defaults to `headscale`, `AWS_CLIENT_CIDRS` to the tailnet, and
+  a configured router behaves exactly as before; existing security groups
+  already match the default rule set.
 - `docker-compose.prod.yml` passes the new `VPN_MODE`, `VPN_NAME`,
   `VPN_INSTRUCTIONS_URL`, `VPN_INSTRUCTIONS` and `AWS_CLIENT_CIDRS`; a site
   using its own compose file must add them to use the new modes.
+- **Apply this release only at a term changeover.** Before deploying, run
+  `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`.
+  It must print `ok`.
+- Set `JUMPBOX_VLAN_BANDS` in `.env` and in `scripts/site.env` to the new
+  string, or delete the line to take the default. Both files must agree.
+- Re-run `jumpbox_configure.sh`; a hand-built jumpbox is adopted first
+  (`docs/JUMPBOX.md`).
+- Set `internal_nic: false` on every single-machine individual entry point.
+- Re-run `scripts/apply_headscale_policy.sh`.
+- Leave `LAB_BRIDGE` and `VMID_RANGE` unset on production;
+  `docker-compose.prod.yml` passes them through empty.
+- No database migration: stored tags do not change.
+- Set `JUMPBOX_SSH` in production's `scripts/site.env`, and make sure the
+  operator machine can SSH to the jumpbox and run `tailscale status --json`
+  there, before running `term_changeover.sh`: its policy stage runs
+  `apply_headscale_policy.sh --apply`, which now fails without it on a
+  Proxmox site.
+- `--isolate-vlans` now also drops lab-VM egress to the management network
+  and the internet, so it removes any egress a hand-built jumpbox provided.
+  No lab needs outbound internet during a session; package installs belong in
+  the image builder.
+- Headscale 0.27.1 can leave the jumpbox without peers after the jumpbox's
+  Tailscale reconnects, and then no student reaches any lab. Re-run
+  `scripts/apply_headscale_policy.sh --apply` after any jumpbox reboot or
+  Tailscale restart; its peer check restarts Headscale once when needed.
 
 ## [1.1.0] - 2026-11-14
 
