@@ -340,9 +340,15 @@ a password.
 
 ### VLAN isolation
 
-The jumpbox is every lab VLAN's gateway, so without this step a lab VM can
-reach another student's lab VM on another VLAN by routing through it. The
-Headscale policy cannot stop that: the traffic never leaves the jumpbox.
+The jumpbox is every lab VLAN's gateway, and it forwards whatever it is
+handed. Without this step a lab VM can reach another student's lab VM on
+another VLAN by routing through it, and it can send packets through the
+jumpbox's management NIC into the management LAN, the Proxmox API and the
+internet. The jumpbox does no NAT, so those packets arrive with the lab
+address and their replies usually find no way back, but they do arrive: a
+staging lab VM's SYNs to the Proxmox API port and its NTP and HTTPS to the
+internet were captured leaving the jumpbox. The Headscale policy cannot stop
+any of this: the traffic never touches the tailnet.
 
 ```bash
 sudo jumpbox/jumpbox_configure.sh --isolate-vlans                         # dry run: shows the diff
@@ -354,19 +360,26 @@ This writes `/etc/nftables.d/jumpbox-vlan-isolation.nft` and
 `/etc/systemd/system/jumpbox-vlan-isolation.service` (a oneshot that loads the
 file before the network) and enables the unit. The file is its own table,
 `inet jumpbox_vlan_isolation`, with a forward hook at priority -10 and policy
-accept, holding one rule: count and drop what enters **and** leaves through a
-`vlan*` interface. Traffic between `tailscale0` and a VLAN (students, staff),
-management traffic and the jumpbox's own traffic are untouched, and so is
-traffic inside one VLAN, which never crosses the jumpbox. A group's entry and
-internal networks are joined by the entry machine's second NIC, not by
-jumpbox routing, so group labs keep working. The ruleset is checked with
-`nft -c -f` first, and the script refuses when `nft` is missing. Have console
-or recovery access before the first `--apply`; `--no-try` applies a pending
-netplan change without the interactive `netplan try`.
+accept, holding two rules, each with its own counter: drop what enters on a
+`vlan*` interface and leaves on a `vlan*` interface, then drop what enters on
+a `vlan*` interface and leaves on anything but `tailscale0`. So routed lab
+traffic may go only to the tailnet. Traffic from `tailscale0` to a VLAN
+(students, staff), the jumpbox's own services (DHCP and DNS on the lab VLANs
+are input, not forwarding) and traffic inside one VLAN, which never crosses
+the jumpbox, are untouched. Lab VMs have no egress except the student's
+tailnet: no lab needs outbound internet during a lab session, and build-time
+package installs happen in the image builder, not in a lab session. Name
+lookups still work, since dnsmasq on the jumpbox answers
+them. A group's entry and internal networks are joined by the entry machine's
+second NIC, not by jumpbox routing, so group labs keep working. The ruleset is
+checked with `nft -c -f` first, and the script refuses when `nft` is missing.
+Have console or recovery access before the first `--apply`; `--no-try`
+applies a pending netplan change without the interactive `netplan try`.
 
 **`--allow-vlans LIST`** (comma-separated tags and `first-last` ranges, tags
-2-4094; only with `--isolate-vlans`) exempts those VLANs from the drop in
-both directions: an exempt VLAN may exchange traffic with every lab VLAN.
+2-4094; only with `--isolate-vlans`) exempts those VLANs from the
+VLAN-to-VLAN drop in both directions: an exempt VLAN may exchange traffic with
+every lab VLAN. It never opens the management side or the internet.
 KOTH players arrive over the tailnet, which the table never touches, so set
 it to the KOTH VLAN range only if KOTH boxes must reach each other across
 VLANs, or team VLANs must reach the KOTH VLANs. Re-run with the new list
@@ -374,8 +387,9 @@ whenever the KOTH tags change; a run without `--allow-vlans` removes every
 exemption.
 
 **Verify:** from a student device, your own lab VM still answers; from a lab
-VM, a VM on another VLAN does not, and the drop counter in
-`sudo nft list table inet jumpbox_vlan_isolation` rises.
+VM, a VM on another VLAN does not, and the first drop counter in
+`sudo nft list table inet jumpbox_vlan_isolation` rises; a ping from a lab VM
+to the management gateway gets no reply, and the second counter rises.
 
 **Reload, never restart.** The script swaps a changed table with
 `reload-or-restart` on the active unit (ExecReload loads the new table in one

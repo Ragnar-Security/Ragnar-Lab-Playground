@@ -31,14 +31,16 @@
 #                     provably covered by the rules, unless --i-have-console.
 #                     Filters every port sshd/ssh.socket listen on; re-run after
 #                     changing the SSH port.
-#   --isolate-vlans   nftables table that drops forwarded traffic between lab
-#                     VLANs (vlan* to vlan*), so lab VMs cannot route to each
-#                     other through the jumpbox. tailscale0 <-> VLAN traffic is
-#                     untouched. Refuses when nft is missing.
+#   --isolate-vlans   nftables table that lets traffic routed from a lab VLAN
+#                     leave only through tailscale0: vlan* to vlan* is dropped
+#                     (lab VMs cannot route to each other), and so is vlan* to
+#                     the management NIC or anything else. tailscale0 -> VLAN
+#                     traffic and the jumpbox's own DHCP/DNS are untouched.
+#                     Refuses when nft is missing.
 #   --allow-vlans LIST  with --isolate-vlans: exempt these VLAN tags (comma
 #                     separated tags and first-last ranges, e.g. 300-310) from
-#                     the drop, for KOTH ranges whose team VLANs must reach the
-#                     KOTH VLAN.
+#                     the VLAN-to-VLAN drop, for KOTH ranges whose team VLANs
+#                     must reach the KOTH VLAN.
 #   --monitoring      Zeek on the trunk plus an hourly RITA import. Refuses
 #                     below JUMPBOX_MONITORING_MIN_GB of root disk.
 #   --no-try          use `netplan apply` instead of `netplan try`, which
@@ -87,7 +89,7 @@ RITA_DATABASE="${JUMPBOX_RITA_DATABASE:-jumpbox}"
 ZEEK_ETC=/opt/zeek/etc
 
 APPLY=0 NO_TRY=0 DO_TS=0 KEY_STDIN=0 DO_SSH=0 DO_SSHF=0 DO_ISO=0 ALLOW_VLANS= HAVE_ALLOW=0 DO_MON=0 I_HAVE_CONSOLE=0
-usage() { sed -n '3,49p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,51p' "$0" | sed 's/^# \{0,1\}//'; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --apply) APPLY=1 ;;

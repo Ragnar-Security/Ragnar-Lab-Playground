@@ -3,6 +3,7 @@ router exactly, never rewrite live network config by surprise, keep the
 Tailscale key off every command line, and never lock the operator out."""
 
 import configparser
+import fnmatch
 import importlib.util
 import ipaddress
 import os
@@ -864,6 +865,9 @@ def test_ssh_staff_only_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_
 VLAN_NFT = "etc/nftables.d/jumpbox-vlan-isolation.nft"
 VLAN_UNIT = "etc/systemd/system/jumpbox-vlan-isolation.service"
 VLAN_UNIT_NAME = "jumpbox-vlan-isolation.service"
+# Lab VLANs reach each other through nothing, and leave the jumpbox only to the tailnet.
+ISOLATION_RULES = ['iifname "vlan*" oifname "vlan*" counter drop',
+                   'iifname "vlan*" oifname != "tailscale0" counter drop']
 
 
 def _nft_structure(text):
@@ -878,29 +882,60 @@ def _nft_structure(text):
     return tables, chains, hooks, rules
 
 
-def test_vlan_isolation_drops_only_vlan_to_vlan_forwarding():
-    # Catches a broad forward drop breaking VPN access to every lab.
+def _nft_verdict(rules, iif, oif, policy="accept"):
+    """First-match verdict of the rendered forward rules for one interface pair."""
+    def matches(spec, name):
+        negate = spec.startswith("!= ")
+        spec = spec[3:] if negate else spec
+        names = re.findall(r'"([^"]+)"', spec)
+        hit = any(fnmatch.fnmatchcase(name, n) for n in names)
+        return hit != negate
+    for rule in rules:
+        m = re.fullmatch(r'iifname (.+?) oifname (.+?) (?:counter )?(accept|drop)', rule)
+        assert m, f"unparsed rule {rule!r}"
+        if matches(m.group(1), iif) and matches(m.group(2), oif):
+            return m.group(3)
+    return policy
+
+
+def test_vlan_isolation_lets_lab_vlans_forward_only_to_the_tailnet():
+    # Catches a lab VM routing through the jumpbox into the management LAN, the
+    # Proxmox API or the internet: measured on staging, the jumpbox forwarded a lab
+    # VM's SYNs to the node's API port and its NTP to the internet (no NAT, so only
+    # the replies were missing). And catches a broad drop breaking VPN access.
     text = _netgen().render_vlan_isolation()
     tables, chains, hooks, rules = _nft_structure(text)
     assert tables == ["table inet jumpbox_vlan_isolation {"]
     assert chains == ["chain forward {"]
     assert hooks == ["type filter hook forward priority -10; policy accept;"]
-    assert rules == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert rules == ISOLATION_RULES
+    for iif, oif, verdict in [
+            ("vlan200", "tailscale0", "accept"), ("tailscale0", "vlan200", "accept"),
+            ("vlan100", "vlan101", "drop"), ("vlan200", "eth0", "drop"),
+            ("vlan200", "ens18", "drop"), ("vlan500", "docker0", "drop"),
+            ("eth0", "tailscale0", "accept")]:
+        assert _nft_verdict(rules, iif, oif) == verdict, (iif, oif)
     # Declare-then-delete-then-recreate makes a repeated load idempotent.
     stmts = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")][:3]
     assert stmts == ["table inet jumpbox_vlan_isolation", "delete table inet jumpbox_vlan_isolation",
                      "table inet jumpbox_vlan_isolation {"]
 
 
-def test_allow_vlans_exempts_listed_tags_in_both_directions_before_drop():
-    # Catches KOTH team VLANs losing their route to the KOTH VLAN (I11).
+def test_allow_vlans_exempts_listed_tags_between_vlans_only():
+    # Catches KOTH team VLANs losing their route to the KOTH VLAN (I11), or the
+    # exemption opening the management LAN to a KOTH VLAN.
     text = _netgen().render_vlan_isolation(allow_vlans=[300, 301])
     _tables, _chains, _hooks, rules = _nft_structure(text)
     assert rules == [
         'iifname "vlan*" oifname { "vlan300", "vlan301" } accept',
         'iifname { "vlan300", "vlan301" } oifname "vlan*" accept',
-        'iifname "vlan*" oifname "vlan*" counter drop',
+        *ISOLATION_RULES,
     ]
+    for iif, oif, verdict in [
+            ("vlan200", "vlan300", "accept"), ("vlan301", "vlan200", "accept"),
+            ("vlan200", "vlan201", "drop"), ("vlan300", "eth0", "drop"),
+            ("vlan300", "tailscale0", "accept")]:
+        assert _nft_verdict(rules, iif, oif) == verdict, (iif, oif)
 
 
 def test_allow_vlans_leaves_the_hook_and_policy_unchanged():
@@ -996,6 +1031,7 @@ def test_isolate_vlans_dry_run_writes_and_mutates_nothing(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert _tree(sysroot) == before and _mutations(_calls(tmp_path)) == []
     assert '+        iifname "vlan*" oifname "vlan*" counter drop' in result.stdout
+    assert '+        iifname "vlan*" oifname != "tailscale0" counter drop' in result.stdout
     assert "would run: systemctl enable jumpbox-vlan-isolation.service" in result.stdout
 
 
@@ -1004,7 +1040,7 @@ def test_isolate_vlans_apply_validates_installs_enables_and_converges(tmp_path):
     first = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans"], env)
     assert first.returncode == 0, first.stdout + first.stderr
     nft_path, unit_path = sysroot / VLAN_NFT, sysroot / VLAN_UNIT
-    assert _nft_structure(nft_path.read_text())[3] == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert _nft_structure(nft_path.read_text())[3] == ISOLATION_RULES
     assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-vlan-isolation.nft" in unit_path.read_text()
     assert stat.S_IMODE(nft_path.stat().st_mode) == 0o644
     assert stat.S_IMODE(unit_path.stat().st_mode) == 0o644
@@ -1048,7 +1084,7 @@ def test_isolate_vlans_with_allow_vlans_installs_the_exemption_rules(tmp_path):
     assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == [
         'iifname "vlan*" oifname { "vlan300", "vlan301" } accept',
         'iifname { "vlan300", "vlan301" } oifname "vlan*" accept',
-        'iifname "vlan*" oifname "vlan*" counter drop',
+        *ISOLATION_RULES,
     ]
 
 
@@ -1071,7 +1107,7 @@ def test_isolate_vlans_accepts_an_empty_allow_list(tmp_path):
     env, sysroot = _isolate_env(tmp_path)
     result = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans", "--allow-vlans", ""], env)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == ISOLATION_RULES
 
 
 def test_isolate_vlans_refuses_a_ruleset_nft_rejects(tmp_path):

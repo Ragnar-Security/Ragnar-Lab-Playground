@@ -242,6 +242,8 @@ SSH_UNIT_NAME = "jumpbox-ssh-filter.service"
 SSH_STAFF_IF = "tailscale0"
 VLAN_TABLE = "jumpbox_vlan_isolation"
 VLAN_NFT_FILE = "/etc/nftables.d/jumpbox-vlan-isolation.nft"
+# The only interface routed lab traffic may leave through.
+TAILNET_IF = "tailscale0"
 
 
 def _staff_networks(addresses):
@@ -377,13 +379,18 @@ def parse_vlan_list(spec):
 
 
 def render_vlan_isolation(allow_vlans=()):
-    """nftables table that stops lab VMs routing to each other through the jumpbox.
+    """nftables table that confines routed lab traffic to the tailnet.
 
-    Only packets entering AND leaving through vlan* interfaces are dropped, so
-    tailscale0 <-> vlan*, management and the jumpbox's own traffic are untouched;
-    same-VLAN traffic is switched on the trunk and never reaches the forward
-    hook. A KOTH range needs team VLANs to reach the KOTH VLAN, so each tag in
-    allow_vlans is accepted ahead of the drop in either direction.
+    A packet that enters on a vlan* interface may leave only on tailscale0:
+    vlan* to vlan* is dropped (lab VMs cannot route to each other), and so is
+    vlan* to anything else (the management NIC, docker0), because the jumpbox
+    would otherwise forward a lab VM's packets into the management LAN, the
+    Proxmox API and the internet. Two counters keep the two cases apart.
+    tailscale0 -> vlan* and the jumpbox's own traffic (DHCP and DNS to it, on
+    the input hook) are untouched; same-VLAN traffic is switched on the trunk
+    and never reaches the forward hook. A KOTH range needs team VLANs to reach
+    the KOTH VLAN, so each tag in allow_vlans is accepted ahead of the drops,
+    in either direction, between VLANs only.
     """
     tags = sorted({int(t) for t in allow_vlans})
     for tag in tags:
@@ -400,6 +407,7 @@ def render_vlan_isolation(allow_vlans=()):
         lines += [f'        iifname "vlan*" oifname {names} accept',
                   f'        iifname {names} oifname "vlan*" accept']
     lines += ['        iifname "vlan*" oifname "vlan*" counter drop',
+              f'        iifname "vlan*" oifname != "{TAILNET_IF}" counter drop',
               "    }",
               "}"]
     return "\n".join(lines) + "\n"
@@ -411,7 +419,7 @@ def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
     return "\n".join([
         f"# {HEADER}",
         "[Unit]",
-        "Description=Isolate routed lab VLANs from each other on the jumpbox (nftables)",
+        "Description=Confine routed lab VLAN traffic to the tailnet on the jumpbox (nftables)",
         "DefaultDependencies=no",
         "Wants=network-pre.target",
         "Before=network-pre.target",
