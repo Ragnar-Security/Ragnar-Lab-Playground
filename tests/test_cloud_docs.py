@@ -21,10 +21,24 @@ from app.template_manager import validate_template_config
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNBOOK = ROOT / "docs" / "CLOUD_BACKENDS.md"
-SPEC = ROOT / "docs" / "superpowers" / "specs" / "2026-11-04-multi-backend-vms-design.md"
+# The cost model as priced when the cloud backends were designed; a change
+# to the runbook's table must change this copy too, on purpose.
+COST_TABLE = [
+    "| Item | While a session runs | Between sessions |",
+    "|---|---|---|",
+    "| VPC, subnets, security groups, firewall rules, routes | free | free |",
+    "| Router, AWS `t4g.nano` plus public IPv4 | about $0.009/h | 8 GB gp3 disk, about $0.64/month |",
+    "| Router, GCP `e2-micro` plus external IPv4 | about $0.013/h (e2-micro is free-tier eligible"
+    " in some US regions) | 10 GB disk, about $0.40/month |",
+    "| NAT gateway | **not used** (AWS would be $0.045/h plus $0.045/GB, about $33/month standing)"
+    " | none |",
+    "| Lab machine, e.g. AWS `t3.medium` | about $0.042/h each | none (deleted) |",
+    "| Lab machine, e.g. GCP `e2-medium` | about $0.034/h each | none (deleted) |",
+    "| Lab disk, 30 GB | about $0.003/h each | none (deleted with the instance) |",
+]
 
 CLOUD_ENV = {
-    "ENABLED_BACKENDS", "LAB_SITE_ID", "JUMPBOX_VLAN_BANDS",
+    "ENABLED_BACKENDS", "LAB_SITE_ID", "VLAN_BANDS",
     "AWS_REGION", "AWS_AVAILABILITY_ZONE", "AWS_LAB_VPC_ID", "AWS_LAB_CIDR",
     "AWS_ROUTER_INSTANCE_ID", "AWS_MAX_VMS", "AWS_ROUTER_IDLE_MINUTES", "AWS_CLIENT_CIDRS",
     "AWS_LAUNCH_TIMEOUT_SECONDS", "AWS_TERMINATE_TIMEOUT_SECONDS",
@@ -197,12 +211,11 @@ def test_examples_carry_no_site_identity(path):
     assert not REAL_ID_PATTERNS.search((ROOT / path).read_text())
 
 
-# Catches a hand-edited price drifting from the design's cost model.
-def test_runbook_cost_table_reproduces_the_spec_table_exactly():
+# Catches a hand-edited price drifting from the cost model.
+def test_runbook_cost_table_reproduces_the_cost_model_exactly():
     runbook = _table_rows(_section(RUNBOOK.read_text(), "## Cost model"))
-    spec = _table_rows(_section(SPEC.read_text(), "## Cost model"))
-    assert len(spec) == 9
-    assert runbook == spec
+    assert len(COST_TABLE) == 9
+    assert runbook == COST_TABLE
 
 
 def _iam_policy():
@@ -358,11 +371,13 @@ def test_term_changeover_doc_documents_stage_4_preflight_and_rollback():
     assert "| `JUMPBOX_SSH` |" in readme and "| `JUMPBOX_PEER_WAIT` |" in readme
 
 
-# Same rule for the operator plan's Procedure R.
-def test_plan_procedure_r_restores_headscale_as_one_stopped_set():
-    plan = (ROOT / "docs" / "superpowers" / "plans" / "2026-11-16-individual-internal-vlans.md").read_text()
-    start = plan.index("- **Procedure R: restore Headscale as one set")
-    procedure = plan[start:plan.index("- [ ] **Step 5 (operator)", start)]
+ROLLOUT = ROOT / "docs" / "INTERNAL_VLAN_ROLLOUT.md"
+
+
+# Same rule for the rollout runbook's Procedure R.
+def test_rollout_procedure_r_restores_headscale_as_one_stopped_set():
+    text = ROLLOUT.read_text()
+    procedure = "\n".join(_section(text, "### Procedure R: restore Headscale as one set"))
     order = [procedure.index(step) for step in (
         "&& echo lines-ok", "docker compose stop headscale", 'undo_file apply "$DB_LINE"',
         'undo_file apply "$KEYS_LINE"', 'undo_file apply "$POLICY_LINE"', "docker compose start headscale",
@@ -370,8 +385,20 @@ def test_plan_procedure_r_restores_headscale_as_one_stopped_set():
     assert order == sorted(order), order
     assert "kill -s HUP" not in procedure
     assert 'docs/TERM_CHANGEOVER.md` "Undo one file"' in procedure
-    for line in ("absent-before:", "backup:"):
-        assert line in plan[plan.index("- [ ] **Step 9 (operator)"):plan.index("- [ ] **Step 10")], line
+    changeover = "\n".join(_section(text, "## 5. Run the changeover"))
+    for line in ("absent-before:", "backup:", "verified: the jumpbox lists every roster device"):
+        assert line in changeover, line
+
+
+# Catches the rollout runbook losing its placeholders, or the links that
+# make it the one place the procedure lives.
+def test_rollout_runbook_is_linked_and_carries_no_site_identity():
+    text = ROLLOUT.read_text()
+    assert not REAL_ID_PATTERNS.search(text)
+    assert "VLAN_BANDS" in text and "JUMPBOX_VLAN_BANDS" in "\n".join(_section(text, "## 2. Deploy the portal"))
+    assert "docs/INTERNAL_VLAN_ROLLOUT.md" in (ROOT / "CHANGELOG.md").read_text()
+    assert "docs/INTERNAL_VLAN_ROLLOUT.md" in (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
+    assert not (ROOT / "docs" / "superpowers").exists()
 
 
 STAGING = ROOT / "docs" / "STAGING.md"

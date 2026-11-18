@@ -18,7 +18,7 @@ def portal_config(monkeypatch):
     monkeypatch.setattr(config, "ENABLED_BACKENDS", ("proxmox", "aws"))
     monkeypatch.setattr(config, "AWS_LAB_CIDR", "172.20.0.0/16")
     monkeypatch.setattr(config, "GCP_LAB_CIDR", "172.21.0.0/16")
-    monkeypatch.setattr(config, "JUMPBOX_VLAN_BANDS", DEFAULT_BANDS)
+    monkeypatch.setattr(config, "VLAN_BANDS", DEFAULT_BANDS)
     return config
 
 
@@ -62,7 +62,7 @@ def test_export_is_the_sorted_roster_groups_koth_and_portal_config(app, portal_c
                 "enabled_backends": ["proxmox", "aws"],
                 "aws_lab_cidr": "172.20.0.0/16",
                 "gcp_lab_cidr": "172.21.0.0/16",
-                "jumpbox_vlan_bands": DEFAULT_BANDS,
+                "vlan_bands": DEFAULT_BANDS,
             },
             "users": [
                 {"login": "alice", "entry_vlan": 105, "internal_vlan": 205},

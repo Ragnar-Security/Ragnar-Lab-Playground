@@ -1,26 +1,27 @@
 """
 Centralized VLAN allocation for users and student groups.
 
-Scopes:
-    'user'  — entry 100-199, internal 200-299. Student index i (0-99) gets
-             100+i / 200+i, so the pool holds 100 students.
-    'group' — entry GROUP_ENTRY_VLAN_MIN-MAX, internal GROUP_INTERNAL_VLAN_MIN-MAX
-             (from app.config, default 300-400 / 400-500)
+Every pool comes from VLAN_BANDS (app.config.vlan_layout()), read at call
+time:
+    'user'  — the entry and internal bands. Student index i gets
+             entry.first+i / internal.first+i, so the pool holds as many
+             students as the entry band has tags.
+    'group' — the first free tag of group-entry and of group-internal.
 
-Both pools are checked for collisions across User, StudentWhitelist, and
-StudentGroup — a tag assigned to any of them is considered used.
+Both pools are checked for collisions across User, StudentWhitelist,
+StudentGroup and unfinished KOTH games — a tag assigned to any of them is
+considered used.
 """
 
-from typing import Literal, Optional, Tuple
+import importlib
+import logging
+from typing import List, Literal, Optional, Tuple
+
+from sqlalchemy import inspect
 
 from .models import db, User, StudentWhitelist, StudentGroup, KothGame
-from .config import (
-    GROUP_ENTRY_VLAN_MIN, GROUP_ENTRY_VLAN_MAX,
-    GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX,
-)
 
-USER_ENTRY_MIN, USER_ENTRY_MAX = 100, 199
-USER_INTERNAL_MIN, USER_INTERNAL_MAX = 200, 299
+logger = logging.getLogger(__name__)
 
 
 class VlanPoolExhausted(Exception):
@@ -31,14 +32,21 @@ class VlanInUse(Exception):
     """Raised when an explicit VLAN tag collides with an existing assignment."""
 
 
+def vlan_layout():
+    # Not `from .config import ...`: the package re-exports a config class
+    # under that name, and tests patch the module's VLAN_BANDS.
+    return importlib.import_module('app.config').vlan_layout()
+
+
 def _pool_for(scope: Literal['user', 'group']) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    layout = vlan_layout()
     if scope == 'user':
-        return ((USER_ENTRY_MIN, USER_ENTRY_MAX),
-                (USER_INTERNAL_MIN, USER_INTERNAL_MAX))
-    if scope == 'group':
-        return ((GROUP_ENTRY_VLAN_MIN, GROUP_ENTRY_VLAN_MAX),
-                (GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX))
-    raise ValueError(f"Unknown scope: {scope!r}")
+        entry, internal = layout.entry, layout.internal
+    elif scope == 'group':
+        entry, internal = layout.group_entry, layout.group_internal
+    else:
+        raise ValueError(f"Unknown scope: {scope!r}")
+    return (entry.first, entry.last), (internal.first, internal.last)
 
 
 def _used_tags() -> set:
@@ -71,11 +79,11 @@ def user_pair_for_index(index: int) -> Tuple[int, int]:
     """Return the (entry, internal) pair of the student at `index` in the pool."""
     if index < 0:
         raise ValueError(f"Student index must not be negative: {index}")
-    if index > USER_ENTRY_MAX - USER_ENTRY_MIN:
+    layout = vlan_layout()
+    if index >= layout.roster_max:
         raise VlanPoolExhausted(
-            f"Student index {index} is past the per-student pool of "
-            f"{USER_ENTRY_MAX - USER_ENTRY_MIN + 1}")
-    return USER_ENTRY_MIN + index, USER_INTERNAL_MIN + index
+            f"Student index {index} is past the per-student pool of {layout.roster_max}")
+    return layout.entry.first + index, layout.internal.first + index
 
 
 def validate_vlan_free(tag: int, exclude_group_id: Optional[int] = None) -> None:
@@ -141,3 +149,74 @@ def allocate_pair(
     used.add(entry)
     internal = _first_free(internal_lo, internal_hi, used)
     return entry, internal
+
+
+_STUDENT_TABLES = ((User, 'user'), (StudentWhitelist, 'whitelisted student'))
+_REFUSALS_SHOWN = 20
+
+
+def _has_columns(model, *columns: str) -> bool:
+    inspector = inspect(db.engine)
+    table = model.__tablename__
+    if not inspector.has_table(table):
+        return False
+    present = {column['name'] for column in inspector.get_columns(table)}
+    return set(columns) <= present
+
+
+def stored_vlan_problems() -> Tuple[List[str], List[str]]:
+    """(refusals, warnings) for VLAN tags already in the database.
+
+    A student's pair must lie in the entry and internal bands: the jumpbox
+    and the Headscale policy serve exactly those, so a pair outside them
+    leaves the student without a network. Groups and KOTH games may hold
+    explicitly chosen VLANs outside every band, which the operator routes;
+    those are only reported. Tables or columns a migration has not created
+    yet are skipped."""
+    layout = vlan_layout()
+    refusals, warnings = [], []
+    for model, kind in _STUDENT_TABLES:
+        if not _has_columns(model, 'login_id', 'entry_vlan_tag', 'internal_vlan_tag'):
+            continue
+        rows = db.session.query(model.login_id, model.entry_vlan_tag,
+                                model.internal_vlan_tag).order_by(model.login_id).all()
+        for login, entry, internal in rows:
+            for label, tag, band in (('entry', entry, layout.entry),
+                                     ('internal', internal, layout.internal)):
+                if tag is not None and tag not in band:
+                    refusals.append(
+                        f"{kind} {login}: {label} VLAN {tag} is outside the {band.name} "
+                        f"band {band.first}-{band.last} of VLAN_BANDS")
+    others = []
+    if _has_columns(StudentGroup, 'name', 'entry_vlan_tag', 'internal_vlan_tag'):
+        others += [(f"group {name}", entry, internal) for name, entry, internal in
+                   db.session.query(StudentGroup.name, StudentGroup.entry_vlan_tag,
+                                    StudentGroup.internal_vlan_tag).order_by(StudentGroup.name)]
+    if _has_columns(KothGame, 'status', 'entry_vlan_tag', 'internal_vlan_tag'):
+        others += [(f"KOTH game {game_id}", entry, internal) for game_id, entry, internal in
+                   db.session.query(KothGame.id, KothGame.entry_vlan_tag,
+                                    KothGame.internal_vlan_tag)
+                   .filter(KothGame.status != 'ended').order_by(KothGame.id)]
+    for owner, *tags in others:
+        outside = [str(tag) for tag in tags if tag is not None and not layout.routes(tag)]
+        if outside:
+            warnings.append(f"{owner}: VLAN {', '.join(outside)} lies outside every VLAN_BANDS "
+                            "band; the jumpbox does not route it")
+    return refusals, warnings
+
+
+def check_stored_vlan_tags() -> None:
+    """Refuse to start when a stored student pair lies outside VLAN_BANDS,
+    so a changed layout cannot silently cut students off their labs; log
+    each group or KOTH VLAN outside every band."""
+    refusals, warnings = stored_vlan_problems()
+    for warning in warnings:
+        logger.warning("%s", warning)
+    if refusals:
+        shown = refusals[:_REFUSALS_SHOWN]
+        if len(refusals) > len(shown):
+            shown.append(f"... and {len(refusals) - len(shown)} more")
+        raise ValueError(
+            "Stored student VLAN pairs lie outside VLAN_BANDS. Restore the VLAN_BANDS they "
+            "were numbered under, or renumber those students, before starting:\n  - "
+            + "\n  - ".join(shown))

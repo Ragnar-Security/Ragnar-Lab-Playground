@@ -57,7 +57,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/site_env.sh"
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" HEADSCALE_URL JUMPBOX_ADMIN_USER JUMPBOX_MGMT_IF \
-    JUMPBOX_TRUNK_IF JUMPBOX_VLAN_BANDS JUMPBOX_DHCP_START JUMPBOX_DHCP_END \
+    JUMPBOX_TRUNK_IF VLAN_BANDS JUMPBOX_DHCP_START JUMPBOX_DHCP_END \
     JUMPBOX_DHCP_LEASE JUMPBOX_DNS_UPSTREAM JUMPBOX_DHCP_RESERVATIONS \
     JUMPBOX_NETPLAN_FILE JUMPBOX_DNSMASQ_FILE JUMPBOX_NETPLAN_TRY_TIMEOUT \
     JUMPBOX_TS_ROUTES JUMPBOX_TS_TAG JUMPBOX_TS_HOSTNAME JUMPBOX_TS_KEY_DIR \
@@ -125,6 +125,10 @@ run() {
 
 [ "$(id -u)" -eq 0 ] || die "run as root (sudo); the netplan files are readable only by root"
 command -v python3 >/dev/null || die "python3 is required"
+# A layout left under the old name would silently fall back to the default
+# bands and renumber every lab network.
+[ -z "${JUMPBOX_VLAN_BANDS:-}" ] \
+    || die "JUMPBOX_VLAN_BANDS was renamed VLAN_BANDS; rename it in $SITE_ENV_FILE (the portal's .env uses the same name and value)"
 if [ "$HAVE_ALLOW" -eq 1 ] && [ "$DO_ISO" -eq 0 ]; then
     die "--allow-vlans only applies with --isolate-vlans"
 fi
@@ -223,7 +227,7 @@ detect_interfaces() {
 }
 
 render_network() {
-    local bands=(--bands "${JUMPBOX_VLAN_BANDS:-}")
+    local bands=(--bands "${VLAN_BANDS:-}")
     python3 "$NETGEN" vlans "${bands[@]}" > "$TMP/vlans"
     python3 "$NETGEN" netplan "${bands[@]}" --mgmt-if "$MGMT_IF" --trunk-if "$TRUNK_IF" > "$TMP/netplan"
     python3 "$NETGEN" dnsmasq "${bands[@]}" --mgmt-if "$MGMT_IF" \

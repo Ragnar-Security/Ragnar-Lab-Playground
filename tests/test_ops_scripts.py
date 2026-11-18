@@ -54,6 +54,17 @@ POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW"
 POLICY_FILE_CURRENT = "  nothing to do: the policy file Headscale serves matches the rendered one."
 
 
+def _copy_changeover_tools(repo: Path) -> None:
+    """The changeover scripts plus the band modules build_students_merged.py
+    reads the roster cap through."""
+    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py",
+                 "purge_roster.sql", "jumpbox_netgen.py"):
+        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    (repo / "app" / "backends").mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "app" / "backends" / "network_slots.py",
+                repo / "app" / "backends" / "network_slots.py")
+
+
 def _clean_env(tmp_path: Path, **values: str) -> dict[str, str]:
     env = dict(os.environ)
     for name in set(TERM_REQUIRED + HEADSCALE_REQUIRED + POLICY_REQUIRED + POLICY_INPUTS):
@@ -168,8 +179,7 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
-        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _copy_changeover_tools(repo)
     # The policy stage (and its preflight) is not what this test is about.
     _executable(repo / "scripts" / "apply_headscale_policy.sh", "#!/usr/bin/env bash\necho 'Headscale policy: stub'\n")
     config = tmp_path / "site.env"
@@ -306,7 +316,7 @@ POLICY_SLOTS = {
         "enabled_backends": ["proxmox", "aws"],
         "aws_lab_cidr": "172.20.0.0/16",
         "gcp_lab_cidr": "172.21.0.0/16",
-        "jumpbox_vlan_bands": "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4",
+        "vlan_bands": "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4",
     },
     "users": [
         {"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
@@ -920,8 +930,7 @@ def _term_rig(tmp_path: Path):
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
-        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _copy_changeover_tools(repo)
     _executable(repo / "scripts" / "apply_headscale_policy.sh", POLICY_STAGE_STUB)
     config = tmp_path / "site.env"
     config.write_text("\n".join([
@@ -1250,8 +1259,7 @@ def _changeover_with_local_hosts(tmp_path: Path, prior: str):
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
-        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _copy_changeover_tools(repo)
     _executable(repo / "scripts" / "apply_headscale_policy.sh", POLICY_STAGE_STUB)
     hs, portal = tmp_path / "headscale-host", tmp_path / "portal-host"
     (hs / "headscale" / "data").mkdir(parents=True)

@@ -15,9 +15,7 @@ from app import create_app, db
 from app import production_policy
 from app.config import is_production
 from app.models import User, StudentWhitelist, VMRecord
-from app.vlan_allocator import (
-    USER_ENTRY_MAX, USER_ENTRY_MIN, VlanPoolExhausted, user_pair_for_index,
-)
+from app.vlan_allocator import VlanPoolExhausted, user_pair_for_index, vlan_layout
 from app.template_manager import TemplateConfigError
 from sqlalchemy import inspect
 
@@ -236,9 +234,9 @@ def import_student_whitelist(csv_path: Optional[str] = None) -> None:
     Import students from students_merged.csv when the whitelist is empty.
     Without `csv_path`, look in ./data/ for local use or /app/data/ for Docker.
 
-    Students are numbered in file order with the per-student pairs
-    100+k/200+k. A file with more students than the pool holds raises
-    ValueError before any row is added.
+    Students are numbered in file order with the per-student pairs of
+    VLAN_BANDS (entry.first+k / internal.first+k). A file with more students
+    than the entry band holds raises ValueError before any row is added.
     """
     import csv
 
@@ -281,7 +279,7 @@ def import_student_whitelist(csv_path: Optional[str] = None) -> None:
     except VlanPoolExhausted:
         raise ValueError(
             f"{csv_path} has {len(new_rows)} students; the per-student VLAN pool "
-            f"holds {USER_ENTRY_MAX - USER_ENTRY_MIN + 1}"
+            f"holds {vlan_layout().roster_max}"
         ) from None
 
     for (login_id, row), (entry_vlan, internal_vlan) in zip(new_rows, pairs):

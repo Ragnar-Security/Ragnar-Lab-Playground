@@ -8,8 +8,7 @@ from app import create_app
 from app.models import db, User, StudentWhitelist, StudentGroup
 from app.vlan_allocator import (
     allocate_pair, validate_vlan_free, VlanPoolExhausted, VlanInUse,
-    USER_ENTRY_MIN, USER_ENTRY_MAX, USER_INTERNAL_MIN, USER_INTERNAL_MAX,
-    user_pair_for_index,
+    user_pair_for_index, vlan_layout,
 )
 
 
@@ -188,8 +187,9 @@ if __name__ == '__main__':
 
 
 def test_user_pools_are_disjoint_and_hold_one_hundred_students():
-    assert (USER_ENTRY_MIN, USER_ENTRY_MAX) == (100, 199)
-    assert (USER_INTERNAL_MIN, USER_INTERNAL_MAX) == (200, 299)
+    layout = vlan_layout()
+    assert (layout.entry.first, layout.entry.last) == (100, 199)
+    assert (layout.internal.first, layout.internal.last) == (200, 299)
 
 
 @pytest.mark.parametrize('index, pair', [(0, (100, 200)), (42, (142, 242)), (99, (199, 299))])
@@ -205,6 +205,6 @@ def test_user_pair_for_index_refuses_outside_the_pool():
 
 
 def test_changeover_roster_cap_equals_the_user_vlan_pool():
-    from scripts.build_students_merged import ROSTER_MAX
-    assert ROSTER_MAX == USER_ENTRY_MAX - USER_ENTRY_MIN + 1 \
-        == USER_INTERNAL_MAX - USER_INTERNAL_MIN + 1 == 100
+    from scripts.build_students_merged import roster_max
+    layout = vlan_layout()
+    assert roster_max() == layout.entry.size == layout.internal.size == 100

@@ -16,7 +16,7 @@ from ..models import db, User, StudentGroup, StudentGroupMember, StudentWhitelis
 from ..backends import get_backend
 from ..backends.base import BACKEND_PROXMOX, VMRef
 from ..template_manager import load_template_config
-from ..vlan_allocator import allocate_pair, VlanPoolExhausted, VlanInUse
+from ..vlan_allocator import allocate_pair, vlan_layout, VlanPoolExhausted, VlanInUse
 from .. import vm_provisioning
 from .vm_creation import cleanup_vms, named_instances, _expected_vm_names
 
@@ -398,8 +398,8 @@ def _build_plan(groups_from_yaml):
                 return t
         return None
 
-    from ..config import (GROUP_ENTRY_VLAN_MIN, GROUP_ENTRY_VLAN_MAX,
-                          GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX)
+    layout = vlan_layout()
+    entry_band, internal_band = layout.group_entry, layout.group_internal
 
     for g in groups_from_yaml:
         name = (g.get('name') or '').strip()
@@ -427,20 +427,18 @@ def _build_plan(groups_from_yaml):
             if explicit_entry is None or explicit_internal is None:
                 errors.append(f'group {name!r}: must set both entry_vlan_tag and internal_vlan_tag or neither')
                 continue
-            entry_in_pool = GROUP_ENTRY_VLAN_MIN <= explicit_entry <= GROUP_ENTRY_VLAN_MAX
-            internal_in_pool = GROUP_INTERNAL_VLAN_MIN <= explicit_internal <= GROUP_INTERNAL_VLAN_MAX
-            for tag, label, in_pool in ((explicit_entry, 'entry_vlan_tag', entry_in_pool),
-                                         (explicit_internal, 'internal_vlan_tag', internal_in_pool)):
+            for tag, label, band in ((explicit_entry, 'entry_vlan_tag', entry_band),
+                                     (explicit_internal, 'internal_vlan_tag', internal_band)):
                 if tag in used:
                     errors.append(f'group {name!r}: {label}={tag} collides with an existing VLAN')
-                elif not in_pool:
+                elif tag not in band:
                     warnings.append(f'group {name!r}: {label}={tag} is outside the configured group pool')
             entry = explicit_entry
             internal = explicit_internal
             used.add(entry); used.add(internal)
         else:
-            entry = _alloc(GROUP_ENTRY_VLAN_MIN, GROUP_ENTRY_VLAN_MAX)
-            internal = _alloc(GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX)
+            entry = _alloc(entry_band.first, entry_band.last)
+            internal = _alloc(internal_band.first, internal_band.last)
             if entry is None or internal is None:
                 errors.append(f'group {name!r}: VLAN pool exhausted')
                 continue

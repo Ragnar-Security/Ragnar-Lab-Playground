@@ -102,9 +102,9 @@ def policy_inputs(slots: Mapping[str, Any]) -> Tuple[PolicyBands, Dict[str, str]
     unknown = sorted(set(enabled) - set(KNOWN_BACKENDS))
     if unknown:
         raise ValueError(f"config.enabled_backends names unknown backend(s) {', '.join(unknown)}")
-    spec = config.get("jumpbox_vlan_bands")
+    spec = config.get("vlan_bands")
     if not isinstance(spec, str):
-        raise ValueError("config.jumpbox_vlan_bands must be a band string")
+        raise ValueError("config.vlan_bands must be a band string (the portal's VLAN_BANDS)")
     cidrs = {}
     for backend in CLOUD_BACKENDS:
         if backend in enabled:

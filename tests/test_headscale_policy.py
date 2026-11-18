@@ -31,7 +31,7 @@ SLOTS = {
         "enabled_backends": ["proxmox", "aws", "gcp"],
         "aws_lab_cidr": "172.20.0.0/16",
         "gcp_lab_cidr": "172.21.0.0/16",
-        "jumpbox_vlan_bands": DEFAULT_BANDS,
+        "vlan_bands": DEFAULT_BANDS,
     },
     "users": [
         {"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
@@ -200,7 +200,7 @@ def test_other_base_sections_are_kept_verbatim():
 def test_policy_inputs_come_from_the_portal_export():
     bands, cidrs = policy_inputs({**SLOTS, "config": {
         "enabled_backends": ["aws"], "aws_lab_cidr": "172.20.0.0/16",
-        "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS}})
+        "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS}})
     assert bands.proxmox_enabled is False
     assert bands.values == tuple(parse_vlan_bands(DEFAULT_BANDS))
     assert cidrs == {"aws": "172.20.0.0/16"}
@@ -214,13 +214,16 @@ def test_policy_inputs_come_from_the_portal_export():
 @pytest.mark.parametrize("config", [
     None,
     {"enabled_backends": ["proxmox", "azure"], "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": "proxmox", "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": ["aws"], "gcp_lab_cidr": "172.21.0.0/16",
-     "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": ["proxmox"], "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": "entry:1-2"},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": "entry:1-2"},
+    # The pre-VLAN_BANDS key is refused, not read.
+    {"enabled_backends": ["proxmox"], "aws_lab_cidr": "172.20.0.0/16",
+     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
 ])
 def test_policy_inputs_refuse_a_malformed_config(config):
     with pytest.raises(ValueError):

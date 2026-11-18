@@ -242,11 +242,48 @@ def aws_client_cidrs():
     return (TAILNET_CIDR,)
 
 
-# The jumpbox's VLAN bands (docs/JUMPBOX.md), read here so the Headscale
-# policy export grants exactly the Proxmox networks the jumpbox routes.
-JUMPBOX_VLAN_BANDS = _env_text(
-    'JUMPBOX_VLAN_BANDS',
-    'entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4')
+# ============ VLAN LAYOUT ============
+# Every VLAN pool and address derives from VLAN_BANDS: the students' entry
+# and internal pairs, the group pools, the roster cap and the jumpbox's
+# subnets (docs/JUMPBOX.md). The default lives in scripts/jumpbox_netgen.py,
+# which also runs alone on the jumpbox, so the two cannot drift apart.
+def _jumpbox_default_bands():
+    import importlib.util
+    path = APP_ROOT / 'scripts' / 'jumpbox_netgen.py'
+    spec = importlib.util.spec_from_file_location('_jumpbox_netgen_defaults', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.DEFAULT_BANDS
+
+
+DEFAULT_VLAN_BANDS = _jumpbox_default_bands()
+VLAN_BANDS = _env_text('VLAN_BANDS', DEFAULT_VLAN_BANDS)
+# Settings VLAN_BANDS replaced. A value left in the environment is reported
+# at startup, because it no longer changes anything.
+REMOVED_VLAN_SETTINGS = ('JUMPBOX_VLAN_BANDS', 'GROUP_ENTRY_VLAN_MIN', 'GROUP_ENTRY_VLAN_MAX',
+                         'GROUP_INTERNAL_VLAN_MIN', 'GROUP_INTERNAL_VLAN_MAX')
+
+
+def vlan_layout():
+    """The parsed VLAN_BANDS; ValueError when validate_config() would refuse it."""
+    from app.backends.network_slots import parse_vlan_layout
+    return parse_vlan_layout(VLAN_BANDS)
+
+
+def _vlan_layout_errors(enabled):
+    """Why VLAN_BANDS cannot serve this portal, or [] when it can."""
+    from app.backends.network_slots import SLOT_MAX
+    try:
+        layout = vlan_layout()
+    except ValueError as error:
+        return [f"VLAN_BANDS {error}"]
+    clouds = [name for name in enabled if name in CLOUD_BACKENDS]
+    if clouds and layout.highest_tag > SLOT_MAX:
+        return [f"VLAN_BANDS reaches VLAN {layout.highest_tag}, past cloud network slot "
+                f"{SLOT_MAX}: {', '.join(clouds)} gives each VLAN tag its own slot subnet "
+                f"and has none above slot {SLOT_MAX}"]
+    return []
+
 
 # ============ ORPHAN REAPER CONFIGURATION ============
 # A fallback for clones whose VMRecord was never committed because the app
@@ -294,20 +331,6 @@ def untracked_survivors_file():
 
 # ============ DATABASE CONFIGURATION ============
 DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///instance/app.db')
-
-# ============ GROUP VLAN POOL ============
-GROUP_ENTRY_VLAN_MIN = _env_number('GROUP_ENTRY_VLAN_MIN', '300', int)
-GROUP_ENTRY_VLAN_MAX = _env_number('GROUP_ENTRY_VLAN_MAX', '400', int)
-GROUP_INTERNAL_VLAN_MIN = _env_number('GROUP_INTERNAL_VLAN_MIN', '400', int)
-GROUP_INTERNAL_VLAN_MAX = _env_number('GROUP_INTERNAL_VLAN_MAX', '500', int)
-
-
-def get_group_vlan_ranges():
-    """Return ((entry_min, entry_max), (internal_min, internal_max)) for student groups."""
-    return (
-        (GROUP_ENTRY_VLAN_MIN, GROUP_ENTRY_VLAN_MAX),
-        (GROUP_INTERNAL_VLAN_MIN, GROUP_INTERNAL_VLAN_MAX),
-    )
 
 
 # --- King of the Hill defaults ---------------------------------------------
@@ -580,26 +603,13 @@ def validate_config():
     errors = [f"{key} {problem}" for key, problem in policy.vpn_problems(
         VPN_MODE, VPN_INSTRUCTIONS_URL, VPN_INSTRUCTIONS)]
     errors += _backend_errors(ENABLED_BACKENDS)
+    errors += _vlan_layout_errors(ENABLED_BACKENDS)
     if errors:
         raise ValueError("Configuration errors:\n  - " + "\n  - ".join(errors))
-
-    # Validate that group VLAN pools don't overlap user VLAN pools (100-199 entry, 200-299 internal).
-    # Treat MAX as exclusive (MIN == MAX is invalid, so [MIN, MAX) is the effective range).
-    group_ranges_errors = []
-    if GROUP_ENTRY_VLAN_MIN >= GROUP_ENTRY_VLAN_MAX:
-        group_ranges_errors.append("GROUP_ENTRY_VLAN_MAX must be > GROUP_ENTRY_VLAN_MIN")
-    if GROUP_INTERNAL_VLAN_MIN >= GROUP_INTERNAL_VLAN_MAX:
-        group_ranges_errors.append("GROUP_INTERNAL_VLAN_MAX must be > GROUP_INTERNAL_VLAN_MIN")
-    # Overlap with user entry pool [100, 200): non-overlap requires MIN >= 200 or MAX <= 100.
-    if not (GROUP_ENTRY_VLAN_MIN >= 200 or GROUP_ENTRY_VLAN_MAX <= 100):
-        logger.warning("GROUP_ENTRY_VLAN range overlaps the user entry VLAN pool (100-199). "
-                       "Collisions will be rejected at allocation time.")
-    # Overlap with user internal pool [200, 300): non-overlap requires MIN >= 300 or MAX <= 200.
-    if not (GROUP_INTERNAL_VLAN_MIN >= 300 or GROUP_INTERNAL_VLAN_MAX <= 200):
-        logger.warning("GROUP_INTERNAL_VLAN range overlaps the user internal VLAN pool (200-299). "
-                       "Collisions will be rejected at allocation time.")
-    if group_ranges_errors:
-        raise ValueError("Group VLAN config errors:\n  - " + "\n  - ".join(group_ranges_errors))
+    for name in REMOVED_VLAN_SETTINGS:
+        if _env_text(name):
+            logger.warning("%s is set but no longer read: VLAN_BANDS now defines every VLAN "
+                           "pool. Express the layout in VLAN_BANDS and delete %s.", name, name)
 
     # Imported here, not at module top: the backends package must be
     # importable while this module is still initialising.

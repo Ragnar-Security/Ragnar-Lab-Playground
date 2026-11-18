@@ -19,14 +19,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from app import create_app
 from app.models import db, User, StudentWhitelist
-from app.vlan_allocator import (
-    USER_ENTRY_MIN as ENTRY_VLAN_MIN,
-    USER_ENTRY_MAX as ENTRY_VLAN_MAX,
-    USER_INTERNAL_MIN as INTERNAL_VLAN_MIN,
-    USER_INTERNAL_MAX as INTERNAL_VLAN_MAX,
-    VlanPoolExhausted,
-    _used_tags,
-)
+from app.vlan_allocator import VlanPoolExhausted, _used_tags, user_pair_for_index, vlan_layout
 from sqlalchemy import text
 
 
@@ -51,9 +44,10 @@ def migrate_database():
 
             print("\n" + "=" * 60)
             print("Migration completed!")
-            print(f"\nVLAN Configuration:")
-            print(f"  - Entry VLAN Range: {ENTRY_VLAN_MIN}-{ENTRY_VLAN_MAX}")
-            print(f"  - Internal VLAN Range: {INTERNAL_VLAN_MIN}-{INTERNAL_VLAN_MAX}")
+            layout = vlan_layout()
+            print(f"\nVLAN Configuration (VLAN_BANDS):")
+            print(f"  - Entry VLAN Range: {layout.entry.first}-{layout.entry.last}")
+            print(f"  - Internal VLAN Range: {layout.internal.first}-{layout.internal.last}")
 
         except Exception as e:
             print(f"\nMigration failed: {str(e)}")
@@ -212,8 +206,8 @@ def _assign_vlans(records, other_model, label):
         if owner is not None:
             pair = (owner.entry_vlan_tag, owner.internal_vlan_tag)
         else:
-            for index in range(ENTRY_VLAN_MAX - ENTRY_VLAN_MIN + 1):
-                pair = (ENTRY_VLAN_MIN + index, INTERNAL_VLAN_MIN + index)
+            layout = vlan_layout()
+            for pair in (user_pair_for_index(index) for index in range(layout.roster_max)):
                 if pair[0] not in used and pair[1] not in used:
                     break
             else:

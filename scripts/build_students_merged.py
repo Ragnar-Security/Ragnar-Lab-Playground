@@ -32,15 +32,38 @@ Usage:
 
 import argparse
 import csv
+import importlib.util
+import os
 import sys
+from pathlib import Path
 
 FIELDNAMES = ['SIS User ID', 'SIS Login ID', 'email', 'headscale_key']
+SCRIPTS = Path(__file__).resolve().parent
 
-# One VLAN pair per student: the portal numbers entry 100-199 and internal
-# 200-299 (USER_ENTRY_MIN/MAX and USER_INTERNAL_MIN/MAX in app/vlan_allocator.py).
-# A literal, because this script stays standard-library only;
-# tests/test_vlan_allocator.py pins it to the allocator.
-ROSTER_MAX = 100
+
+def _load(name, path):
+    # By path, not `import app...`: this script stays standard-library only.
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module  # dataclasses resolve their module by name
+    spec.loader.exec_module(module)
+    return module
+
+
+def roster_max():
+    """How many students the portal can number: one VLAN pair each, so the
+    size of the entry band of VLAN_BANDS (from the environment or
+    scripts/site.env, else the jumpbox default)."""
+    spec = (os.environ.get('VLAN_BANDS') or '').strip()
+    if not spec:
+        spec = _load('_jumpbox_netgen', SCRIPTS / 'jumpbox_netgen.py').DEFAULT_BANDS
+    slots = _load('_lab_network_slots', SCRIPTS.parent / 'app' / 'backends' / 'network_slots.py')
+    try:
+        return slots.parse_vlan_layout(spec).roster_max
+    except ValueError as error:
+        sys.exit(f"Error: VLAN_BANDS {error}")
 
 
 def read_canvas(path):
@@ -64,9 +87,10 @@ def read_canvas(path):
 
     if dropped:
         print(f"Dropped {len(dropped)} row(s) with no SIS User ID: {', '.join(dropped)}")
-    if len(students) > ROSTER_MAX:
+    cap = roster_max()
+    if len(students) > cap:
         sys.exit(f"Error: {path} has {len(students)} students; the portal numbers "
-                 f"at most {ROSTER_MAX} (one VLAN pair each)")
+                 f"at most {cap} (one VLAN pair each, from the entry band of VLAN_BANDS)")
     return students
 
 

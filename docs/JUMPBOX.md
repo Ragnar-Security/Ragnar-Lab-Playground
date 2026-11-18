@@ -37,27 +37,60 @@ jumpbox section of `scripts/site.env.example`.
 
 ## Address plan
 
-Each lab VLAN tag *N* gets one /24 network. The jumpbox holds `.1`, and
-dnsmasq leases `.50` to `.254` for 12 hours:
-
-| Band | VLANs | Network | Portal pool |
-|------|-------|---------|-------------|
-| `entry` | 100–199 | `10.<N>.0.0/24` | per-student entry VLAN (`app/vlan_allocator.py`) |
-| `internal` | 200–299 | `10.<N-100>.1.0/24` | per-student internal VLAN (`app/vlan_allocator.py`) |
-| `group-entry` | 300–399 | `10.<N-200>.2.0/24` | group entry VLAN (`GROUP_ENTRY_VLAN_MIN/MAX`) |
-| `group-internal` | 400–500 | `10.<N-300>.4.0/24` | group internal VLAN (`GROUP_INTERNAL_VLAN_MIN/MAX`) |
-
-The bands must cover every VLAN the portal can assign. The portal's bounds
-are inclusive, so group-internal includes VLAN 500, and
-`tests/test_jumpbox_scripts.py` fails if the defaults stop covering the
-allocator's pools. A student's two networks share the second octet: entry VLAN
-142 is `10.142.0.0/24` and internal VLAN 242 is `10.142.1.0/24`. If you change
-the portal's `GROUP_*_VLAN_*` settings, set `JUMPBOX_VLAN_BANDS` to match:
+One setting, `VLAN_BANDS`, is the whole VLAN layout. The portal allocates
+every VLAN from it and the jumpbox routes exactly it, so it must have the
+same value in the portal's `.env` and in `scripts/site.env`. Each band is
+`name:first-last:offset:third`, and VLAN tag *N* in a band gets the /24
+`10.<N-offset>.<third>.0/24`. The jumpbox holds `.1`, and dnsmasq leases
+`.50` to `.254` for 12 hours. The default:
 
 ```
-JUMPBOX_VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
-#                   name:first-last:offset:third  ->  VLAN N = 10.<N-offset>.<third>.1/24
+VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
+#           name:first-last:offset:third  ->  VLAN N = 10.<N-offset>.<third>.1/24
 ```
+
+| Band | Default VLANs | Default network | Portal pool |
+|------|---------------|-----------------|-------------|
+| `entry` | 100–199 | `10.<N>.0.0/24` | per-student entry VLAN: student *i* gets `first+i` |
+| `internal` | 200–299 | `10.<N-100>.1.0/24` | per-student internal VLAN: student *i* gets `first+i` |
+| `group-entry` | 300–399 | `10.<N-200>.2.0/24` | group entry VLAN: the first free tag |
+| `group-internal` | 400–500 | `10.<N-300>.4.0/24` | group internal VLAN: the first free tag |
+
+A student's two networks share the second octet: entry VLAN 142 is
+`10.142.0.0/24` and internal VLAN 242 is `10.142.1.0/24`. The roster holds
+as many students as the `entry` band has tags (100 by default); the
+changeover and the seed refuse a larger one.
+
+The portal refuses to start unless the layout satisfies these rules, each
+because something depends on it:
+
+- `entry`, `internal`, `group-entry` and `group-internal` each appear
+  exactly once: they are the pools the portal allocates from. Other bands
+  may be added for the jumpbox to route; the portal never assigns them.
+- No two bands share a tag or a subnet.
+- `internal` has exactly as many tags as `entry`, because a student's pair
+  is one index into both bands.
+- `group-internal` has at least as many tags as `group-entry`, because each
+  group takes one tag from each. The default's `group-internal` holds one
+  tag more (400–500).
+- Every tag lies in 2–4094 and every derived address is valid
+  (`0 <= N-offset <= 255`, `0 <= third <= 255`).
+- With `aws` or `gcp` enabled, no tag is above 500: a cloud gives each VLAN
+  tag its own network slot, and slot 500 is the highest.
+- Every stored student pair (users and the whitelist) lies in the `entry`
+  and `internal` bands. Changing the layout while a term's roster is seeded
+  therefore refuses to start instead of cutting students off their labs:
+  change it between terms, or put the old value back.
+
+The bands describe what the jumpbox serves. A group or KOTH game given an
+explicit VLAN outside every band is allowed, and startup names each one in
+a warning, but the jumpbox and the Headscale policy do not route it; that
+VLAN is the operator's to route.
+
+After changing `VLAN_BANDS`, set the same value in both files, restart the
+portal, re-run `jumpbox_configure.sh --apply` on the jumpbox, and re-run
+`scripts/apply_headscale_policy.sh --apply`, which refuses while the
+portal's exported bands and `scripts/site.env` differ.
 
 Templates with a `static_mac` can get a fixed address on every network of
 one band, for example a domain controller at `.10` on each group-internal
@@ -68,7 +101,7 @@ JUMPBOX_DHCP_RESERVATIONS="group-internal=02:00:00:00:00:01,dc,10"
 ```
 
 The Proxmox bridge must carry these VLANs (`bridge-vlan-aware yes`, with
-`bridge-vids` including 100–500), and so must the switch ports between nodes.
+`bridge-vids` including every tag in `VLAN_BANDS`, 100–500 by default), and so must the switch ports between nodes.
 
 ## 1. Create the VM
 
@@ -563,5 +596,5 @@ list.
 |---------|-------|
 | Lab VMs get no address | `ip -br addr \| grep vlan` shows the `.1` gateways; `journalctl -u dnsmasq`; `df -h /`, because a full disk stops lease writes |
 | Students cannot reach lab VMs | `tailscale status`; route approved (`headscale nodes list-routes`); ACL allows `10.0.0.0/8`; `sysctl net.ipv4.ip_forward` |
-| A VLAN works but a new group's does not | the group's VLAN is outside `JUMPBOX_VLAN_BANDS`; re-run configure after widening the bands |
+| A VLAN works but a new group's does not | the group's VLAN is outside `VLAN_BANDS` (an explicit tag; the startup log names it); widen the bands in both `.env` and `scripts/site.env`, then re-run configure |
 | `netplan try` reverted | you did not confirm within the timeout, or the change cut your session; read the dry-run diff and re-run |

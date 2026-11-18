@@ -8,6 +8,10 @@ The script changes no Proxmox VM or template.
 
 The script never touches a dojo repository.
 
+The changeover that upgrades a site to per-student internal VLANs runs inside
+a longer procedure (portal deploy, jumpbox adoption, smoke test, rollback):
+follow `docs/INTERNAL_VLAN_ROLLOUT.md` for that one.
+
 ## Before you start
 
 1. Export the Canvas gradebook as CSV.
@@ -24,8 +28,10 @@ The script never touches a dojo repository.
    nor `JUMPBOX_PEER_WAIT`.
 5. Run the script from this repository root.
 6. Confirm that SSH reaches both production hosts.
-7. The roster holds at most 100 students, because each student gets one VLAN
-   pair; the script refuses a larger one before changing anything.
+7. The roster holds at most as many students as the `entry` band of
+   `VLAN_BANDS` has tags (100 by default), because each student gets one VLAN
+   pair; the script reads `VLAN_BANDS` from `scripts/site.env` (which must
+   match the portal's `.env`) and refuses a larger roster before changing anything.
 8. After a seed,
    `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`
    must print `ok`.

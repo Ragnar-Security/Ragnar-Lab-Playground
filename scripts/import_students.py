@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import create_app
 from app.models import db, StudentWhitelist
-from app.vlan_allocator import VlanPoolExhausted, user_pair_for_index
+from app.vlan_allocator import VlanPoolExhausted, user_pair_for_index, vlan_layout
 
 
 def import_students_from_csv(csv_path):
@@ -105,9 +105,10 @@ def import_students_from_csv(csv_path):
                     continue
 
                 # Number the student after the highest entry tag in the whitelist
-                max_entry_vlan = db.session.query(db.func.max(StudentWhitelist.entry_vlan_tag)).scalar() or 99
+                max_entry_vlan = db.session.query(db.func.max(StudentWhitelist.entry_vlan_tag)).scalar()
+                index = 0 if max_entry_vlan is None else max_entry_vlan - vlan_layout().entry.first + 1
                 try:
-                    entry_vlan, internal_vlan = user_pair_for_index(max_entry_vlan - 99)
+                    entry_vlan, internal_vlan = user_pair_for_index(index)
                 except VlanPoolExhausted:
                     db.session.rollback()
                     sys.exit(

@@ -250,7 +250,8 @@ Use an operator-owned staging `site.env` kept outside the checkout (for example
   `JUMPBOX_STORAGE=<STORAGE>`, `JUMPBOX_SSH_PUBKEY=<PUBKEY_FILE>`;
 - `JUMPBOX_BRIDGE=vmbr0`, `JUMPBOX_MGMT_VLAN=<MGMT_VLAN>`, `JUMPBOX_TRUNK_BRIDGE=<STAGING_BRIDGE>`;
 - `HEADSCALE_URL=http://<STAGING_VPN_ADDR>:8080`,
-  `JUMPBOX_VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"`;
+  `VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"`
+  (the same value as the staging portal's `.env`; `apply_headscale_policy.sh` refuses a difference);
 - the policy keys of section 6.
 
 Then follow `docs/JUMPBOX.md` sections 1-3 exactly, with `SITE_ENV_FILE=` pointing at that file on
@@ -364,7 +365,7 @@ FIXED_NODE=<STAGING_NODE>
 ENABLE_LOAD_BALANCING=false
 LAB_BRIDGE=<STAGING_BRIDGE>
 VMID_RANGE=<STAGING_VMID_RANGE>
-JUMPBOX_VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
+VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 ENABLED_BACKENDS=proxmox
 VPN_LOGIN_SERVER=http://<STAGING_VPN_ADDR>:8080
 ORPHAN_REAPER_ENABLED=false

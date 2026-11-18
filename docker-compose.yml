@@ -25,6 +25,7 @@ services:
       - FIXED_NODE=${FIXED_NODE}
       - LAB_BRIDGE=${LAB_BRIDGE:-}
       - VMID_RANGE=${VMID_RANGE:-}
+      - VLAN_BANDS=${VLAN_BANDS:-}
       - CPU_THRESHOLD=${CPU_THRESHOLD}
       - MEMORY_THRESHOLD=${MEMORY_THRESHOLD}
       - TEMPLATES_FILE=${TEMPLATES_FILE:-/app/templates.yaml}

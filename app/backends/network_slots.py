@@ -1,6 +1,7 @@
 """Slot-to-subnet and client-network arithmetic shared by the cloud
 backends, the Headscale policy renderer, config validation and the host
 preflight. Pure: no app.config import, stdlib only."""
+import functools
 import ipaddress
 import re
 from dataclasses import dataclass
@@ -110,6 +111,13 @@ class VlanBand:
     offset: int
     third: int
 
+    @property
+    def size(self) -> int:
+        return self.last - self.first + 1
+
+    def __contains__(self, tag: object) -> bool:
+        return isinstance(tag, int) and self.first <= tag <= self.last
+
 
 def parse_vlan_bands(spec: str) -> List[VlanBand]:
     """Same grammar and safety checks as scripts/jumpbox_netgen.parse_bands."""
@@ -137,6 +145,71 @@ def parse_vlan_bands(spec: str) -> List[VlanBand]:
                 raise ValueError(f"VLAN {tag} and VLAN {seen_nets[net]} map to the same subnet")
             seen_tags[tag], seen_nets[net] = band.name, tag
     return bands
+
+
+# The bands the portal allocates from. Others may be listed for the jumpbox
+# to route, but the portal never hands out their tags.
+POOL_BANDS = ('entry', 'internal', 'group-entry', 'group-internal')
+
+
+@dataclass(frozen=True)
+class VlanLayout:
+    """A parsed VLAN_BANDS: every band, plus the four the portal allocates
+    from. Student i gets entry.first + i and internal.first + i; a group
+    takes the first free tag of group-entry and of group-internal."""
+    bands: Tuple[VlanBand, ...]
+    entry: VlanBand
+    internal: VlanBand
+    group_entry: VlanBand
+    group_internal: VlanBand
+
+    @property
+    def roster_max(self) -> int:
+        """How many students the per-student pairs can number."""
+        return self.entry.size
+
+    @property
+    def pair_offset(self) -> int:
+        """internal tag - entry tag, the same for every student."""
+        return self.internal.first - self.entry.first
+
+    @property
+    def highest_tag(self) -> int:
+        return max(band.last for band in self.bands)
+
+    def routes(self, tag: object) -> bool:
+        """Whether the jumpbox serves `tag`: it lies in some band."""
+        return any(tag in band for band in self.bands)
+
+
+@functools.lru_cache(maxsize=8)
+def parse_vlan_layout(spec: str) -> VlanLayout:
+    """parse_vlan_bands, then the rules the allocator relies on: each pool
+    band exactly once, internal as large as entry (a student's pair shares
+    one index into both), and group-internal at least as large as
+    group-entry (each group takes one tag from each)."""
+    bands = tuple(parse_vlan_bands(spec))
+    by_name = {}
+    for band in bands:
+        if band.name in by_name:
+            raise ValueError(f"band {band.name} appears more than once")
+        by_name[band.name] = band
+    missing = [name for name in POOL_BANDS if name not in by_name]
+    if missing:
+        raise ValueError(f"band {', '.join(missing)} is missing; the portal allocates from "
+                         f"{', '.join(POOL_BANDS)}")
+    entry, internal = by_name['entry'], by_name['internal']
+    if internal.size != entry.size:
+        raise ValueError(
+            f"band internal has {internal.size} tags but entry has {entry.size}: student i "
+            "gets entry first+i and internal first+i, so both must hold the same number")
+    group_entry, group_internal = by_name['group-entry'], by_name['group-internal']
+    if group_internal.size < group_entry.size:
+        raise ValueError(
+            f"band group-internal has {group_internal.size} tags, fewer than group-entry's "
+            f"{group_entry.size}: each group takes one tag from each, so group-internal "
+            "must hold at least as many")
+    return VlanLayout(bands, entry, internal, group_entry, group_internal)
 
 
 def proxmox_slot_cidr(slot: int, bands: Sequence[VlanBand]) -> Optional[str]:

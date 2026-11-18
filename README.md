@@ -35,7 +35,7 @@ Each deployment group runs on one backend, chosen in `templates.yaml` by `backen
 - **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%); cloud backends admit against their machine cap instead
 - **Cross-node template sync** -- `sync_template.sh` replicates templates between nodes using vzdump/qmrestore (no NFS)
 - **Automatic cleanup** -- a background task destroys expired VMs every minute on every backend; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record, and on each enabled cloud only leftovers carrying this portal's `LAB_SITE_ID`
-- **Per-student VLAN isolation** -- entry VLAN (100-199) and internal VLAN (200-299) per student; on a cloud backend the same tags select the student's two network slots
+- **Per-student VLAN isolation** -- an entry VLAN and an internal VLAN per student (100-199 and 200-299 by default; `VLAN_BANDS` sets the layout); on a cloud backend the same tags select the student's two network slots
 - **Startup config validation** -- templates.yaml is validated at boot; mismatches are caught before any VM is created
 
 ## Tech Stack
@@ -309,7 +309,7 @@ These values normally live in `.env`:
 | `DISTRIBUTED_VM_LOCKS` | Serialize each VMID's stop/delete/retire across gunicorn workers with MySQL `GET_LOCK`; defaults to `false`, which uses an in-process lock only, enough for the single production worker. Set `true` before running more than one worker; each lock holder then uses a second database connection |
 | `ENABLED_BACKENDS` | Comma list of `proxmox`, `aws`, `gcp`; unset or empty means `proxmox`. Startup refuses an unknown name and the missing settings of an enabled backend |
 | `LAB_SITE_ID` | Ownership tag on every cloud resource; required when `aws` or `gcp` is enabled. The orphan reaper deletes resources carrying it that no record owns, so two portals sharing one value would sweep each other's machines |
-| `JUMPBOX_VLAN_BANDS` | The jumpbox's VLAN bands, exactly as `scripts/site.env` sets them; exported to the Headscale policy |
+| `VLAN_BANDS` | The one VLAN layout, `name:first-last:offset:third` bands (default `entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4`). The student pairs, the group pools, the roster cap (the entry band's size), the jumpbox's subnets and the Headscale policy all derive from it; set the same value in `scripts/site.env`. Startup refuses a layout without exactly one `entry`, `internal`, `group-entry` and `group-internal` band, overlapping bands, an `internal` band of a different size than `entry`, a `group-internal` band smaller than `group-entry`, an invalid tag or address, a tag above cloud slot 500 with `aws`/`gcp` enabled, and a stored student pair outside the `entry`/`internal` bands (`docs/JUMPBOX.md`) |
 | `AWS_*` / `GCP_*` | Region and zone, lab VPC or network, lab CIDR, router instance, the mandatory `AWS_MAX_VMS` / `GCP_MAX_VMS` cap, router idle minutes and timeouts; each is described in `.env.example`. Credentials come from boto3's standard chain and Application Default Credentials (`docs/CLOUD_BACKENDS.md`) |
 | `SMTP_*` / `ALERT_WEBHOOK_*` | Alert notification settings |
 | `DOCKERHUB_USERNAME` | Docker Hub namespace |
@@ -397,7 +397,7 @@ A group runs on Proxmox unless it, or one of its machines, sets `backend: aws` o
 python scripts/import_students.py data/students.csv
 ```
 
-The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags (100-199) and internal VLAN tags (200-299), plus optional Headscale auth keys.
+The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags from the `entry` band and internal VLAN tags from the `internal` band of `VLAN_BANDS` (100-199 and 200-299 by default), plus optional Headscale auth keys.
 
 ### Registration flow
 

@@ -7,13 +7,15 @@ from pathlib import Path
 
 import pytest
 
-from scripts.audit_vlan_pairs import USER_ENTRY_FIRST, USER_ENTRY_LAST, USER_INTERNAL_OFFSET, audit
+from scripts.audit_vlan_pairs import audit
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def _slots(users=(), groups=(), koth=()):
-    return {"config": {}, "users": list(users), "groups": list(groups), "koth": list(koth)}
+    bands = "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
+    return {"config": {"vlan_bands": bands}, "users": list(users), "groups": list(groups),
+            "koth": list(koth)}
 
 
 def _user(login, entry, internal):
@@ -55,7 +57,9 @@ def test_cli_exits_nonzero_and_names_each_problem(tmp_path):
     assert result.returncode == 1 and "zed" in result.stdout
 
 
-def test_audit_pool_matches_the_allocator():
-    from app.vlan_allocator import USER_ENTRY_MAX, USER_ENTRY_MIN, USER_INTERNAL_MIN
-    assert (USER_ENTRY_FIRST, USER_ENTRY_LAST, USER_INTERNAL_OFFSET) == (
-        USER_ENTRY_MIN, USER_ENTRY_MAX, USER_INTERNAL_MIN - USER_ENTRY_MIN)
+# Catches the audit judging pairs by a different layout than the allocator's.
+def test_audit_accepts_every_pair_the_allocator_numbers():
+    from app.config import VLAN_BANDS
+    from app.vlan_allocator import user_pair_for_index, vlan_layout
+    users = [_user(f"s{i}", *user_pair_for_index(i)) for i in range(vlan_layout().roster_max)]
+    assert audit({"config": {"vlan_bands": VLAN_BANDS}, "users": users}) == []

@@ -83,15 +83,41 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   longer carry `headscale_key`.
 - The release bundle also carries `app/backends/network_slots.py`, which
   `scripts/preflight_env.py` now loads for the client-network checks.
-- The jumpbox serves each student's internal VLAN (200-299,
+- The jumpbox serves each student's internal VLAN (200-299 by default,
   `10.<N-100>.1.0/24`), and the entry band ends at 199.
 - The Headscale policy grants each student their own internal VLAN on every
   enabled backend.
-- The per-student pools are 100-199 and 200-299.
-- The roster importers and `term_changeover.sh` refuse a roster of more than
-  100 students before changing the roster. `migrate_add_vlan.py` refuses to
-  assign pairs when the pool is exhausted, before assigning any pair (its
-  schema columns are added first).
+- `VLAN_BANDS` is the one VLAN layout. It replaces `JUMPBOX_VLAN_BANDS` and
+  the group pool settings, and everything else derives from it: the student
+  entry and internal pools and their pair offset, the group pools, the roster
+  cap (the `entry` band's size) in the seed, the importers and
+  `term_changeover.sh`, `audit_vlan_pairs.py`, `migrate_add_vlan.py`, the
+  network-slot export (key `config.vlan_bands`, was `jumpbox_vlan_bands`),
+  the Headscale policy and the jumpbox's subnets. The default is unchanged
+  (`entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2
+  group-internal:400-500:300:4`): student pairs 100-199 and 200-299, and
+  `migrate_add_vlan.py` still refuses to assign pairs when the pool is
+  exhausted, before assigning any. The group entry pool is now exactly the
+  `group-entry` band, 300-399; it used to end at 400, the first tag of the
+  group-internal pool.
+- The portal refuses to start when `VLAN_BANDS` does not parse, lacks one of
+  `entry`, `internal`, `group-entry`, `group-internal` or repeats one, has
+  overlapping bands, an `internal` band of a different size than `entry` (a
+  student's pair is one index into both), a `group-internal` band smaller
+  than `group-entry` (each group takes one tag of each), a tag outside
+  2-4094 or an invalid address, or, with `aws` or `gcp` enabled, a tag above
+  cloud slot 500. It also refuses while a stored user or whitelist pair lies
+  outside the `entry`/`internal` bands, so a changed layout cannot cut
+  students off their labs. A group or KOTH game with an explicit VLAN outside
+  every band still starts, with a warning naming it.
+- `scripts/apply_headscale_policy.sh` (every mode) refuses on a Proxmox site
+  while the portal's exported `VLAN_BANDS` differs from `VLAN_BANDS` in
+  `scripts/site.env` (else the default), the layout the jumpbox routes.
+  `jumpbox_configure.sh` reads `VLAN_BANDS` and refuses a leftover
+  `JUMPBOX_VLAN_BANDS`, which would otherwise fall back to the default bands.
+  `scripts/preflight_env.py` applies the same `VLAN_BANDS` rules (except the
+  stored-pair check, which needs the database) and reports each removed
+  setting still in the `.env`.
 - `jumpbox_configure.sh --isolate-vlans` (J2) drops VLAN-to-VLAN forwarding
   only; lab egress moved to its own table (above), which does not wait for J2.
   `--allow-vlans` (KOTH) still exempts VLAN-to-VLAN traffic only.
@@ -100,6 +126,10 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 
 - The image builder (`scripts/image_build/`), added after 1.1.0 and never in a
   release, moved to its own public repo, `Ragnar-Security/lab-image-builder`.
+- `GROUP_ENTRY_VLAN_MIN`, `GROUP_ENTRY_VLAN_MAX`, `GROUP_INTERNAL_VLAN_MIN`,
+  `GROUP_INTERNAL_VLAN_MAX` and `JUMPBOX_VLAN_BANDS`, replaced by
+  `VLAN_BANDS`, and `app.config.get_group_vlan_ranges()`. A value left in the
+  portal's environment is reported by a startup warning and otherwise ignored.
 
 ### Fixed
 
@@ -115,19 +145,19 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `docker-compose.prod.yml` passes the new `VPN_MODE`, `VPN_NAME`,
   `VPN_INSTRUCTIONS_URL`, `VPN_INSTRUCTIONS` and `AWS_CLIENT_CIDRS`; a site
   using its own compose file must add them to use the new modes.
-- **Apply this release only at a term changeover, in this order.** The
-  checked-in runbook is Task 8 Steps 5-12 of
-  `docs/superpowers/plans/2026-11-16-individual-internal-vlans.md`, with
-  `docs/JUMPBOX.md` and `docs/TERM_CHANGEOVER.md`:
+- **Apply this release only at a term changeover, in this order.** The full
+  operator runbook, with every check and the rollback, is
+  `docs/INTERNAL_VLAN_ROLLOUT.md`; it uses `docs/JUMPBOX.md` and
+  `docs/TERM_CHANGEOVER.md`. In outline:
   1. **Preconditions.** Before deploying, run
      `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`.
      It must print `ok`; fix any offending rows first. Set `JUMPBOX_SSH` in
      production's `scripts/site.env` (Proxmox sites), and make sure the
      operator machine can SSH to the jumpbox and run `tailscale status --json`
      there.
-  2. **Deploy the portal.** Set `JUMPBOX_VLAN_BANDS` in `.env` and in
-     `scripts/site.env` to the new string, or delete the line to take the
-     default; both files must agree. Leave `LAB_BRIDGE` and `VMID_RANGE` unset
+  2. **Deploy the portal.** Rename `JUMPBOX_VLAN_BANDS` to `VLAN_BANDS` in
+     `.env` and in `scripts/site.env` (or delete the line in both to take the
+     default); both files must agree. Leave `LAB_BRIDGE` and `VMID_RANGE` unset
      (`docker-compose.prod.yml` passes them through empty). No database
      migration: stored tags do not change.
   3. **Adopt the jumpbox.** Re-run `jumpbox_configure.sh --apply`; a hand-built
@@ -157,6 +187,20 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   Tailscale reconnects, and then no student reaches any lab. The watchdog
   restarts Headscale once when that happens; `scripts/apply_headscale_policy.sh
   --apply` after any jumpbox reboot or Tailscale restart does the same check.
+- **`VLAN_BANDS` replaces `JUMPBOX_VLAN_BANDS` and the `GROUP_*_VLAN_*`
+  settings.** In the portal's `.env` and in `scripts/site.env`, rename
+  `JUMPBOX_VLAN_BANDS` to `VLAN_BANDS` (same value), and delete every
+  `GROUP_ENTRY_VLAN_*` / `GROUP_INTERNAL_VLAN_*` line. A site that customised
+  the group pools must express them as the `group-entry` and `group-internal`
+  bands of `VLAN_BANDS` (with the jumpbox routing the same bands); the old
+  names are no longer read. `docker-compose.prod.yml` (and the development
+  `docker-compose.yml`, which passed no band setting before) now pass `VLAN_BANDS`;
+  a site with its own compose file must pass it instead of
+  `JUMPBOX_VLAN_BANDS`. Startup refuses while a stored student pair lies
+  outside the configured `entry`/`internal` bands: change the layout only
+  between terms, or restore the old value. Update the portal and the
+  operator checkout together: the export's band key is now `vlan_bands`, and
+  `apply_headscale_policy.sh` refuses an export without it.
 
 ## [1.1.0] - 2026-11-14
 

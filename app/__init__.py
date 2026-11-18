@@ -106,7 +106,14 @@ def create_app(testing=False, test_config=None, start_background_tasks=True):
 
     # Initialize database
     db.init_app(app)
-    
+
+    # A student pair outside VLAN_BANDS has no network on the jumpbox, so a
+    # changed layout refuses to start instead of cutting students off.
+    if not testing and not app.config.get('TESTING'):
+        from .vlan_allocator import check_stored_vlan_tags
+        with app.app_context():
+            check_stored_vlan_tags()
+
     # Register blueprints
     from .routes import api
     from .auth import auth

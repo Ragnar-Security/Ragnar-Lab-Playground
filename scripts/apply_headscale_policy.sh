@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/headscale_peers.sh"
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR \
-    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT VLAN_BANDS
 for name in PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR; do
     require_site_var "$name"
 done
@@ -42,6 +42,23 @@ else
     PYTHON="$(command -v python || true)"
 fi
 POLICY_TOOL="$SCRIPT_DIR/headscale_policy.py"
+NETGEN="$SCRIPT_DIR/jumpbox_netgen.py"
+# The jumpbox routes the bands scripts/site.env gives jumpbox_configure.sh;
+# the policy grants the bands the portal exports. Both must be one layout,
+# or students are granted networks the jumpbox does not route.
+SITE_BANDS_PY='import importlib.util,json,sys
+spec = importlib.util.spec_from_file_location("jumpbox_netgen", sys.argv[2])
+netgen = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(netgen)
+site = " ".join((sys.argv[3] or netgen.DEFAULT_BANDS).split())
+with open(sys.argv[1], encoding="utf-8") as handle:
+    portal = (json.load(handle).get("config") or {}).get("vlan_bands")
+if not isinstance(portal, str):
+    raise SystemExit("the portal export has no config.vlan_bands")
+portal = " ".join(portal.split())
+if portal != site:
+    raise SystemExit("the portal exports VLAN_BANDS \"" + portal + "\" but the jumpbox layout "
+                     "(VLAN_BANDS in scripts/site.env, else the default) is \"" + site + "\"")'
 APPLY=0
 PREFLIGHT=0
 TMP_DIR=""
@@ -54,7 +71,10 @@ Render the Headscale policy that lets each roster student reach only their
 own lab networks, their group's networks and the running KOTH arena.
 
 The roster, VLANs, enabled backends, lab CIDRs and VLAN bands are exported
-from the running portal. The operator's base policy (HEADSCALE_BASE_POLICY)
+from the running portal. With the proxmox backend, the exported VLAN_BANDS
+must equal the jumpbox's (VLAN_BANDS in scripts/site.env, else the default)
+or the run refuses before contacting Headscale.
+The operator's base policy (HEADSCALE_BASE_POLICY)
 supplies every other section and rule; its blanket "autogroup:member" rule
 is cut down to its autogroup:self part, and any other rule whose src
 includes autogroup:member or "*" must grant only autogroup:self or the
@@ -224,6 +244,10 @@ fetch_slots > "$TMP_DIR/slots.json" || die "Could not export network slots from 
 # The jumpbox serves only the Proxmox labs; a cloud-only portal has none to check.
 PROXMOX_ENABLED="$(proxmox_enabled "$TMP_DIR/slots.json")" \
     || die "Could not read the enabled backends from the portal's export."
+if ((PROXMOX_ENABLED)); then
+    "$PYTHON" -c "$SITE_BANDS_PY" "$TMP_DIR/slots.json" "$NETGEN" "${VLAN_BANDS:-}" \
+        || die "Set the same VLAN_BANDS in the portal's .env and scripts/site.env (then re-run jumpbox_configure.sh) before applying the policy."
+fi
 
 # What --apply needs before it may change anything, checked on its own so that
 # term_changeover.sh can run it before its first destructive stage.

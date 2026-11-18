@@ -86,9 +86,9 @@ services:
       # they come from the operator-owned compose override in that runbook.
       - ENABLED_BACKENDS=${ENABLED_BACKENDS:-}
       - LAB_SITE_ID=${LAB_SITE_ID:-}
-      # The jumpbox's bands, which scripts/export_network_slots.py reads in
-      # this container for the Headscale policy.
-      - JUMPBOX_VLAN_BANDS=${JUMPBOX_VLAN_BANDS:-}
+      # The VLAN layout every pool, pair and lab network derives from; the
+      # same value as VLAN_BANDS in scripts/site.env, which the jumpbox routes.
+      - VLAN_BANDS=${VLAN_BANDS:-}
       - AWS_REGION=${AWS_REGION:-}
       - AWS_AVAILABILITY_ZONE=${AWS_AVAILABILITY_ZONE:-}
       - AWS_LAB_VPC_ID=${AWS_LAB_VPC_ID:-}
