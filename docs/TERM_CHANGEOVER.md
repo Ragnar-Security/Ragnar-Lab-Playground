@@ -29,6 +29,9 @@ The script never touches a dojo repository.
 8. After a seed,
    `docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py | python3 scripts/audit_vlan_pairs.py -`
    must print `ok`.
+9. Before `--apply`, record the live policy file's hash on the Headscale host:
+   `sha256sum <host-policy-file>` (the host path behind `HEADSCALE_POLICY_FILE`). A rollback after
+   a run whose stage 4 installed nothing compares against it.
 
 Exported environment variables override `scripts/site.env`. The scripts have
 no host, IP, or username defaults; they stop immediately and name a missing
@@ -290,36 +293,61 @@ A second completed apply also skips every destructive stage.
 
 Use only the backup paths printed by the failed apply run. Replace each angle-bracket placeholder below with the corresponding value from `scripts/site.env`.
 
-Restore what the stages that ran changed, and nothing else. Stage 1 prints the Headscale database
-and key-file backups. Stage 2 prints the roster-file backups. Stage 3 prints the MySQL dump. Stage 4
-prints the policy backup (`backup:`). A stage that printed no backup changed nothing. Restore, in
-this order: Headscale, the roster files, MySQL (only if stage 3 purged or seeded), and then the
-policy. The policy goes last because it must match the roster you restored: an old policy with the
-new roster, or the reverse, names identities Headscale does not have. After the restore, the dry
-run with the *outgoing* term's export must report every stage `nothing to do`.
+Restore what the stages that ran changed, and nothing else:
+
+- Stage 1 prints the Headscale database and key-file backups.
+- Stage 2 prints the roster-file backups.
+- Stage 3 prints the MySQL dump.
+- Stage 4 prints the policy backup (`backup: <headscale-host>:<host-policy-file>.<YYYYmmddTHHMMSSZ>`).
+
+A stage that printed no backup changed nothing.
+
+The Headscale database and the policy file must go back **together, while Headscale is
+stopped**. Headscale checks that every user the policy names exists. Starting the outgoing database
+under the incoming policy, or the reverse, can fail to start, and a re-render from the portal needs
+Headscale running. So the order is:
+
+1. Headscale, as one set: the database, the key file and the policy file.
+2. The roster files.
+3. MySQL, only if stage 3 purged or seeded.
+4. The checks.
+
+After the restore, the dry run with the *outgoing* term's export must report stages 1-3
+`nothing to do`.
 
 If you instead finish the changeover forward, fix the cause (for example `JUMPBOX_SSH`) and run
 `--apply` again with the *incoming* export. A completed stage is a no-op on a re-run. The dry run
 with the incoming export must then report every stage, including stage 4, `nothing to do`.
 
-### Restore Headscale
+### Restore Headscale: database, key file and policy together
 
-Stop Headscale before restoring its SQLite database.
+On the Headscale host, in `<headscale-dir>`, with Headscale stopped. Copy back each file whose
+backup the run printed: the database and key file from stage 1, the policy file from stage 4.
+`<host-policy-file>` is the `backup:` path without its `.<stamp>` suffix.
 
 ```bash
 ssh <headscale-host>
 cd <headscale-dir>
 docker compose stop headscale
-cp <remote-backup-dir>/headscale-db-YYYYMMDD-HHMMSS.sqlite headscale/data/db.sqlite
-cp <remote-backup-dir>/headscale-keys-YYYYMMDD-HHMMSS.csv students_with_keys.csv
+cp <remote-backup-dir>/headscale-db-YYYYMMDD-HHMMSS.sqlite headscale/data/db.sqlite        # stage 1
+cp <remote-backup-dir>/headscale-keys-YYYYMMDD-HHMMSS.csv students_with_keys.csv           # stage 1
 chmod 600 headscale/data/db.sqlite students_with_keys.csv
+cp -p <host-policy-file>.<YYYYmmddTHHMMSSZ> <host-policy-file>.restoring \
+  && mv -f <host-policy-file>.restoring <host-policy-file>                                   # stage 4
 docker compose start headscale
+docker compose exec -T headscale headscale policy check --file <policy-file>   # must exit 0
 docker compose exec -T headscale headscale users list
 ```
 
-Read the user list after the start.
+`<policy-file>` is `HEADSCALE_POLICY_FILE`, the path inside the container. If stage 4 printed no
+`backup:` line, it installed nothing. Check that the live policy file is the one recorded before
+the changeover ("Before you start"): `sha256sum <host-policy-file>` must match. If it does not
+match, stop and find out why before restoring anything else.
 
-Confirm that the configured infrastructure and staff users still own their expected nodes.
+Read the user list after the start. Confirm that the configured infrastructure and staff users
+still own their expected nodes. If Headscale does not start, read `docker compose logs headscale`:
+a user the policy names but the database lacks means the set is mixed. Copy back the backup that
+belongs with the other one, and start it again.
 
 ### Restore the roster files
 
@@ -352,29 +380,16 @@ docker compose -f docker-compose.prod.yml restart vm-automation
 
 Wait for the portal health check.
 
-Run the dry command with the restored term export.
+### Check the restored state
 
-### Restore the policy
+Run the dry command with the restored term export. Stages 1-3 must report `nothing to do`.
 
-Only after Headscale and the roster files (and MySQL, if it was restored) match the roster you
-restored. Either re-render from the restored portal, which runs the same peer check:
-
-```bash
-scripts/apply_headscale_policy.sh --apply
-```
-
-or restore the exact file stage 4 backed up, on the Headscale host in `<headscale-dir>`, with
-`<backup>` the path after `backup: <headscale-host>:`:
-
-```bash
-docker compose exec -T headscale headscale policy check --file /dev/stdin < <backup>   # must exit 0
-cp -p <backup> <policy-file>.restoring && mv -f <policy-file>.restoring <policy-file>
-docker compose kill -s HUP headscale
-```
-
-After a restored file, check the jumpbox by hand. `tailscale status --json` there must show
-`"BackendState": "Running"` and the roster's devices among its peers. If it has none, run
-`docker compose restart headscale` once on the Headscale host.
+With the proxmox backend, check the jumpbox's peers against the restored roster. Run
+`scripts/headscale_peer_watchdog.sh` once: it reads the restored portal and logs `ok`, or it
+restarts Headscale once and logs `recovered`. Do not run `scripts/apply_headscale_policy.sh
+--apply` here. It renders this release's policy, and a rollback is usually back to the previous
+release's policy (run that release's apply script, from its checkout, if the policy must be
+re-rendered).
 
 ## Mid-term or end-of-term key rotation
 

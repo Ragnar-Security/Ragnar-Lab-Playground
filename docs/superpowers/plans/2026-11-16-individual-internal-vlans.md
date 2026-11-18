@@ -1123,24 +1123,31 @@ Open the PR against `main`. CI runs from the PR event (push CI does not cover `f
   - **After Step 10's policy applies (10e and 10i.4) and after Step 11:** exit 0 with the post-changeover counts.
 
   **At the first result that differs, stop and run Step 12 for every step done so far.**
-- **Procedure R: restore a Headscale policy backup (rollback only).** Only Step 12 item 3 uses it, and only after the same run's Headscale and roster restore: the backup is the outgoing roster's policy, and with the incoming roster still in Headscale and the portal it names identities that no longer exist. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used. The apply script prints `backup: <HEADSCALE_HOST>:<path>`, so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix. `BACKUP_REF` is the `backup:` value that Step 9's policy stage printed.
+- **Procedure R: restore Headscale as one set (rollback only).** Only Step 12 item 3 uses it. It puts back, **with Headscale stopped**, the database and key file that Step 9's stage 1 backed up together with the policy file that stage 4 backed up. Headscale checks that every user the policy names exists, so the outgoing database must never start under the incoming policy, or the reverse. Run it on the Headscale host, in `HEADSCALE_DIR`, after setting `HEADSCALE_HOST` in that shell to exactly the value the apply script used.
+  - `BACKUP_REF` is the `backup:` value that Step 9's policy stage printed. The apply script prints `backup: <HEADSCALE_HOST>:<path>`, so strip that exact prefix (IPv6-safe). The live file is the backup path without its `.<stamp>` suffix. Leave `BACKUP_REF` empty if stage 4 printed none.
+  - `DB_BACKUP` and `KEYS_BACKUP` are the two paths stage 1 printed. Leave both empty if stage 1 printed none.
   ```bash
-  BACKUP_REF='<everything after "backup: ">'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"; HOST_FILE="${BACKUP%.*}"
-  STAMP=$(date -u +%Y%m%dT%H%M%SZ); printf 'ref=%s\nbackup=%s\nlive=%s\n' "$BACKUP_REF" "$BACKUP" "$HOST_FILE"
-  [[ "${BACKUP##*.}" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] && test -f "$BACKUP" && test -f "$HOST_FILE" && echo files-ok
+  BACKUP_REF='<everything after "backup: ", or empty>'; DB_BACKUP='<stage 1 db path, or empty>'; KEYS_BACKUP='<stage 1 key-file path, or empty>'
+  HOST_FILE='<host policy file>'; BACKUP="${BACKUP_REF#"$HEADSCALE_HOST:"}"
+  [[ -z "$BACKUP_REF" || ( "${BACKUP##*.}" =~ ^[0-9]{8}T[0-9]{6}Z$ && "${BACKUP%.*}" == "$HOST_FILE" && -f "$BACKUP" ) ]] \
+    && [[ ( -z "$DB_BACKUP" && -z "$KEYS_BACKUP" ) || ( -f "$DB_BACKUP" && -f "$KEYS_BACKUP" ) ]] && test -f "$HOST_FILE" && echo files-ok
+  [[ -n "$BACKUP_REF" ]] || sha256sum "$HOST_FILE"   # no stage-4 backup: must equal Step 5's record
   ```
-  Expected: `files-ok`. Otherwise stop: nothing has been modified. Then:
+  Expected: `files-ok`, and without a stage-4 backup a hash equal to Step 5's record. Otherwise stop: nothing has been modified. Then:
   ```bash
-  docker compose exec -T headscale headscale policy check --file /dev/stdin < "$BACKUP"   # must exit 0
-  cp -p "$HOST_FILE" "$HOST_FILE.$STAMP.replaced" && chmod 600 "$HOST_FILE.$STAMP.replaced"
-  cp -p "$HOST_FILE" "$HOST_FILE.$STAMP.tmp" && cat "$BACKUP" > "$HOST_FILE.$STAMP.tmp" \
-      && mv -f "$HOST_FILE.$STAMP.tmp" "$HOST_FILE"
-  docker compose kill -s HUP headscale
-  docker compose exec -T headscale headscale policy get > "$HOST_FILE.$STAMP.readback"
-  python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' \
-      "$HOST_FILE.$STAMP.readback" "$BACKUP" && echo restored
+  docker compose stop headscale
+  [[ -z "$DB_BACKUP" ]] || { cp "$DB_BACKUP" headscale/data/db.sqlite && cp "$KEYS_BACKUP" students_with_keys.csv \
+    && chmod 600 headscale/data/db.sqlite students_with_keys.csv; }
+  [[ -z "$BACKUP_REF" ]] || { cp -p "$BACKUP" "$HOST_FILE.restoring" && mv -f "$HOST_FILE.restoring" "$HOST_FILE"; }
+  docker compose start headscale
+  for i in $(seq 1 30); do docker compose exec -T headscale headscale policy get > /dev/null 2>&1 && break; sleep 1; done
+  docker compose exec -T headscale headscale policy check --file '<HEADSCALE_POLICY_FILE>'   # must exit 0
+  docker compose exec -T headscale headscale users list                                      # the outgoing roster, staff, infrastructure
+  [[ -z "$BACKUP_REF" ]] || { docker compose exec -T headscale headscale policy get > /tmp/policy.readback \
+    && python3 -c 'import json,sys; a,b=(json.load(open(p)) for p in sys.argv[1:]); sys.exit(a != b)' /tmp/policy.readback "$BACKUP" \
+    && echo restored; }
   ```
-  Expected: `restored`. If the read-back differs (a single-file bind mount keeps showing the old file), run `docker compose restart headscale` once, wait until `headscale policy get` answers, and repeat the read-back. If it still differs, stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md`, "Apply the Headscale policy"). Then check the jumpbox's peers by hand, since Procedure R signals Headscale without the apply script's peer check: on the jumpbox, `tailscale status --json | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d.get("BackendState"), len(d.get("Peer") or {}))'` must print `Running` and a count that includes the roster's devices; if it prints `Running 0`, restart Headscale once as above. The access check that follows is the proof of what is enforced.
+  Expected: Headscale starts, `policy check` exits 0, the user list is the outgoing roster plus the staff and infrastructure users, and (with a stage-4 backup) `restored`. If Headscale does not start, `docker compose logs headscale` names the user the policy lacks: the set is mixed, so stop and escalate. A matching file proves only what Headscale serves, not what it has loaded (`docs/CLOUD_BACKENDS.md`, "Apply the Headscale policy"). The peer check comes after the roster and portal restore (Step 12 item 3). The access check that follows is the proof of what is enforced.
 
 - [ ] **Step 5 (operator): Preconditions and pre-change records**
 
@@ -1177,6 +1184,7 @@ All of these must hold before continuing:
   - `sudo sh -c 'nft list table inet jumpbox_vlan_isolation > /root/j1-before-j2.nft'` if the J1 table exists. Otherwise record "no J1".
   - `ip -br addr | grep -c '^vlan' | sudo tee /root/vlan-count-before`.
   - Then take a Proxmox backup of the jumpbox VM.
+- **Policy record:** on the Headscale host, `sha256sum <host policy file>`, kept with the changeover ticket. Procedure R compares against it when stage 4 installed nothing.
 - Run the student-access check and record the result as the baseline.
 
 - [ ] **Step 6 (operator): Deploy the portal**
@@ -1311,11 +1319,12 @@ First establish what ran: which of Steps 6-11, and for Step 9 which changeover s
    If J1 existed in Step 11, restore it with `sudo nft -f /root/j1-before-j2.nft`. Then `sudo nft list table inet jumpbox_vlan_isolation` shows J1's log-only rules and no drop rule. J1 is transient, as it was before.
 3. **The changeover (Step 9), if any stage of it ran.** Choose one direction, and record which in the changeover isolation ticket:
    - **Back to the outgoing roster.** Follow `docs/TERM_CHANGEOVER.md` "Rollback" with every backup path Step 9 printed, in its order:
-     1. Restore the Headscale database and key file (stage 1), then start Headscale and check `headscale users list` and the staff and infrastructure nodes.
+     1. Restore Headscale as one set with Procedure R: the database and key file (stage 1) and the policy file (stage 4), all with Headscale stopped. Then start Headscale, run `policy check`, and read `headscale users list` and the staff and infrastructure nodes. If stage 4 printed no backup, Procedure R checks that the live policy file matches Step 5's record instead.
      2. Restore the local and production roster CSVs (stage 2).
      3. Restore MySQL from the dump, but only if stage 3 purged and seeded. Restart `vm-automation` and wait for `healthy`.
+     4. Check. Run `scripts/headscale_peer_watchdog.sh` once: it reads the restored portal and logs `ok`, or restarts Headscale once and logs `recovered`. The new release's `scripts/term_changeover.sh <outgoing-canvas-export>.csv` dry run reports stages 1-3 `nothing to do`, and after item 5 the access check matches the Step 5 baseline.
 
-     Then restore a policy that matches the restored roster. Either use Procedure R with Step 9's `BACKUP_REF`, or re-render from the previous release's checkout after item 5 (`scripts/apply_headscale_policy.sh --apply` there, then the manual peer check from Procedure R). Procedure R is valid only here, after the Headscale and roster restore. Verify: the new release's `scripts/term_changeover.sh <outgoing-canvas-export>.csv` dry run reports stages 1-3 `nothing to do`, and the access check matches the Step 5 baseline.
+     Never restore the policy file alone, or start Headscale between restoring the database and the policy. If the policy must instead be re-rendered, do that only with the restored set running and the previous release deployed, from that release's checkout, after item 5.
    - **Forward to the incoming roster.** Fix the cause, then run `scripts/term_changeover.sh --apply <canvas-export>.csv` again. Completed stages are no-ops, the preflight runs first, and stage 4 must end with the verified peer line. Verify all four stages: the dry run reports every stage, including stage 4, `nothing to do`; the Step 5 audit prints `ok`; and the access check matches the post-changeover baseline. Nothing else in this list is undone in this direction unless the failure was in Steps 6-7.
 4. **Jumpbox network files.** If Step 7 ran, from the console:
    ```bash

@@ -335,16 +335,40 @@ def test_jumpbox_doc_documents_lab_egress_and_the_peer_watchdog():
         assert needle in watchdog, needle
 
 
-# Catches the canonical changeover runbook losing stage 4, the pre-mutation
-# preflight, or the order of a rollback that restores the policy last.
+# Catches the canonical changeover runbook losing stage 4 or the pre-mutation
+# preflight, and a rollback that starts the outgoing Headscale database under
+# the incoming policy (or the reverse), which Headscale can refuse to start.
 def test_term_changeover_doc_documents_stage_4_preflight_and_rollback():
     text = (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
     for needle in ("### 4. Apply the Headscale policy", "apply_headscale_policy.sh --preflight",
-                   "nothing was changed", "JUMPBOX_SSH", "### Restore the policy",
-                   "verified: the jumpbox\nlists every roster device as a peer."):
+                   "nothing was changed", "JUMPBOX_SSH",
+                   "verified: the jumpbox\nlists every roster device as a peer.",
+                   "sha256sum <host-policy-file>"):
         assert needle in text, needle
+    restore = "\n".join(_section(text, "### Restore Headscale: database, key file and policy together"))
+    block = _fenced_blocks(restore, "bash")[0]
+    order = [block.index(step) for step in (
+        "docker compose stop headscale", "headscale/data/db.sqlite", "students_with_keys.csv",
+        "mv -f <host-policy-file>.restoring <host-policy-file>", "docker compose start headscale",
+        "headscale policy check --file", "headscale users list")]
+    assert order == sorted(order), order
+    rollback = "\n".join(_section(text, "## Rollback"))
+    assert "kill -s HUP" not in rollback
     readme = (ROOT / "README.md").read_text()
     assert "| `JUMPBOX_SSH` |" in readme and "| `JUMPBOX_PEER_WAIT` |" in readme
+
+
+# Same rule for the operator plan's Procedure R.
+def test_plan_procedure_r_restores_headscale_as_one_stopped_set():
+    plan = (ROOT / "docs" / "superpowers" / "plans" / "2026-11-16-individual-internal-vlans.md").read_text()
+    start = plan.index("- **Procedure R: restore Headscale as one set")
+    procedure = plan[start:plan.index("- [ ] **Step 5 (operator)", start)]
+    order = [procedure.index(step) for step in (
+        "docker compose stop headscale", "headscale/data/db.sqlite",
+        'mv -f "$HOST_FILE.restoring" "$HOST_FILE"', "docker compose start headscale",
+        "headscale policy check --file", "headscale users list")]
+    assert order == sorted(order), order
+    assert "kill -s HUP" not in procedure
 
 
 STAGING = ROOT / "docs" / "STAGING.md"
