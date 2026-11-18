@@ -385,7 +385,8 @@ with open(os.environ["DOCKER_LOG"], "a") as log:
 mode = os.environ.get("PEERS", "present")
 shown = mode == "present" or (mode == "after-restart" and os.path.exists(os.environ["RESTART_MARK"]))
 nodes = json.load(open(os.environ["NODES_FILE"])) if shown else []
-print(json.dumps({"Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
+print(json.dumps({"BackendState": "Running",
+                  "Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
 """
 POLICY_NODES = [
     {"id": 1, "given_name": "alice-laptop", "user": {"name": "alice"},

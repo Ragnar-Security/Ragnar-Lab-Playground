@@ -402,9 +402,13 @@ roster device Headscale knows is one of the jumpbox's peers. On the first build 
 the reload: the jumpbox's packet filter already held both students' rules, yet every client's
 traffic to the lab went unanswered until `docker compose restart headscale` on the VPN VM. So when a
 device is missing, the script restarts Headscale once, checks again, and fails, naming the devices,
-if one is still missing. To check by hand on the jumpbox:
+if one is still missing. It happened a second time after the jumpbox's Tailscale reconnected
+(`tailscale down`, then `up`): the jumpbox ran with no peers until the script restarted Headscale.
+So also run `--apply` after the jumpbox reboots or its Tailscale restarts. A stopped jumpbox
+(`BackendState` other than `Running`) still lists its last peers, so the script counts it as having
+none. To check by hand on the jumpbox:
 `tailscale status --json | python3 -c 'import json, sys; print(sorted(p["HostName"] for p in (json.load(sys.stdin).get("Peer") or {}).values()))'`
-lists `zz-a` and `zz-b`.
+lists `zz-a` and `zz-b`, and `tailscale status --json` shows `"BackendState": "Running"`.
 
 ## 7. The acceptance test
 

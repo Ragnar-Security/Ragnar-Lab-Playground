@@ -384,9 +384,10 @@ NODES = [_node("alice-laptop", "alice", "100.64.0.1"), _node("bob-laptop", "bob"
          _node("jumpbox", "term-infrastructure", "100.64.0.3"), _node("prof", "instructor", "100.64.0.4")]
 
 
-def _status(*ips):
+def _status(*ips, state="Running"):
     """`tailscale status --json` on the jumpbox, listing these peer addresses."""
-    return {"Peer": {f"nodekey:{i}": {"HostName": f"h{i}", "TailscaleIPs": [ip]} for i, ip in enumerate(ips)}}
+    return {"BackendState": state,
+            "Peer": {f"nodekey:{i}": {"HostName": f"h{i}", "TailscaleIPs": [ip]} for i, ip in enumerate(ips)}}
 
 
 # Catches a Headscale reload that leaves the subnet router without the students
@@ -396,6 +397,14 @@ def test_missing_peers_names_roster_devices_the_jumpbox_does_not_list():
     assert missing_peers(NODES, SLOTS, _status("100.64.0.4")) == [
         "alice-laptop (alice)", "bob-laptop (bob)"]
     assert missing_peers(NODES, SLOTS, {"Peer": None}) == ["alice-laptop (alice)", "bob-laptop (bob)"]
+
+
+# Catches a stopped jumpbox passing the check: measured on staging, `tailscale
+# down` leaves BackendState "Stopped" with the last netmap's peers still listed.
+def test_missing_peers_counts_every_device_missing_unless_the_jumpbox_is_running():
+    for state in ("Stopped", "NeedsLogin", "Starting", None):
+        assert missing_peers(NODES, SLOTS, _status("100.64.0.1", "100.64.0.2", state=state)) == [
+            "alice-laptop (alice)", "bob-laptop (bob)"], state
 
 
 # Catches a false alarm (and a needless Headscale restart) for devices the

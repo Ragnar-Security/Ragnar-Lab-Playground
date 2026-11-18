@@ -271,10 +271,12 @@ def missing_peers(nodes: Any, slots: Mapping[str, Any], status: Any) -> List[str
 
     The policy grants each roster login routes the jumpbox serves, so every
     device of a roster login must be a peer of the jumpbox; a device that is
-    not cannot reach any lab. Headscale v0.27.1 once reloaded a policy and left
-    the jumpbox with no peers at all (staging, 2026-11-18). Offline devices stay
-    in a netmap and count; expired ones are no one's peer and are skipped, as
-    are staff and infrastructure devices, which the roster does not name.
+    not cannot reach any lab. Headscale v0.27.1 left the jumpbox with no peers
+    once after a policy reload and once after the jumpbox reconnected (staging,
+    2026-11-18). Offline devices stay in a netmap and count; expired ones are no
+    one's peer and are skipped, as are staff and infrastructure devices, which
+    the roster does not name. A jumpbox whose backend is not Running keeps its
+    last netmap's peers in the status, so then every device counts as missing.
     """
     if not isinstance(nodes, list) or not all(isinstance(n, Mapping) for n in nodes):
         raise ValueError("the Headscale node list must be a JSON list of nodes")
@@ -282,8 +284,9 @@ def missing_peers(nodes: Any, slots: Mapping[str, Any], status: Any) -> List[str
         raise ValueError("the jumpbox status must be a JSON object")
     roster = {normalize_login(user.get("login")) for user in _list(slots, "users")}
     peer_ips: Set[str] = set()
-    for peer in (status.get("Peer") or {}).values():
-        peer_ips.update(peer.get("TailscaleIPs") or [])
+    if status.get("BackendState") == "Running":
+        for peer in (status.get("Peer") or {}).values():
+            peer_ips.update(peer.get("TailscaleIPs") or [])
     now = time.time()
     missing = []
     for node in nodes:
