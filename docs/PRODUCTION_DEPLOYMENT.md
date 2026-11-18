@@ -448,10 +448,13 @@ from it, so the table must exist before the new code's first expiry pass.
 
 `migrate_add_vlan_layout_record.py` adds the `vlan_layout_record` table,
 which holds the `VLAN_BANDS` layout the stored student pairs were numbered
-under. The old code never reads it; the new code creates it at startup too
-and records the configured layout on its first start, after which startup
-refuses a changed layout while student pairs are stored
-(`docs/JUMPBOX.md`, "Address plan").
+under, and seeds it. While student pairs are stored it needs that layout,
+`--bands '<pre-upgrade layout>'` or `--site-env <pre-upgrade site.env>`
+(`docs/INTERNAL_VLAN_ROLLOUT.md`, section 2), and the new code refuses to
+start until it is seeded. On a database without student pairs it may run
+without one; the new code then records its configured layout on its first
+start. After that, startup refuses a changed layout while student pairs are
+stored (`docs/JUMPBOX.md`, "Address plan").
 
 `migrate_add_vm_backend.py` adds `backend`, `provider_id`, `deployment_id`
 and `network_slot` to `vm_records`, plus an index on `deployment_id`.

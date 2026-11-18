@@ -1083,6 +1083,9 @@ def select_best_node(proxmox: ProxmoxAPI,
     reservations = _NODE_RESERVATIONS
 
     def admit(conn):
+        # A process left on an older VLAN layout must not place labs.
+        from .vlan_allocator import check_layout_current
+        check_layout_current(conn)
         now = coordination.lease_clock()
         if reservation_id and conn.execute(
                 select(reservations.c.reservation_id)

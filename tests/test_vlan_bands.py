@@ -90,7 +90,8 @@ def test_no_pool_literal_outside_the_default_string():
         for path in sorted((ROOT / base).rglob("*")):
             if path.suffix not in (".py", ".sh") or "__pycache__" in path.parts:
                 continue
-            if path.name == "jumpbox_netgen.py":
+            # The default, and the pre-upgrade default an upgrade seeds from.
+            if path.name in ("jumpbox_netgen.py", "migrate_add_vlan_layout_record.py"):
                 continue
             for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
                 if pool_range.search(line) or "ROSTER_MAX" in line:
@@ -107,7 +108,9 @@ def test_removed_settings_are_read_nowhere():
             if path.suffix not in (".py", ".sh", ".example") or "__pycache__" in path.parts:
                 continue
             if path in (ROOT / "app" / "config.py", ROOT / "scripts" / "jumpbox_configure.sh",
-                        ROOT / "scripts" / "preflight_env.py"):
+                        ROOT / "scripts" / "preflight_env.py",
+                        # reads the pre-upgrade name to seed the old layout
+                        ROOT / "scripts" / "migrate_add_vlan_layout_record.py"):
                 continue  # each names a removed setting once, to report a stale value
             text = path.read_text(encoding="utf-8")
             if removed.search(text):
@@ -375,6 +378,7 @@ def _student(model, login, entry, internal):
 
 @pytest.mark.parametrize("model", [User, StudentWhitelist])
 def test_startup_refuses_a_student_pair_outside_the_bands(app, monkeypatch, model, custom):
+    _seed(app, CUSTOM)
     with app.app_context():
         db.session.add(_student(model, "alice", 100, 200))
         db.session.commit()
@@ -383,11 +387,25 @@ def test_startup_refuses_a_student_pair_outside_the_bands(app, monkeypatch, mode
 
 
 def test_startup_accepts_student_pairs_inside_the_bands(app, monkeypatch, custom):
+    _seed(app, CUSTOM)
     with app.app_context():
         db.session.add_all([_student(User, "alice", 1000, 1050),
                             _student(StudentWhitelist, "alice", 1000, 1050)])
         db.session.commit()
     _start(app, monkeypatch)
+
+
+def _seed(app, bands):
+    """Seed the layout record, as the migration does on an upgrade."""
+    _migration().run_migration(app.config["SQLALCHEMY_DATABASE_URI"], bands=bands)
+
+
+def _migration():
+    spec = importlib.util.spec_from_file_location(
+        "migrate_add_vlan_layout_record", ROOT / "scripts" / "migrate_add_vlan_layout_record.py")
+    migration = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(migration)
+    return migration
 
 
 # Explicit group and KOTH VLANs may sit outside the pools by design; they are
@@ -509,3 +527,117 @@ def test_the_layout_migration_creates_the_model_table_and_is_idempotent(tmp_path
                for c in inspect(create_engine(url)).get_columns("vlan_layout_record")}
     model = {c.name: (str(c.type), c.nullable) for c in VlanLayoutRecord.__table__.columns}
     assert columns == model
+
+
+# ---- introducing the record on a site that already has students ------------
+
+def _with_pairs(app):
+    with app.app_context():
+        db.session.add_all([_student(StudentWhitelist, "alice", 100, 200),
+                            _student(User, "alice", 100, 200)])
+        db.session.commit()
+
+
+# Catches the introducing deploy blessing whatever VLAN_BANDS it starts with.
+def test_stored_pairs_with_no_recorded_layout_refuse_to_start(app, monkeypatch):
+    _with_pairs(app)
+    with pytest.raises(ValueError, match=r"No VLAN layout is recorded.*migrate_add_vlan_layout_record"):
+        _start(app, monkeypatch)
+    assert _recorded(app) is None
+
+
+def test_a_changed_offset_on_the_introducing_deploy_refuses(app, monkeypatch):
+    _with_pairs(app)
+    with pytest.raises(SystemExit, match="2 student VLAN pair"):
+        _seed(app, None)  # a layout is required once pairs exist
+    _seed(app, DEFAULT)   # the correct pre-upgrade layout
+    assert _recorded(app) == DEFAULT
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)
+    with pytest.raises(ValueError, match="differs from the layout"):
+        _start(app, monkeypatch)
+    monkeypatch.setattr(_config(), "VLAN_BANDS", DEFAULT)
+    _start(app, monkeypatch)
+
+
+def test_the_seed_is_validated_against_every_stored_pair(app):
+    _with_pairs(app)
+    with pytest.raises(SystemExit, match="user alice: entry VLAN 100 is in no band"):
+        _seed(app, CUSTOM)
+    assert _recorded(app) is None
+
+
+# The release before VLAN_BANDS routed no internal band: seeding that layout
+# makes the upgrade show, and require accepting, every internal network move.
+def test_upgrading_from_the_pre_internal_layout_lists_the_moves(app, monkeypatch, tmp_path, capsys):
+    _with_pairs(app)
+    site = tmp_path / "site.env"
+    site.write_text("PORTAL_HOST=portal-host\n")  # JUMPBOX_VLAN_BANDS was unset
+    migration = _migration()
+    _seed(app, migration.bands_from_site_env(str(site)))
+    assert _recorded(app) == migration.PRE_VLAN_BANDS_DEFAULT
+    with pytest.raises(ValueError, match="differs from the layout"):
+        _start(app, monkeypatch)
+    assert _accept(app, monkeypatch) == 0
+    out = capsys.readouterr().out
+    assert "alice: internal VLAN 200: 10.200.0.0/24 -> 10.100.1.0/24" in out
+    assert "entry VLAN 100" not in out
+    assert _accept(app, monkeypatch, "--apply") == 0
+    _start(app, monkeypatch)
+    site.write_text(f'JUMPBOX_VLAN_BANDS="{CUSTOM}"\n')
+    assert migration.bands_from_site_env(str(site)) == CUSTOM
+
+
+# ---- accept and admission exclude each other ------------------------------
+
+def test_an_admitted_deployment_blocks_the_accept(app, monkeypatch, capsys):
+    from app import coordination
+    from app.models import NodeMemoryReservation
+    _start(app, monkeypatch)
+    with app.app_context():
+        db.session.add(NodeMemoryReservation(reservation_id="r1", node="node-a", memory_bytes=1,
+                                             expires_at=coordination.lease_clock() + 600))
+        db.session.commit()
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)
+    assert _accept(app, monkeypatch, "--apply") == 1
+    assert "1 deployment admission(s) are in progress" in capsys.readouterr().err
+    assert _recorded(app) == DEFAULT
+
+
+# Catches a portal still running the old layout placing labs after an accept.
+def test_an_old_layout_process_refuses_to_deploy_after_an_accept(app, monkeypatch):
+    from app.backends.base import AdmissionRefused
+    from app.backends.cloud_admission import reserve_cloud_capacity
+    from app.models import NodeMemoryReservation
+    from app.vlan_allocator import accept_vlan_layout_locked
+    _start(app, monkeypatch)
+    with app.app_context():
+        accept_vlan_layout_locked(SHIFTED)  # another process accepted SHIFTED
+        with pytest.raises(AdmissionRefused, match="differs from the recorded layout — restart required"):
+            reserve_cloud_capacity("aws", "zone-a", 5, "r-old")
+        assert NodeMemoryReservation.query.count() == 0
+    monkeypatch.setattr(_config(), "VLAN_BANDS", SHIFTED)  # the restarted process
+    with app.app_context():
+        assert reserve_cloud_capacity("aws", "zone-a", 5, "r-new") == "zone-a"
+
+
+# Catches the accept skipping the admission lock: while an admission holds
+# it, the accept must wait and record nothing.
+def test_the_accept_waits_for_the_admission_lock(app, monkeypatch):
+    import threading
+    from app import coordination
+    from app.vlan_allocator import accept_vlan_layout_locked
+    _start(app, monkeypatch)
+
+    def accept():
+        with app.app_context():
+            accept_vlan_layout_locked(SHIFTED)
+
+    lock = coordination._process_locks[coordination.NODE_ADMISSION]
+    with lock:
+        worker = threading.Thread(target=accept)
+        worker.start()
+        worker.join(timeout=1)
+        assert worker.is_alive()
+        assert _recorded(app) == DEFAULT
+    worker.join(timeout=10)
+    assert not worker.is_alive() and _recorded(app) == SHIFTED

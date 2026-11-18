@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, insert, select
 from app import coordination
 from app.backends.base import AdmissionRefused
 from app.models import NodeMemoryReservation, VMRecord
+from app.vlan_allocator import VlanLayoutStale, check_layout_current
 
 _RESERVATIONS = NodeMemoryReservation.__table__
 
@@ -46,6 +47,11 @@ def reserve_cloud_capacity(backend: str, location: str, max_vms: int,
     engine = coordination.current_engine()
 
     def admit(conn):
+        # A process left on an older VLAN layout must not place labs.
+        try:
+            check_layout_current(conn)
+        except VlanLayoutStale as error:
+            raise AdmissionRefused(str(error)) from None
         now = coordination.lease_clock()
         conn.execute(delete(_RESERVATIONS).where(_RESERVATIONS.c.expires_at <= now))
         if conn.execute(

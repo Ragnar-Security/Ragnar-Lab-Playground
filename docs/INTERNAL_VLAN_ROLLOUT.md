@@ -183,21 +183,51 @@ All of these must hold before continuing:
 
 ## 2. Deploy the portal
 
-Deploy the release with `VLAN_BANDS` in `.env`: rename an existing
-`JUMPBOX_VLAN_BANDS` line to `VLAN_BANDS`, or remove it to take the default,
-and delete any `GROUP_ENTRY_VLAN_*` / `GROUP_INTERNAL_VLAN_*` line. Make the
-same change in `scripts/site.env`. Leave `LAB_BRIDGE` and `VMID_RANGE`
-absent. Run the release's migrations first (`docs/PRODUCTION_DEPLOYMENT.md`
-step 3), including `migrate_add_vlan_layout_record.py`. Recreate
-`vm-automation`.
+1. **Record the pre-upgrade layout.** Before editing anything, note the
+   layout the stored student pairs were numbered under: the value of
+   `JUMPBOX_VLAN_BANDS` in the pre-upgrade `.env`, or, where it was unset,
+   the pre-upgrade default
+   `entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4`.
+2. **Set the new layout.** Rename `JUMPBOX_VLAN_BANDS` to `VLAN_BANDS` in
+   `.env` and give it the release's layout, or remove the line to take the
+   default; delete any `GROUP_ENTRY_VLAN_*` / `GROUP_INTERNAL_VLAN_*` line.
+   Make the same change in `scripts/site.env`. Leave `LAB_BRIDGE` and
+   `VMID_RANGE` absent.
+3. **Migrate and seed.** With the portal stopped, run the release's
+   migrations (`docs/PRODUCTION_DEPLOYMENT.md` step 3). The layout
+   migration needs the pre-upgrade layout from step 1, and refuses without
+   it while student pairs are stored, and refuses a layout that does not
+   route every stored pair:
+
+   ```bash
+   docker compose -f <PORTAL_COMPOSE> run --rm vm-automation \
+     python scripts/migrate_add_vlan_layout_record.py --bands '<pre-upgrade layout from step 1>'
+   ```
+
+   The portal refuses to start while pairs are stored and no layout is
+   recorded, so this step cannot be skipped.
+4. **Accept the change.** The new layout differs from the recorded one, so
+   the portal refuses to start until it is accepted. No VM is live
+   (section 1):
+
+   ```bash
+   docker compose -f <PORTAL_COMPOSE> run --rm vm-automation python scripts/accept_vlan_layout.py
+   ```
+
+   The dry run lists every student network that moves. With the default
+   layouts on both sides it lists internal networks only: internal VLAN 200
+   moves from `10.200.0.0/24` to `10.100.1.0/24`, and 201-299 move from
+   `outside every band` to their first network. **Any entry network in the
+   list means the new `VLAN_BANDS` is wrong: stop and fix it.** Then run the
+   same command with `--apply`.
+5. Recreate `vm-automation`.
 
 Verify: `docker exec <PORTAL_APP_CONTAINER> python
 scripts/export_network_slots.py | jq -r .config.vlan_bands` prints the band
-string, and the portal started. On its first start it records that layout
-in the database; later starts refuse while a stored student pair lies
-outside the bands, or while `VLAN_BANDS` differs from the recorded layout
-and any student pair is stored (`docs/JUMPBOX.md`, "Address plan"). Then run
-the access check.
+string, and the portal started. Later starts refuse while a stored student
+pair lies outside the bands, or while `VLAN_BANDS` differs from the recorded
+layout and any student pair is stored (`docs/JUMPBOX.md`, "Address plan").
+Then run the access check.
 
 ## 3. Adopt the jumpbox
 

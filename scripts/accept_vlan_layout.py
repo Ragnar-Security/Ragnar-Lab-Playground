@@ -11,10 +11,13 @@ policy would serve the students different networks than their labs use.
 
 The dry run prints the recorded and configured layouts and every student
 network that changes (old -> new subnet). --apply records the configured
-layout, and refuses while any VM record is live (a running lab keeps the old
-addresses) or while a stored pair lies outside the new entry/internal bands
-(those students need renumbering first). Run it between terms, then restart
-the portal, re-run jumpbox_configure.sh --apply and apply_headscale_policy.sh.
+layout, and refuses while any VM record is live or a deployment is being
+admitted (a running lab keeps the old addresses; the check and the write
+hold the admission lock together) or while a stored pair lies outside the
+new entry/internal bands (those students need renumbering first). Run it
+between terms with the portal stopped, then start the portal, re-run
+jumpbox_configure.sh --apply and apply_headscale_policy.sh. A portal process
+still running the old layout refuses every deployment until restarted.
 """
 
 import argparse
@@ -28,7 +31,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app import create_app  # noqa: E402
 from app.backends.network_slots import parse_vlan_bands, proxmox_slot_cidr  # noqa: E402
 from app.models import StudentWhitelist, User, VMRecord, db  # noqa: E402
-from app.vlan_allocator import record_vlan_layout, recorded_vlan_layout, stored_vlan_problems  # noqa: E402
+from app.vlan_allocator import (  # noqa: E402
+    AcceptRefused, accept_vlan_layout_locked, recorded_vlan_layout, stored_vlan_problems)
 
 
 def _subnet(tag: Optional[int], bands) -> str:
@@ -91,7 +95,16 @@ def main(argv=None) -> int:
         if blockers:
             print("refused: nothing recorded.", file=sys.stderr)
             return 1
-        record_vlan_layout(current.canonical)
+        # The live-VM check and the write are repeated in one transaction under
+        # the deployment admission lock, so no deployment can be admitted in
+        # between.
+        db.session.remove()
+        try:
+            accept_vlan_layout_locked(current.canonical)
+        except AcceptRefused as error:
+            print(f"BLOCKED: {error}", file=sys.stderr)
+            print("refused: nothing recorded.", file=sys.stderr)
+            return 1
         print(f"recorded {current.canonical}. Restart the portal, then re-run "
               "jumpbox_configure.sh --apply and apply_headscale_policy.sh --apply.")
         return 0

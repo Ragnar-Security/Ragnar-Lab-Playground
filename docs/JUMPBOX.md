@@ -93,21 +93,34 @@ VLAN is the operator's to route.
 
 To change `VLAN_BANDS` while students are stored, do it between terms:
 
-1. Destroy every lab; the next step refuses while any VM record is live,
+1. Destroy every lab, then stop the portal
+   (`docker compose -f <PORTAL_COMPOSE> stop vm-automation`). The accept
+   refuses while any VM record is live or a deployment is being admitted,
    because a running lab keeps its old addresses.
-2. Set the new value in the portal's `.env` (it refuses to start until
-   step 4) and in `scripts/site.env`.
-3. The portal now refuses to start, so run the tool in a one-off container:
+2. Set the new value in the portal's `.env` and in `scripts/site.env`. The
+   accept records the value the portal's `.env` holds.
+3. Accept it in a one-off container:
    `docker compose -f <PORTAL_COMPOSE> run --rm vm-automation python
    scripts/accept_vlan_layout.py`. This dry run prints the recorded and new
    layouts and every student network that moves, `old subnet -> new subnet`.
-4. Re-run it with `--apply` to record the new layout, then restart the
-   portal, re-run `jumpbox_configure.sh --apply` on the jumpbox, and
-   re-run `scripts/apply_headscale_policy.sh --apply`, which refuses while
-   the portal's exported bands and `scripts/site.env` differ.
+   Re-run it with `--apply` to record the new layout. The live-VM check and
+   the write run in one transaction under the lock deployment admission
+   takes, so no deployment can slip in between.
+4. Start the portal, re-run `jumpbox_configure.sh --apply` on the jumpbox,
+   and re-run `scripts/apply_headscale_policy.sh --apply`, which refuses
+   while the portal's exported bands and `scripts/site.env` differ.
 
-With no student pair stored, setting the same value in both files and
-following step 4 from the restart is enough.
+A portal process still running the old layout (one that was not stopped)
+refuses every deployment after the accept with `portal VLAN layout differs
+from the recorded layout — restart required`. With no student pair stored,
+setting the same value in both files and step 4 are enough: the portal
+records the new layout itself.
+
+The record is created by `scripts/migrate_add_vlan_layout_record.py`. On a
+database that already holds student pairs, the portal refuses to start until
+that migration has seeded the layout those pairs were numbered under
+(`docs/INTERNAL_VLAN_ROLLOUT.md`, section 2); a new database, or one with no
+student pair, records the configured layout on its first start.
 
 Templates with a `static_mac` can get a fixed address on every network of
 one band, for example a domain controller at `.10` on each group-internal

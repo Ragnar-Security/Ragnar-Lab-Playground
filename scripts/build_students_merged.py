@@ -71,26 +71,28 @@ def roster_max(bands):
         sys.exit(f"Error: VLAN_BANDS {error}")
 
 
-_SITE_BANDS = re.compile(r'\s*(?:export\s+)?VLAN_BANDS=(.*)')
-
-
-def bands_from_site_env(path):
-    """VLAN_BANDS as the site.env file at `path` sets it ('' when it has no
-    VLAN_BANDS line, which means the default bands)."""
+def site_env_value(path, name):
+    """The value the site.env file at `path` gives `name` ('' when unset)."""
+    pattern = re.compile(r'\s*(?:export\s+)?' + re.escape(name) + r'=(.*)')
     try:
         with open(path, 'r', encoding='utf-8') as handle:
             lines = handle.read().splitlines()
     except OSError as error:
         sys.exit(f"Error: cannot read the site settings {path}: {error.strerror}")
-    bands = ''
+    value = ''
     for line in lines:
-        match = _SITE_BANDS.fullmatch(line)
+        match = pattern.fullmatch(line)
         if match:
             value = match.group(1).strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in '"\'':
                 value = value[1:-1]
-            bands = value
-    return bands
+    return value
+
+
+def bands_from_site_env(path):
+    """VLAN_BANDS as the site.env file at `path` sets it ('' when it has no
+    VLAN_BANDS line, which means the default bands)."""
+    return site_env_value(path, 'VLAN_BANDS')
 
 
 def read_canvas(path, bands):

@@ -18,7 +18,7 @@ from datetime import datetime
 import logging
 from typing import List, Literal, Optional, Tuple
 
-from sqlalchemy import inspect
+from sqlalchemy import func, insert, inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .models import db, User, StudentWhitelist, StudentGroup, KothGame, VlanLayoutRecord
@@ -239,16 +239,49 @@ def has_student_pairs() -> bool:
     return False
 
 
+SEED_COMMAND = ("python scripts/migrate_add_vlan_layout_record.py --bands "
+                "'<the VLAN layout the stored pairs were numbered under>'")
+
+
+class VlanLayoutStale(Exception):
+    """This process's VLAN_BANDS is not the layout the database records."""
+
+
+def check_layout_current(conn) -> None:
+    """Refuse, inside the admission transaction, when the recorded layout is
+    not this process's VLAN_BANDS: after an accept, a portal still running
+    the old layout would otherwise deploy labs onto networks the jumpbox no
+    longer serves for them. Nothing recorded (or no table) passes; startup
+    handles those."""
+    table = VlanLayoutRecord.__table__
+    if not inspect(conn).has_table(table.name):
+        return
+    recorded = conn.execute(select(table.c.bands).where(table.c.id == 1)).scalar()
+    current = vlan_layout().canonical
+    if recorded is not None and recorded != current:
+        raise VlanLayoutStale(
+            "portal VLAN layout differs from the recorded layout — restart required "
+            f"(recorded: {recorded}; this portal process: {current})")
+
+
 def check_vlan_layout_record() -> None:
     """Compare VLAN_BANDS with the layout the database records. None
-    recorded: record it. Equal: nothing to do. Different: refuse while any
-    student pair is stored, because the same tags would then lie on other
-    subnets; with no stored pair, record the new layout."""
+    recorded: record it, unless student pairs are stored, whose layout
+    only the operator knows (the migration seeds it). Equal: nothing to do.
+    Different: refuse while any student pair is stored, because the same
+    tags would then lie on other subnets; with no stored pair, record the
+    new layout."""
     if not inspect(db.engine).has_table(VlanLayoutRecord.__tablename__):
         return  # created by db.create_all / the migration; checked next start
     current = vlan_layout().canonical
     recorded = recorded_vlan_layout()
     if recorded is None:
+        if has_student_pairs():
+            raise ValueError(
+                "No VLAN layout is recorded, but student VLAN pairs are stored, so the "
+                "layout they were numbered under is unknown and VLAN_BANDS cannot be checked "
+                f"against it. Seed it first: {SEED_COMMAND} (the pre-upgrade value; "
+                "docs/INTERNAL_VLAN_ROLLOUT.md, section 2).")
         record_vlan_layout(current)
         recorded = recorded_vlan_layout()
     if recorded == current:
@@ -282,3 +315,38 @@ def check_stored_vlan_tags() -> None:
             "Stored student VLAN pairs lie outside VLAN_BANDS. Restore the VLAN_BANDS they "
             "were numbered under, or renumber those students, before starting:\n  - "
             + "\n  - ".join(shown))
+
+
+class AcceptRefused(Exception):
+    """A layout cannot be accepted while a lab is live or being admitted."""
+
+
+def accept_vlan_layout_locked(canonical: str) -> None:
+    """Record `canonical` as the layout of the stored pairs, in one
+    transaction under the lock every deployment's admission takes: no VM
+    record may be live and no admission reservation held. A deployment
+    admitted first therefore blocks the accept, and one admitted after it
+    is refused by check_layout_current until its portal restarts."""
+    from . import coordination
+    from .models import NodeMemoryReservation, VMRecord
+
+    def accept(conn):
+        records = VMRecord.__table__
+        live = conn.execute(select(func.count()).select_from(records).where(
+            or_(records.c.destroyed.is_(False), records.c.destroyed.is_(None)))).scalar_one()
+        reservations = NodeMemoryReservation.__table__
+        held = conn.execute(select(func.count()).select_from(reservations).where(
+            reservations.c.expires_at > coordination.lease_clock())).scalar_one()
+        if live or held:
+            raise AcceptRefused(
+                f"{live} VM record(s) are live and {held} deployment admission(s) are in "
+                "progress; stop the portal and destroy every lab first, because a running "
+                "lab keeps its old addresses")
+        table = VlanLayoutRecord.__table__
+        if conn.execute(select(table.c.id).where(table.c.id == 1)).first():
+            conn.execute(update(table).where(table.c.id == 1)
+                         .values(bands=canonical, recorded_at=datetime.now()))
+        else:
+            conn.execute(insert(table).values(id=1, bands=canonical, recorded_at=datetime.now()))
+
+    coordination.run_locked(coordination.current_engine(), coordination.NODE_ADMISSION, accept)

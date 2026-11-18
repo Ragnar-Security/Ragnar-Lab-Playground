@@ -110,10 +110,18 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   outside the `entry`/`internal` bands, and while `VLAN_BANDS` differs from
   the layout recorded in the new `vlan_layout_record` table and any student
   pair is stored (a new offset can move in-band tags to other subnets); the
-  message names both layouts. The first start records the layout.
+  message names both layouts. A database with no student pair records the
+  layout on first start; one that already holds pairs refuses to start until
+  `scripts/migrate_add_vlan_layout_record.py --bands <layout>` (or
+  `--site-env <path>`) has seeded the layout those pairs were numbered
+  under, validated against every stored pair.
   `scripts/accept_vlan_layout.py` (dry run by default) lists every student
-  network that moves and, with `--apply`, records the new layout; it refuses
-  while any VM record is live. A group or KOTH game with an explicit VLAN
+  network that moves and, with `--apply`, records the new layout; its
+  live-VM and admission check and the write run in one transaction under the
+  deployment admission lock. Deployment admission refuses, under the same
+  lock, when the recorded layout is not the process's own (`restart
+  required`), so a portal left running on the old layout cannot place labs
+  after an accept. A group or KOTH game with an explicit VLAN
   outside every band still starts, with a warning naming it.
 - `scripts/build_students_merged.py` takes the VLAN layout explicitly,
   `--site-env <path>` or `--bands <VLAN_BANDS>`, and refuses to run without
@@ -163,11 +171,15 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
      production's `scripts/site.env` (Proxmox sites), and make sure the
      operator machine can SSH to the jumpbox and run `tailscale status --json`
      there.
-  2. **Deploy the portal.** Rename `JUMPBOX_VLAN_BANDS` to `VLAN_BANDS` in
-     `.env` and in `scripts/site.env` (or delete the line in both to take the
-     default); both files must agree. Leave `LAB_BRIDGE` and `VMID_RANGE` unset
-     (`docker-compose.prod.yml` passes them through empty). No database
-     migration: stored tags do not change.
+  2. **Deploy the portal.** Note the pre-upgrade layout (the old
+     `JUMPBOX_VLAN_BANDS`, or the old default when it was unset), then rename
+     `JUMPBOX_VLAN_BANDS` to `VLAN_BANDS` in `.env` and in `scripts/site.env`
+     (or delete the line in both to take the default); both files must agree.
+     Leave `LAB_BRIDGE` and `VMID_RANGE` unset (`docker-compose.prod.yml`
+     passes them through empty). Seed the pre-upgrade layout with
+     `migrate_add_vlan_layout_record.py --bands '<pre-upgrade layout>'`, then
+     accept the new one with `accept_vlan_layout.py` (dry run, then
+     `--apply`). Stored tags do not change.
   3. **Adopt the jumpbox.** Re-run `jumpbox_configure.sh --apply`; a hand-built
      jumpbox is adopted first (`docs/JUMPBOX.md`). This installs the lab egress
      table, which removes any egress a hand-built jumpbox gave lab VMs toward
@@ -205,8 +217,16 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   `docker-compose.yml`, which passed no band setting before) now pass `VLAN_BANDS`;
   a site with its own compose file must pass it instead of
   `JUMPBOX_VLAN_BANDS`. Run `scripts/migrate_add_vlan_layout_record.py` with
-  the other migrations (`docs/PRODUCTION_DEPLOYMENT.md` step 3); the first
-  start records the configured layout. Startup then refuses while a stored
+  the other migrations (`docs/PRODUCTION_DEPLOYMENT.md` step 3), giving it
+  the pre-upgrade layout: the value of `JUMPBOX_VLAN_BANDS` in the
+  pre-upgrade `.env`, or, where it was unset, the pre-upgrade default
+  `entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4`
+  (`--bands '<layout>'`, or `--site-env <pre-upgrade site.env>`, which reads
+  `VLAN_BANDS`, then `JUMPBOX_VLAN_BANDS`, then that default). It is
+  required while student pairs are stored; a site without one may omit it.
+  Then accept the release's layout between terms with
+  `scripts/accept_vlan_layout.py` (`docs/INTERNAL_VLAN_ROLLOUT.md`, section
+  2). Startup then refuses while a stored
   student pair lies outside the `entry`/`internal` bands, or while
   `VLAN_BANDS` differs from the recorded layout with student pairs stored:
   change the layout between terms with `scripts/accept_vlan_layout.py`
