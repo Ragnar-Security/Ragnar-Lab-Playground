@@ -67,8 +67,10 @@ The default dry run reads both real hosts and writes nothing. It reports:
   - Whitelist rows to delete and seed.
   - The Headscale policy change for the roster the portal holds now.
 
-Use --apply to create backups and perform the changeover. The script never
-changes a Proxmox VM, a template, or a dojo repository.
+Use --apply to create backups and perform the changeover. It first runs the
+policy stage's preflight (apply_headscale_policy.sh --preflight) and refuses
+before changing anything if the policy stage could not complete. The script
+never changes a Proxmox VM, a template, or a dojo repository.
 
 Examples:
   scripts/term_changeover.sh ~/Downloads/canvas-gradebook.csv
@@ -449,6 +451,15 @@ purge_and_seed_database() {
 
 printf 'Mode: %s\n' "$([[ "$APPLY" == 1 ]] && printf APPLY || printf 'DRY RUN (read-only)')"
 printf 'Canvas export: %s\n\n' "$CANVAS"
+# Stage 4 runs after stages 1-3 have replaced the roster, so whatever it needs
+# (on a Proxmox site: JUMPBOX_SSH, SSH to the jumpbox and a Running Tailscale
+# there) is checked before stage 1 can change anything.
+if ((APPLY == 1)); then
+    printf '[preflight] Headscale policy stage\n'
+    preflight_output="$(SITE_ENV_FILE="$SITE_ENV_FILE" bash "$APPLY_POLICY" --preflight 2>&1)" \
+        || { printf '%s\n' "$preflight_output"; die "The policy stage's preflight failed; nothing was changed."; }
+    printf '%s\n\n' "$preflight_output"
+fi
 require_remote_access
 
 read_headscale_summary

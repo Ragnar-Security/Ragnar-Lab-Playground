@@ -47,7 +47,8 @@ POLICY_REQUIRED = [
     "HEADSCALE_DIR",
 ]
 POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW", "CHECK_FAIL",
-                 "RELOAD_FAIL", "JUMPBOX_SSH", "JUMPBOX_PEER_WAIT", "PEERS"]
+                 "RELOAD_FAIL", "JUMPBOX_SSH", "JUMPBOX_PEER_WAIT", "PEERS", "TS_BACKEND",
+                 "HEADSCALE_WATCHDOG_STATE", "HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL"]
 # term_changeover.sh reads this exact line from the policy stage's dry run.
 POLICY_FILE_CURRENT = "  nothing to do: the policy file Headscale serves matches the rendered one."
 
@@ -166,9 +167,10 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql",
-                 "apply_headscale_policy.sh"):
+    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
         shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    # The policy stage (and its preflight) is not what this test is about.
+    _executable(repo / "scripts" / "apply_headscale_policy.sh", "#!/usr/bin/env bash\necho 'Headscale policy: stub'\n")
     config = tmp_path / "site.env"
     config.write_text(
         "\n".join(
@@ -318,6 +320,9 @@ SSH_STUB = """#!/bin/bash
 while [ "$1" = "-o" ]; do shift 2; done
 host="$1"; shift
 printf 'ssh %s %s\\n=====\\n' "$host" "$*" >> "$SSH_LOG"
+if [ "$host" = unreachable-host ]; then
+    echo "ssh: connect to host $host port 22: No route to host" >&2; exit 255
+fi
 exec /bin/sh -c "$*"
 """
 SCP_STUB = """#!/bin/bash
@@ -385,7 +390,7 @@ with open(os.environ["DOCKER_LOG"], "a") as log:
 mode = os.environ.get("PEERS", "present")
 shown = mode == "present" or (mode == "after-restart" and os.path.exists(os.environ["RESTART_MARK"]))
 nodes = json.load(open(os.environ["NODES_FILE"])) if shown else []
-print(json.dumps({"BackendState": "Running",
+print(json.dumps({"BackendState": os.environ.get("TS_BACKEND", "Running"),
                   "Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
 """
 POLICY_NODES = [
@@ -717,6 +722,127 @@ def test_apply_policy_refuses_an_export_with_no_enabled_backend(tmp_path):
     assert policy.read_text() == original and _backups(policy) == []
 
 
+# ---- apply_headscale_policy.sh --preflight -----------------------------------
+
+# Catches a preflight that writes, reloads, or talks to Headscale, or passes a
+# jumpbox the policy stage could not check.
+@pytest.mark.parametrize("case,expect", [
+    ("ready", "ready: the jumpbox (jumpbox-host) answers and its Tailscale is Running."),
+    ("missing", "JUMPBOX_SSH"),
+    ("unreachable", "Could not read tailscale status on the jumpbox (unreachable-host)"),
+    ("stopped", "Stopped, not Running"),
+    ("cloud-only", PEER_CHECK_SKIPPED.strip()),
+])
+def test_apply_policy_preflight_checks_only_what_apply_needs(tmp_path, case, expect):
+    env, policy, original, _ = _policy_rig(tmp_path)
+    if case == "missing":
+        env.pop("JUMPBOX_SSH")
+    elif case == "unreachable":
+        env["JUMPBOX_SSH"] = "unreachable-host"
+    elif case == "stopped":
+        env["TS_BACKEND"] = "Stopped"
+    elif case == "cloud-only":
+        env.pop("JUMPBOX_SSH")
+        Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _apply_policy(env, "--preflight")
+    passes = case in ("ready", "cloud-only")
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    assert expect in result.stdout + result.stderr
+    assert ("preflight passed" in result.stdout) == passes
+    # Read-only, and Headscale is not contacted at all.
+    assert "headscale-host" not in _log(env, "SSH_LOG")
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
+
+
+def test_apply_policy_preflight_and_apply_are_separate_runs(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path)
+    result = _apply_policy(env, "--apply", "--preflight")
+    assert result.returncode != 0 and "separate runs" in result.stderr
+    assert _log(env, "SSH_LOG") == ""
+
+
+# ---- scripts/headscale_peer_watchdog.sh --------------------------------------
+
+WATCHDOG = ROOT / "scripts" / "headscale_peer_watchdog.sh"
+
+
+def _watchdog(env):
+    return subprocess.run(["bash", str(WATCHDOG)], env=env, capture_output=True, text=True, timeout=60)
+
+
+def _watchdog_rig(tmp_path, **extra):
+    env, policy, original, _ = _policy_rig(
+        tmp_path, HEADSCALE_WATCHDOG_STATE=str(tmp_path / "watchdog" / "last-restart"), **extra)
+    return env, policy, original
+
+
+def _restarts(env):
+    return _log(env, "DOCKER_LOG").splitlines().count("restart headscale")
+
+
+# Catches a watchdog that writes the policy, signals Headscale, or restarts a
+# healthy one.
+def test_watchdog_does_nothing_while_the_jumpbox_lists_every_roster_device(tmp_path):
+    env, policy, original = _watchdog_rig(tmp_path)
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ok: the jumpbox lists every roster device as a peer" in result.stdout
+    docker = _log(env, "DOCKER_LOG")
+    assert _restarts(env) == 0 and "reload" not in docker and "policy check" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original
+
+
+# Catches the peerless-jumpbox failure (Headscale v0.27.1 after a jumpbox
+# reconnect) persisting until someone notices that no student reaches a lab.
+def test_watchdog_restarts_headscale_once_and_recovers_the_peers(tmp_path):
+    env, policy, original = _watchdog_rig(tmp_path, PEERS="after-restart")
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _restarts(env) == 1
+    assert "alice-laptop (alice)" in result.stdout
+    assert "recovered: the jumpbox lists every roster device as a peer after one Headscale restart" in result.stdout
+    assert policy.read_text() == original
+
+
+# Catches a restart loop: a jumpbox Headscale cannot fix must page someone,
+# not restart Headscale (and drop every student's session) every five minutes.
+def test_watchdog_fails_loudly_and_restarts_at_most_once_per_interval(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, PEERS="never")
+    first = _watchdog(env)
+    assert first.returncode != 0
+    assert "still does not list" in first.stdout + first.stderr
+    assert _restarts(env) == 1
+    again = _watchdog(env)
+    assert again.returncode != 0
+    assert "not restarting it again before" in again.stdout + again.stderr
+    assert _restarts(env) == 1
+    env["HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL"] = "0"
+    later = _watchdog(env)
+    assert later.returncode != 0 and _restarts(env) == 2
+
+
+# Catches a restart for a jumpbox whose own Tailscale is down, which no
+# Headscale restart can fix.
+def test_watchdog_never_restarts_headscale_for_a_stopped_jumpbox(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, TS_BACKEND="Stopped")
+    result = _watchdog(env)
+    assert result.returncode != 0
+    assert "Stopped" in result.stdout + result.stderr and "not restarting Headscale" in result.stdout + result.stderr
+    assert _restarts(env) == 0
+
+
+def test_watchdog_skips_a_portal_without_the_proxmox_backend(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "skipped: proxmox backend not enabled" in result.stdout
+    assert "jumpbox status" not in _log(env, "DOCKER_LOG") and _restarts(env) == 0
+
+
 # ---- scripts/term_changeover.sh, fourth stage -------------------------------
 
 TERM_SSH_STUB = """#!/usr/bin/env python3
@@ -869,10 +995,12 @@ def test_term_changeover_applies_the_policy_after_the_new_roster_is_seeded(tmp_p
     assert result.returncode == 0, result.stderr
     events = _events(env)
     policy = [i for i, line in enumerate(events) if line.startswith("POLICY")]
-    assert [events[i] for i in policy] == [f"POLICY [--apply] SITE_ENV_FILE={config}"]
-    assert events.index("PURGE") < events.index("PORTAL RESTART") < policy[0]
+    assert [events[i] for i in policy] == [f"POLICY [--preflight] SITE_ENV_FILE={config}",
+                                           f"POLICY [--apply] SITE_ENV_FILE={config}"]
+    assert policy[0] < events.index("DB BACKUP")
+    assert events.index("PURGE") < events.index("PORTAL RESTART") < policy[1]
     last_read = max(i for i, line in enumerate(events) if line == "WHITELIST READ")
-    assert last_read < policy[0]
+    assert last_read < policy[1]
     assert "verified: the whitelist has the exact 1 rows." in result.stdout
     assert result.stdout.index("[3/4] Production database") < result.stdout.index("[4/4] Headscale policy")
 
@@ -908,7 +1036,8 @@ def test_term_changeover_policy_stage_keeps_exported_policy_paths(tmp_path, expo
         env=env, capture_output=True, text=True, timeout=60)
 
     assert result.returncode == 0, result.stderr
-    assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected]
+    # The preflight and the apply both see the operator's paths.
+    assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected, expected]
 
 
 # The policy stage's remote commands, which the combined rig runs against the
@@ -917,13 +1046,14 @@ POLICY_STAGE_MARKERS = ("export_network_slots", "headscale policy", "ps -q heads
                         "kill -s HUP", "restart headscale", "nodes list -o json", "tailscale status")
 
 
-# Catches the changeover's last stage failing on a cloud-only site, which has
-# no Proxmox jumpbox to check, after the roster has already been replaced.
-def test_term_changeover_stage_4_applies_a_cloud_only_policy_without_a_jumpbox(tmp_path):
+def _term_rig_with_the_real_policy_stage(tmp_path: Path, slots, **policy_extra: str):
+    """term_changeover.sh with stages 1-3 against the term stubs and the real
+    apply_headscale_policy.sh against the policy stubs. Every stage 1-3 command
+    is logged as `TERM <command>` in EVENT_LOG."""
     (tmp_path / "policy").mkdir()
     (tmp_path / "term").mkdir()
-    policy_env, policy, _, _ = _policy_rig(tmp_path / "policy", PEERS="never")
-    Path(policy_env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    policy_env, policy, original, _ = _policy_rig(tmp_path / "policy", **policy_extra)
+    Path(policy_env["SLOTS_FILE"]).write_text(json.dumps(slots) + "\n")
     repo, env, config, roster = _term_rig(tmp_path / "term")
     # The real policy stage, reached through the path term_changeover.sh runs.
     _executable(repo / "scripts" / "apply_headscale_policy.sh",
@@ -939,20 +1069,86 @@ command = " ".join(args[1:])
 if any(marker in command for marker in {POLICY_STAGE_MARKERS!r}):
     with open(os.environ["SSH_LOG"], "a") as log:
         log.write("ssh " + args[0] + " " + command + "\\n=====\\n")
+    if args[0] == "unreachable-host":
+        sys.exit("ssh: connect to host unreachable-host port 22: No route to host")
     os.execv("/bin/sh", ["sh", "-c", command])
+with open(os.environ["EVENT_LOG"], "a") as log:
+    log.write("TERM " + " ".join(command.split()) + "\\n")
 os.execv(sys.executable, [sys.executable, {str(term_bin / "term_ssh.py")!r}, *sys.argv[1:]])
 """)
     policy_bin = policy_env["PATH"].split(":", 1)[0]
     stage_env = {name: policy_env[name] for name in (
         "HEADSCALE_DIR", "HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "HOST_POLICY", "HOST_DATA",
-        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK", "PEERS")}
+        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK")}
+    stage_env.update({name: policy_env[name] for name in ("PEERS", "JUMPBOX_SSH", "TS_BACKEND")
+                      if name in policy_env})
     env.update(stage_env, PATH=f"{term_bin}:{policy_bin}:{os.environ['PATH']}")
-    result = subprocess.run(
+    return repo, env, roster, policy, original
+
+
+def _changeover(repo, env, roster):
+    return subprocess.run(
         ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
         env=env, capture_output=True, text=True, timeout=120)
 
+
+# Catches the changeover's last stage failing on a cloud-only site, which has
+# no Proxmox jumpbox to check, after the roster has already been replaced.
+def test_term_changeover_stage_4_applies_a_cloud_only_policy_without_a_jumpbox(tmp_path):
+    repo, env, roster, policy, _ = _term_rig_with_the_real_policy_stage(
+        tmp_path, CLOUD_ONLY_SLOTS, PEERS="never")
+    env.pop("JUMPBOX_SSH", None)
+    result = _changeover(repo, env, roster)
+
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout.index("[4/4] Headscale policy") < result.stdout.index(PEER_CHECK_SKIPPED)
+    # Once in the preflight, once in stage 4.
+    assert result.stdout.count(PEER_CHECK_SKIPPED) == 2
+    assert result.stdout.index("[preflight]") < result.stdout.index("[1/4] Headscale roster")
+    assert result.stdout.index("[4/4] Headscale policy") < result.stdout.rindex(PEER_CHECK_SKIPPED)
     assert policy.read_text() == canonical(render(EXAMPLE_POLICY, CLOUD_ONLY_SLOTS,
                                                   *policy_inputs(CLOUD_ONLY_SLOTS)))
     assert "jumpbox status" not in _log(env, "DOCKER_LOG")
+
+
+# Catches a Proxmox changeover that replaces the Headscale users, the roster
+# files and the database, and only then finds the policy stage cannot run:
+# the preflight must refuse before the first stage touches anything.
+@pytest.mark.parametrize("jumpbox", [None, "unreachable-host", "stopped"],
+                         ids=["missing", "unreachable", "tailscale-stopped"])
+def test_term_changeover_refuses_before_stage_1_when_the_policy_stage_could_not_run(tmp_path, jumpbox):
+    extra = {"TS_BACKEND": "Stopped"} if jumpbox == "stopped" else {}
+    repo, env, roster, policy, original = _term_rig_with_the_real_policy_stage(tmp_path, POLICY_SLOTS, **extra)
+    if jumpbox is None:
+        env.pop("JUMPBOX_SSH")
+    elif jumpbox == "unreachable-host":
+        env["JUMPBOX_SSH"] = jumpbox
+    merged = repo / "data" / "students_merged.csv"
+    roster_before = merged.read_bytes()
+    result = _changeover(repo, env, roster)
+
+    assert result.returncode != 0
+    assert "preflight failed; nothing was changed" in result.stderr
+    assert {"missing": "JUMPBOX_SSH", "unreachable-host": "Could not read tailscale status",
+            "stopped": "Stopped, not Running"}[jumpbox or "missing"] in result.stdout + result.stderr
+    assert "[1/4]" not in result.stdout
+    log = Path(env["EVENT_LOG"])
+    events = log.read_text().splitlines() if log.exists() else []
+    # Not one stage 1-3 command ran: no Headscale helper, roster copy, backup,
+    # purge or portal restart, not even their read-only checks.
+    assert not [e for e in events if e.startswith("TERM ")], events
+    assert not {"DB BACKUP", "PURGE", "PORTAL RESTART"} & set(events)
+    assert merged.read_bytes() == roster_before
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert policy.read_text() == original
+
+
+def test_term_changeover_runs_every_stage_after_a_passing_proxmox_preflight(tmp_path):
+    repo, env, roster, policy, _ = _term_rig_with_the_real_policy_stage(tmp_path, POLICY_SLOTS)
+    result = _changeover(repo, env, roster)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ready: the jumpbox (jumpbox-host) answers and its Tailscale is Running." in result.stdout
+    assert result.stdout.index("[preflight]") < result.stdout.index("[1/4] Headscale roster")
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, POLICY_SLOTS,
+                                                  *policy_inputs(POLICY_SLOTS)))

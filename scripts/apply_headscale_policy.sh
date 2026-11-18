@@ -6,6 +6,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/site_env.sh"
+source "$SCRIPT_DIR/headscale_peers.sh"
 
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
@@ -42,11 +43,12 @@ else
 fi
 POLICY_TOOL="$SCRIPT_DIR/headscale_policy.py"
 APPLY=0
+PREFLIGHT=0
 TMP_DIR=""
 
 usage() {
     cat <<'EOF'
-Usage: scripts/apply_headscale_policy.sh [--apply]
+Usage: scripts/apply_headscale_policy.sh [--apply | --preflight]
 
 Render the Headscale policy that lets each roster student reach only their
 own lab networks, their group's networks and the running KOTH arena.
@@ -67,6 +69,11 @@ required) that the jumpbox lists every roster device as a peer, waiting up to
 JUMPBOX_PEER_WAIT seconds; if any is missing it restarts Headscale once and
 checks again, and fails if one still is. A portal without the proxmox backend
 has no jumpbox, and the check is skipped.
+
+--preflight reads the portal export and checks only what --apply will need:
+with the proxmox backend, that JUMPBOX_SSH is set, answers over SSH, and
+reports a Running Tailscale. It changes nothing and does not contact
+Headscale. term_changeover.sh --apply runs it before its first stage.
 EOF
 }
 
@@ -85,11 +92,13 @@ trap cleanup EXIT
 while (($#)); do
     case "$1" in
         --apply) APPLY=1 ;;
+        --preflight) PREFLIGHT=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown argument: $1" ;;
     esac
     shift
 done
+((APPLY == 0 || PREFLIGHT == 0)) || die "--apply and --preflight are separate runs."
 
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
 [[ -f "$POLICY_TOOL" ]] || die "Policy renderer not found: $POLICY_TOOL"
@@ -112,11 +121,6 @@ host = best[1].rstrip("/") + target[len(best[0]):]
 if not re.fullmatch(r"/[A-Za-z0-9._/@+-]+", host):
     raise SystemExit("the host path of the policy file has unsupported characters")
 print(host)'
-
-fetch_slots() {
-    ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" \
-        "docker exec '$PORTAL_APP_CONTAINER' python scripts/export_network_slots.py"
-}
 
 fetch_policy() {
     ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" \
@@ -188,44 +192,6 @@ reload_headscale() {
         || die "Could not signal Headscale to reload its policy."
 }
 
-restart_headscale() {
-    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "cd '$HEADSCALE_DIR' &&
-        docker compose restart headscale >/dev/null &&
-        for attempt in \$(seq 1 30); do
-            docker compose exec -T headscale headscale policy get >/dev/null 2>&1 && exit 0
-            sleep 1
-        done
-        exit 1" || die "Headscale did not come back after the restart."
-}
-
-# Headscale v0.27.1 once reloaded a policy and left the jumpbox, the subnet
-# router for every lab, with no peers: its packet filter held every student's
-# rules, yet no student reached any lab until Headscale was restarted. So a
-# reload is not done until the jumpbox lists every roster device as a peer.
-fetch_nodes() {
-    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" \
-        "cd '$HEADSCALE_DIR' && docker compose exec -T headscale headscale nodes list -o json"
-}
-
-# Prints the roster devices the jumpbox does not list as peers, one per line.
-missing_peers() {
-    ssh "${SSH_OPTIONS[@]}" "$JUMPBOX_SSH" "tailscale status --json" > "$TMP_DIR/jumpbox-status.json" \
-        || die "Could not read tailscale status on the jumpbox ($JUMPBOX_SSH)."
-    "$PYTHON" "$POLICY_TOOL" missing-peers "$TMP_DIR/nodes.json" "$TMP_DIR/slots.json" \
-        "$TMP_DIR/jumpbox-status.json" || die "Could not compare the jumpbox's peers with Headscale's nodes."
-}
-
-# Polls for up to JUMPBOX_PEER_WAIT seconds; leaves the last result in $missing.
-wait_for_peers() {
-    local deadline=$((SECONDS + JUMPBOX_PEER_WAIT))
-    while :; do
-        missing="$(missing_peers)" || exit 1
-        [[ -z "$missing" ]] && return 0
-        ((SECONDS < deadline)) || return 1
-        sleep 3
-    done
-}
-
 verify_jumpbox_peers() {
     local missing=""
     if ((PROXMOX_ENABLED == 0)); then
@@ -248,15 +214,33 @@ verify_jumpbox_peers() {
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/headscale-policy.XXXXXX")"
 chmod 700 "$TMP_DIR"
 
-printf 'Headscale policy: %s\n' "$([[ "$APPLY" == 1 ]] && printf APPLY || printf 'DRY RUN (read-only)')"
+mode="DRY RUN (read-only)"
+((APPLY == 0)) || mode=APPLY
+((PREFLIGHT == 0)) || mode="PREFLIGHT (read-only)"
+printf 'Headscale policy: %s\n' "$mode"
 fetch_slots > "$TMP_DIR/slots.json" || die "Could not export network slots from the portal."
 "$PYTHON" "$POLICY_TOOL" render "$HEADSCALE_BASE_POLICY" "$TMP_DIR/slots.json" > "$TMP_DIR/desired.json" \
     || die "Could not render the Headscale policy."
 # The jumpbox serves only the Proxmox labs; a cloud-only portal has none to check.
-# The render above has already validated config.enabled_backends.
-PROXMOX_ENABLED="$("$PYTHON" -c 'import json, sys
-print(int("proxmox" in json.load(open(sys.argv[1]))["config"]["enabled_backends"]))' "$TMP_DIR/slots.json")" \
+PROXMOX_ENABLED="$(proxmox_enabled "$TMP_DIR/slots.json")" \
     || die "Could not read the enabled backends from the portal's export."
+
+# What --apply needs before it may change anything, checked on its own so that
+# term_changeover.sh can run it before its first destructive stage.
+if ((PREFLIGHT)); then
+    if ((PROXMOX_ENABLED == 0)); then
+        printf '  Proxmox jumpbox peer check skipped: proxmox backend not enabled.\n'
+    else
+        require_site_var JUMPBOX_SSH
+        read_jumpbox_status
+        state="$(jumpbox_backend_state)"
+        [[ "$state" == Running ]] \
+            || die "The jumpbox's Tailscale ($JUMPBOX_SSH) is $state, not Running: no student can reach a lab, and the policy stage's peer check would fail. Bring it up first."
+        printf '  ready: the jumpbox (%s) answers and its Tailscale is Running.\n' "$JUMPBOX_SSH"
+    fi
+    printf '  preflight passed: --apply can apply and check the policy.\n'
+    exit 0
+fi
 # Before any change: with Proxmox, a reload nothing can check is never applied.
 ((APPLY == 0 || PROXMOX_ENABLED == 0)) || require_site_var JUMPBOX_SSH
 
