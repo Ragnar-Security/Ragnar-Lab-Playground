@@ -114,7 +114,8 @@ def aws_instance_backend(app, monkeypatch):
 
 @pytest.fixture
 def aws_network_backend(app, monkeypatch):
-    """AWSBackend with the production network path (ruling I13): no
+    """AWSBackend with the production network path, kept apart from the
+    instance fixture's resolver and untagged networks: no
     resolver, no pre-created slot subnet or security group, and a running
     router instance configured as AWS_ROUTER_INSTANCE_ID."""
     _fake_credentials(monkeypatch)
@@ -447,7 +448,7 @@ def test_list_managed_names_round_trip_to_the_portal_vm_name(aws_instance_backen
 
 
 def test_set_expiry_raises_backend_error_when_ec2_cannot_find_instance(aws_instance_backend):
-    # Catches a failed provider tag update being counted as a successful extension (I2).
+    # Catches a failed provider tag update being counted as a successful extension.
     backend, spec, ec2, resources = aws_instance_backend
     missing = replace(resources['ref_without_provider'], provider_id='i-00000000000000000')
     with pytest.raises(BackendError):
@@ -455,7 +456,7 @@ def test_set_expiry_raises_backend_error_when_ec2_cannot_find_instance(aws_insta
 
 
 def test_destroy_refuses_a_retagged_instance_without_terminating_it(aws_instance_backend):
-    # Catches a stale destroy terminating an instance another record or portal now owns (I1).
+    # Catches a stale destroy terminating an instance another record or portal now owns.
     backend, spec, ec2, resources = aws_instance_backend
     launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
     ec2.create_tags(Resources=[launched.provider_id],
@@ -468,7 +469,7 @@ def test_destroy_refuses_a_retagged_instance_without_terminating_it(aws_instance
 
 
 def test_ref_without_provider_id_resolves_by_site_vmid_and_deployment_tags(aws_instance_backend):
-    # Catches a launch-then-waiter-timeout survivor never being destroyed and billing forever (C7).
+    # Catches a launch-then-waiter-timeout survivor never being destroyed and billing forever.
     backend, spec, ec2, resources = aws_instance_backend
     launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
     survivor = resources['ref_without_provider']
@@ -482,7 +483,7 @@ def test_ref_without_provider_id_resolves_by_site_vmid_and_deployment_tags(aws_i
 
 
 def test_survivor_resolution_ignores_ref_location(aws_instance_backend):
-    # Catches a survivor recorded with location='aws' (T8) never resolving.
+    # Catches a survivor recorded with location='aws' instead of a zone never resolving.
     backend, spec, ec2, resources = aws_instance_backend
     launched = backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
     survivor = replace(resources['ref_without_provider'], location='aws')
@@ -815,8 +816,8 @@ def test_ensure_slot_creates_one_private_subnet_with_exact_cidr_az_and_tags(aws_
 
 
 def test_network_inventory_carries_creation_time_and_deployment_key(aws_network_backend):
-    # Catches leaked SGs/subnets being invisible to the age-gated sweeper (C2)
-    # and SG identity disagreeing with GCP's 16-character key (C1).
+    # Catches leaked SGs/subnets being invisible to the age-gated sweeper
+    # and SG identity disagreeing with GCP's 16-character key.
     backend, spec, ec2, resources = aws_network_backend
     before = int(time.time())
     with vm_lifecycle_lock(slot_lock_key(BACKEND_AWS, 1)):
@@ -846,7 +847,7 @@ def test_network_inventory_reports_no_age_for_a_missing_or_malformed_created_tag
 
 
 def test_create_without_slot_subnet_raises_slot_network_missing(aws_network_backend):
-    # Catches a launch into a slot a concurrent retirement just released (I3).
+    # Catches a launch into a slot a concurrent retirement just released.
     backend, spec, ec2, resources = aws_network_backend
     with pytest.raises(SlotNetworkMissing):
         backend.create(spec, 'us-east-1a', heartbeat=lambda: None)
@@ -930,7 +931,8 @@ def test_create_uses_exact_deployment_security_group_rules(aws_network_backend):
     assert ('-1', 'cidr', '0.0.0.0/0') not in egress
     [instance] = ec2.describe_instances(InstanceIds=[launched.provider_id])['Reservations'][0]['Instances']
     # moto 5.2.5 reports a NetworkInterfaces-launched instance's groups only
-    # on its interface (EC2 reports both; see the T11 create test).
+    # on its interface (EC2 reports both; see
+    # test_create_launches_one_private_tagged_instance_with_disposable_root_disk).
     assert [g['GroupId'] for g in instance['NetworkInterfaces'][0]['Groups']] == [
         group['GroupId']]
     assert 'PublicIpAddress' not in instance
@@ -1646,7 +1648,8 @@ def test_get_backend_aws_lazily_returns_one_aws_backend(app, monkeypatch):
 
 
 def test_importing_backends_does_not_import_aws_or_boto3_in_subprocess():
-    # Catches app.backends eagerly importing aws.py (ruling I8's import cycle).
+    # Catches app.backends eagerly importing aws.py: the registry imports a
+    # backend lazily so that importing app.backends cannot form an import cycle.
     program = '''
 import sys
 import app.backends

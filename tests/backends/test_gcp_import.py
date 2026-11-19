@@ -28,8 +28,9 @@ assert 'grpc' not in sys.modules
 
 
 def test_importing_backends_does_not_import_gcp_or_google_auth():
-    # Catches app.backends eagerly importing gcp.py (ruling I8's import
-    # cycle) or the registry discovering credentials at import.
+    # Catches app.backends eagerly importing gcp.py (the registry imports a
+    # backend lazily, so app.backends cannot form an import cycle) or the
+    # registry discovering credentials at import.
     result = _run('''
 import sys
 import app.backends

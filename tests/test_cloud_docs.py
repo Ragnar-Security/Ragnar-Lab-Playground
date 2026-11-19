@@ -168,7 +168,7 @@ def test_env_example_keeps_proxmox_default_and_inert_cloud_settings():
 # ---- templates.example.yaml ------------------------------------------------
 
 def test_template_example_has_valid_neutral_blocks_for_all_backends(monkeypatch):
-    # Catches an example that only validates when a cloud is enabled (I10).
+    # Catches an example that only validates when a cloud is enabled.
     monkeypatch.setattr(importlib.import_module("app.config"),
                         "ENABLED_BACKENDS", ("proxmox",))
     catalog = yaml.safe_load((ROOT / "templates.example.yaml").read_text())
@@ -180,8 +180,8 @@ def test_template_example_has_valid_neutral_blocks_for_all_backends(monkeypatch)
     assert machine["aws"] == {"image_id": "<aws-ami-id>", "instance_type": "t3.medium", "disk_gb": 30}
     assert machine["gcp"] == {"image": "projects/<gcp-project>/global/images/<image-name>",
                               "machine_type": "e2-medium", "disk_gb": 30}
-    # The flat legacy form is the Proxmox spec unchanged (ruling: the nested
-    # proxmox: overlay is shown in a comment so test_templates_config holds).
+    # The flat legacy form is the Proxmox spec unchanged (the nested proxmox:
+    # overlay is shown in a comment so test_templates_config holds).
     assert machine["template_locations"]
     assert set(machine["template_locations"]) == set(machine["storage_locations"])
     assert backend_block(machine, "proxmox") == machine
@@ -338,7 +338,7 @@ def test_jumpbox_doc_documents_lab_egress_and_the_peer_watchdog():
     egress = "\n".join(_section(text, "### Lab egress: routed lab traffic leaves only to the tailnet"))
     for needle in ("every `--apply` installs `inet jumpbox_lab_egress`",
                    'iifname "vlan*" oifname != "tailscale0" counter drop',
-                   # Instructor, 2026-11-18.
+                   # The rule's one-line statement, kept verbatim.
                    "Lab VMs have no egress except the student's",
                    "nft list table inet jumpbox_lab_egress"):
         assert needle in egress, needle
@@ -398,7 +398,6 @@ def test_rollout_runbook_is_linked_and_carries_no_site_identity():
     assert "VLAN_BANDS" in text and "JUMPBOX_VLAN_BANDS" in "\n".join(_section(text, "## 2. Deploy the portal"))
     assert "docs/INTERNAL_VLAN_ROLLOUT.md" in (ROOT / "CHANGELOG.md").read_text()
     assert "docs/INTERNAL_VLAN_ROLLOUT.md" in (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
-    assert not (ROOT / "docs" / "superpowers").exists()
 
 
 STAGING = ROOT / "docs" / "STAGING.md"

@@ -254,7 +254,7 @@ def test_inspect_reports_match_mismatch_and_absence(proxmox_case):
 
 # The ~10 s after a clone: /cluster/resources reports the name empty, or as
 # the previous guest's at a reused VMID, while the guest's config already
-# names it (measured live, LIVE-REPORT I1/I2). Catches the portal refusing
+# names it (measured on a live cluster). Catches the portal refusing
 # to destroy (or clean up) its own fresh guest during that window.
 @pytest.mark.parametrize('listed_name', [None, '', 'student-previous-vm'],
                          ids=['none', 'empty', 'stale-previous-name'])
@@ -270,7 +270,7 @@ def test_inspect_trusts_the_guest_config_while_the_listed_name_lags(
 
 # Catches the config fallback admitting a guest that is genuinely someone
 # else's, whatever the lagging listing says about it, including a name that
-# only shares the expected name as a prefix (review M2).
+# only shares the expected name as a prefix.
 @pytest.mark.parametrize('foreign', ['other', 'prefix', 'truncated'])
 @pytest.mark.parametrize('listed_name', [None, 'student-previous-vm',
                                          'student-other-vm'])
@@ -305,7 +305,7 @@ def _deletes(case):
     return [call for call in case.api.calls if call[0] == 'DELETE']
 
 
-# Review I1: catches the delete trusting the identity read before the stop,
+# Catches the delete trusting the identity read before the stop,
 # which may wait up to a minute, while another guest took the VMID.
 @pytest.mark.parametrize('policy', list(DestroyPolicy))
 def test_destroy_rechecks_identity_between_the_stop_and_the_delete(
@@ -388,7 +388,7 @@ def test_confirm_absent_answers_from_a_fresh_read(proxmox_case):
 # --- inventory ---------------------------------------------------------------
 
 # Catches reconcile/contract losing templates, status, or presence evidence, and
-# list_managed growing a per-guest config read (C5).
+# list_managed growing a per-guest config read.
 def test_list_managed_is_the_cluster_index_projection(proxmox_case):
     case = proxmox_case
     reset_cluster_vm_index()
@@ -472,7 +472,7 @@ def test_delete_resource_refuses_a_template(proxmox_case):
 
 # --- display reads -----------------------------------------------------------
 
-# Catches /list regressing from one cluster read per render to one per VM (C5).
+# Catches /list regressing from one cluster read per render to one per VM.
 def test_status_and_ips_share_one_cached_cluster_read(proxmox_case):
     case = proxmox_case
     reset_cluster_vm_index()
@@ -540,7 +540,7 @@ def test_set_expiry_writes_the_local_isoformat_description(
             {'description': f'Expires: {new_expiry.isoformat()}'}) in case.api.calls
 
 
-# Catches a failed Proxmox description write being counted as an extension (I2).
+# Catches a failed Proxmox description write being counted as an extension.
 def test_set_expiry_raises_backend_error_on_config_failure(proxmox_case):
     case = proxmox_case
     case.api.fail_config_put = True

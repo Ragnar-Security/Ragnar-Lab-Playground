@@ -171,7 +171,7 @@ def test_group_mode_cloud_deploy_uses_the_group_tags_as_slots(app, group_member_
     assert sorted(launched.network_slot for launched in fake.instances.values()) == [300, 400]
 
 
-# Catches a group without an internal tag reaching allocation on a cloud (I9).
+# Catches a group without an internal tag reaching allocation on a cloud.
 def test_group_mode_cloud_refuses_a_group_without_internal_tag(app, group_member_client):
     with app.app_context():
         StudentGroup.query.filter_by(name='team-a').one().internal_vlan_tag = None

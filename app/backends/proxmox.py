@@ -445,7 +445,7 @@ class ProxmoxBackend:
             self._forget_guest(ref)
         return absent
 
-    # Display reads: the cached index (ruling C5), so one /list render costs
+    # Display reads: the cached index, so one /list render costs
     # one cluster call however many VMs it shows, outage or not.
 
     def _display_index(self):
@@ -544,7 +544,8 @@ class ProxmoxBackend:
     def list_managed(self) -> List[ManagedResource]:
         """Every cluster guest, templates included, from one fresh read.
 
-        Presence only (ruling C5): no per-guest config read, so no expiry.
+        Presence only: no per-guest config read, so no expiry. Reconcile
+        needs presence, and the Proxmox orphan sweep reads `Expires:` itself.
         A failed read propagates; an empty list would mean "all gone".
         """
         index = proxmox_service.get_cluster_vm_index(

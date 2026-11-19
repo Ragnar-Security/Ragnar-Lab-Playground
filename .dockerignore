@@ -8,7 +8,7 @@
 .env*
 **/.env*
 
-# Operator-owned deployment files (CLAUDE.md rule 13). The test stack mounts
+# Operator-owned deployment files (CONTRIBUTING.md rule 13). The test stack mounts
 # its catalog from tests/fixtures, which stays in the context.
 scripts/site.env
 config/headscale-acl.json

@@ -102,7 +102,7 @@ class TemplatesGroupFilterTestCase(unittest.TestCase):
         self.assertIn('Regular', names)
         self.assertIn('KOTH', names)
 
-    # Catches backend validation errors never reaching the admin who must fix the YAML (M12).
+    # Catches backend validation errors never reaching the admin who must fix the YAML.
     def test_admin_sees_config_errors_and_students_do_not(self):
         bad = {'deployment_groups': [
             {'display_name': 'Cloud Lab', 'enabled': True, 'backend': 'aws',

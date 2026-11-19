@@ -296,7 +296,7 @@ def test_smallest_base_that_holds_slot_500_is_accepted(monkeypatch):
     cfg.validate_config()
 
 
-# Catches cloud admission reservations silently consuming a Proxmox node's capacity (M14).
+# Catches cloud admission reservations silently consuming a Proxmox node's capacity.
 @pytest.mark.parametrize('node', ['aws', 'GCP'])
 def test_proxmox_fixed_node_named_like_a_backend_is_rejected(monkeypatch, node):
     cfg = reload_config(monkeypatch, ENABLED_BACKENDS='proxmox', FIXED_NODE=node,

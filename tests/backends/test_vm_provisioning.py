@@ -46,7 +46,7 @@ config = importlib.import_module('app.config')
 # --- cloud: the generic create order -----------------------------------------
 
 # Catches create holding the router lock (serialized class launches, stalled expiry) or
-# launching before the router/slot exist (C4).
+# launching before the router/slot exist.
 def test_cloud_create_locks_only_router_start_and_slot_ensure(app, memory_backend_case):
     case = memory_backend_case
     location, launched = create_vm(
@@ -90,7 +90,7 @@ def test_router_less_create_skips_the_router_and_its_lock(app, memory_backend_ca
 
 
 
-# Catches a slot released between ensure_slot and create failing the launch (I3).
+# Catches a slot released between ensure_slot and create failing the launch.
 def test_create_re_ensures_a_slot_lost_before_launch_once(app, memory_backend_case):
     case = memory_backend_case
     case.backend.lose_slot_once = True
@@ -101,7 +101,7 @@ def test_create_re_ensures_a_slot_lost_before_launch_once(app, memory_backend_ca
     assert case.spec.network_slot in case.backend.slot_networks
 
 
-# Catches retirement deleting a slot an in-flight admission is about to launch into (I3).
+# Catches retirement deleting a slot an in-flight admission is about to launch into.
 def test_slot_release_waits_while_backend_has_unexpired_reservation(app, memory_backend_case):
     case = memory_backend_case
     case.backend.ensure_slot(case.spec.network_slot)
@@ -153,7 +153,7 @@ def test_deploy_bundle_persists_backend_identity(app, memory_backend_case):
         assert record.node == 'memory-zone'
 
 
-# Catches a cloud deploy_bundle constructing ProxmoxAPI or reading Proxmox nodes (I19).
+# Catches a cloud deploy_bundle constructing ProxmoxAPI or reading Proxmox nodes.
 # Lives here, not in tests/test_vmid_allocator.py, because memory_backend_case is a
 # tests/backends/ fixture.
 def test_cloud_bundle_on_cloud_only_portal_never_constructs_proxmox(
@@ -187,7 +187,7 @@ def test_cloud_bundle_releases_admission_and_vmids_after_commit(
     assert case.backend.reservations == set()
 
 
-# --- cloud: the admission lease keeps the router up (C4) ----------------------
+# --- cloud: the admission lease keeps the router up ---------------------------
 
 class _LedgerBackend(FakeBackend):
     """FakeBackend admitting through the real cloud ledger, so the router idle
@@ -295,7 +295,7 @@ def _deploy_in_thread(app, outcome):
 
 
 # Catches the admission lease lapsing during a long create or before the
-# VMRecord commits, which lets the idle step stop the router under a launch (C4).
+# VMRecord commits, which lets the idle step stop the router under a launch.
 def test_cloud_admission_keeps_router_up_from_admit_through_record_commit(
         app, ledger_cloud, monkeypatch):
     backend, clock = ledger_cloud
@@ -353,7 +353,7 @@ def test_lease_lost_before_commit_restarts_a_router_stopped_in_that_window(
 
 
 # Catches a create whose admission lease was lost mid-launch carrying on as if
-# admitted (I16): nothing then holds its router up or its capacity.
+# admitted: nothing then holds its router up or its capacity.
 def test_cloud_create_fails_when_its_admission_lease_is_lost_mid_create(
         app, ledger_cloud):
     backend, _clock = ledger_cloud
@@ -498,7 +498,7 @@ def test_after_record_retired_keeps_deployment_with_live_vmid_reservation(
 
 
 # Catches a provider error during cleanup failing the retirement that already
-# committed; the sweeper owns leftovers (T15).
+# committed; the orphan sweeper owns leftovers.
 def test_after_record_retired_never_raises(app, memory_backend_case):
     case = memory_backend_case
     with app.app_context():
@@ -552,7 +552,7 @@ def proxmox_portal(app, monkeypatch):
     api.add_guest(TEMPLATE_VMID, 'template-base', node=NODE, template=1)
     monkeypatch.setattr(config, 'ENABLED_BACKENDS', (BACKEND_PROXMOX,))
     register_backend_factory(BACKEND_PROXMOX, lambda: ProxmoxBackend(client=api))
-    # Failed-deploy cleanup still opens its own connection (T8 moves it).
+    # Failed-deploy cleanup still opens its own connection.
     with patch('app.proxmox_service.ProxmoxAPI', return_value=api):
         yield api
     forget_proxmox_caches()
@@ -818,7 +818,7 @@ def test_proxmox_bundle_releases_leases_only_after_commit(app, proxmox_portal):
     assert seen == [('node', 2), ('node', 2), ('vmid', 2)]
 
 
-# Catches a nested `proxmox:` block being ignored by the create path (T4).
+# Catches a nested `proxmox:` block being ignored by the create path.
 def test_proxmox_bundle_resolves_the_backend_block(app, proxmox_portal):
     api = proxmox_portal
     template = _qemu('vm', memory=1024, proxmox={'memory': 2048})

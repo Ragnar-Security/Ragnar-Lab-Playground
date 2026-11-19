@@ -119,7 +119,7 @@ def test_cloud_live_run_needs_its_backend_enabled(backend):
 ])
 def test_cloud_marker_bypasses_the_proxmox_guard_only_for_its_provider(
         markers, skipped):
-    # Catches LIVE_AWS=1 runs being skipped by the LIVE_PROXMOX guard (I15).
+    # Catches LIVE_AWS=1 runs being skipped by the LIVE_PROXMOX guard.
     env = aws_env()
     assert 'LIVE_PROXMOX' not in env
     assert (select_live_skip_reason(markers, env) is not None) is skipped
@@ -192,7 +192,7 @@ def test_skipped_live_cloud_modules_build_no_client_and_import_no_backend():
 
 
 def test_opted_in_but_incomplete_cloud_runs_skip_on_their_own_guard_not_proxmox():
-    # Catches the collection hook applying LIVE_PROXMOX to cloud items (I15),
+    # Catches the collection hook applying LIVE_PROXMOX to cloud items,
     # and an opted-in run with a missing variable building a client anyway.
     env = {**aws_env(), **gcp_env(), 'ENABLED_BACKENDS': 'aws,gcp'}
     del env['LIVE_AWS_IMAGE_ID'], env['LIVE_GCP_MACHINE_TYPE']
@@ -467,7 +467,7 @@ def test_network_cleanup_is_retried_while_the_provider_reports_it_in_use():
     assert len(slept) == 2
 
 
-# --- the router after teardown (B1 I2) -------------------------------------------
+# --- the router after teardown --------------------------------------------------
 # Live: a DescribeInstances straight after StartInstances answered 'stopped',
 # the teardown's stop_router believed it, and the router came up and billed
 # after a run that reported itself clean.
@@ -526,7 +526,7 @@ def test_teardown_retries_until_a_direct_start_is_visible_then_stops():
     assert 20 <= sum(clock.slept) < ROUTER_READ_LAG_SECONDS
 
 
-# Review I2: both the stop and the final check read the stale 'stopped'
+# Both the stop and the final check read the stale 'stopped'
 # for longer than any fixed wait. A run that accepted it would report clean
 # while the router came up; teardown must fail, bounded, instead.
 def test_teardown_fails_when_a_direct_start_never_becomes_visible(capsys):

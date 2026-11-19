@@ -116,7 +116,7 @@ while (($#)); do
 done
 
 [[ -n "$CANVAS" ]] || { usage >&2; exit 2; }
-# Canvas downloads to the Windows file system, so the instructor copies a path
+# Canvas downloads to the Windows file system, so the operator copies a path
 # like C:\Users\<you>\Downloads\...csv out of Explorer. This shell is WSL, where
 # that path does not exist. Translate it instead of failing. A backslash form
 # also loses its separators in some shells, so convert the slashes first.

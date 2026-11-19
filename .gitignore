@@ -10,7 +10,6 @@ build/
 venv/
 env/
 .DS_Store
-.superpowers/
 # Site-specific template catalog; copy templates.example.yaml before startup.
 /templates.yaml
 /templates.yaml.bak
@@ -18,8 +17,9 @@ env/
 /docker-compose.local.yml
 
 
-# Per-workstation tool permissions and deployment configuration.
+# Per-workstation tool state and permissions, and deployment configuration.
 .claude/*
+.superpowers/
 scripts/site.env
 # The image builder moved to Ragnar-Security/lab-image-builder. Keep an older
 # checkout's config.env (hosts and cloud IDs) out of commits.
@@ -32,7 +32,7 @@ config/headscale-acl.json
 .worktrees/
 
 # Student data and credentials: never commit (FERPA records, live VPN keys).
-# Production receives the roster over SSH; see CLAUDE.md rule 8.
+# Production receives the roster over SSH; see CONTRIBUTING.md rule 8.
 *.csv
 # Generated jumpbox initial passwords (explicit, in case the rule above is loosened).
 jumpbox-credentials*.csv

@@ -5,7 +5,7 @@ over the v1 JSON REST API only (no gRPC client).
 Identity is the label set written at insert, never the DB row: an instance
 is this record's only when its name and every contract label agree. The
 instance name is deterministic, so a ref without a provider id (a create that
-raised after the insert) needs no lookup (ruling C7). Where an instance is,
+raised after the insert) needs no lookup and is never lost. Where an instance is,
 and whether it exists at all, comes only from the project-wide aggregated
 list, never from a record's location: a 404 from the wrong zone says nothing.
 Absence needs that list to have reached every zone and to hold no instance of
@@ -23,9 +23,10 @@ network, and a firewall its deployment network only as exactly
 Each also needs a parseable creationTimestamp. Anything merely sharing the
 site prefix (the operator's static tailnet rule above all) is never listed
 or deleted, and every delete re-reads the resource first. Lock scope belongs
-to the caller (ruling C4): no method here takes a lifecycle lock.
+to the caller: no method here takes a lifecycle lock, because the admission
+reservation keeps a router or slot from being stopped under a launch.
 
-Configuration is read as `config.<NAME>` at call time (ruling I8): this
+Configuration is read as `config.<NAME>` at call time, never at import: this
 module is imported lazily by the registry factory, and a module-level
 `from app.config import ...` would also defeat tests that patch config.
 google.auth is imported only when a backend builds its own session.
@@ -624,7 +625,7 @@ class GCPBackend:
         name = instance_name(site, spec.vmid)
         slot = spec.network_slot
         # The slot a concurrent retirement may have released since
-        # ensure_slot: create_vm re-ensures it and retries once (ruling I3).
+        # ensure_slot: create_vm re-ensures it and retries once.
         subnet = self._get(self._slot_path(slot), what=f'slot {slot} subnetwork')
         if subnet is None:
             raise SlotNetworkMissing(f'slot {slot} has no subnetwork for VM {spec.vmid}')
@@ -1001,7 +1002,7 @@ class GCPBackend:
                     backend=BACKEND_GCP, kind=KIND_DEPLOYMENT_NETWORK,
                     provider_id=firewall.get('selfLink') or firewall['name'],
                     name=firewall['name'],
-                    # The 16-character key on both clouds (ruling C1).
+                    # The 16-character key the firewall name carries, as on AWS.
                     deployment_id=key,
                     created_at_epoch=_created_epoch(firewall.get('creationTimestamp'))))
         return resources

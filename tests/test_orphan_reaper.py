@@ -247,7 +247,7 @@ def test_failed_delete_task_is_reported_not_reaped(app):
                         "status": "delete_failed", "error": "locked"}]
 
 
-# Review I1 (pre-existing in v1.0.0's sweep): catches the delete acting on a
+# Pre-existing in v1.0.0's sweep: catches the delete acting on a
 # VMID another guest took while the stop waited, or the stop acting on one
 # taken since the sweep's listing.
 @pytest.mark.parametrize("when", ["before stop", "after stop"])
@@ -764,7 +764,7 @@ def test_cloud_instance_from_another_backend_template_or_without_vmid_is_kept(ap
 
 def test_deployment_network_requires_no_record_reservation_or_instance_and_old_age(app, backend):
     # Catches removal of a firewall/SG while its deployment is live or creating,
-    # including the 16-character key vs 32-character id mismatch (C1).
+    # including the 16-character key vs 32-character id mismatch.
     old, young = NOW_EPOCH - 3601, NOW_EPOCH - 3599
     backend.resources = [
         managed_network("net-orphan", "a" * 16, old),
@@ -817,7 +817,7 @@ def test_listed_instance_with_unknown_network_identity_keeps_that_network_kind(a
 
 
 def test_cloud_instance_delete_rechecks_under_vmid_lock(app, backend):
-    # Catches deleting an instance whose VMRecord committed after the sweep's first query (I14).
+    # Catches deleting an instance whose VMRecord committed after the sweep's first query.
     orphan = managed_instance("aws", "i-late", 806, expires=NOW_EPOCH - 3601)
     backend.resources = [orphan]
     backend.on_list = lambda: add_live_record(backend="aws", vmid=806)
@@ -1007,7 +1007,7 @@ def test_a_failing_first_backend_does_not_stop_the_second(app, backend, monkeypa
 
 
 def test_combined_sweep_without_proxmox_runs_only_the_cloud_pass(app, backend):
-    # Catches a cloud-only portal (no Proxmox client) never reaping cloud leaks (C6).
+    # Catches a cloud-only portal (no Proxmox client) never reaping cloud leaks.
     backend.reset_with_old_orphans(1)
     reports = orphan_reaper.reap_orphaned_vms(
         None, now=datetime.fromtimestamp(NOW_EPOCH))

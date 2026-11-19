@@ -199,10 +199,11 @@ def extend_vm():
                     backend_for(ref).set_expiry(ref, new_expiration)
                     extended_count += 1
                 except Exception as e:
-                    # set_expiry raises BackendError by contract (ruling
-                    # I2); anything else here is a provider that could not
-                    # even be reached. Either way the extension stands and
-                    # only provider updates that landed are counted.
+                    # set_expiry raises BackendError by contract, so a failed
+                    # write never looks successful; anything else here is a
+                    # provider that could not even be reached. Either way the
+                    # extension stands and only provider updates that landed
+                    # are counted.
                     logger.warning(f"Warning: Could not update the expiry of VM {vmid} on {ref.backend}: {e}")
 
         if new_expiration is None:

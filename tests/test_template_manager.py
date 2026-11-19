@@ -313,7 +313,7 @@ class GetTemplateForVMTestCase(unittest.TestCase):
         self.assertIsNone(get_template_for_vm(config, 'empty/anything'))
 
 
-# Catches a Proxmox node named like a cloud backend sharing its admission reservations (M14).
+# Catches a Proxmox node named like a cloud backend sharing its admission reservations.
 @pytest.mark.parametrize('group', [
     {'display_name': 'LB Lab', 'load_balancing': {'enabled': False, 'fixed_node': 'AWS'},
      'templates': [{'name': 'vm', 'template_locations': {'node-a': 7001}}]},

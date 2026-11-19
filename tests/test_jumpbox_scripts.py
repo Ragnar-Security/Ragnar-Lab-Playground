@@ -1010,7 +1010,7 @@ def test_lab_egress_lets_lab_vlans_leave_only_to_the_tailnet_and_leaves_vlan_to_
 
 
 def test_allow_vlans_exempts_listed_tags_between_vlans_only():
-    # Catches KOTH team VLANs losing their route to the KOTH VLAN (I11), or the
+    # Catches KOTH team VLANs losing their route to the KOTH VLAN, or the
     # exemption opening the management LAN to a KOTH VLAN.
     text = _netgen().render_vlan_isolation(allow_vlans=[300, 301])
     _tables, _chains, _hooks, rules = _nft_structure(text)
@@ -1048,7 +1048,7 @@ def test_parse_vlan_list_rejects_invalid_tags(spec):
 @pytest.mark.parametrize("spec", [
     _netgen().DEFAULT_BANDS, "entry:100-150:0:0 group-internal:400-450:300:4"])
 def test_portal_and_jumpbox_band_parsers_agree(spec):
-    # Catches Headscale policy granting a subnet the jumpbox does not serve (M8).
+    # Catches Headscale policy granting a subnet the jumpbox does not serve.
     netgen = _netgen()
     jumpbox = netgen.parse_bands(spec)
     portal = parse_vlan_bands(spec)

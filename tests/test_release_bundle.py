@@ -24,7 +24,7 @@ TARBALL = f'lab-playground-{VERSION}-deploy.tar.gz'
 PREFIX = f'lab-playground-{VERSION}/'
 MARKER = 'PLANTED-OPERATOR-SECRET-7f3c'
 
-# Untracked operator files (CLAUDE.md rule 13) plus untracked files that
+# Untracked operator files (CONTRIBUTING.md rule 13) plus untracked files that
 # match the bundle's own globs, and must still stay out.
 PLANTED = {
     '.env': f'SECRET_KEY={MARKER}\n',

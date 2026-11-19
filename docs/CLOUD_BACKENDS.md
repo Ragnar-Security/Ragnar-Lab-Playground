@@ -10,7 +10,7 @@ jumpbox isolation that go with it, and how to take it all down again.
 Every value in this file is a placeholder: `<aws-region>`, `<aws-vpc-id>`,
 `<gcp-project>`, `<site-id>` and so on. Real account, project, VPC, image and
 router identifiers belong only in your untracked `.env` and `templates.yaml`
-(repository rule 13 in `CLAUDE.md`).
+(repository rule 13 in `CONTRIBUTING.md`).
 
 The cloud base infrastructure (VPC, router subnet, router instance, route,
 firewall rules, IAM) is created by the operator from this document, not by
@@ -516,7 +516,7 @@ site-to-site VPN or Transit Gateway from its campus network. Set:
 
 ```bash
 VPN_MODE=external
-VPN_NAME="the UMD lab VPN"                 # what students are told to connect to
+VPN_NAME="the lab VPN"                     # what students are told to connect to
 VPN_INSTRUCTIONS_URL=https://<your-vpn-guide>   # and/or a short VPN_INSTRUCTIONS text
 AWS_CLIENT_CIDRS=<observed-source-cidr>    # what lab VMs see; table below. At most 8
 AWS_ROUTER_INSTANCE_ID=                    # empty: the VPN does the routing
@@ -955,7 +955,7 @@ Two accepted limits:
   key, and admission never selects a cluster node of that name.
 - **With Proxmox enabled, a Proxmox outage also blocks cloud deploys.** VMID
   allocation still reads the Proxmox inventory so that it never hands out a
-  VMID someone occupied by hand (accepted trade-off, ruling M20). A
+  VMID someone occupied by hand (an accepted trade-off). A
   cloud-only portal does not read Proxmox at all.
 
 **Do not change a placement setting while the backend holds anything.** The
@@ -1015,7 +1015,7 @@ uv run python -m pytest tests/live/test_aws_contract.py -v -rs
 
 Adding a cloud widens nothing by itself: the Headscale policy grants each
 student only their own networks on every backend. Applying it to the live
-Headscale host is an instructor step, not part of a deployment.
+Headscale host is an operator step, not part of a deployment.
 
 `scripts/apply_headscale_policy.sh` reads `scripts/site.env`
 (`PORTAL_HOST`, `PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`;
@@ -1127,7 +1127,7 @@ need the restart before it does.
 The policy controls what a student's laptop reaches. Lab machines reaching
 other students' labs through the Proxmox jumpbox is a separate path, closed
 by `jumpbox_configure.sh --isolate-vlans` (`docs/JUMPBOX.md`, "VLAN
-isolation"). It is an instructor step on the live jumpbox.
+isolation"). It is an operator step on the live jumpbox.
 
 1. **Have console or recovery access** to the jumpbox first.
 2. Copy the current `scripts/jumpbox_configure.sh`, `jumpbox_netgen.py`,

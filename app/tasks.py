@@ -90,7 +90,7 @@ def reconcile_missing_vm_records(skip_backends=frozenset()):
     confirmed under the VMID lifecycle lock. A failed inventory read is never
     evidence: it restarts the count. Returns retired VMIDs.
 
-    One list_managed() snapshot per backend per pass (ruling C5), the cost
+    One list_managed() snapshot per backend per pass, the cost
     of the single cluster read this pass always made; never a per-record
     inspect(), which for Proxmox is a fresh inventory read each.
     """
@@ -380,7 +380,7 @@ def check_and_destroy_expired_vms(app):
                 # (ORPHAN_REAPER_MAX_PASS_*): a backlog of hung orphans must
                 # never stand between an expired VM and its destroy. It runs
                 # every pass, so a cloud-only portal still sweeps its cloud
-                # leftovers (ruling C6). The Proxmox sweep uses the pass's
+                # leftovers. The Proxmox sweep uses the pass's
                 # connection and is left out when Proxmox is not enabled or
                 # was unreachable at the start of this pass.
                 proxmox = (get_backend(BACKEND_PROXMOX).connect()
@@ -443,9 +443,10 @@ def _stop_idle_cloud_routers(*, now_epoch: Optional[float] = None) -> List[str]:
     Idle means no live VMRecord and no unexpired admission reservation on
     that backend. The deciding read happens under the router lifecycle
     lock, which a launch holds around ensure_router_running() after
-    inserting its reservation (ruling C4), so a launch can never find its
+    inserting its reservation, so a launch can never find its
     router stopped under it. Reservation expiry is compared with now_epoch,
-    which is also the idle clock (ruling M13); it defaults to
+    which is also the idle clock, so a leaked lease expires instead of
+    keeping the router billing; it defaults to
     coordination.lease_clock(). A backend's failure is logged and keeps its
     idle timestamp, so the next pass retries; the other backends go ahead.
     A backend without a router (has_router() False) is skipped outright: no
@@ -504,7 +505,7 @@ def _destroy_expired(ref):
 
     Returns whether the guest is confirmed gone. Every failure — a provider
     error, a refused STRICT delete, an identity mismatch, or a backend later
-    removed from ENABLED_BACKENDS (ruling I18) — keeps the record, which the
+    removed from ENABLED_BACKENDS — keeps the record, which the
     caller counts as a failed attempt so the retry backoff and the deletion
     alert see it. The record is the only thing that keeps this guest from
     running unaccounted.

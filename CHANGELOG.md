@@ -284,7 +284,7 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   and nothing for a local roster created from nothing, so a rollback either
   failed on a missing backup or left the incoming file behind.
   `docs/TERM_CHANGEOVER.md` "Rollback" now undoes each line with one
-  `undo_file` function (copy back, or delete); the operator plan's
+  `undo_file` function (copy back, or delete); `docs/INTERNAL_VLAN_ROLLOUT.md`
   Procedure R uses it. The other lines changed form too: the database and
   MySQL dump lines are now `backup:`.
 - A destroy, expiry or failed-deploy cleanup in the first ~10 s after a
@@ -352,7 +352,7 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   which the runbook requires before students use the cloud), and
   credentials through an instance role or an untracked compose override,
   never a tracked file.
-- **Instructor steps after the upgrade, not part of it:** the Headscale
+- **Operator steps after the upgrade, not part of it:** the Headscale
   policy (`scripts/apply_headscale_policy.sh --apply`) and jumpbox
   `--isolate-vlans`. The policy cuts the blanket `autogroup:member` rule down
   to its `autogroup:self` part, which also changes what students reach on
