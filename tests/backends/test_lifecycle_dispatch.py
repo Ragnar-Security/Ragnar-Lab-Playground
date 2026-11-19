@@ -279,7 +279,7 @@ def test_admin_bulk_dispatches_best_effort(app, admin_client, memory_backend_cas
     assert case.backend.destroyed[record.vmid] == DestroyPolicy.BEST_EFFORT
 
 
-# Catches a failed deploy leaking its deployment network or its slot subnet (I4).
+# Catches a failed deploy leaking its deployment network or its slot subnet.
 def test_failed_deploy_dispatches_best_effort_and_cleans_network_and_slot(
         app, memory_backend_case):
     case = memory_backend_case
@@ -294,7 +294,7 @@ def test_failed_deploy_dispatches_best_effort_and_cleans_network_and_slot(
     assert VMRecord.query.filter_by(destroyed=False).count() == 0
 
 
-# Catches a launch-then-raise cloud instance with no provider id leaking forever (C7).
+# Catches a launch-then-raise cloud instance with no provider id leaking forever.
 def test_failed_deploy_destroys_instance_created_before_create_raised(
         app, memory_backend_case):
     case = memory_backend_case
@@ -363,7 +363,7 @@ def test_list_uses_backend_private_ip_and_status(app, client, memory_backend_cas
 
 
 # Catches a record of a disabled backend vanishing from the dashboard or being
-# put up for retirement by /list (I18).
+# put up for retirement by /list.
 def test_list_shows_disabled_backend_record_as_unknown(
         app, client, memory_backend_case):
     record = persist_case_record(memory_backend_case, backend='gcp')
@@ -403,7 +403,7 @@ def test_concurrent_last_retirements_converge_without_error(
     assert case.spec.network_slot not in case.backend.slot_networks
 
 
-# Catches an operator YAML edit redirecting a running VM to another provider (M6).
+# Catches an operator YAML edit redirecting a running VM to another provider.
 def test_destroy_uses_record_backend_not_current_template(
         app, client, memory_backend_case):
     case = memory_backend_case
@@ -421,7 +421,7 @@ def test_destroy_uses_record_backend_not_current_template(
     assert gcp.destroyed == {}
 
 
-# Catches a failed provider expiry update being counted as extended (I2).
+# Catches a failed provider expiry update being counted as extended.
 def test_extend_counts_only_successful_provider_updates(
         app, client, memory_backend_case):
     case = memory_backend_case
@@ -454,7 +454,7 @@ def test_extend_writes_the_committed_expiry_to_the_provider(
 
 
 # Catches a backend removed from ENABLED_BACKENDS leaving live VMs undestroyable
-# and silent (I18), or stopping the pass before another backend's record.
+# and silent, or stopping the pass before another backend's record.
 def test_record_of_disabled_backend_is_retained_retried_and_alerted(
         app, memory_backend_case, monkeypatch):
     case = memory_backend_case
@@ -753,7 +753,7 @@ def test_reconcile_provider_exception_keeps_the_record(
 
 
 # Catches reconcile reading inventory per record instead of once per backend
-# per pass (ruling C5).
+# per pass, which would turn one Proxmox read per pass into one per VM.
 def test_reconcile_reads_inventory_once_per_backend(
         app, memory_backend_case):
     case = memory_backend_case
@@ -808,7 +808,7 @@ def test_reconcile_unknown_confirmation_restarts_the_count(
 
 # Catches the failed-deploy cloud sweep matching by name or by deployment
 # alone: it must take the bundle's instance whatever the provider named it,
-# and nothing that only shares a name or a deployment (C7).
+# and nothing that only shares a name or a deployment.
 def test_failed_deploy_cloud_sweep_matches_deployment_and_vmid_only(
         app, memory_backend_case):
     case = memory_backend_case

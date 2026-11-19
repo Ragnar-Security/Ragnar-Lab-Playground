@@ -34,8 +34,8 @@ def backend_case(request, app):
 
 
 # Catches a provider adapter that cannot complete the common VM lifecycle.
-# Like create_vm (T7), each test starts the router and ensures the slot before
-# admit/create: AWS and GCP create() need the slot network (ruling C3).
+# Like create_vm, each test starts the router and ensures the slot before
+# admit/create: AWS and GCP create() need the slot network.
 def test_backend_lifecycle_contract(backend_case):
     case = backend_case
     case.backend.ensure_router_running()
@@ -67,7 +67,8 @@ def test_backend_lifecycle_contract(backend_case):
 # Acceptance smoke: catches an adapter that rejects a policy value or leaves
 # a healthy matching guest behind under it. It does not prove a policy is
 # enforced — clouds terminate in one call, so every policy behaves the same
-# there; enforcement on stop failure is pinned per adapter (Proxmox in T6).
+# there; enforcement on stop failure is pinned per adapter (Proxmox in
+# test_proxmox_backend.py).
 @pytest.mark.parametrize('policy', list(DestroyPolicy))
 def test_every_policy_destroys_a_healthy_matching_guest(backend_case, policy):
     case = backend_case
@@ -98,7 +99,7 @@ def test_backend_cleanup_invariant(backend_case):
     case.backend.cleanup_deployment(case.spec.deployment_id)
     case.backend.release_slot(case.spec.network_slot)
     case.backend.stop_router()
-    # Not vacuous for Proxmox, whose resources carry no deployment id (M7).
+    # Not vacuous for Proxmox, whose resources carry no deployment id.
     assert not [r for r in case.backend.list_managed()
                 if r.kind == 'instance' and r.vmid == ref.vmid]
     key = deployment_key(case.spec.deployment_id)
@@ -106,8 +107,9 @@ def test_backend_cleanup_invariant(backend_case):
                 if r.deployment_id is not None and deployment_key(r.deployment_id) == key]
 
 
-# The fake stands in for clouds in route tests (T7, T8, T16, T19), so the
-# failure modes those tests rely on are pinned here, against the fake alone.
+# The fake stands in for clouds in route, lifecycle, idle-router and
+# live-guard tests, so the failure modes those tests rely on are pinned here,
+# against the fake alone.
 
 def _launched_fake():
     case = make_memory_backend_case(None)
@@ -132,7 +134,7 @@ def test_fake_destroy_fails_closed_on_identity_mismatch():
 
 
 # Catches a survivor row without a provider id (create raised after launch)
-# becoming impossible to inspect or destroy (ruling C7).
+# becoming impossible to inspect or destroy while it bills.
 def test_fake_resolves_ref_without_provider_id_by_vmid():
     case, ref = _launched_fake()
     anonymous = replace(ref, provider_id=None)
@@ -174,7 +176,7 @@ def test_fake_fail_next_create_is_one_shot():
     assert case.spec.vmid in case.backend.instances
 
 
-# Catches a cloud create launching into a slot network that no longer exists (I3).
+# Catches a cloud create launching into a slot network that no longer exists.
 def test_fake_create_requires_slot_and_lose_slot_once_drops_it():
     case = make_memory_backend_case(None)
     with pytest.raises(SlotNetworkMissing):
@@ -190,7 +192,7 @@ def test_fake_create_requires_slot_and_lose_slot_once_drops_it():
     assert case.spec.vmid in case.backend.instances
 
 
-# Catches a failed expiry write looking successful (ruling I2).
+# Catches a failed expiry write looking successful.
 def test_fake_set_expiry_failure_raises_backend_error():
     case, ref = _launched_fake()
     before = dict(case.backend.expiry)
@@ -200,7 +202,7 @@ def test_fake_set_expiry_failure_raises_backend_error():
     assert case.backend.expiry == before
 
 
-# Catches lock-scope assertions (T7) reading call lists instead of the locks
+# Catches lock-scope assertions reading call lists instead of the locks
 # actually held by this thread when the operation ran.
 def test_fake_records_lifecycle_locks_held_on_entry():
     backend = FakeBackend('aws')

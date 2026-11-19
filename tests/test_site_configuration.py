@@ -98,13 +98,13 @@ def test_headscale_mode_keeps_the_tailscale_panel_and_key(app):
 # another VPN, and operator text rendered as markup.
 def test_external_mode_shows_the_operators_vpn_and_no_key(app):
     html, me = _dashboard(
-        app, VPN_MODE="external", VPN_NAME="the UMD lab VPN",
+        app, VPN_MODE="external", VPN_NAME="the lab VPN",
         VPN_INSTRUCTIONS_URL="https://vpn.example.edu/guide?a=1&b=2",
         VPN_INSTRUCTIONS=_HOSTILE)
     assert "tailscale" not in html.lower() and "--auth-key" not in html
     assert "headscale" not in html.lower() and "vpn.example.edu --" not in html
     assert 'id="vpn-setup"' in html
-    assert "Connect to the UMD lab VPN before you use them." in html
+    assert "Connect to the lab VPN before you use them." in html
     assert 'href="https://vpn.example.edu/guide?a=1&amp;b=2"' in html
     assert "&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;" in html
     assert "<script>alert" not in html and "<b>bold</b>" not in html

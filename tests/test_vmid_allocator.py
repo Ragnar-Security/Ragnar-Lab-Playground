@@ -445,7 +445,7 @@ class ConcurrentStudentDeployTestCase(unittest.TestCase):
                          self.STUDENT_COUNT)
 
 
-# Catches a cloud-only portal trying to contact a disabled Proxmox cluster (I19).
+# Catches a cloud-only portal trying to contact a disabled Proxmox cluster.
 def test_allocator_uses_database_and_reservations_without_proxmox(app):
     with app.app_context():
         db.session.add(VMRecord(

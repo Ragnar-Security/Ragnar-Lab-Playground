@@ -15,8 +15,8 @@ def memory_backend_case(app, monkeypatch):
     """A registered in-memory 'aws' case on a mixed Proxmox + AWS portal.
 
     Proxmox is served by an empty FakeProxmox: with Proxmox enabled the VMID
-    allocator reads its inventory (ruling I19), and a test must never reach a
-    real cluster through the default factory.
+    allocator reads its inventory to avoid hand-made guests, and a test must
+    never reach a real cluster through the default factory.
     """
     case = make_memory_backend_case(app, name='aws')
     monkeypatch.setattr(importlib.import_module('app.config'),

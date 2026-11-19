@@ -1,7 +1,7 @@
 """Stateful in-memory VMBackend and the shared contract-case harness.
 
-Later tasks (T7, T8, T16, T19) assert against FakeBackend's public state, so
-its attribute names are part of the plan's contract (ruling I5): tests read
+Route, lifecycle, idle-router and live-guard tests assert against
+FakeBackend's public state, so its attribute names are a contract: tests read
 what the fake now holds, never a list of mock calls.
 """
 
@@ -54,7 +54,7 @@ class FakeBackend:
         self._instance_tags: Dict[int, Dict[str, object]] = {}
 
     def _observe_locks(self, method: str) -> None:
-        # The lifecycle-lock table is the seam T7 asserts lock scope through:
+        # The lifecycle-lock table is the seam lock-scope tests assert through:
         # which keys this thread held when the operation ran, not which
         # context managers were entered somewhere.
         from app import proxmox_service
@@ -115,7 +115,7 @@ class FakeBackend:
         if launched is None:
             return GUEST_ABSENT
         # No provider id (create raised after launch) resolves by VMID alone,
-        # as the clouds resolve by site + VMID tags (ruling C7).
+        # as the clouds resolve by site + VMID tags, so no launch is lost.
         if ref.provider_id is not None and ref.provider_id != launched.provider_id:
             return GUEST_MISMATCH
         return GUEST_MATCH
@@ -228,7 +228,8 @@ class BackendContractCase:
     expected_status: str
     cleanup: Callable[[], None]
     # Proxmox's inventory is the cluster-index projection, which carries no
-    # expiry (ruling C5); its case sets this False.
+    # expiry (the Proxmox sweep reads `Expires:` itself); its case sets this
+    # False.
     inventory_reports_expiry: bool = True
 
     def ref(self, launched: LaunchedVM, location: str) -> VMRef:
@@ -257,8 +258,8 @@ def make_memory_backend_case(app, name: str = 'aws') -> BackendContractCase:
         deployment_id='a' * 32, owner='student-a')
 
     def cleanup() -> None:
-        # The shared tests start the router and ensure the slot (ruling C3);
-        # the fake owns nothing else.
+        # The shared tests start the router and ensure the slot, as create_vm
+        # does in production; the fake owns nothing else.
         backend.release_slot(spec.network_slot)
         backend.stop_router()
 
@@ -372,8 +373,8 @@ def make_aws_backend_case(app) -> BackendContractCase:
     backend = RecordingAWSBackend(ec2, expected_ips=expected_ips)
 
     def cleanup() -> None:
-        # The shared tests start the router and ensure the slot (ruling C3)
-        # and have already terminated the instance.
+        # The shared tests start the router and ensure the slot, as create_vm
+        # does in production, and have already terminated the instance.
         try:
             backend.release_slot(spec.network_slot)
             backend.stop_router()

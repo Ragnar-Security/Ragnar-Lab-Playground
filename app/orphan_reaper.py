@@ -4,9 +4,9 @@ The database remains the source of truth for normal lifecycle handling. This
 sweeper only acts when a provider still has an app-owned guest or network but
 no database or KOTH reference survived the deploy that created it.
 
-Two passes share one pass budget: the raw Proxmox sweep (unchanged, ruling
-M11) and a provider-generic sweep over each enabled cloud backend's
-list_managed() inventory.
+Two passes share one pass budget: the raw Proxmox sweep (unchanged, because
+it is proven and incident-tested) and a provider-generic sweep over each
+enabled cloud backend's list_managed() inventory.
 """
 
 import logging
@@ -547,7 +547,7 @@ class _CloudOwners:
         admitting = (db.session.query(NodeMemoryReservation.node)
                      .filter(NodeMemoryReservation.expires_at > lease_now)
                      .all())
-        # Deployment identity compares by key (ruling C1): a network reports
+        # Deployment identity compares by key: a network reports
         # the 16-character key, records and reservations the full id. A
         # bundle's reservation id is its deployment id.
         keys = {deployment_key(deployment) for _b, _v, deployment, _s in records
@@ -666,7 +666,8 @@ def _recheck_and_delete_cloud(backend, resource, is_dry_run, budget):
     Returns a report, None when an owner appeared, or _OUT_OF_BUDGET.
     """
     if resource.kind == _KIND_INSTANCE:
-        # The lock every create/destroy of this VMID decides under (I14).
+        # The lock every create/destroy of this VMID decides under, so a
+        # record committed after the first query is seen before the delete.
         with vm_lifecycle_lock(resource.vmid):
             db.session.rollback()
             # Lease first, record second: allocation holds the lease until

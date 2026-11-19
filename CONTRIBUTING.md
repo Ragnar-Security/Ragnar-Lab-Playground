@@ -1,4 +1,4 @@
-# Claude / contributor notes for this repo
+# Contributing
 
 A Flask + SQLAlchemy + MySQL portal that orchestrates lab VM lifecycles on
 Proxmox and, optionally, Amazon EC2 and Google Compute Engine
@@ -8,39 +8,35 @@ Group-mode and the King-of-the-Hill (KOTH, Proxmox-only) competitive arena
 layer on top. Every lifecycle path goes through `app/backends/` (one
 `VMBackend` per provider) and dispatches by the record's `backend` column.
 
-This file is loaded into context at the start of every Claude Code session
-in this directory. Keep it short, opinionated, and focused on things you
-need to know before touching the code.
+This file holds the repository rules other files cite by number ("rule 8",
+"rule 13"), the conventions the code relies on, and the commands to test and
+run it. Read it before touching the code.
 
-## Workflow — change → test → codex review → commit
+## Workflow — change → test → review → commit
 
 For any **non-trivial change** (anything touching business logic, security
 boundaries, the DB schema, or the production deployment), follow this loop
 in order. Don't skip steps and don't reorder them.
 
-1. **Make the changes.** Sequential or via subagent-driven implementation as
-   the scope warrants.
+1. **Make the changes.**
 2. **Run the tests.** `uv run python -m pytest tests/ --ignore=tests/integration`
    or the targeted subset for what you touched. Must be green before moving
-   on. The full suite is ~325 tests and runs in ~4 minutes.
-3. **Codex review.** Invoke the `codex:codex-rescue` subagent (via the
-   `/codex:rescue` slash command, or Agent tool with `subagent_type:
-   codex:codex-rescue`). Give it: a focused changeset summary, the key code
-   paths to look at, and ask for findings ranked Critical / Important /
-   Minor with file:line refs. Then **fix every Critical and Important
-   finding** before moving on. Re-run the tests after the fixes.
-4. **Commit.** Single descriptive commit (unless the user explicitly asks
-   for per-task commits). Co-author line stays.
+   on.
+3. **Get a review.** Give the reviewer a focused summary of the change and
+   the key code paths, and ask for findings ranked Critical / Important /
+   Minor with file:line references. **Fix every Critical and Important
+   finding** before moving on, then re-run the tests.
+4. **Commit.** One descriptive commit per change.
 
-**Why this matters.** A previous session shipped 6 important issues that
-317/317 unit tests had passed cleanly through (race in claim-event
-ordering, unbounded base64 decode, missing PATCH bounds, NaN/Inf points,
-YAML-bomb gap, race-window in flag dedup). Codex caught them all on first
-review. Tests verify code correctness; codex review catches design and
-threat-model gaps the tests can't see.
+**Why this matters.** A change once shipped six important issues that the
+whole unit suite passed cleanly (a race in claim-event ordering, an
+unbounded base64 decode, missing PATCH bounds, NaN/Inf points, a YAML-bomb
+gap, a race window in flag dedup). Review found all of them. Tests verify
+code correctness; review catches design and threat-model gaps the tests
+can't see.
 
-**Trivial exceptions.** Single-line typo fix, docstring tweak, README
-edit — fine to skip the codex step. Anything else, run it.
+**Trivial exceptions.** A single-line typo fix, a docstring tweak or a
+README edit can skip the review. Anything else gets one.
 
 ## Test, build, and deploy commands
 
@@ -300,14 +296,6 @@ tests/                      # unit tests; tests/integration: Playwright against 
 - **Comments**: write WHY, not WHAT. Past-incident references are valuable
   ("we tripped this once; here's what to avoid"). Don't add
   end-of-file change-log style comments.
-
-## Where to find more
-
-- `docs/KING_OF_THE_HILL.md` — KOTH user-facing guide
-- `docs/PRODUCTION_DEPLOYMENT.md` — full prod deploy + rollback playbook
-- `docs/CLOUD_BACKENDS.md` — AWS/GCP setup, IAM, cost, Headscale policy,
-  jumpbox VLAN isolation, teardown and rollback
-- `docs/JUMPBOX.md` — the Proxmox lab router
 - **Never delete a `VMRecord` because a Proxmox call failed.** The expiry
   daemon tracks VMs by database row, so a deleted row means the VM runs
   until a human notices. `_verify_vm_exists` returns
@@ -319,3 +307,11 @@ tests/                      # unit tests; tests/integration: Playwright against 
   The expiry loop's `reconcile_missing_vm_records` retires a live record
   only after that answer held for `ORPHAN_CONFIRM_SECONDS`, the last read
   under `vm_lifecycle_lock`; any other answer restarts the count.
+
+## Where to find more
+
+- `docs/KING_OF_THE_HILL.md` — KOTH user-facing guide
+- `docs/PRODUCTION_DEPLOYMENT.md` — full prod deploy + rollback playbook
+- `docs/CLOUD_BACKENDS.md` — AWS/GCP setup, IAM, cost, Headscale policy,
+  jumpbox VLAN isolation, teardown and rollback
+- `docs/JUMPBOX.md` — the Proxmox lab router

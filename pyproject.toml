@@ -44,7 +44,7 @@ dev = [
 
 [tool.pytest.ini_options]
 # utcnow() is deprecated and, in this app, wrong by design: columns are naive
-# LOCAL time (CLAUDE.md). Fail the suite if it creeps back in.
+# LOCAL time (CONTRIBUTING.md). Fail the suite if it creeps back in.
 filterwarnings = [
     "error:datetime.datetime.utcnow\\(\\) is deprecated:DeprecationWarning",
 ]

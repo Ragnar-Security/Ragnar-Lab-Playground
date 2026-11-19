@@ -946,7 +946,7 @@ def register_cloud_sweep_backend(name):
 
 
 def test_cloud_only_expiry_pass_runs_the_cloud_sweep(app, monkeypatch):
-    # Catches a cloud-only portal never reaping leaked cloud resources (C6).
+    # Catches a cloud-only portal never reaping leaked cloud resources.
     import importlib
     from app import orphan_reaper
     from app.backends import register_backend_factory
@@ -984,7 +984,7 @@ def test_proxmox_outage_pass_still_runs_the_cloud_sweep_without_proxmox(
     reaper.assert_called_once_with(None)
 
 
-# ---- idle cloud routers (T16) ----------------------------------------------
+# ---- idle cloud routers ----------------------------------------------------
 
 import importlib
 import time
@@ -1120,7 +1120,7 @@ def test_live_record_or_unexpired_admission_reservation_resets_idle_window(app, 
 
 
 def test_unexpired_admission_reservation_blocks_stop_without_any_record(app, router_backend):
-    # Catches a stop between a launch's router start and its VMRecord commit (C4).
+    # Catches a stop between a launch's router start and its VMRecord commit.
     observe_idle_at(0)
     add_node_reservation(node="aws", expires_at=10_060)
     assert _stop_idle_cloud_routers(now_epoch=10_000) == []
@@ -1128,7 +1128,7 @@ def test_unexpired_admission_reservation_blocks_stop_without_any_record(app, rou
 
 
 def test_expired_reservation_does_not_block_stop(app, router_backend):
-    # Catches a leaked lease keeping the router billing forever (M13).
+    # Catches a leaked lease keeping the router billing forever.
     observe_idle_at(0)
     add_node_reservation(node="aws", expires_at=9_999)
     assert _stop_idle_cloud_routers(now_epoch=10_000) == ["aws"]
@@ -1184,7 +1184,7 @@ def test_stopped_router_is_not_stopped_again_every_pass(app, router_backend):
 def test_an_already_stopped_router_is_not_reported_as_stopped(
         app, router_backend, caplog):
     # Catches a portal that starts with its router stopped logging a stop it
-    # never made (B2 M3), and listing it among the routers this pass stopped.
+    # never made, and listing it among the routers this pass stopped.
     router_backend.router_running = False
     observe_idle_at(0)
     with caplog.at_level('INFO', logger='app.tasks'):

@@ -73,7 +73,7 @@ def test_cloud_sdks_are_runtime_and_moto_ec2_is_dev_only():
     assert any(_requirement_name(v) == 'moto' and '[ec2]' in v.lower()
                for v in dev)
     assert 'moto' not in runtime
-    # Catches a bare constraint letting an unrelated `uv lock` upgrade a cloud SDK (M10).
+    # Catches a bare constraint letting an unrelated `uv lock` upgrade a cloud SDK.
     pinned = {_requirement_name(v): v for v in project['project']['dependencies']
               if _requirement_name(v) in {'boto3', 'google-auth'}}
     assert all(re.search(r'==\d', v) for v in pinned.values()), pinned

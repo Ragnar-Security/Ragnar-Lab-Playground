@@ -15,7 +15,7 @@ requestId returns the original operation without changing state.
 None of this observes Google's real behaviour: the list-filter grammar, the
 aggregated-list warnings, the status codes chosen for synchronous refusals,
 and `/wait` returning an unchanged non-DONE operation are modelled, not
-measured (T19 live-confirms).
+measured (the opt-in live GCP run in tests/live confirms them).
 
 make_gcp_backend_case builds the shared-contract case on this fake.
 """
@@ -719,8 +719,8 @@ def make_gcp_backend_case(app) -> BackendContractCase:
     backend = GCPBackend(session=fake)
 
     def cleanup() -> None:
-        # The shared tests start the router and ensure the slot (ruling C3)
-        # and have already deleted the instance.
+        # The shared tests start the router and ensure the slot, as create_vm
+        # does in production, and have already deleted the instance.
         try:
             backend.release_slot(spec.network_slot)
             backend.stop_router()

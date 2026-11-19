@@ -186,7 +186,7 @@ def test_create_heartbeats_while_the_operation_runs(backend, gce, spec):
 
 
 def test_create_without_slot_subnetwork_raises_slot_network_missing(backend, gce, spec):
-    # Catches a launch into a slot a concurrent retirement just released (I3).
+    # Catches a launch into a slot a concurrent retirement just released.
     gce.subnetworks.clear()
     gce.firewalls.clear()
     with pytest.raises(SlotNetworkMissing):
@@ -237,7 +237,7 @@ def test_status_maps_provider_states(backend, gce, spec, provider_state, status)
 def test_ref_without_provider_id_uses_the_derived_instance_name(backend, gce, spec):
     # Catches a launch-then-crash survivor never being destroyed.
     ref = _launch(backend, spec)
-    # A survivor may carry location='gcp' (T8): it names no zone.
+    # A survivor may carry location='gcp': it names no zone.
     survivor = replace(ref, provider_id=None, location='gcp')
     assert backend.inspect(survivor) == GUEST_MATCH
     backend.destroy(survivor, DestroyPolicy.BEST_EFFORT)
@@ -368,7 +368,7 @@ def test_set_expiry_stops_after_three_conflicts(backend, gce, spec, conflicts, s
     ('GET', INSTANCE_PATH), ('POST', INSTANCE_PATH + '/setLabels'),
 ])
 def test_set_expiry_transport_failure_raises_backend_error(backend, gce, spec, method, path):
-    # Catches a failed provider label update being counted as extended (contract I2).
+    # Catches a failed provider label update being counted as extended.
     ref = _launch(backend, spec)
     original = _labels(gce)
     gce.fail(method, path, status=500)
@@ -612,7 +612,7 @@ def test_terminal_insert_failure_then_corrected_cause_launches_the_same_spec(
         with pytest.raises(SlotNetworkMissing) as raised:
             backend.create(spec, ZONE, heartbeat=lambda: None)
         assert isinstance(raised.value.__cause__, OperationFailed)
-        gce.add_subnetwork(REGION, SUBNET, SLOT_CIDR)  # create_vm re-ensures (I3)
+        gce.add_subnetwork(REGION, SUBNET, SLOT_CIDR)  # create_vm re-ensures it
     assert gce.instances == {}
     launched = backend.create(spec, ZONE, heartbeat=lambda: None)
     again = backend.create(spec, ZONE, heartbeat=lambda: None)
@@ -950,7 +950,7 @@ def test_ensure_slot_and_create_refuse_a_misplaced_slot_subnetwork(backend, gce,
 def test_a_slot_released_during_the_insert_raises_slot_network_missing(
         backend, gce, spec, monkeypatch, mode):
     # Catches a launch that lost its slot mid-insert failing for good
-    # instead of letting create_vm re-ensure the slot and retry once (I3).
+    # instead of letting create_vm re-ensure the slot and retry once.
     gce.subnetwork_failure = mode
     _release_slot_during_insert(gce, monkeypatch)
     with pytest.raises(SlotNetworkMissing):
@@ -1139,14 +1139,14 @@ def test_list_managed_parses_only_owned_subnets_and_firewalls_with_timestamps(ba
 
 
 def test_firewall_inventory_reports_the_deployment_key(backend, gce, spec):
-    # Catches the firewall's deployment identity disagreeing with AWS and T15 (C1).
+    # Catches the firewall's deployment identity disagreeing with AWS and the orphan sweep.
     backend.create(spec, ZONE, heartbeat=lambda: None)
     [firewall] = [r for r in backend.list_managed() if r.kind == 'deployment-network']
     assert firewall.deployment_id == deployment_key(spec.deployment_id) == '0123456789abcdef'
 
 
 def test_inventory_attributes_every_kind_for_the_sweeper(backend, gce, spec):
-    # Catches T15's cloud sweep never reaping GCP networks because the
+    # Catches the orphan sweep never reaping GCP networks because the
     # instances that hold them report no slot or deployment.
     _launch(backend, spec)
     resources = {r.kind: r for r in backend.list_managed()}

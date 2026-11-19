@@ -51,7 +51,8 @@ def _renewing_admission(heartbeat: Callable[[], None]
 
     A provider call can outlast the admission TTL without calling heartbeat
     (AWS's running waiter), as can the wait for a router or slot lock; the
-    lease must still hold until the caller's VMRecord commits (ruling C4).
+    lease must still hold until the caller's VMRecord commits, or the idle
+    step could stop the router under the launch.
     A thread like the deploy's other renewers: a greenlet under gevent. On a
     normal exit the guard runs once more after the renewer has stopped, so
     a renewal that failed during teardown is raised too; an exception
@@ -86,7 +87,8 @@ def _renewing_admission(heartbeat: Callable[[], None]
 
 
 def ensure_router_running(backend_name: str) -> None:
-    """Start `backend_name`'s router under its lifecycle lock (ruling C4);
+    """Start `backend_name`'s router under its lifecycle lock, held only for
+    the start: the admission reservation, not this lock, protects the launch;
     nothing for a backend without one."""
     backend = get_backend(backend_name)
     if not backend.has_router():
@@ -146,7 +148,7 @@ def create_vm(spec: VMSpec, *, reservation_id: str,
                                       heartbeat=guarded_heartbeat, **options)
     # The renewer has stopped and its last renewal was checked on the way
     # out: a launch the lease stopped covering is a failed create, and the
-    # caller's cleanup resolves the instance by VMID (ruling C7).
+    # caller's cleanup resolves the instance by VMID, so none bills unfound.
     return location, launched
 
 
@@ -169,7 +171,7 @@ def provider_session(backend: VMBackend) -> ContextManager:
 def release_slot_if_unused(backend: str, slot: int) -> None:
     """Release a cloud slot network that no VM uses or is about to use.
 
-    Never raises: a slot left behind is reaped by the sweeper (T15).
+    Never raises: a slot left behind is reaped by the orphan sweeper.
     """
     try:
         with vm_lifecycle_lock(slot_lock_key(backend, slot)):
@@ -194,7 +196,7 @@ def after_record_retired(ref: VMRef) -> None:
     """Clean up what a retired record's deployment and slot no longer need.
 
     Call after the retirement commits. Never raises: leftovers belong to the
-    sweeper (T15), and the retirement itself already succeeded.
+    orphan sweeper, and the retirement itself already succeeded.
     """
     if ref.deployment_id:
         try:

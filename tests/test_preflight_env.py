@@ -322,7 +322,7 @@ def test_preflight_rejects_overlapping_cloud_cidrs(tmp_path):
     assert result.stderr.startswith('AWS_LAB_CIDR:')
 
 
-# Catches cloud reservations draining a Proxmox node named like a backend (M14).
+# Catches cloud reservations draining a Proxmox node named like a backend.
 def test_preflight_rejects_fixed_node_named_like_a_backend(tmp_path):
     result = _run(str(_write_env(tmp_path / '.env', {**GOOD, 'FIXED_NODE': 'GCP'})))
     assert result.returncode == 1

@@ -467,8 +467,9 @@ def _sweep_cloud_by_deployment(payload, created_vms, backend_name):
     """Give each cloud result the instance its create left behind.
 
     A create can raise after the provider launched the instance (a waiter
-    timeout), leaving a result without a provider id (ruling C7). The match
-    is by (deployment_id, vmid), never by name: GCP names an instance
+    timeout), leaving a result without a provider id that no other path
+    would find while it bills. The match is by (deployment_id, vmid), never
+    by name: GCP names an instance
     lp-<site>-<vmid>, not the portal's vm_name. Results are updated in
     place, so the survivor record of an instance that will not die names
     where it actually runs.
@@ -753,8 +754,9 @@ def create_single_vm_task(vm_index, template_config, assigned_vmid, student_name
         elif backend_name != BACKEND_PROXMOX and spec is not None:
             # The bundle's VMID reservation makes this VMID ours alone, so
             # a cloud instance carrying it and this deployment can only be
-            # this create's, even when create() raised after the launch
-            # (ruling C7). Cleanup inspects it; the cloud sweep supplies the
+            # this create's, even when create() raised after the launch, so
+            # it is never left billing where no path can find it.
+            # Cleanup inspects it; the cloud sweep supplies the
             # provider id and zone when the instance exists.
             result.update({
                 'vmid': spec.vmid,
@@ -954,7 +956,7 @@ def _finalize_failed_deployment(
     _release_vm_reservations(vm_results)
     if backend_name != BACKEND_PROXMOX:
         # Slot networks carry no deployment id, so only this release keeps a
-        # failed deploy from leaking its subnet (ruling I4). After the
+        # failed deploy from leaking its subnet. After the
         # bundle's own admissions are gone, which would otherwise hold it.
         for slot in sorted({vm['network_slot'] for vm in vm_results
                             if vm.get('network_slot') is not None}):
@@ -1149,7 +1151,7 @@ def deploy_bundle(*, deployment_group_name, templates, owning_identifier,
             datetime.now() + timedelta(minutes=uptime_minutes))
         vm_records = []
         # A cloud admission must stay live until its VMRecord commits, or the
-        # router idle step could stop the router under it (ruling C4).
+        # router idle step could stop the router under it.
         renewing = (nullcontext(set()) if backend_name == BACKEND_PROXMOX else
                     _heartbeat_deployment_reservations(
                         created_vms, vmid_reservation_id))
@@ -1386,7 +1388,7 @@ def create_vm():
                 # An unreachable cluster fails a Proxmox deploy here, as it
                 # always has. A cloud bundle on a portal with Proxmox enabled
                 # still opens a connection later, in deploy_bundle, so its
-                # VMIDs avoid manually created Proxmox guests (ruling I19).
+                # VMIDs avoid manually created Proxmox guests.
                 get_proxmox_connection()
 
             # Pre-flight: detect an already-fully-deployed state (idempotent

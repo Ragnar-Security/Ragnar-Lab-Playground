@@ -40,8 +40,8 @@ The real values live in the operator's notes, never in this repository.
 
 ### Boundary
 
-There is no dedicated staging node; the instructor approved the isolated bridge on an existing
-production node. So staging is **network-isolated, not resource-isolated**:
+There is no dedicated staging node; the isolated bridge lives on an existing production node. So
+staging is **network-isolated, not resource-isolated**:
 
 - **Isolated:** lab traffic. The staging bridge has no physical port, so a staging lab VM's only
   router is the staging jumpbox. The jumpbox's lab egress table (installed by every
@@ -74,7 +74,7 @@ VMIDs until a reset (section 7), so a range of *n* VMIDs holds ⌊*n*/4⌋ runs 
 On a node, before anything is created. VMIDs are a cluster-wide namespace, so every check reads
 `/cluster/resources`: a node's own `qm list` does not show a VMID that is in use on another node.
 Each check prints its own `ok`, and all thirteen must print. Otherwise choose other values with the
-instructor.
+site owner.
 
 ```bash
 pvesh get /cluster/resources --type vm --output-format json | python3 -c '
@@ -148,7 +148,7 @@ trusting the exit code. If the diff shows anything but the one new warning, rest
 before running anything else. If any `vmbr0*` line differs after `ifup`, run
 `ifdown <STAGING_BRIDGE>`, restore the backup file, compare again, and stop.
 
-To remove the bridge (instructor decision, only with no VM attached): `ifdown <STAGING_BRIDGE>`,
+To remove the bridge (the site owner's decision, only with no VM attached): `ifdown <STAGING_BRIDGE>`,
 restore `/root/interfaces.before-staging-bridge`, then repeat the two `vmbr0*` diffs.
 
 ## 3. The staging VPN VM
@@ -522,7 +522,7 @@ Portal commands run in the staging checkout on `<STAGING_PORTAL_HOST>`.
   4. Run `docker compose -f docker-compose.yml -f docker-compose.local.yml up -d` (`init_db.py`
      reseeds `zz-a`/`zz-b`), then section 6 again.
   5. On the jumpbox, `jumpbox_configure.sh --apply` must report every file unchanged.
-- **Remove** (instructor decision only): `qm destroy` both VMs and the template; remove the token,
+- **Remove** (the site owner's decision only): `qm destroy` both VMs and the template; remove the token,
   user, roles and pool (`pveum user delete staging-portal@pve`, `pveum role delete Staging…`,
   `pveum pool delete <STAGING_POOL>` after removing the template from it); then remove the bridge as
   in section 2.

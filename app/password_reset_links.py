@@ -18,7 +18,7 @@ from .models import PasswordResetToken, User, db
 
 
 def _now():
-    # Naive local time, like every other column (see CLAUDE.md conventions).
+    # Naive local time, like every other column (see CONTRIBUTING.md conventions).
     return datetime.now()
 
 

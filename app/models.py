@@ -18,7 +18,7 @@ def _iso_local(value):
     """ISO-8601 with an explicit UTC offset, or None.
 
     Every datetime column here is written with `datetime.now()` (naive,
-    host-local — see CLAUDE.md). `.astimezone()` on a naive value assumes
+    host-local — see CONTRIBUTING.md). `.astimezone()` on a naive value assumes
     the host timezone and attaches its offset, which is what the browser
     needs in order to parse the instant correctly. Serializing a bare
     naive string makes JS reinterpret it in the *viewer's* timezone.

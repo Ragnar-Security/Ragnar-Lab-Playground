@@ -160,7 +160,8 @@ def select_live_skip_reason(marker_names: AbstractSet[str],
                             environ: Mapping[str, str]) -> Optional[str]:
     """The one skip decision for a collected item. A cloud marker selects
     only that provider's guard; the Proxmox guard applies only to `live`
-    items that carry no cloud marker (ruling I15)."""
+    items that carry no cloud marker, so LIVE_PROXMOX never skips a cloud
+    run."""
     clouds = [backend for backend, marker in CLOUD_MARKERS.items()
               if marker in marker_names]
     for backend in clouds:

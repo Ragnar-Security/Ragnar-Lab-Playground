@@ -31,6 +31,8 @@ Start here to get the application up and running:
 - **[RELEASING.md](RELEASING.md)** - Maintainer checklist for cutting a `vX.Y.Z` release
 
 ### Development
+- **[CONTRIBUTING.md](../CONTRIBUTING.md)** - Repository rules, conventions, test commands and the change → test → review → commit workflow
+
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** - Comprehensive development guide
   - Local setup with Docker
   - Hot reload configuration
@@ -127,9 +129,10 @@ Start here to get the application up and running:
 4. [CLOUD_BACKENDS.md](CLOUD_BACKENDS.md) - Only when placing labs on AWS or Google Cloud
 
 ### "I want to develop/contribute"
-1. [DEVELOPMENT.md](DEVELOPMENT.md) - Development setup
-2. [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) - Code architecture
-3. [../README.md](../README.md) - Project overview
+1. [../CONTRIBUTING.md](../CONTRIBUTING.md) - Repository rules and workflow
+2. [DEVELOPMENT.md](DEVELOPMENT.md) - Development setup
+3. [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) - Code architecture
+4. [../README.md](../README.md) - Project overview
 
 ### "I need to configure authentication"
 1. [AUTHENTICATION.md](AUTHENTICATION.md) - System overview

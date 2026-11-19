@@ -11,10 +11,12 @@ transient error can never retire a record whose instance still bills.
 
 Networks are identified the same way: a slot subnet and a deployment
 security group are this site's only while their identity tags say so, and
-every reuse or delete re-reads them first. Lock scope belongs to the caller
-(ruling C4): the slot and router methods here never take a lifecycle lock.
+every reuse or delete re-reads them first. Lock scope belongs to the caller:
+the slot and router methods here never take a lifecycle lock, because the
+admission reservation, not a lock held across create(), keeps a router or
+slot from being stopped under a launch.
 
-Configuration is read as `config.<NAME>` at call time (ruling I8): this
+Configuration is read as `config.<NAME>` at call time, never at import: this
 module is imported lazily by the registry factory, and a module-level
 `from app.config import ...` would also defeat tests that patch config.
 """
@@ -259,7 +261,8 @@ class AWSBackend:
     # Networks. A slot subnet exists from ensure_slot until release_slot; a
     # deployment's group is created by its first launch and removed by
     # cleanup_deployment. Both are tagged at creation (never in a later
-    # call), so a crash can never leave one unattributable or ageless (C2).
+    # call), so a crash can never leave one unattributable or ageless: EC2
+    # reports no creation time, and the sweeper never deletes an untimed one.
 
     def _tagged(self, kind: _NetworkKind, pairs: dict) -> list:
         """Every `kind` carrying `pairs`, from one fresh paginated read."""
@@ -557,7 +560,7 @@ class AWSBackend:
     def _resolve_network(self, spec: VMSpec) -> Tuple[str, str]:
         """The production resolver: the slot subnet ensure_slot made, and
         the deployment's group, created or reused. A slot released since
-        ensure_slot raises SlotNetworkMissing so create_vm re-ensures it (I3)."""
+        ensure_slot raises SlotNetworkMissing so create_vm re-ensures it once."""
         subnet = self._own_subnet(spec.network_slot)
         if subnet is None:
             raise SlotNetworkMissing(
@@ -839,8 +842,8 @@ class AWSBackend:
 
     def _resolve(self, ref: VMRef, *, placement: bool = True) -> _Resolution:
         """A fresh describe of the instance `ref` names. Location is never
-        consulted: a survivor may carry location='aws' (T8). Placement is
-        judged unless the caller only displays the result."""
+        consulted: a survivor may carry location='aws' rather than a zone.
+        Placement is judged unless the caller only displays the result."""
         if ref.provider_id is not None:
             return self._describe_id(ref.provider_id, self._expected_tags(ref),
                                      placement=placement)
@@ -973,7 +976,7 @@ class AWSBackend:
             resources.append(ManagedResource(
                 backend=BACKEND_AWS, kind=KIND_DEPLOYMENT_NETWORK,
                 provider_id=group['GroupId'], name=group.get('GroupName', ''),
-                # The 16-character key on both clouds (ruling C1).
+                # The 16-character key, as on GCP, whose firewall names fit no more.
                 deployment_id=deployment_key(deployment) if deployment else None,
                 created_at_epoch=_created_epoch(tags)))
         for subnet in self._tagged(_SUBNETS, {TAG_SITE: site, TAG_KIND: KIND_SLOT_NETWORK}):
@@ -1027,6 +1030,6 @@ class AWSBackend:
         pairs = {TAG_SITE: _config().LAB_SITE_ID, TAG_KIND: resource.kind}
         if resource.network_slot is not None:
             pairs[TAG_SLOT] = str(resource.network_slot)
-        # A listed group carries the 16-character key (ruling C1).
+        # A listed group carries the 16-character key, which is what this compares.
         self._delete_owned_network(kind, resource.provider_id, pairs,
                                    key=resource.deployment_id)

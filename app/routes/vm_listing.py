@@ -38,8 +38,8 @@ class _RenderBackends:
     """Each record's backend for one render, on one connection per backend.
 
     A Proxmox render must stay one login and one cluster read however many
-    VMs it shows (ruling C5). A backend that cannot be resolved or reached —
-    one later removed from ENABLED_BACKENDS included (ruling I18) — answers
+    VMs it shows, not one per VM. A backend that cannot be resolved or
+    reached — one later removed from ENABLED_BACKENDS included — answers
     None, and its VMs are listed unverified with their records kept.
     """
 

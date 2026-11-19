@@ -1102,11 +1102,12 @@ def set_student_tags(app, entry, internal):
 
 def serve_empty_proxmox():
     """With Proxmox enabled the VMID allocator reads its inventory even for a
-    cloud bundle (ruling I19); an empty fake cluster answers that read."""
+    cloud bundle, to avoid hand-made guests; an empty fake cluster answers
+    that read."""
     register_backend_factory('proxmox', lambda: ProxmoxBackend(client=FakeProxmox()))
 
 
-# Catches the Proxmox-only VLAN gate still deciding a tagged cloud deployment (I9):
+# Catches the Proxmox-only VLAN gate still deciding a tagged cloud deployment:
 # the gate is forced to refuse, yet the cloud deploy with valid slot tags must succeed.
 def test_create_cloud_group_succeeds_when_the_proxmox_vlan_gate_would_refuse(
         app, student_client):
@@ -1136,7 +1137,7 @@ def test_create_proxmox_group_still_obeys_the_vlan_gate(app, student_client):
         assert VMIDReservation.query.count() == 0
 
 
-# Catches a cloud deploy reaching allocation with no slot identity (I9).
+# Catches a cloud deploy reaching allocation with no slot identity.
 @pytest.mark.parametrize('entry,internal,missing', [
     (None, 201, 'entry_vlan_tag'),
     (101, None, 'internal_vlan_tag'),
@@ -1156,7 +1157,7 @@ def test_create_cloud_refuses_owner_without_slot_tags(
         assert VMIDReservation.query.count() == 0
 
 
-# Catches the reorder changing the existing Proxmox missing-VLAN behaviour (M5).
+# Catches the cloud checks changing the existing Proxmox missing-VLAN behaviour.
 def test_create_proxmox_group_still_refuses_missing_vlans(app, student_client):
     set_student_tags(app, None, None)
     with patch('app.routes.vm_creation.load_template_config',
@@ -1168,7 +1169,7 @@ def test_create_proxmox_group_still_refuses_missing_vlans(app, student_client):
         assert VMIDReservation.query.count() == 0
 
 
-# Catches the spec's "not found" not being reported first for a user without
+# Catches "not found" not being reported first for a user without
 # VLANs, now that the group is read before the Proxmox-only VLAN gate.
 def test_create_unknown_group_reports_not_found_before_missing_vlans(app, student_client):
     set_student_tags(app, None, None)
@@ -1179,7 +1180,7 @@ def test_create_unknown_group_reports_not_found_before_missing_vlans(app, studen
 
 
 # Catches an unknown/disabled/mixed group reaching allocation or provider calls;
-# the refusal carries the template validation error the admin must fix (M12).
+# the refusal carries the template validation error the admin must fix.
 @pytest.mark.parametrize('catalog,reason', [
     (unknown_backend_catalog(), "unknown backend 'azure'"),
     (disabled_backend_catalog(), "backend 'aws' is not enabled"),
@@ -1200,8 +1201,8 @@ def test_create_refuses_invalid_backend_before_allocation(
         assert VMRecord.query.count() == 0
 
 
-# Catches a flat legacy catalog deploying on anything but Proxmox (a call
-# recording by nature, ruling M17).
+# Catches a flat legacy catalog deploying on anything but Proxmox (asserted on
+# the recorded call, because no state records the choice).
 def test_create_flat_legacy_catalog_deploys_on_proxmox(app, student_client):
     with patch('app.routes.vm_creation.load_template_config',
                return_value=valid_proxmox_catalog()), patch(

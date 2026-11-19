@@ -203,7 +203,7 @@ class ListCallCountTests(unittest.TestCase):
 
     def _list(self, proxmox):
         # Where ProxmoxBackend opens its connection: the real backend runs,
-        # so the counts below are what a production render costs (C5).
+        # so the counts below are what a production render costs.
         with patch('app.proxmox_service.get_proxmox_connection',
                    return_value=proxmox), \
              patch('app.routes.vm_listing.load_template_config',

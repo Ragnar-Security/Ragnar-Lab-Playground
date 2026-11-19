@@ -557,7 +557,7 @@ def test_destroy_stops_deletes_and_confirms_absence():
     assert run.owned_vmids() == []
 
 
-# --- the listed name lags a clone (LIVE-REPORT I1) ------------------------------
+# --- the listed name lags a clone (measured live) --------------------------------
 # /cluster/resources reports a fresh clone's name empty for ~10 s, or as the
 # previous guest's at a reused VMID. Every guard used to read it at once and
 # refused (and so leaked) the run's own guests.

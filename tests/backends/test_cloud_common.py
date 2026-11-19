@@ -52,14 +52,14 @@ def test_lock_keys_refuse_unknown_backend():
         slot_lock_key('proxmox', 1)
 
 
-# Catches the sweeper comparing a 16-character firewall key with 32-character ids (C1).
+# Catches the sweeper comparing a 16-character firewall key with 32-character ids.
 def test_deployment_key_is_the_name_suffix_and_idempotent():
     assert deployment_key('0123456789abcdef' * 2) == '0123456789abcdef'
     assert deployment_key(deployment_key('f' * 32)) == 'f' * 16
     assert deployment_network_name('site-a', 'f' * 32).endswith('-d-' + deployment_key('f' * 32))
 
 
-# Catches leaked SGs/subnets being unsweepable for lack of a creation time (C2).
+# Catches leaked SGs/subnets being unsweepable for lack of a creation time.
 def test_created_tag_key_is_fixed():
     assert TAG_CREATED == 'lab-playground-created'
 
