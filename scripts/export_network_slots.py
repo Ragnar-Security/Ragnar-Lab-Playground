@@ -67,7 +67,7 @@ def collect_network_slots() -> Dict[str, Any]:
             "enabled_backends": list(config.ENABLED_BACKENDS),
             "aws_lab_cidr": config.AWS_LAB_CIDR,
             "gcp_lab_cidr": config.GCP_LAB_CIDR,
-            "jumpbox_vlan_bands": config.JUMPBOX_VLAN_BANDS,
+            "vlan_bands": config.VLAN_BANDS,
         },
         "users": users,
         "groups": groups,

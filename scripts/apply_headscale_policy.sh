@@ -6,17 +6,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/site_env.sh"
+source "$SCRIPT_DIR/headscale_peers.sh"
 
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR \
-    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT VLAN_BANDS
 for name in PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR; do
     require_site_var "$name"
 done
 
 HEADSCALE_BASE_POLICY="${HEADSCALE_BASE_POLICY:-config/headscale-acl.json}"
 HEADSCALE_POLICY_FILE="${HEADSCALE_POLICY_FILE:-/etc/headscale/acl.json}"
+# Seconds to wait for the jumpbox to list every roster device after a reload.
+JUMPBOX_PEER_WAIT="${JUMPBOX_PEER_WAIT:-60}"
+[[ "$JUMPBOX_PEER_WAIT" =~ ^[0-9]+$ ]] \
+    || { printf 'ERROR: JUMPBOX_PEER_WAIT must be a number of seconds\n' >&2; exit 1; }
 [[ "$HEADSCALE_BASE_POLICY" == /* ]] || HEADSCALE_BASE_POLICY="$REPO_ROOT/$HEADSCALE_BASE_POLICY"
 for name in HEADSCALE_DIR HEADSCALE_POLICY_FILE; do
     [[ "${!name}" == /* ]] \
@@ -37,18 +42,39 @@ else
     PYTHON="$(command -v python || true)"
 fi
 POLICY_TOOL="$SCRIPT_DIR/headscale_policy.py"
+NETGEN="$SCRIPT_DIR/jumpbox_netgen.py"
+# The jumpbox routes the bands scripts/site.env gives jumpbox_configure.sh;
+# the policy grants the bands the portal exports. Both must be one layout,
+# or students are granted networks the jumpbox does not route.
+SITE_BANDS_PY='import importlib.util,json,sys
+spec = importlib.util.spec_from_file_location("jumpbox_netgen", sys.argv[2])
+netgen = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(netgen)
+site = " ".join((sys.argv[3] or netgen.DEFAULT_BANDS).split())
+with open(sys.argv[1], encoding="utf-8") as handle:
+    portal = (json.load(handle).get("config") or {}).get("vlan_bands")
+if not isinstance(portal, str):
+    raise SystemExit("the portal export has no config.vlan_bands")
+portal = " ".join(portal.split())
+if portal != site:
+    raise SystemExit("the portal exports VLAN_BANDS \"" + portal + "\" but the jumpbox layout "
+                     "(VLAN_BANDS in scripts/site.env, else the default) is \"" + site + "\"")'
 APPLY=0
+PREFLIGHT=0
 TMP_DIR=""
 
 usage() {
     cat <<'EOF'
-Usage: scripts/apply_headscale_policy.sh [--apply]
+Usage: scripts/apply_headscale_policy.sh [--apply | --preflight]
 
 Render the Headscale policy that lets each roster student reach only their
 own lab networks, their group's networks and the running KOTH arena.
 
 The roster, VLANs, enabled backends, lab CIDRs and VLAN bands are exported
-from the running portal. The operator's base policy (HEADSCALE_BASE_POLICY)
+from the running portal. With the proxmox backend, the exported VLAN_BANDS
+must equal the jumpbox's (VLAN_BANDS in scripts/site.env, else the default)
+or the run refuses before contacting Headscale.
+The operator's base policy (HEADSCALE_BASE_POLICY)
 supplies every other section and rule; its blanket "autogroup:member" rule
 is cut down to its autogroup:self part, and any other rule whose src
 includes autogroup:member or "*" must grant only autogroup:self or the
@@ -58,6 +84,16 @@ The default dry run reads both hosts, prints the change, and writes nothing.
 Use --apply to check the policy inside the Headscale container, back up the
 current file, install the new one atomically, signal Headscale to reload it,
 and verify the read-back (restarting the headscale service once if it differs).
+With the proxmox backend enabled, --apply then checks over SSH (JUMPBOX_SSH,
+required) that the jumpbox lists every roster device as a peer, waiting up to
+JUMPBOX_PEER_WAIT seconds; if any is missing it restarts Headscale once and
+checks again, and fails if one still is. A portal without the proxmox backend
+has no jumpbox, and the check is skipped.
+
+--preflight reads the portal export and checks only what --apply will need:
+with the proxmox backend, that JUMPBOX_SSH is set, answers over SSH, and
+reports a Running Tailscale. It changes nothing and does not contact
+Headscale. term_changeover.sh --apply runs it before its first stage.
 EOF
 }
 
@@ -76,11 +112,13 @@ trap cleanup EXIT
 while (($#)); do
     case "$1" in
         --apply) APPLY=1 ;;
+        --preflight) PREFLIGHT=1 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown argument: $1" ;;
     esac
     shift
 done
+((APPLY == 0 || PREFLIGHT == 0)) || die "--apply and --preflight are separate runs."
 
 [[ -x "$PYTHON" ]] || die "Python not found: $PYTHON"
 [[ -f "$POLICY_TOOL" ]] || die "Policy renderer not found: $POLICY_TOOL"
@@ -103,11 +141,6 @@ host = best[1].rstrip("/") + target[len(best[0]):]
 if not re.fullmatch(r"/[A-Za-z0-9._/@+-]+", host):
     raise SystemExit("the host path of the policy file has unsupported characters")
 print(host)'
-
-fetch_slots() {
-    ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" \
-        "docker exec '$PORTAL_APP_CONTAINER' python scripts/export_network_slots.py"
-}
 
 fetch_policy() {
     ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" \
@@ -179,23 +212,61 @@ reload_headscale() {
         || die "Could not signal Headscale to reload its policy."
 }
 
-restart_headscale() {
-    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "cd '$HEADSCALE_DIR' &&
-        docker compose restart headscale >/dev/null &&
-        for attempt in \$(seq 1 30); do
-            docker compose exec -T headscale headscale policy get >/dev/null 2>&1 && exit 0
-            sleep 1
-        done
-        exit 1" || die "Headscale did not come back after the restart."
+verify_jumpbox_peers() {
+    local missing=""
+    if ((PROXMOX_ENABLED == 0)); then
+        printf '  Proxmox jumpbox peer check skipped: proxmox backend not enabled.\n'
+        return 0
+    fi
+    fetch_nodes > "$TMP_DIR/nodes.json" || die "Could not list Headscale's nodes."
+    if ! wait_for_peers; then
+        printf '  the jumpbox does not list these roster devices as peers; restarting Headscale once:\n'
+        sed 's/^/    /' <<< "$missing"
+        restart_headscale
+        wait_for_peers || die "After one Headscale restart the jumpbox ($JUMPBOX_SSH) still does not list" \
+            "these roster devices as peers, so their students cannot reach their labs:" \
+            "${missing//$'\n'/; }." \
+            "Check 'headscale nodes list-routes' and 'tailscale debug netmap' on the jumpbox."
+    fi
+    printf '  verified: the jumpbox lists every roster device as a peer.\n'
 }
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/headscale-policy.XXXXXX")"
 chmod 700 "$TMP_DIR"
 
-printf 'Headscale policy: %s\n' "$([[ "$APPLY" == 1 ]] && printf APPLY || printf 'DRY RUN (read-only)')"
+mode="DRY RUN (read-only)"
+((APPLY == 0)) || mode=APPLY
+((PREFLIGHT == 0)) || mode="PREFLIGHT (read-only)"
+printf 'Headscale policy: %s\n' "$mode"
 fetch_slots > "$TMP_DIR/slots.json" || die "Could not export network slots from the portal."
 "$PYTHON" "$POLICY_TOOL" render "$HEADSCALE_BASE_POLICY" "$TMP_DIR/slots.json" > "$TMP_DIR/desired.json" \
     || die "Could not render the Headscale policy."
+# The jumpbox serves only the Proxmox labs; a cloud-only portal has none to check.
+PROXMOX_ENABLED="$(proxmox_enabled "$TMP_DIR/slots.json")" \
+    || die "Could not read the enabled backends from the portal's export."
+if ((PROXMOX_ENABLED)); then
+    "$PYTHON" -c "$SITE_BANDS_PY" "$TMP_DIR/slots.json" "$NETGEN" "${VLAN_BANDS:-}" \
+        || die "Set the same VLAN_BANDS in the portal's .env and scripts/site.env (then re-run jumpbox_configure.sh) before applying the policy."
+fi
+
+# What --apply needs before it may change anything, checked on its own so that
+# term_changeover.sh can run it before its first destructive stage.
+if ((PREFLIGHT)); then
+    if ((PROXMOX_ENABLED == 0)); then
+        printf '  Proxmox jumpbox peer check skipped: proxmox backend not enabled.\n'
+    else
+        require_site_var JUMPBOX_SSH
+        read_jumpbox_status
+        state="$(jumpbox_backend_state)"
+        [[ "$state" == Running ]] \
+            || die "The jumpbox's Tailscale ($JUMPBOX_SSH) is $state, not Running: no student can reach a lab, and the policy stage's peer check would fail. Bring it up first."
+        printf '  ready: the jumpbox (%s) answers and its Tailscale is Running.\n' "$JUMPBOX_SSH"
+    fi
+    printf '  preflight passed: --apply can apply and check the policy.\n'
+    exit 0
+fi
+# Before any change: with Proxmox, a reload nothing can check is never applied.
+((APPLY == 0 || PROXMOX_ENABLED == 0)) || require_site_var JUMPBOX_SSH
 
 changes="$(policy_changes)"
 if [[ -z "$changes" ]]; then
@@ -210,6 +281,7 @@ if [[ -z "$changes" ]]; then
     check_policy
     reload_headscale
     printf '  signalled Headscale to reload that file.\n'
+    verify_jumpbox_peers
     exit 0
 fi
 printf '%s\n' "$changes"
@@ -230,3 +302,4 @@ if [[ -n "$readback" ]]; then
     [[ -z "$readback" ]] || die "The policy file Headscale serves still differs after one restart."
 fi
 printf '  verified: the policy file Headscale serves matches the rendered one.\n'
+verify_jumpbox_peers

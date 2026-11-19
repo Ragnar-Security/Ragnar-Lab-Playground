@@ -157,8 +157,8 @@ class User(db.Model):
         email (str): Optional email address
         full_name (str): Full name of the student
         is_admin (bool): Whether the user has admin privileges
-        entry_vlan_tag (int): Entry point VLAN tag (100-200), IP: 10.0.<vlan>.x
-        internal_vlan_tag (int): Internal VLAN tag (200-300) for all VMs
+        entry_vlan_tag (int): Entry point VLAN tag, from the entry band of VLAN_BANDS
+        internal_vlan_tag (int): Internal VLAN tag for all VMs, from the internal band of VLAN_BANDS
         created_at (datetime): When the account was created
         last_login (datetime): Last login timestamp
     """
@@ -171,8 +171,8 @@ class User(db.Model):
     email = db.Column(db.String(255))
     full_name = db.Column(db.String(255))
     is_admin = db.Column(db.Boolean, default=False, nullable=False, index=True)
-    entry_vlan_tag = db.Column(db.Integer, unique=True, nullable=True, index=True)  # Entry point VLAN (100-200), IP: 10.0.<vlan>.x
-    internal_vlan_tag = db.Column(db.Integer, unique=True, nullable=True, index=True)  # Internal VLAN (200-300) for all VMs
+    entry_vlan_tag = db.Column(db.Integer, unique=True, nullable=True, index=True)  # Entry point VLAN (entry band of VLAN_BANDS)
+    internal_vlan_tag = db.Column(db.Integer, unique=True, nullable=True, index=True)  # Internal VLAN for all VMs (internal band of VLAN_BANDS)
     headscale_key = db.Column(db.String(255), nullable=True)  # Headscale/Tailscale auth key
     created_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
     last_login = db.Column(db.DateTime)
@@ -236,8 +236,8 @@ class StudentWhitelist(db.Model):
     full_name = db.Column(db.String(255))
     student_id = db.Column(db.String(100))
     section = db.Column(db.String(100))
-    entry_vlan_tag = db.Column(db.Integer, unique=True, nullable=True)  # Pre-assigned entry VLAN (100-200)
-    internal_vlan_tag = db.Column(db.Integer, unique=True, nullable=True)  # Pre-assigned internal VLAN (200-300)
+    entry_vlan_tag = db.Column(db.Integer, unique=True, nullable=True)  # Pre-assigned entry VLAN (entry band of VLAN_BANDS)
+    internal_vlan_tag = db.Column(db.Integer, unique=True, nullable=True)  # Pre-assigned internal VLAN (internal band of VLAN_BANDS)
     headscale_key = db.Column(db.String(255), nullable=True)  # Headscale/Tailscale auth key
     added_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
 
@@ -950,3 +950,16 @@ class PasswordResetFailure(db.Model):
         Index('ix_password_reset_failures_key', 'scope', 'key_hash', 'failed_at'),
         Index('ix_password_reset_failures_failed_at', 'failed_at'),
     )
+
+
+class VlanLayoutRecord(db.Model):
+    """The VLAN_BANDS layout the stored student pairs were numbered under:
+    one row (id 1), holding the canonical band string. Startup compares it
+    with the configured VLAN_BANDS, so a layout change that would move a
+    student's networks cannot take effect silently;
+    scripts/accept_vlan_layout.py records a new one between terms."""
+    __tablename__ = 'vlan_layout_record'
+
+    id = db.Column(db.Integer, primary_key=True)
+    bands = db.Column(db.String(1024), nullable=False)
+    recorded_at = db.Column(db.DateTime, nullable=False, default=datetime.now)

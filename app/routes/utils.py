@@ -20,12 +20,6 @@ logger = logging.getLogger(__name__)
 # the box from spamming us via /koth/claim with a multi-megabyte file.
 _GUEST_FILE_MAX_BYTES = 4096
 
-# VLAN management constants
-ENTRY_VLAN_MIN = 100
-ENTRY_VLAN_MAX = 200
-INTERNAL_VLAN_MIN = 200
-INTERNAL_VLAN_MAX = 300
-
 # Track config issue alerts to prevent spam (vmid -> timestamp)
 _config_issue_alerts_sent = {}
 

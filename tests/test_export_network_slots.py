@@ -9,7 +9,7 @@ from app.models import KothGame, StudentGroup, StudentGroupMember, StudentWhitel
 from scripts import export_network_slots
 from scripts.export_network_slots import collect_network_slots
 
-DEFAULT_BANDS = "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
+DEFAULT_BANDS = "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 
 
 @pytest.fixture
@@ -18,7 +18,7 @@ def portal_config(monkeypatch):
     monkeypatch.setattr(config, "ENABLED_BACKENDS", ("proxmox", "aws"))
     monkeypatch.setattr(config, "AWS_LAB_CIDR", "172.20.0.0/16")
     monkeypatch.setattr(config, "GCP_LAB_CIDR", "172.21.0.0/16")
-    monkeypatch.setattr(config, "JUMPBOX_VLAN_BANDS", DEFAULT_BANDS)
+    monkeypatch.setattr(config, "VLAN_BANDS", DEFAULT_BANDS)
     return config
 
 
@@ -62,7 +62,7 @@ def test_export_is_the_sorted_roster_groups_koth_and_portal_config(app, portal_c
                 "enabled_backends": ["proxmox", "aws"],
                 "aws_lab_cidr": "172.20.0.0/16",
                 "gcp_lab_cidr": "172.21.0.0/16",
-                "jumpbox_vlan_bands": DEFAULT_BANDS,
+                "vlan_bands": DEFAULT_BANDS,
             },
             "users": [
                 {"login": "alice", "entry_vlan": 105, "internal_vlan": 205},

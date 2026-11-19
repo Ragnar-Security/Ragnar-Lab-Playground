@@ -13,6 +13,7 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
+    missing_peers,
     normalize_login,
     parse_vlan_bands,
     policy_diff,
@@ -22,7 +23,7 @@ from scripts.headscale_policy import (
 
 ROOT = Path(__file__).resolve().parent.parent
 CLI = ROOT / "scripts" / "headscale_policy.py"
-DEFAULT_BANDS = "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
+DEFAULT_BANDS = "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
 BASE = json.loads((ROOT / "config" / "headscale-acl.example.json").read_text())
 CLOUDS = {"aws": "172.20.0.0/16", "gcp": "172.21.0.0/16"}
 SLOTS = {
@@ -30,7 +31,7 @@ SLOTS = {
         "enabled_backends": ["proxmox", "aws", "gcp"],
         "aws_lab_cidr": "172.20.0.0/16",
         "gcp_lab_cidr": "172.21.0.0/16",
-        "jumpbox_vlan_bands": DEFAULT_BANDS,
+        "vlan_bands": DEFAULT_BANDS,
     },
     "users": [
         {"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
@@ -41,11 +42,11 @@ SLOTS = {
     "koth": [],
 }
 DEFAULT_POLICY_BANDS = PolicyBands(tuple(parse_vlan_bands(DEFAULT_BANDS)), proxmox_enabled=True)
-# Own entry 100 plus the group's 300/400 -- never the user-internal slot 200.
+# Own entry 100 and internal 200 plus the group's 300/400.
 EXPECTED_ALICE_CIDRS = [
-    "10.100.0.0/24", "10.100.2.0/24", "10.100.4.0/24",
-    "172.20.25.0/26", "172.20.75.0/26", "172.20.100.0/26",
-    "172.21.25.0/26", "172.21.75.0/26", "172.21.100.0/26",
+    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24", "10.100.4.0/24",
+    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26", "172.20.100.0/26",
+    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26", "172.21.100.0/26",
 ]
 SELF_RULE = {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
 
@@ -54,8 +55,7 @@ def _forward(policy, login):
     return next(r for r in policy["acls"] if r["src"] == [login])
 
 
-# Catches a student reaching another student's networks, their own internal
-# VLAN, or losing the operator's base sections.
+# Catches a student reaching another student's networks, or losing the operator's base sections.
 def test_alice_reaches_exactly_her_entry_and_group_blocks_on_every_backend():
     base = copy.deepcopy(BASE)
     policy = render(base, SLOTS, DEFAULT_POLICY_BANDS, CLOUDS)
@@ -72,7 +72,7 @@ def test_alice_reaches_exactly_her_entry_and_group_blocks_on_every_backend():
                              "dst": ["alice@:*"]}
     # The blanket rule survives only as its autogroup:self part.
     assert [r for r in policy["acls"] if "autogroup:member" in r["src"]] == [SELF_RULE]
-    assert all("200" not in dst for dst in alice_forward["dst"])
+    assert not {"10.101.0.0/24:*", "10.101.1.0/24:*"} & set(alice_forward["dst"])
     assert "10.200.0.0/24" not in json.dumps(policy)
 
 
@@ -123,7 +123,7 @@ def test_every_roster_login_gets_non_ended_koth_blocks_on_proxmox_only():
 # A login whose only routed blocks are KOTH's gets the forward rule and no
 # reverse rule (an empty src would be an invalid policy).
 def test_a_login_with_only_koth_blocks_gets_no_reverse_rule():
-    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
+    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": [], "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*", "10.150.4.0/24:*"]
@@ -200,7 +200,7 @@ def test_other_base_sections_are_kept_verbatim():
 def test_policy_inputs_come_from_the_portal_export():
     bands, cidrs = policy_inputs({**SLOTS, "config": {
         "enabled_backends": ["aws"], "aws_lab_cidr": "172.20.0.0/16",
-        "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS}})
+        "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS}})
     assert bands.proxmox_enabled is False
     assert bands.values == tuple(parse_vlan_bands(DEFAULT_BANDS))
     assert cidrs == {"aws": "172.20.0.0/16"}
@@ -214,17 +214,27 @@ def test_policy_inputs_come_from_the_portal_export():
 @pytest.mark.parametrize("config", [
     None,
     {"enabled_backends": ["proxmox", "azure"], "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": "proxmox", "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": ["aws"], "gcp_lab_cidr": "172.21.0.0/16",
-     "jumpbox_vlan_bands": DEFAULT_BANDS},
+     "vlan_bands": DEFAULT_BANDS},
     {"enabled_backends": ["proxmox"], "aws_lab_cidr": "172.20.0.0/16",
-     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": "entry:1-2"},
+     "gcp_lab_cidr": "172.21.0.0/16", "vlan_bands": "entry:1-2"},
+    # The pre-VLAN_BANDS key is refused, not read.
+    {"enabled_backends": ["proxmox"], "aws_lab_cidr": "172.20.0.0/16",
+     "gcp_lab_cidr": "172.21.0.0/16", "jumpbox_vlan_bands": DEFAULT_BANDS},
 ])
 def test_policy_inputs_refuse_a_malformed_config(config):
     with pytest.raises(ValueError):
         policy_inputs({**SLOTS, "config": config})
+
+
+# Catches an empty backend list rendering a policy, which the apply script would
+# then read as "no Proxmox" and skip the jumpbox peer check for.
+def test_policy_inputs_refuse_an_empty_backend_list():
+    with pytest.raises(ValueError, match="enabled_backends is empty"):
+        policy_inputs({**SLOTS, "config": {**SLOTS["config"], "enabled_backends": []}})
 
 
 # Catches the policy churning (and Headscale restarting) because input order changed.
@@ -254,14 +264,14 @@ def test_group_membership_grants_only_that_groups_blocks():
     ]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "alice@")["dst"] == [
-        "10.100.0.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
+        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
     assert _forward(policy, "bob@")["dst"] == [
-        "10.101.0.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
+        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
 
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
 def test_student_with_no_routed_block_gets_no_rule():
-    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 250, "internal_vlan": 260}],
+    slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": []}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
     assert policy["acls"] == [BASE["acls"][0], SELF_RULE]
@@ -278,6 +288,10 @@ def _with(**changes):
                   {"login": "Alice", "entry_vlan": 101, "internal_vlan": 201}], groups=[]), {}),
     (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
                   {"login": "bob", "entry_vlan": 100, "internal_vlan": 201}], groups=[]), {}),
+    (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
+                  {"login": "bob", "entry_vlan": 101, "internal_vlan": 200}], groups=[]), {}),
+    (_with(users=[{"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
+                  {"login": "bob", "entry_vlan": 200, "internal_vlan": 201}], groups=[]), {}),
     (_with(groups=[{"slug": "red-team", "members": ["alice"], "entry_vlan": 101,
                     "internal_vlan": 400}]), {}),
     (_with(koth=[{"game_id": 1, "entry_vlan": 300, "internal_vlan": 450}]), {}),
@@ -295,6 +309,16 @@ def _with(**changes):
 def test_invalid_or_overlapping_inputs_are_refused(slots, clouds):
     with pytest.raises(ValueError):
         render(BASE, slots, DEFAULT_POLICY_BANDS, clouds)
+
+
+# Catches an internal VLAN granted on any backend where no band routes it.
+def test_internal_vlan_outside_every_band_is_not_granted():
+    bands = PolicyBands(tuple(parse_vlan_bands(
+        "entry:100-199:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4")),
+        proxmox_enabled=True)
+    dst = set(_forward(render(BASE, SLOTS, bands, CLOUDS), "alice@")["dst"])
+    assert "10.100.0.0/24:*" in dst
+    assert not {"10.100.1.0/24:*", "172.20.50.0/26:*", "172.21.50.0/26:*"} & dst
 
 
 @pytest.mark.parametrize("base", [{}, {"acls": {}}, {"acls": ["rule"]}, []])
@@ -356,3 +380,64 @@ def test_cli_diff_is_empty_when_equal_and_errors_go_to_stderr(tmp_path):
     assert result.returncode != 0
     assert result.stdout == ""
     assert "desired.json" in result.stderr
+
+
+# ---- missing-peers: the jumpbox's view after a reload ----------------------
+
+def _node(name, user, ip, expiry=-62135596800):
+    """One `headscale nodes list -o json` entry (v0.27), trimmed to what is read."""
+    return {"given_name": name, "user": {"name": user}, "ip_addresses": [ip, "fd7a:115c:a1e0::9"],
+            "expiry": {"seconds": expiry}}
+
+
+NODES = [_node("alice-laptop", "alice", "100.64.0.1"), _node("bob-laptop", "bob", "100.64.0.2"),
+         _node("jumpbox", "term-infrastructure", "100.64.0.3"), _node("prof", "instructor", "100.64.0.4")]
+
+
+def _status(*ips, state="Running"):
+    """`tailscale status --json` on the jumpbox, listing these peer addresses."""
+    return {"BackendState": state,
+            "Peer": {f"nodekey:{i}": {"HostName": f"h{i}", "TailscaleIPs": [ip]} for i, ip in enumerate(ips)}}
+
+
+# Catches a Headscale reload that leaves the subnet router without the students
+# the policy grants (measured on staging with v0.27.1: every student lost every lab).
+def test_missing_peers_names_roster_devices_the_jumpbox_does_not_list():
+    assert missing_peers(NODES, SLOTS, _status("100.64.0.1", "100.64.0.2", "100.64.0.4")) == []
+    assert missing_peers(NODES, SLOTS, _status("100.64.0.4")) == [
+        "alice-laptop (alice)", "bob-laptop (bob)"]
+    assert missing_peers(NODES, SLOTS, {"Peer": None}) == ["alice-laptop (alice)", "bob-laptop (bob)"]
+
+
+# Catches a stopped jumpbox passing the check: measured on staging, `tailscale
+# down` leaves BackendState "Stopped" with the last netmap's peers still listed.
+def test_missing_peers_counts_every_device_missing_unless_the_jumpbox_is_running():
+    for state in ("Stopped", "NeedsLogin", "Starting", None):
+        assert missing_peers(NODES, SLOTS, _status("100.64.0.1", "100.64.0.2", state=state)) == [
+            "alice-laptop (alice)", "bob-laptop (bob)"], state
+
+
+# Catches a false alarm (and a needless Headscale restart) for devices the
+# jumpbox is not meant to list: staff and infrastructure users, and expired nodes.
+def test_missing_peers_ignores_non_roster_and_expired_nodes():
+    nodes = [_node("jumpbox", "term-infrastructure", "100.64.0.3"),
+             _node("old", "alice", "100.64.0.8", expiry=1_000_000_000),
+             _node("Alice-Phone", "ALICE", "100.64.0.9")]
+    assert missing_peers(nodes, SLOTS, _status()) == ["Alice-Phone (ALICE)"]
+    assert missing_peers(nodes[:2], SLOTS, _status()) == []
+
+
+def test_missing_peers_refuses_malformed_input():
+    with pytest.raises(ValueError):
+        missing_peers({"nodes": NODES}, SLOTS, _status())
+    with pytest.raises(ValueError):
+        missing_peers(NODES, SLOTS, ["not", "a", "status"])
+
+
+def test_cli_missing_peers_prints_one_device_per_line(tmp_path):
+    paths = {}
+    for name, value in (("nodes", NODES), ("slots", SLOTS), ("status", _status("100.64.0.2"))):
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(value))
+    result = _cli("missing-peers", str(paths["nodes"]), str(paths["slots"]), str(paths["status"]))
+    assert (result.returncode, result.stdout) == (0, "alice-laptop (alice)\n")

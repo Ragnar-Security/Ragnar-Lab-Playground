@@ -6,6 +6,7 @@ Creates all necessary tables if they don't exist and initializes admin account
 import time
 import os
 import sys
+from typing import Optional
 
 # Add parent directory to path so we can import app
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -14,6 +15,7 @@ from app import create_app, db
 from app import production_policy
 from app.config import is_production
 from app.models import User, StudentWhitelist, VMRecord
+from app.vlan_allocator import VlanPoolExhausted, user_pair_for_index, vlan_layout
 from app.template_manager import TemplateConfigError
 from sqlalchemy import inspect
 
@@ -227,10 +229,14 @@ def create_test_student():
 
 
 
-def import_student_whitelist():
+def import_student_whitelist(csv_path: Optional[str] = None) -> None:
     """
     Import students from students_merged.csv when the whitelist is empty.
-    Look in /app/data/ for Docker or ./data/ for local use.
+    Without `csv_path`, look in ./data/ for local use or /app/data/ for Docker.
+
+    Students are numbered in file order with the per-student pairs of
+    VLAN_BANDS (entry.first+k / internal.first+k). A file with more students
+    than the entry band holds raises ValueError before any row is added.
     """
     import csv
 
@@ -239,64 +245,64 @@ def import_student_whitelist():
         print(f"✓ Student whitelist already populated ({existing_count} entries)")
         return
 
-    data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
+    if csv_path is None:
+        data_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 
-    possible_paths = [
-        os.path.join(data_dir, 'students_merged.csv'),
-        '/app/data/students_merged.csv',
-    ]
+        possible_paths = [
+            os.path.join(data_dir, 'students_merged.csv'),
+            '/app/data/students_merged.csv',
+        ]
 
-    csv_path = None
-    for path in possible_paths:
-        if os.path.exists(path):
-            csv_path = path
-            break
+        for path in possible_paths:
+            if os.path.exists(path):
+                csv_path = path
+                break
 
     if not csv_path:
         print("⚠️  No students_merged.csv file found. The student whitelist is empty.")
         return
 
-    # Determine next available VLAN offset (in case some students already exist)
-    max_entry_vlan = db.session.query(db.func.max(StudentWhitelist.entry_vlan_tag)).scalar() or 99
-    vlan_offset = max(max_entry_vlan - 100 + 1, 0)
-
-    imported_count = 0
+    new_rows = []
+    seen = set()
     with open(csv_path, 'r', encoding='utf-8') as csvfile:
-        reader = csv.DictReader(csvfile)
-
-        for row in reader:
+        for row in csv.DictReader(csvfile):
             login_id = row.get('SIS Login ID', '').strip().lower()
-            sis_user_id = row.get('SIS User ID', '').strip()
-            full_name = row.get('Student', '').strip() if 'Student' in row else None
-            headscale_key = row.get('headscale_key', '').strip()
-
-            if not login_id:
+            if not login_id or login_id in seen:
                 continue
+            seen.add(login_id)
+            new_rows.append((login_id, row))
 
-            existing = StudentWhitelist.query.filter_by(login_id=login_id).first()
-            if existing:
-                continue
+    pairs = []
+    try:
+        for k in range(len(new_rows)):
+            pairs.append(user_pair_for_index(k))
+    except VlanPoolExhausted:
+        raise ValueError(
+            f"{csv_path} has {len(new_rows)} students; the per-student VLAN pool "
+            f"holds {vlan_layout().roster_max}"
+        ) from None
 
-            entry_vlan = 100 + vlan_offset
-            internal_vlan = 200 + vlan_offset
-            vlan_offset += 1
+    for (login_id, row), (entry_vlan, internal_vlan) in zip(new_rows, pairs):
+        sis_user_id = row.get('SIS User ID', '').strip()
+        full_name = row.get('Student', '').strip() if 'Student' in row else None
+        headscale_key = row.get('headscale_key', '').strip()
 
-            student = StudentWhitelist(
-                login_id=login_id,
-                sis_user_id=sis_user_id,
-                full_name=full_name,
-                entry_vlan_tag=entry_vlan,
-                internal_vlan_tag=internal_vlan,
-                headscale_key=headscale_key or None,
-            )
-            db.session.add(student)
-            key_info = f", headscale key: {'yes' if headscale_key else 'no'}"
-            print(f"  Added {login_id} (entry VLAN: {entry_vlan}, internal VLAN: {internal_vlan}{key_info})")
-            imported_count += 1
+        student = StudentWhitelist(
+            login_id=login_id,
+            sis_user_id=sis_user_id,
+            full_name=full_name,
+            entry_vlan_tag=entry_vlan,
+            internal_vlan_tag=internal_vlan,
+            headscale_key=headscale_key or None,
+        )
+        db.session.add(student)
+        key_info = f", headscale key: {'yes' if headscale_key else 'no'}"
+        print(f"  Added {login_id} (entry VLAN: {entry_vlan}, internal VLAN: {internal_vlan}{key_info})")
 
     db.session.commit()
-    print(f"✓ Imported {imported_count} students into whitelist from {csv_path}")
-    print(f"  VLAN range: entry 100-{99 + vlan_offset}, internal 200-{199 + vlan_offset}")
+    print(f"✓ Imported {len(new_rows)} students into whitelist from {csv_path}")
+    if pairs:
+        print(f"  VLAN range: entry {pairs[0][0]}-{pairs[-1][0]}, internal {pairs[0][1]}-{pairs[-1][1]}")
 
 
 

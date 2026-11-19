@@ -749,6 +749,30 @@ def test_proxmox_bundle_nic_layout(app, proxmox_portal, template, entry, expecte
     assert record.network_slot == (101 if entry else 201)
 
 
+# Catches the plain machine of a two-machine individual lab (an AD DC) gaining
+# a second NIC, whatever order the templates are listed in.
+@pytest.mark.parametrize('order', [('srv01', 'dc01'), ('dc01', 'srv01')])
+def test_proxmox_two_machine_bundle_keeps_the_plain_machine_single_homed(
+        app, proxmox_portal, order):
+    machines = {'srv01': _qemu('srv01', entry_point=True), 'dc01': _qemu('dc01')}
+    records = _deploy(app, [machines[name] for name in order])
+    nics = {r.is_entry_point: proxmox_portal.guests[r.vmid]['config'] for r in records}
+    assert (nics[True].get('net0'), nics[True].get('net1')) == (
+        'virtio,bridge=vmbr0,tag=101', 'virtio,bridge=vmbr0,tag=201')
+    assert (nics[False].get('net0'), nics[False].get('net1'), nics[False].get('delete')) == (
+        'virtio,bridge=vmbr0,tag=201', None, 'net1')
+
+
+# Catches a NIC left on vmbr0 when the portal runs on an isolated bridge.
+def test_lab_bridge_replaces_vmbr0_on_every_nic(app, proxmox_portal, monkeypatch):
+    monkeypatch.setattr(config, 'LAB_BRIDGE', 'vmbrtest')
+    records = _deploy(app, [_qemu('srv01', entry_point=True), _qemu('dc01'), _lxc('ct')])
+    nets = [value for r in records
+            for key, value in proxmox_portal.guests[r.vmid]['config'].items() if key.startswith('net')]
+    assert len(nets) == 4
+    assert all('bridge=vmbrtest' in v for v in nets) and not any('vmbr0' in v for v in nets)
+
+
 # Catches a failed VMRecord commit leaving half a bundle recorded, or its
 # guests and leases behind.
 def test_proxmox_bundle_rolls_back_atomically_when_staging_fails(app, proxmox_portal):

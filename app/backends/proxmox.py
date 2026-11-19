@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Callable, List, Mapping, Optional, Tuple
 
 from app import proxmox_service
+from app.vlan_allocator import VlanLayoutStale
 from app.backends.base import (
     BACKEND_PROXMOX, GUEST_ABSENT, GUEST_MATCH, GUEST_MISMATCH,
     AdmissionRefused, BackendError, DestroyPolicy, DestroyRefused, LaunchedVM,
@@ -145,14 +146,17 @@ class ProxmoxBackend:
     def admit(self, spec: VMSpec, *, reservation_id: str,
               load_balancing_config: Optional[Mapping]) -> str:
         locations = spec.template.get('template_locations') or {}
-        node = proxmox_service.select_best_node(
-            self._api,
-            required_memory_mb=spec.memory_mb,
-            required_cores=spec.cores,
-            load_balancing_config=load_balancing_config,
-            available_nodes=list(locations) if locations else None,
-            reservation_id=reservation_id,
-        )
+        try:
+            node = proxmox_service.select_best_node(
+                self._api,
+                required_memory_mb=spec.memory_mb,
+                required_cores=spec.cores,
+                load_balancing_config=load_balancing_config,
+                available_nodes=list(locations) if locations else None,
+                reservation_id=reservation_id,
+            )
+        except VlanLayoutStale as error:
+            raise AdmissionRefused(str(error)) from None
         if not node:
             raise AdmissionRefused('No suitable nodes available')
         return node

@@ -4,6 +4,7 @@ Handles VM creation from deployment groups with parallel processing
 """
 
 from contextlib import contextmanager, nullcontext
+import importlib
 from flask import Blueprint, request, jsonify, current_app, has_app_context
 from datetime import datetime, timedelta
 import time
@@ -173,11 +174,11 @@ def create_lxc_container(proxmox, node, vmid, vm_name, config, expiration_time,
     }
 
     # Configure networks with VLAN tags
-
-    params['net0'] = f'name=eth0,bridge=vmbr0,tag={entry_vlan_tag},ip=dhcp' if entry_vlan_tag \
-                     else f'name=eth0,bridge=vmbr0,tag={internal_vlan_tag},ip=dhcp'
+    bridge = importlib.import_module('app.config').LAB_BRIDGE
+    params['net0'] = f'name=eth0,bridge={bridge},tag={entry_vlan_tag},ip=dhcp' if entry_vlan_tag \
+                     else f'name=eth0,bridge={bridge},tag={internal_vlan_tag},ip=dhcp'
     if entry_vlan_tag:
-        params['net1'] = f'name=eth1,bridge=vmbr0,tag={internal_vlan_tag},ip=dhcp'
+        params['net1'] = f'name=eth1,bridge={bridge},tag={internal_vlan_tag},ip=dhcp'
 
 
     proxmox.nodes(node).lxc.create(**params)
@@ -223,13 +224,14 @@ def create_qemu_vm(proxmox, target_node, source_node, vmid, vm_name, source_vmid
     )
 
     # Configure networks
+    bridge = importlib.import_module('app.config').LAB_BRIDGE
     static_mac = config.get('static_mac')
     mac_suffix = f',macaddr={static_mac}' if static_mac else ''
     if entry_vlan_tag:
-        net0 = f'virtio,bridge=vmbr0,tag={entry_vlan_tag}{mac_suffix}'
+        net0 = f'virtio,bridge={bridge},tag={entry_vlan_tag}{mac_suffix}'
         proxmox.nodes(target_node).qemu(vmid).config.put(net0=net0)
         if config.get('internal_nic', True):
-            net1 = f'virtio,bridge=vmbr0,tag={internal_vlan_tag}'
+            net1 = f'virtio,bridge={bridge},tag={internal_vlan_tag}'
             proxmox.nodes(target_node).qemu(vmid).config.put(net1=net1)
             logger.info(f"Configured entry VLAN {entry_vlan_tag} + internal "
                         f"VLAN {internal_vlan_tag} for VM {vmid}")
@@ -240,8 +242,8 @@ def create_qemu_vm(proxmox, target_node, source_node, vmid, vm_name, source_vmid
     else:
         proxmox.nodes(target_node).qemu(vmid).config.put(delete="net1")
 
-        net0 = f'virtio,bridge=vmbr0,tag={internal_vlan_tag}{mac_suffix}' if internal_vlan_tag \
-            else f'virtio,bridge=vmbr0{mac_suffix}'
+        net0 = f'virtio,bridge={bridge},tag={internal_vlan_tag}{mac_suffix}' if internal_vlan_tag \
+            else f'virtio,bridge={bridge}{mac_suffix}'
 
         proxmox.nodes(target_node).qemu(vmid).config.put(net0=net0)
 

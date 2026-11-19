@@ -12,7 +12,7 @@ load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
     EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS HEADSCALE_SCRIPT HEADSCALE_DB \
-    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE VLAN_BANDS
 for name in PORTAL_HOST PORTAL_DIR PORTAL_COMPOSE PORTAL_APP_CONTAINER \
     HEADSCALE_HOST HEADSCALE_DIR HEADSCALE_KEEP_USER HEADSCALE_STAFF \
     EMAIL_DOMAIN REMOTE_BACKUP_DIR KEY_DAYS; do
@@ -67,8 +67,10 @@ The default dry run reads both real hosts and writes nothing. It reports:
   - Whitelist rows to delete and seed.
   - The Headscale policy change for the roster the portal holds now.
 
-Use --apply to create backups and perform the changeover. The script never
-changes a Proxmox VM, a template, or a dojo repository.
+Use --apply to create backups and perform the changeover. It first runs the
+policy stage's preflight (apply_headscale_policy.sh --preflight) and refuses
+before changing anything if the policy stage could not complete. The script
+never changes a Proxmox VM, a template, or a dojo repository.
 
 Examples:
   scripts/term_changeover.sh ~/Downloads/canvas-gradebook.csv
@@ -141,7 +143,7 @@ HEADSCALE_SUMMARY_PY='import base64,contextlib,csv,hashlib,io,json,sys
 sys.path.insert(0, sys.argv[2])
 from scripts.build_students_merged import read_canvas
 with contextlib.redirect_stdout(sys.stderr):
-    students = read_canvas(sys.argv[1])
+    students = read_canvas(sys.argv[1], sys.argv[4])
 if not students:
     raise SystemExit("Canvas export has no real students")
 logins = [login for _, login in students]
@@ -183,7 +185,7 @@ DB_SUMMARY_PY='import base64,contextlib,csv,io,sys
 sys.path.insert(0, sys.argv[2])
 from scripts.build_students_merged import read_canvas
 with contextlib.redirect_stdout(io.StringIO()):
-    students = read_canvas(sys.argv[1])
+    students = read_canvas(sys.argv[1], sys.argv[3])
 lines = sys.stdin.buffer.read().splitlines()
 if len(lines) != 2:
     raise SystemExit("Portal inventory returned an invalid payload")
@@ -242,7 +244,7 @@ fetch_headscale_keys_b64() {
 read_headscale_summary() {
     local summary
     summary="$(fetch_headscale_payload | "$PYTHON" -c "$HEADSCALE_SUMMARY_PY" \
-        "$CANVAS" "$REPO_ROOT" "$HEADSCALE_KEEP_USER,$HEADSCALE_STAFF")" \
+        "$CANVAS" "$REPO_ROOT" "$HEADSCALE_KEEP_USER,$HEADSCALE_STAFF" "${VLAN_BANDS:-}")" \
         || die "Could not compare the Canvas and Headscale rosters."
     IFS=$'\t' read -r ROSTER_COUNT USERS_REMOVE USERS_CREATE KEYS_MISSING KEYS_EXTRA DESIRED_HASH <<< "$summary"
 }
@@ -275,10 +277,24 @@ verify_helper_count() {
         || die "Headscale counts disagree: helper=$helper_remove orchestrator=$USERS_REMOVE."
 }
 
+# Every artifact a stage replaces is reported in exactly one of two forms:
+#   backup: <host>:<backup file>          a copy of the old file was written
+#   absent-before: <host>:<original>      there was no old file; a rollback deletes it
+# so a rollback restores by copy or by delete, never by guessing.
+report_artifact() {
+    local state="$1" location="$2" original="$3"
+    case "$state" in
+        present) printf '  backup: %s\n' "$location" ;;
+        absent) printf '  absent-before: %s\n' "$original" ;;
+        *) die "Could not tell whether $original existed before the change." ;;
+    esac
+}
+
 backup_headscale() {
     local db_backup="$REMOTE_BACKUP_DIR/headscale-db-$STAMP.sqlite"
     local keys_backup="$REMOTE_BACKUP_DIR/headscale-keys-$STAMP.csv"
-    ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "set -e
+    local result
+    result="$(ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "set -e
         umask 077
         mkdir -p '$REMOTE_BACKUP_DIR'
         chmod 700 '$REMOTE_BACKUP_DIR'
@@ -291,6 +307,9 @@ backup_headscale() {
         if test -f students_with_keys.csv; then
             cp students_with_keys.csv '$keys_backup'
             chmod 600 '$keys_backup'
+            echo keys=present
+        else
+            echo keys=absent
         fi
         docker compose start headscale >/dev/null
         trap - EXIT
@@ -299,9 +318,10 @@ backup_headscale() {
             docker compose exec -T headscale headscale users list -o json >/dev/null 2>&1 && exit 0
             sleep 1
         done
-        exit 1" || die "The Headscale backup or restart failed."
-    printf '  backup: %s:%s\n' "$HEADSCALE_HOST" "$db_backup"
-    printf '  key backup: %s:%s\n' "$HEADSCALE_HOST" "$keys_backup"
+        exit 1")" || die "The Headscale backup or restart failed."
+    report_artifact present "$HEADSCALE_HOST:$db_backup" "$HEADSCALE_HOST:$HEADSCALE_DIR/$HEADSCALE_DB"
+    report_artifact "$(sed -n 's/^keys=//p' <<< "$result")" "$HEADSCALE_HOST:$keys_backup" \
+        "$HEADSCALE_HOST:$HEADSCALE_DIR/students_with_keys.csv"
 }
 
 portal_mysql() {
@@ -329,7 +349,7 @@ fetch_portal_whitelist_b64() {
 read_db_summary() {
     local summary
     summary="$({ fetch_headscale_keys_b64; fetch_portal_whitelist_b64; } \
-        | "$PYTHON" -c "$DB_SUMMARY_PY" "$CANVAS" "$REPO_ROOT")" \
+        | "$PYTHON" -c "$DB_SUMMARY_PY" "$CANVAS" "$REPO_ROOT" "${VLAN_BANDS:-}")" \
         || die "Could not compare the portal whitelist with the roster."
     IFS=$'\t' read -r WHITELIST_CURRENT WHITELIST_DELETE WHITELIST_SEED WHITELIST_EXACT <<< "$summary"
 }
@@ -347,7 +367,9 @@ build_merged_file() {
     TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/term-changeover.XXXXXX")"
     ssh "${SSH_OPTIONS[@]}" "$HEADSCALE_HOST" "cat '$HEADSCALE_DIR/students_with_keys.csv'" > "$TMP_DIR/students_with_keys.csv"
     chmod 600 "$TMP_DIR/students_with_keys.csv"
-    "$PYTHON" "$BUILD_MERGED" "$CANVAS" "$TMP_DIR/students_with_keys.csv" "$TMP_DIR/students_merged.csv"
+    # VLAN_BANDS as load_site_env resolved it (environment, else site.env);
+    # empty means the default bands, as jumpbox_configure.sh reads it.
+    "$PYTHON" "$BUILD_MERGED" --bands "${VLAN_BANDS:-}" "$CANVAS" "$TMP_DIR/students_with_keys.csv" "$TMP_DIR/students_merged.csv"
     local count
     count="$("$PYTHON" -c 'import csv,sys; print(sum(1 for _ in csv.DictReader(open(sys.argv[1], encoding="utf-8"))))' "$TMP_DIR/students_merged.csv")"
     [[ "$count" == "$ROSTER_COUNT" ]] || die "The merged file has $count rows, not $ROSTER_COUNT."
@@ -364,11 +386,13 @@ replace_roster_files() {
 
     if [[ "$local_hash" != "$DESIRED_HASH" ]]; then
         local local_backup="$REPO_ROOT/.git/term-changeover-backups/$STAMP/students_merged.csv"
-        mkdir -p "$(dirname "$local_backup")"
         if [[ -f "$LOCAL_MERGED" ]]; then
+            mkdir -p "$(dirname "$local_backup")"
             cp "$LOCAL_MERGED" "$local_backup"
             chmod 600 "$local_backup"
-            printf '  local roster backup: %s\n' "$local_backup"
+            report_artifact present "$local_backup" "$LOCAL_MERGED"
+        else
+            report_artifact absent "$local_backup" "$LOCAL_MERGED"
         fi
         cp "$new_file" "$LOCAL_MERGED"
     fi
@@ -376,15 +400,19 @@ replace_roster_files() {
     if [[ "$remote_hash" != "$DESIRED_HASH" ]]; then
         local remote_backup="$REMOTE_BACKUP_DIR/students_merged-$STAMP.csv"
         local remote_tmp="$PORTAL_DIR/data/.students_merged-$STAMP.tmp"
-        ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" "set -e
+        local remote_state
+        remote_state="$(ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" "set -e
             umask 077
             mkdir -p '$REMOTE_BACKUP_DIR'
             chmod 700 '$REMOTE_BACKUP_DIR'
             if test -f '$PORTAL_DIR/data/students_merged.csv'; then
                 cp '$PORTAL_DIR/data/students_merged.csv' '$remote_backup'
                 chmod 600 '$remote_backup'
-            fi"
-        printf '  portal roster backup: %s:%s\n' "$PORTAL_HOST" "$remote_backup"
+                echo present
+            else
+                echo absent
+            fi")" || die "The portal roster backup failed."
+        report_artifact "$remote_state" "$PORTAL_HOST:$remote_backup" "$PORTAL_HOST:$PORTAL_DIR/data/students_merged.csv"
         scp "${SSH_OPTIONS[@]}" "$new_file" "$PORTAL_HOST:$remote_tmp" >/dev/null
         # The roster carries reusable VPN keys: readable by its owner and by the
         # app container's group (APP_GID), not by other accounts on the host.
@@ -407,7 +435,7 @@ backup_portal_database() {
           'export MYSQL_PWD=\"\$MYSQL_PASSWORD\"; exec mysqldump --single-transaction -u\"\$MYSQL_USER\" \"\$MYSQL_DATABASE\"' > '$DB_BACKUP'
         test -s '$DB_BACKUP'
         chmod 600 '$DB_BACKUP'" || die "The production database backup failed."
-    printf '  database backup: %s:%s\n' "$PORTAL_HOST" "$DB_BACKUP"
+    report_artifact present "$PORTAL_HOST:$DB_BACKUP" "MySQL"
 }
 
 wait_for_portal() {
@@ -449,6 +477,15 @@ purge_and_seed_database() {
 
 printf 'Mode: %s\n' "$([[ "$APPLY" == 1 ]] && printf APPLY || printf 'DRY RUN (read-only)')"
 printf 'Canvas export: %s\n\n' "$CANVAS"
+# Stage 4 runs after stages 1-3 have replaced the roster, so whatever it needs
+# (on a Proxmox site: JUMPBOX_SSH, SSH to the jumpbox and a Running Tailscale
+# there) is checked before stage 1 can change anything.
+if ((APPLY == 1)); then
+    printf '[preflight] Headscale policy stage\n'
+    preflight_output="$(SITE_ENV_FILE="$SITE_ENV_FILE" bash "$APPLY_POLICY" --preflight 2>&1)" \
+        || { printf '%s\n' "$preflight_output"; die "The policy stage's preflight failed; nothing was changed."; }
+    printf '%s\n\n' "$preflight_output"
+fi
 require_remote_access
 
 read_headscale_summary

@@ -98,167 +98,19 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(d["scan_interval_sec"], 12)
 
 
-class TestGroupVlanConfig(unittest.TestCase):
-    """Tests for the group VLAN pool env vars."""
-
-    def tearDown(self):
-        """Restore app.config module state after tests that reload it with
-        patched env. Without this, a reloaded module carries its last-loaded
-        state (e.g. inverted VLAN ranges) into subsequent test files in the
-        same pytest run, corrupting unrelated tests."""
-        import sys, importlib
-        cfg_module = sys.modules.get('app.config')
-        if cfg_module is not None:
-            importlib.reload(cfg_module)
-
-    def test_defaults_when_unset(self):
-        """When GROUP_*_VLAN_* env vars are unset, defaults must be used."""
-        import sys
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith('GROUP_') or not k.endswith('_VLAN_MIN')
-               and not k.endswith('_VLAN_MAX')}
-        with patch.dict(os.environ, env, clear=True):
-            # Re-import module so it re-reads env
-            # Use sys.modules key to avoid the name collision with the module-level
-            # `config = ProductionConfig` variable that shadows `app.config` attribute access.
-            import importlib
-            cfg_module = sys.modules['app.config']
-            importlib.reload(cfg_module)
-            self.assertEqual(cfg_module.GROUP_ENTRY_VLAN_MIN, 300)
-            self.assertEqual(cfg_module.GROUP_ENTRY_VLAN_MAX, 400)
-            self.assertEqual(cfg_module.GROUP_INTERNAL_VLAN_MIN, 400)
-            self.assertEqual(cfg_module.GROUP_INTERNAL_VLAN_MAX, 500)
-
-    def test_get_group_vlan_ranges_returns_tuple_pair(self):
-        """get_group_vlan_ranges() returns ((entry_min, entry_max), (internal_min, internal_max))."""
-        import sys
-        cfg = sys.modules['app.config']
-        entry, internal = cfg.get_group_vlan_ranges()
-        self.assertEqual(entry, (cfg.GROUP_ENTRY_VLAN_MIN, cfg.GROUP_ENTRY_VLAN_MAX))
-        self.assertEqual(internal, (cfg.GROUP_INTERNAL_VLAN_MIN, cfg.GROUP_INTERNAL_VLAN_MAX))
-
-    def test_inverted_entry_range_raises(self):
-        """When GROUP_ENTRY_VLAN_MIN >= GROUP_ENTRY_VLAN_MAX, validate_config raises."""
-        env = dict(os.environ)
-        env.update({
-            'GROUP_ENTRY_VLAN_MIN': '400',
-            'GROUP_ENTRY_VLAN_MAX': '300',
-            # Keep Proxmox config satisfied so we reach the group validation block
-            'PROXMOX_HOST': 'example.test',
-            'PROXMOX_PASSWORD': 'x',
-        })
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            with self.assertRaises(ValueError) as ctx:
-                cfg.validate_config()
-            self.assertIn('GROUP_ENTRY_VLAN_MAX', str(ctx.exception))
-
-    def test_inverted_internal_range_raises(self):
-        """When GROUP_INTERNAL_VLAN_MIN >= GROUP_INTERNAL_VLAN_MAX, validate_config raises."""
-        env = dict(os.environ)
-        env.update({
-            'GROUP_INTERNAL_VLAN_MIN': '500',
-            'GROUP_INTERNAL_VLAN_MAX': '400',
-            'PROXMOX_HOST': 'example.test',
-            'PROXMOX_PASSWORD': 'x',
-        })
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            with self.assertRaises(ValueError) as ctx:
-                cfg.validate_config()
-            self.assertIn('GROUP_INTERNAL_VLAN_MAX', str(ctx.exception))
-
-    def test_defaults_produce_no_validation_errors(self):
-        """Default group ranges are valid and raise nothing."""
-        env = {k: v for k, v in os.environ.items()
-               if not (k.startswith('GROUP_') and (k.endswith('_VLAN_MIN') or k.endswith('_VLAN_MAX')))}
-        env.update({'PROXMOX_HOST': 'example.test', 'PROXMOX_PASSWORD': 'x',
-                    'FLASK_ENV': 'development'})
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            cfg.validate_config()  # must not raise
-
-    def test_entry_vlan_overlap_warns_entry_only(self):
-        """A group-entry pool straddling the user entry pool [100,200) emits entry warning only."""
-        env = dict(os.environ)
-        env.update({
-            'GROUP_ENTRY_VLAN_MIN': '150',
-            'GROUP_ENTRY_VLAN_MAX': '250',
-            'GROUP_INTERNAL_VLAN_MIN': '400',
-            'GROUP_INTERNAL_VLAN_MAX': '500',
-            'PROXMOX_HOST': 'example.test',
-            'PROXMOX_PASSWORD': 'x',
-            'FLASK_ENV': 'development',
-        })
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            with self.assertLogs('app.config', level=logging.WARNING) as cm:
-                cfg.validate_config()
-        self.assertTrue(any('GROUP_ENTRY_VLAN' in m for m in cm.output),
-                        f"expected an entry-pool warning; got: {cm.output}")
-        self.assertFalse(any('GROUP_INTERNAL_VLAN' in m for m in cm.output),
-                         f"unexpected internal-pool warning; got: {cm.output}")
-
-    def test_internal_vlan_overlap_warns_internal_only(self):
-        """A group-internal pool straddling the user internal pool [200,300) emits internal warning only."""
-        env = dict(os.environ)
-        env.update({
-            'GROUP_ENTRY_VLAN_MIN': '300',
-            'GROUP_ENTRY_VLAN_MAX': '400',
-            'GROUP_INTERNAL_VLAN_MIN': '250',
-            'GROUP_INTERNAL_VLAN_MAX': '350',
-            'PROXMOX_HOST': 'example.test',
-            'PROXMOX_PASSWORD': 'x',
-            'FLASK_ENV': 'development',
-        })
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            with self.assertLogs('app.config', level=logging.WARNING) as cm:
-                cfg.validate_config()
-        self.assertFalse(any('GROUP_ENTRY_VLAN' in m for m in cm.output),
-                         f"unexpected entry-pool warning; got: {cm.output}")
-        self.assertTrue(any('GROUP_INTERNAL_VLAN' in m for m in cm.output),
-                        f"expected an internal-pool warning; got: {cm.output}")
-
-    def test_defaults_produce_no_overlap_warnings(self):
-        """Default group ranges must emit zero overlap warnings."""
-        env = {k: v for k, v in os.environ.items()
-               if not (k.startswith('GROUP_') and
-                       (k.endswith('_VLAN_MIN') or k.endswith('_VLAN_MAX')))}
-        env.update({
-            'PROXMOX_HOST': 'example.test',
-            'PROXMOX_PASSWORD': 'x',
-            'FLASK_ENV': 'development',
-            'SECRET_KEY': 'test-secret-key',
-        })
-        import sys, importlib
-        with patch.dict(os.environ, env, clear=True):
-            cfg = sys.modules['app.config']
-            importlib.reload(cfg)
-            with self.assertNoLogs('app.config', level=logging.WARNING):
-                cfg.validate_config()
-
-
 # ============ VM backend selection ============
 
 # Every key whose value decides which backends run and what they need. A
 # key is set to '' rather than deleted so an operator's .env cannot refill
 # it when the reloaded module calls load_dotenv().
 BACKEND_ENV_KEYS = (
-    'ENABLED_BACKENDS', 'LAB_SITE_ID', 'JUMPBOX_VLAN_BANDS',
+    'ENABLED_BACKENDS', 'LAB_SITE_ID', 'VLAN_BANDS',
+    # Removed settings, blanked so a stale .env value cannot add a warning.
+    'JUMPBOX_VLAN_BANDS', 'GROUP_ENTRY_VLAN_MIN', 'GROUP_ENTRY_VLAN_MAX',
+    'GROUP_INTERNAL_VLAN_MIN', 'GROUP_INTERNAL_VLAN_MAX',
     'PROXMOX_HOST', 'PROXMOX_USER', 'PROXMOX_PASSWORD', 'PROXMOX_TOKEN_ID',
     'PROXMOX_TOKEN_SECRET', 'PROXMOX_VERIFY_SSL', 'PROXMOX_CA_BUNDLE',
-    'ENABLE_LOAD_BALANCING', 'FIXED_NODE',
+    'ENABLE_LOAD_BALANCING', 'FIXED_NODE', 'LAB_BRIDGE', 'VMID_RANGE',
     'AWS_REGION', 'AWS_AVAILABILITY_ZONE', 'AWS_LAB_VPC_ID', 'AWS_LAB_CIDR',
     'AWS_ROUTER_INSTANCE_ID', 'AWS_MAX_VMS', 'AWS_ROUTER_IDLE_MINUTES',
     'AWS_CLIENT_CIDRS', 'VPN_MODE', 'VPN_NAME', 'VPN_INSTRUCTIONS_URL',
@@ -318,6 +170,16 @@ def reload_valid_cloud_config(monkeypatch, **overrides):
         'ENABLED_BACKENDS': 'aws,gcp', **AWS_VALUES, **GCP_VALUES, **overrides})
 
 
+def _netgen():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "scripts" / "jumpbox_netgen.py"
+    spec = importlib.util.spec_from_file_location("jumpbox_netgen", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # Catches the contract's defaults drifting, or an unset ENABLED_BACKENDS
 # no longer meaning the Proxmox-only portal every existing site runs.
 def test_backend_defaults_match_the_contract(monkeypatch):
@@ -329,8 +191,9 @@ def test_backend_defaults_match_the_contract(monkeypatch):
     assert (cfg.AWS_ROUTER_IDLE_MINUTES, cfg.GCP_ROUTER_IDLE_MINUTES) == (30, 30)
     assert (cfg.AWS_LAUNCH_TIMEOUT_SECONDS, cfg.AWS_TERMINATE_TIMEOUT_SECONDS,
             cfg.GCP_OPERATION_TIMEOUT_SECONDS) == (600, 600, 600)
-    assert cfg.JUMPBOX_VLAN_BANDS == (
-        'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4')
+    assert cfg.VLAN_BANDS.split() == _netgen().DEFAULT_BANDS.split() == [
+        "entry:100-199:0:0", "internal:200-299:100:1",
+        "group-entry:300-399:200:2", "group-internal:400-500:300:4"]
 
 
 # Catches a list that keeps case, whitespace or duplicates, which every
@@ -553,6 +416,38 @@ def test_tailnet_range_is_reserved_only_under_headscale(monkeypatch):
         cfg.validate_config()
     cfg = reload_valid_cloud_config(monkeypatch, VPN_MODE='none', **cloud)
     cfg.validate_config()
+
+
+# Catches a staging-only setting changing what production does when unset.
+def test_lab_bridge_and_vmid_range_defaults_are_todays_behaviour(monkeypatch):
+    cfg = reload_config(monkeypatch)
+    assert (cfg.LAB_BRIDGE, cfg.VMID_RANGE, cfg.VMID_RANGE_ERROR) == ('vmbr0', None, None)
+
+
+@pytest.mark.parametrize('text, parsed', [('', None), ('4000-4099', (4000, 4099)), (' 100-100 ', (100, 100))])
+def test_parse_vmid_range_accepts_min_dash_max(monkeypatch, text, parsed):
+    assert reload_config(monkeypatch).parse_vmid_range(text) == parsed
+
+
+@pytest.mark.parametrize('text', ['4000', '4099-4000', '99-200', '4000-1000000000', 'a-b', '4000-4099,4100-4199'])
+def test_parse_vmid_range_rejects_anything_else(monkeypatch, text):
+    with pytest.raises(ValueError):
+        reload_config(monkeypatch).parse_vmid_range(text)
+
+
+def test_invalid_vmid_range_is_refused_at_startup(monkeypatch):
+    cfg = reload_config(monkeypatch, VMID_RANGE='4099-4000')
+    assert cfg.VMID_RANGE is None and 'VMID_RANGE' in cfg.VMID_RANGE_ERROR
+    with pytest.raises(ValueError, match='VMID_RANGE'):
+        cfg.validate_config()
+
+
+# Catches a bridge value that injects options into a Proxmox net string.
+@pytest.mark.parametrize('bridge', ['vmbrtest,firewall=0', 'vmbr 7', '7vmbr', 'a' * 16])
+def test_invalid_lab_bridge_is_refused_at_startup(monkeypatch, bridge):
+    cfg = reload_config(monkeypatch, ENABLED_BACKENDS='proxmox', LAB_BRIDGE=bridge)
+    with pytest.raises(ValueError, match='LAB_BRIDGE'):
+        cfg.validate_config()
 
 
 if __name__ == '__main__':

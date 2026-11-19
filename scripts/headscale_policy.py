@@ -3,6 +3,7 @@
 
     headscale_policy.py render BASE_POLICY.json SLOTS.json   # desired policy
     headscale_policy.py diff CURRENT.json DESIRED.json       # unified diff
+    headscale_policy.py missing-peers NODES.json SLOTS.json STATUS.json
 
 BASE_POLICY is the operator's policy file (config/headscale-acl.json): every
 section and every ACL rule is kept, except the blanket rule whose src is
@@ -13,11 +14,15 @@ or the render fails: such a rule would keep the blanket access the
 per-student rules replace. SLOTS is scripts/export_network_slots.py
 output from the running portal; the backends, lab CIDRs and VLAN bands come
 only from it, so the policy grants exactly the networks that portal
-allocates. Each roster login gets one rule to its own entry network, its
-group's entry and internal networks, and every non-ended KOTH game's
-networks (Proxmox only), plus the reverse rule back to its devices from its
-own and its groups' networks. KOTH networks get no reverse rule: a box any
+allocates. Each roster login gets one rule to its own entry and internal
+networks, its group's entry and internal networks, and every non-ended KOTH
+game's networks (Proxmox only), plus the reverse rule back to its devices from
+its own and its groups' networks. KOTH networks get no reverse rule: a box any
 player has rooted must not reach every player's devices.
+
+missing-peers reads `headscale nodes list -o json`, the slots export and
+`tailscale status --json` from the jumpbox, and prints each roster device the
+jumpbox does not list as a peer, one per line (nothing when all are there).
 
 Standard library only: this runs on the operator's workstation.
 """
@@ -29,6 +34,7 @@ import importlib.util
 import json
 import re
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Set, Tuple
@@ -91,12 +97,14 @@ def policy_inputs(slots: Mapping[str, Any]) -> Tuple[PolicyBands, Dict[str, str]
     enabled = config.get("enabled_backends")
     if not isinstance(enabled, list) or not all(isinstance(b, str) for b in enabled):
         raise ValueError("config.enabled_backends must be a list of backend names")
+    if not enabled:
+        raise ValueError("config.enabled_backends is empty: the portal exports at least one backend")
     unknown = sorted(set(enabled) - set(KNOWN_BACKENDS))
     if unknown:
         raise ValueError(f"config.enabled_backends names unknown backend(s) {', '.join(unknown)}")
-    spec = config.get("jumpbox_vlan_bands")
+    spec = config.get("vlan_bands")
     if not isinstance(spec, str):
-        raise ValueError("config.jumpbox_vlan_bands must be a band string")
+        raise ValueError("config.vlan_bands must be a band string (the portal's VLAN_BANDS)")
     cidrs = {}
     for backend in CLOUD_BACKENDS:
         if backend in enabled:
@@ -144,15 +152,13 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
         owners[tag] = owner
         return tag
 
-    entries: Dict[str, int] = {}
+    granted: Dict[str, Set[int]] = {}
     for user in _list(slots, "users"):
         identity = normalize_login(user.get("login"))
-        if identity in entries:
+        if identity in granted:
             raise ValueError(f"login {identity} appears twice in the roster")
-        entries[identity] = claim(_tag(user, "entry_vlan", identity), identity)
-        claim(_tag(user, "internal_vlan", identity), identity)
-
-    granted: Dict[str, Set[int]] = {identity: {entry} for identity, entry in entries.items()}
+        granted[identity] = {claim(_tag(user, "entry_vlan", identity), identity),
+                             claim(_tag(user, "internal_vlan", identity), identity)}
     slugs = set()
     for group in _list(slots, "groups"):
         slug = group.get("slug")
@@ -262,6 +268,44 @@ def _load(path: str) -> Any:
         raise ValueError(f"{path}: {exc}") from None
 
 
+def missing_peers(nodes: Any, slots: Mapping[str, Any], status: Any) -> List[str]:
+    """Roster devices Headscale knows that the jumpbox does not list as peers.
+
+    The policy grants each roster login routes the jumpbox serves, so every
+    device of a roster login must be a peer of the jumpbox; a device that is
+    not cannot reach any lab. Headscale v0.27.1 left the jumpbox with no peers
+    once after a policy reload and once after the jumpbox reconnected (staging,
+    2026-11-18). Offline devices stay in a netmap and count; expired ones are no
+    one's peer and are skipped, as are staff and infrastructure devices, which
+    the roster does not name. A jumpbox whose backend is not Running keeps its
+    last netmap's peers in the status, so then every device counts as missing.
+    """
+    if not isinstance(nodes, list) or not all(isinstance(n, Mapping) for n in nodes):
+        raise ValueError("the Headscale node list must be a JSON list of nodes")
+    if not isinstance(status, Mapping):
+        raise ValueError("the jumpbox status must be a JSON object")
+    roster = {normalize_login(user.get("login")) for user in _list(slots, "users")}
+    peer_ips: Set[str] = set()
+    if status.get("BackendState") == "Running":
+        for peer in (status.get("Peer") or {}).values():
+            peer_ips.update(peer.get("TailscaleIPs") or [])
+    now = time.time()
+    missing = []
+    for node in nodes:
+        user = (node.get("user") or {}).get("name") or ""
+        try:
+            if normalize_login(user) not in roster:
+                continue
+        except ValueError:
+            continue
+        expiry = (node.get("expiry") or {}).get("seconds") or 0
+        if 0 < expiry <= now:
+            continue
+        if not set(node.get("ip_addresses") or []) & peer_ips:
+            missing.append(f"{node.get('given_name') or node.get('name')} ({user})")
+    return sorted(missing)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -271,11 +315,19 @@ def main(argv=None) -> int:
     diff_cmd = commands.add_parser("diff", help="print a diff; empty when equal")
     diff_cmd.add_argument("current")
     diff_cmd.add_argument("desired")
+    peers_cmd = commands.add_parser("missing-peers",
+                                    help="print roster devices the jumpbox lacks as peers")
+    peers_cmd.add_argument("nodes")
+    peers_cmd.add_argument("slots")
+    peers_cmd.add_argument("status")
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
             slots = _load(args.slots)
             output = canonical(render(_load(args.base_policy), slots, *policy_inputs(slots)))
+        elif args.command == "missing-peers":
+            output = "".join(f"{device}\n" for device in missing_peers(
+                _load(args.nodes), _load(args.slots), _load(args.status)))
         else:
             output = policy_diff(_load(args.current), _load(args.desired))
     except ValueError as exc:

@@ -102,7 +102,7 @@ A cloud slot *N* (0–500) is the `/26` at `base + N × 64`
 
 | Backend | Base | Slot 101 | Slot 400 | Slot 500 (highest) |
 |---|---|---|---|---|
-| Proxmox | `JUMPBOX_VLAN_BANDS` | `10.101.0.0/24` | `10.100.4.0/24` | `10.200.4.0/24` |
+| Proxmox | `VLAN_BANDS` (default shown) | `10.101.0.0/24` | `10.100.4.0/24` | `10.200.4.0/24` |
 | AWS | `AWS_LAB_CIDR`, default `172.20.0.0/16` | `172.20.25.64/26` | `172.20.100.0/26` | `172.20.125.0/26` |
 | GCP | `GCP_LAB_CIDR`, default `172.21.0.0/16` | `172.21.25.64/26` | `172.21.100.0/26` | `172.21.125.0/26` |
 
@@ -823,7 +823,8 @@ only the router disks bill.
    ([Using another VPN](#using-another-vpn-aws-client-vpn-site-to-site)).
    `docker-compose.prod.yml` passes each of these names into the container;
    an empty value means the code's default, exactly as if it were unset.
-   Set `JUMPBOX_VLAN_BANDS` to the jumpbox's value if you changed it there.
+   `VLAN_BANDS` must equal the value in `scripts/site.env` (the jumpbox's);
+   with a cloud enabled the portal refuses a band above slot 500.
 
 3. **Credentials, never in a tracked file.** AWS uses boto3's standard chain
    and GCP uses Application Default Credentials. **A portal host that runs
@@ -1018,8 +1019,9 @@ Headscale host is an instructor step, not part of a deployment.
 
 `scripts/apply_headscale_policy.sh` reads `scripts/site.env`
 (`PORTAL_HOST`, `PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`;
-optional `HEADSCALE_BASE_POLICY`, default `config/headscale-acl.json`, and
-`HEADSCALE_POLICY_FILE`, default `/etc/headscale/acl.json`):
+`JUMPBOX_SSH` for `--apply` with the proxmox backend; optional `HEADSCALE_BASE_POLICY`, default
+`config/headscale-acl.json`, `HEADSCALE_POLICY_FILE`, default
+`/etc/headscale/acl.json`, and `JUMPBOX_PEER_WAIT`, default 60 seconds):
 
 ```bash
 scripts/apply_headscale_policy.sh            # dry run: prints the diff, writes nothing
@@ -1027,17 +1029,28 @@ scripts/apply_headscale_policy.sh --apply
 ```
 
 Both modes export the roster, groups, VLAN pairs, non-ended KOTH games,
-enabled backends, lab CIDRs and `JUMPBOX_VLAN_BANDS` from the running portal
+enabled backends, lab CIDRs and `VLAN_BANDS` from the running portal
 (`docker exec <PORTAL_APP_CONTAINER> python scripts/export_network_slots.py`),
 render the policy locally (`scripts/headscale_policy.py`), and diff it
 against `headscale policy get`. The export fails, and nothing is applied,
 when a roster student or group lacks either VLAN tag or a group has a member
-who is not on the roster. Review the diff. `--apply` then checks the policy
+who is not on the roster. With the proxmox backend, both modes also refuse,
+before contacting Headscale, while the exported `VLAN_BANDS` differs from the
+jumpbox's (`VLAN_BANDS` in `scripts/site.env`, else the default): the policy
+would grant networks the jumpbox does not route. Review the diff. `--apply` then checks the policy
 inside the Headscale container (`headscale policy check`), backs up the
 current file as `<policy-file>.<YYYYmmddTHHMMSSZ>` (mode 0600), installs the
 new one atomically, signals Headscale (`SIGHUP`) to reload it, and reads it
 back; only if the read-back differs does it restart the headscale service
-once, and it fails if it still differs.
+once, and it fails if it still differs. Last, it checks the jumpbox over SSH
+(`JUMPBOX_SSH`, `tailscale status --json`): every roster device Headscale
+knows must be one of its peers, because a device that is not cannot reach
+any lab. Headscale v0.27.1 has reloaded a policy and left the jumpbox with
+no peers at all. The script waits up to `JUMPBOX_PEER_WAIT` seconds,
+restarts Headscale once if a device is still missing, and fails, naming the
+devices, if one is missing after that. Without the proxmox backend there is no
+jumpbox: the check is skipped, and says so (`Proxmox jumpbox peer check
+skipped: proxmox backend not enabled`), and `JUMPBOX_SSH` is not needed.
 
 **In file mode `headscale policy get` returns the policy file, not the
 policy Headscale has loaded.** A match therefore proves only that the file
@@ -1052,10 +1065,10 @@ student every lab.
 
 What the policy grants:
 
-- Each roster login `<login>@` reaches its own entry slot, its groups' entry
-  and internal slots, and the entry and internal blocks of **every KOTH game
-  whose status is not `ended`** (Proxmox only, since KOTH runs only there).
-  Only slots inside `JUMPBOX_VLAN_BANDS` are granted, the same kinds on every
+- Each roster login `<login>@` reaches its own entry and internal slots, its
+  groups' entry and internal slots, and the entry and internal blocks of
+  **every KOTH game whose status is not `ended`** (Proxmox only, since KOTH runs only there).
+  Only slots inside `VLAN_BANDS` are granted, the same kinds on every
   backend. The login's own and groups' blocks may connect back to that
   login's own devices only. KOTH blocks may not connect back at all: a box
   any player has rooted must not reach every player's devices.

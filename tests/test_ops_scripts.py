@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -47,9 +48,21 @@ POLICY_REQUIRED = [
     "HEADSCALE_DIR",
 ]
 POLICY_INPUTS = ["HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "POLICY_VIEW", "CHECK_FAIL",
-                 "RELOAD_FAIL"]
+                 "RELOAD_FAIL", "JUMPBOX_SSH", "JUMPBOX_PEER_WAIT", "PEERS", "TS_BACKEND",
+                 "HEADSCALE_WATCHDOG_STATE", "HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL"]
 # term_changeover.sh reads this exact line from the policy stage's dry run.
 POLICY_FILE_CURRENT = "  nothing to do: the policy file Headscale serves matches the rendered one."
+
+
+def _copy_changeover_tools(repo: Path) -> None:
+    """The changeover scripts plus the band modules build_students_merged.py
+    reads the roster cap through."""
+    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py",
+                 "purge_roster.sql", "jumpbox_netgen.py"):
+        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    (repo / "app" / "backends").mkdir(parents=True, exist_ok=True)
+    shutil.copy(ROOT / "app" / "backends" / "network_slots.py",
+                repo / "app" / "backends" / "network_slots.py")
 
 
 def _clean_env(tmp_path: Path, **values: str) -> dict[str, str]:
@@ -166,9 +179,9 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql",
-                 "apply_headscale_policy.sh"):
-        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _copy_changeover_tools(repo)
+    # The policy stage (and its preflight) is not what this test is about.
+    _executable(repo / "scripts" / "apply_headscale_policy.sh", "#!/usr/bin/env bash\necho 'Headscale policy: stub'\n")
     config = tmp_path / "site.env"
     config.write_text(
         "\n".join(
@@ -206,6 +219,7 @@ def test_term_changeover_delivers_roster_readable_only_by_owner_and_app_group(tm
         f"  *\"base64 -w0 && printf\"*) printf '%s\\n%s\\n' '{users}' '{keys}' ;;\n"
         f"  *\"base64 -w0 students_with_keys.csv\"*) printf '%s' '{keys}' ;;\n"
         f"  *\"cat '\"*) printf '%s' '{key_line}' ;;\n"
+        "  *\"echo absent\"*) printf 'absent\\n' ;;\n"
         "  *sha256sum*) printf 'missing' ;;\n"
         "esac\n"
         "exit 0\n"
@@ -302,7 +316,7 @@ POLICY_SLOTS = {
         "enabled_backends": ["proxmox", "aws"],
         "aws_lab_cidr": "172.20.0.0/16",
         "gcp_lab_cidr": "172.21.0.0/16",
-        "jumpbox_vlan_bands": "entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4",
+        "vlan_bands": "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4",
     },
     "users": [
         {"login": "alice", "entry_vlan": 100, "internal_vlan": 200},
@@ -318,6 +332,9 @@ SSH_STUB = """#!/bin/bash
 while [ "$1" = "-o" ]; do shift 2; done
 host="$1"; shift
 printf 'ssh %s %s\\n=====\\n' "$host" "$*" >> "$SSH_LOG"
+if [ "$host" = unreachable-host ]; then
+    echo "ssh: connect to host $host port 22: No route to host" >&2; exit 255
+fi
 exec /bin/sh -c "$*"
 """
 SCP_STUB = """#!/bin/bash
@@ -365,12 +382,35 @@ elif args == ["compose", "kill", "-s", "HUP", "headscale"]:
         shutil.copy(policy, loaded)
 elif args == ["compose", "restart", "headscale"]:
     event("restart headscale")
+    open(os.environ["RESTART_MARK"], "a").close()
     if view == "stale":
         shutil.copy(policy, loaded)
+elif args == ["compose", "exec", "-T", "headscale", "headscale", "nodes", "list", "-o", "json"]:
+    event("nodes list")
+    sys.stdout.write(open(os.environ["NODES_FILE"]).read())
 else:
     event("unexpected " + " ".join(args))
     sys.exit(97)
 """
+# `tailscale status --json` on the jumpbox. PEERS: "present" lists every node,
+# "after-restart" only once Headscale has restarted, "never" none of them.
+TAILSCALE_STUB = """#!/usr/bin/env python3
+import json, os, sys
+assert sys.argv[1:] == ["status", "--json"], sys.argv
+with open(os.environ["DOCKER_LOG"], "a") as log:
+    log.write("jumpbox status\\n")
+mode = os.environ.get("PEERS", "present")
+shown = mode == "present" or (mode == "after-restart" and os.path.exists(os.environ["RESTART_MARK"]))
+nodes = json.load(open(os.environ["NODES_FILE"])) if shown else []
+print(json.dumps({"BackendState": os.environ.get("TS_BACKEND", "Running"),
+                  "Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
+"""
+POLICY_NODES = [
+    {"id": 1, "given_name": "alice-laptop", "user": {"name": "alice"},
+     "ip_addresses": ["100.64.0.1"], "expiry": {"seconds": -62135596800}},
+    {"id": 2, "given_name": "bob-laptop", "user": {"name": "bob"},
+     "ip_addresses": ["100.64.0.2"], "expiry": {"seconds": -62135596800}},
+]
 
 
 def _executable(path: Path, body: str) -> None:
@@ -384,6 +424,9 @@ def _policy_rig(tmp_path: Path, **extra: str):
     _executable(bin_dir / "ssh", SSH_STUB)
     _executable(bin_dir / "scp", SCP_STUB)
     _executable(bin_dir / "docker", DOCKER_STUB)
+    _executable(bin_dir / "tailscale", TAILSCALE_STUB)
+    nodes = tmp_path / "nodes.json"
+    nodes.write_text(json.dumps(POLICY_NODES))
     headscale_dir = tmp_path / "headscale"
     config_dir = headscale_dir / "config"
     config_dir.mkdir(parents=True)
@@ -407,6 +450,10 @@ def _policy_rig(tmp_path: Path, **extra: str):
         HEADSCALE_DIR=str(headscale_dir),
         HEADSCALE_BASE_POLICY=str(base),
         HEADSCALE_POLICY_FILE="/etc/headscale/acl.json",
+        JUMPBOX_SSH="jumpbox-host",
+        JUMPBOX_PEER_WAIT="0",
+        NODES_FILE=str(nodes),
+        RESTART_MARK=str(tmp_path / "restarted"),
         HOST_POLICY=str(policy),
         HOST_DATA=str(headscale_dir / "data"),
         LOADED_POLICY=str(loaded),
@@ -483,7 +530,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     docker = _log(env, "DOCKER_LOG").splitlines()
     check = docker.index(f"policy check while-installed={original_digest}")
     assert check < docker.index("reload headscale") < len(docker) - 1
-    assert docker[-1] == "policy get"
+    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
     assert not any("restart" in line for line in docker)
     assert "verified: the policy file Headscale serves matches the rendered one." in result.stdout
     assert Path(env["LOADED_POLICY"]).read_text() == desired
@@ -499,7 +546,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     assert not any("restart" in line for line in rerun)
     rechecks = [i for i, line in enumerate(rerun) if line.startswith("policy check")]
     assert len(rechecks) == 1 and rechecks[0] < len(rerun) - 1
-    assert rerun[-1] == "reload headscale"
+    assert rerun[-3:] == ["reload headscale", "nodes list", "jumpbox status"]
 
     dry = _apply_policy(env)
     assert dry.returncode == 0, dry.stderr
@@ -554,7 +601,7 @@ def test_apply_policy_restarts_headscale_once_when_the_read_back_is_stale(tmp_pa
     assert docker.count("reload headscale") == 1
     assert docker.count("restart headscale") == 1
     assert docker.index("reload headscale") < docker.index("restart headscale")
-    assert docker[-1] == "policy get"
+    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
     assert Path(env["LOADED_POLICY"]).read_text() == desired
     assert policy.read_text() == desired
 
@@ -578,6 +625,253 @@ def test_apply_policy_failed_check_leaves_the_policy_and_backups_unchanged(tmp_p
     assert policy.read_text() == original
     assert sorted(p.name for p in policy.parent.iterdir()) == ["acl.json"]
     assert "restart" not in _log(env, "DOCKER_LOG")
+
+
+# Catches a reload that leaves the subnet router without the students it serves
+# being reported as success: on staging, Headscale v0.27.1 did exactly that once,
+# and every student lost every lab until Headscale was restarted.
+def test_apply_policy_checks_the_jumpbox_peers_without_a_restart_when_present(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path)
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+    assert "restart headscale" not in _log(env, "DOCKER_LOG")
+    assert "ssh jumpbox-host tailscale status --json" in _log(env, "SSH_LOG")
+
+
+def test_apply_policy_restarts_headscale_once_when_the_jumpbox_lacks_peers(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="after-restart")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    docker = _log(env, "DOCKER_LOG").splitlines()
+    assert docker.count("restart headscale") == 1
+    assert docker.index("reload headscale") < docker.index("jumpbox status") < docker.index("restart headscale")
+    assert docker[-1] == "jumpbox status"
+    assert "alice-laptop (alice)" in result.stdout
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+
+    # The matching-file path signals a reload too, so it checks the same way.
+    Path(env["RESTART_MARK"]).unlink()
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert _log(env, "DOCKER_LOG").splitlines().count("restart headscale") == 2
+
+
+def test_apply_policy_fails_closed_when_peers_are_still_missing_after_one_restart(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="never")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "alice-laptop (alice)" in result.stderr and "bob-laptop (bob)" in result.stderr
+    assert "cannot reach their labs" in result.stderr
+    assert "verified: the jumpbox" not in result.stdout
+    assert _log(env, "DOCKER_LOG").splitlines().count("restart headscale") == 1
+
+
+# Catches a fail-closed check that fails a tailnet with no student device yet
+# (the start of a term), restarting Headscale for nothing.
+def test_apply_policy_accepts_a_jumpbox_without_peers_when_no_student_has_a_device(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, PEERS="never")
+    Path(env["NODES_FILE"]).write_text(json.dumps([
+        {"id": 3, "given_name": "jumpbox", "user": {"name": "term-infrastructure"},
+         "ip_addresses": ["100.64.0.3"], "expiry": {"seconds": -62135596800}}]))
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert "restart headscale" not in _log(env, "DOCKER_LOG")
+
+
+# Catches --apply reloading Headscale with nothing able to check the result.
+def test_apply_policy_requires_the_jumpbox_ssh_target_to_apply_with_proxmox(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path)
+    env.pop("JUMPBOX_SSH")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "JUMPBOX_SSH" in result.stderr
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
+    dry = _apply_policy(env)
+    assert dry.returncode == 0, dry.stderr
+
+
+CLOUD_ONLY_SLOTS = {**POLICY_SLOTS, "config": {**POLICY_SLOTS["config"], "enabled_backends": ["aws"]}}
+PEER_CHECK_SKIPPED = "  Proxmox jumpbox peer check skipped: proxmox backend not enabled."
+
+
+# Catches a cloud-only portal, which has no Proxmox jumpbox, being unable to
+# apply its policy at all.
+def test_apply_policy_skips_the_jumpbox_peer_check_without_proxmox(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert PEER_CHECK_SKIPPED in result.stdout.splitlines()
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, CLOUD_ONLY_SLOTS,
+                                                  *policy_inputs(CLOUD_ONLY_SLOTS)))
+    docker = _log(env, "DOCKER_LOG")
+    assert "nodes list" not in docker and "jumpbox status" not in docker and "restart" not in docker
+    # The matching-file path signals a reload too, and skips the same way.
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert PEER_CHECK_SKIPPED in again.stdout.splitlines()
+
+
+# Catches an export with no backend at all taking the cloud-only skip path and
+# reloading a policy nothing checks.
+def test_apply_policy_refuses_an_export_with_no_enabled_backend(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(
+        {**POLICY_SLOTS, "config": {**POLICY_SLOTS["config"], "enabled_backends": []}}) + "\n")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "enabled_backends is empty" in result.stderr
+    assert PEER_CHECK_SKIPPED not in result.stdout
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
+
+
+# ---- apply_headscale_policy.sh --preflight -----------------------------------
+
+# Catches a preflight that writes, reloads, or talks to Headscale, or passes a
+# jumpbox the policy stage could not check.
+@pytest.mark.parametrize("case,expect", [
+    ("ready", "ready: the jumpbox (jumpbox-host) answers and its Tailscale is Running."),
+    ("missing", "JUMPBOX_SSH"),
+    ("unreachable", "Could not read tailscale status on the jumpbox (unreachable-host)"),
+    ("stopped", "Stopped, not Running"),
+    ("cloud-only", PEER_CHECK_SKIPPED.strip()),
+])
+def test_apply_policy_preflight_checks_only_what_apply_needs(tmp_path, case, expect):
+    env, policy, original, _ = _policy_rig(tmp_path)
+    if case == "missing":
+        env.pop("JUMPBOX_SSH")
+    elif case == "unreachable":
+        env["JUMPBOX_SSH"] = "unreachable-host"
+    elif case == "stopped":
+        env["TS_BACKEND"] = "Stopped"
+    elif case == "cloud-only":
+        env.pop("JUMPBOX_SSH")
+        Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _apply_policy(env, "--preflight")
+    passes = case in ("ready", "cloud-only")
+    assert (result.returncode == 0) == passes, result.stdout + result.stderr
+    assert expect in result.stdout + result.stderr
+    assert ("preflight passed" in result.stdout) == passes
+    # Read-only, and Headscale is not contacted at all.
+    assert "headscale-host" not in _log(env, "SSH_LOG")
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original and _backups(policy) == []
+
+
+def test_apply_policy_preflight_and_apply_are_separate_runs(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path)
+    result = _apply_policy(env, "--apply", "--preflight")
+    assert result.returncode != 0 and "separate runs" in result.stderr
+    assert _log(env, "SSH_LOG") == ""
+
+
+# ---- scripts/headscale_peer_watchdog.sh --------------------------------------
+
+WATCHDOG = ROOT / "scripts" / "headscale_peer_watchdog.sh"
+
+
+def _watchdog(env):
+    return subprocess.run(["bash", str(WATCHDOG)], env=env, capture_output=True, text=True, timeout=60)
+
+
+def _watchdog_rig(tmp_path, **extra):
+    env, policy, original, _ = _policy_rig(
+        tmp_path, HEADSCALE_WATCHDOG_STATE=str(tmp_path / "watchdog" / "last-restart"), **extra)
+    return env, policy, original
+
+
+def _restarts(env):
+    return _log(env, "DOCKER_LOG").splitlines().count("restart headscale")
+
+
+# Catches a watchdog that writes the policy, signals Headscale, or restarts a
+# healthy one.
+def test_watchdog_does_nothing_while_the_jumpbox_lists_every_roster_device(tmp_path):
+    env, policy, original = _watchdog_rig(tmp_path)
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ok: the jumpbox lists every roster device as a peer" in result.stdout
+    docker = _log(env, "DOCKER_LOG")
+    assert _restarts(env) == 0 and "reload" not in docker and "policy check" not in docker
+    assert "scp " not in _log(env, "SSH_LOG")
+    assert policy.read_text() == original
+
+
+# Catches the peerless-jumpbox failure (Headscale v0.27.1 after a jumpbox
+# reconnect) persisting until someone notices that no student reaches a lab.
+def test_watchdog_restarts_headscale_once_and_recovers_the_peers(tmp_path):
+    env, policy, original = _watchdog_rig(tmp_path, PEERS="after-restart")
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _restarts(env) == 1
+    assert "alice-laptop (alice)" in result.stdout
+    assert "recovered: the jumpbox lists every roster device as a peer after one Headscale restart" in result.stdout
+    assert policy.read_text() == original
+
+
+# Catches a restart loop: a jumpbox Headscale cannot fix must page someone,
+# not restart Headscale (and drop every student's session) every five minutes.
+def test_watchdog_fails_loudly_and_restarts_at_most_once_per_interval(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, PEERS="never")
+    first = _watchdog(env)
+    assert first.returncode != 0
+    assert "still does not list" in first.stdout + first.stderr
+    assert _restarts(env) == 1
+    again = _watchdog(env)
+    assert again.returncode != 0
+    assert "not restarting it again before" in again.stdout + again.stderr
+    assert _restarts(env) == 1
+    env["HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL"] = "0"
+    later = _watchdog(env)
+    assert later.returncode != 0 and _restarts(env) == 2
+
+
+# Catches a fresh fault left unrepaired for half an hour because an earlier
+# restart (which worked) is still inside the interval. Measured on staging: a
+# jumpbox reboot 24 minutes after a successful recovery left every student
+# without labs while the watchdog refused to restart. The limit is for faults
+# a restart does not fix; a healthy run in between ends it.
+def test_watchdog_healthy_run_ends_the_restart_interval(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path)
+    state = Path(env["HEADSCALE_WATCHDOG_STATE"])
+    state.parent.mkdir(parents=True)
+    state.write_text(f"{int(time.time()) - 60}\n")  # a restart one minute ago
+    healthy = _watchdog(env)
+    assert healthy.returncode == 0, healthy.stdout + healthy.stderr
+    assert not state.exists()
+    env["PEERS"] = "after-restart"
+    fault = _watchdog(env)
+    assert fault.returncode == 0, fault.stdout + fault.stderr
+    assert _restarts(env) == 1
+
+
+# Catches a restart for a jumpbox whose own Tailscale is down, which no
+# Headscale restart can fix.
+def test_watchdog_never_restarts_headscale_for_a_stopped_jumpbox(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, TS_BACKEND="Stopped")
+    result = _watchdog(env)
+    assert result.returncode != 0
+    assert "Stopped" in result.stdout + result.stderr and "not restarting Headscale" in result.stdout + result.stderr
+    assert _restarts(env) == 0
+
+
+def test_watchdog_skips_a_portal_without_the_proxmox_backend(tmp_path):
+    env, _, _ = _watchdog_rig(tmp_path, PEERS="never")
+    env.pop("JUMPBOX_SSH")
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(CLOUD_ONLY_SLOTS) + "\n")
+    result = _watchdog(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "skipped: proxmox backend not enabled" in result.stdout
+    assert "jumpbox status" not in _log(env, "DOCKER_LOG") and _restarts(env) == 0
 
 
 # ---- scripts/term_changeover.sh, fourth stage -------------------------------
@@ -636,8 +930,7 @@ def _term_rig(tmp_path: Path):
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     (repo / "data").mkdir()
-    for name in ("term_changeover.sh", "site_env.sh", "build_students_merged.py", "purge_roster.sql"):
-        shutil.copy(ROOT / "scripts" / name, repo / "scripts" / name)
+    _copy_changeover_tools(repo)
     _executable(repo / "scripts" / "apply_headscale_policy.sh", POLICY_STAGE_STUB)
     config = tmp_path / "site.env"
     config.write_text("\n".join([
@@ -732,12 +1025,29 @@ def test_term_changeover_applies_the_policy_after_the_new_roster_is_seeded(tmp_p
     assert result.returncode == 0, result.stderr
     events = _events(env)
     policy = [i for i, line in enumerate(events) if line.startswith("POLICY")]
-    assert [events[i] for i in policy] == [f"POLICY [--apply] SITE_ENV_FILE={config}"]
-    assert events.index("PURGE") < events.index("PORTAL RESTART") < policy[0]
+    assert [events[i] for i in policy] == [f"POLICY [--preflight] SITE_ENV_FILE={config}",
+                                           f"POLICY [--apply] SITE_ENV_FILE={config}"]
+    assert policy[0] < events.index("DB BACKUP")
+    assert events.index("PURGE") < events.index("PORTAL RESTART") < policy[1]
     last_read = max(i for i, line in enumerate(events) if line == "WHITELIST READ")
-    assert last_read < policy[0]
+    assert last_read < policy[1]
     assert "verified: the whitelist has the exact 1 rows." in result.stdout
     assert result.stdout.index("[3/4] Production database") < result.stdout.index("[4/4] Headscale policy")
+
+
+# Catches a roster too large to number reaching the purge.
+def test_term_changeover_refuses_a_roster_larger_than_the_vlan_pool(tmp_path):
+    repo, env, config, roster = _term_rig(tmp_path)
+    roster.write_text("SIS User ID,SIS Login ID\n"
+                      + "".join(f"{1000 + i},student{i}\n" for i in range(101)))
+    result = subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0
+    assert "101 students" in result.stderr and "at most 100" in result.stderr
+    log = Path(env["EVENT_LOG"])
+    events = log.read_text().splitlines() if log.exists() else []
+    assert not {"DB BACKUP", "PURGE", "PORTAL RESTART"} & set(events)
 
 
 # Catches site.env overwriting the operator's exported policy paths, so the
@@ -756,4 +1066,350 @@ def test_term_changeover_policy_stage_keeps_exported_policy_paths(tmp_path, expo
         env=env, capture_output=True, text=True, timeout=60)
 
     assert result.returncode == 0, result.stderr
-    assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected]
+    # The preflight and the apply both see the operator's paths.
+    assert [line for line in _events(env) if line.startswith("STAGE INPUTS")] == [expected, expected]
+
+
+# The policy stage's remote commands, which the combined rig runs against the
+# policy rig's docker and tailscale stubs; everything else is a stage 1-3 command.
+POLICY_STAGE_MARKERS = ("export_network_slots", "headscale policy", "ps -q headscale",
+                        "kill -s HUP", "restart headscale", "nodes list -o json", "tailscale status")
+
+
+def _term_rig_with_the_real_policy_stage(tmp_path: Path, slots, **policy_extra: str):
+    """term_changeover.sh with stages 1-3 against the term stubs and the real
+    apply_headscale_policy.sh against the policy stubs. Every stage 1-3 command
+    is logged as `TERM <command>` in EVENT_LOG."""
+    (tmp_path / "policy").mkdir()
+    (tmp_path / "term").mkdir()
+    policy_env, policy, original, _ = _policy_rig(tmp_path / "policy", **policy_extra)
+    Path(policy_env["SLOTS_FILE"]).write_text(json.dumps(slots) + "\n")
+    repo, env, config, roster = _term_rig(tmp_path / "term")
+    # The real policy stage, reached through the path term_changeover.sh runs.
+    _executable(repo / "scripts" / "apply_headscale_policy.sh",
+                f'#!/usr/bin/env bash\nexec bash "{APPLY_POLICY}" "$@"\n')
+    term_bin = Path(env["PATH"].split(":", 1)[0])
+    (term_bin / "term_ssh.py").write_text(TERM_SSH_STUB)
+    _executable(term_bin / "ssh", f"""#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+while args and args[0] == "-o":
+    args = args[2:]
+command = " ".join(args[1:])
+if any(marker in command for marker in {POLICY_STAGE_MARKERS!r}):
+    with open(os.environ["SSH_LOG"], "a") as log:
+        log.write("ssh " + args[0] + " " + command + "\\n=====\\n")
+    if args[0] == "unreachable-host":
+        sys.exit("ssh: connect to host unreachable-host port 22: No route to host")
+    os.execv("/bin/sh", ["sh", "-c", command])
+with open(os.environ["EVENT_LOG"], "a") as log:
+    log.write("TERM " + " ".join(command.split()) + "\\n")
+os.execv(sys.executable, [sys.executable, {str(term_bin / "term_ssh.py")!r}, *sys.argv[1:]])
+""")
+    policy_bin = policy_env["PATH"].split(":", 1)[0]
+    stage_env = {name: policy_env[name] for name in (
+        "HEADSCALE_DIR", "HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "HOST_POLICY", "HOST_DATA",
+        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK")}
+    stage_env.update({name: policy_env[name] for name in ("PEERS", "JUMPBOX_SSH", "TS_BACKEND")
+                      if name in policy_env})
+    env.update(stage_env, PATH=f"{term_bin}:{policy_bin}:{os.environ['PATH']}")
+    return repo, env, roster, policy, original
+
+
+def _changeover(repo, env, roster):
+    return subprocess.run(
+        ["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+        env=env, capture_output=True, text=True, timeout=120)
+
+
+# Catches the changeover's last stage failing on a cloud-only site, which has
+# no Proxmox jumpbox to check, after the roster has already been replaced.
+def test_term_changeover_stage_4_applies_a_cloud_only_policy_without_a_jumpbox(tmp_path):
+    repo, env, roster, policy, _ = _term_rig_with_the_real_policy_stage(
+        tmp_path, CLOUD_ONLY_SLOTS, PEERS="never")
+    env.pop("JUMPBOX_SSH", None)
+    result = _changeover(repo, env, roster)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Once in the preflight, once in stage 4.
+    assert result.stdout.count(PEER_CHECK_SKIPPED) == 2
+    assert result.stdout.index("[preflight]") < result.stdout.index("[1/4] Headscale roster")
+    assert result.stdout.index("[4/4] Headscale policy") < result.stdout.rindex(PEER_CHECK_SKIPPED)
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, CLOUD_ONLY_SLOTS,
+                                                  *policy_inputs(CLOUD_ONLY_SLOTS)))
+    assert "jumpbox status" not in _log(env, "DOCKER_LOG")
+
+
+# Catches a Proxmox changeover that replaces the Headscale users, the roster
+# files and the database, and only then finds the policy stage cannot run:
+# the preflight must refuse before the first stage touches anything.
+@pytest.mark.parametrize("jumpbox", [None, "unreachable-host", "stopped"],
+                         ids=["missing", "unreachable", "tailscale-stopped"])
+def test_term_changeover_refuses_before_stage_1_when_the_policy_stage_could_not_run(tmp_path, jumpbox):
+    extra = {"TS_BACKEND": "Stopped"} if jumpbox == "stopped" else {}
+    repo, env, roster, policy, original = _term_rig_with_the_real_policy_stage(tmp_path, POLICY_SLOTS, **extra)
+    if jumpbox is None:
+        env.pop("JUMPBOX_SSH")
+    elif jumpbox == "unreachable-host":
+        env["JUMPBOX_SSH"] = jumpbox
+    merged = repo / "data" / "students_merged.csv"
+    roster_before = merged.read_bytes()
+    result = _changeover(repo, env, roster)
+
+    assert result.returncode != 0
+    assert "preflight failed; nothing was changed" in result.stderr
+    assert {"missing": "JUMPBOX_SSH", "unreachable-host": "Could not read tailscale status",
+            "stopped": "Stopped, not Running"}[jumpbox or "missing"] in result.stdout + result.stderr
+    assert "[1/4]" not in result.stdout
+    log = Path(env["EVENT_LOG"])
+    events = log.read_text().splitlines() if log.exists() else []
+    # Not one stage 1-3 command ran: no Headscale helper, roster copy, backup,
+    # purge or portal restart, not even their read-only checks.
+    assert not [e for e in events if e.startswith("TERM ")], events
+    assert not {"DB BACKUP", "PURGE", "PORTAL RESTART"} & set(events)
+    assert merged.read_bytes() == roster_before
+    docker = _log(env, "DOCKER_LOG")
+    assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
+    assert policy.read_text() == original
+
+
+def test_term_changeover_runs_every_stage_after_a_passing_proxmox_preflight(tmp_path):
+    repo, env, roster, policy, _ = _term_rig_with_the_real_policy_stage(tmp_path, POLICY_SLOTS)
+    result = _changeover(repo, env, roster)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ready: the jumpbox (jumpbox-host) answers and its Tailscale is Running." in result.stdout
+    assert result.stdout.index("[preflight]") < result.stdout.index("[1/4] Headscale roster")
+    assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
+    assert policy.read_text() == canonical(render(EXAMPLE_POLICY, POLICY_SLOTS,
+                                                  *policy_inputs(POLICY_SLOTS)))
+
+
+# ---- scripts/term_changeover.sh, backup: and absent-before: lines ----------
+
+# Runs every file-handling remote command for real against two local
+# directories standing in for the Headscale and portal hosts; answers the
+# Headscale helper and the MySQL calls like TERM_SSH_STUB.
+LOCAL_HOSTS_SSH_STUB = """#!/usr/bin/env python3
+import os, subprocess, sys
+args = sys.argv[1:]
+while args and args[0] == "-o":
+    args = args[2:]
+command = " ".join(args[1:])
+state = os.environ["TERM_STATE"]
+def flag(name):
+    return os.path.exists(os.path.join(state, name))
+def set_flag(name):
+    open(os.path.join(state, name), "w").close()
+reads_sql = "exec mysql " in command
+sql = sys.stdin.read() if reads_sql else ""
+out = sys.stdout.write
+if "python3 -c" in command:
+    sys.stdin.read()
+    if command.rstrip().endswith("--apply"):
+        with open(os.path.join(os.environ["HS_DIR"], "students_with_keys.csv"), "w") as keys:
+            keys.write("student1,student1@example.edu,new-key\\n")
+        set_flag("hs-applied")
+    else:
+        out("to remove: 1 users\\n")
+elif "mysqldump" in command:
+    pass
+elif "restart vm-automation" in command:
+    if flag("purged"):
+        set_flag("seeded")
+elif "docker inspect --format" in command:
+    out("healthy")
+elif reads_sql:
+    if "DELETE FROM" in sql:
+        set_flag("purged")
+    elif "SELECT login_id, sis_user_id" in sql:
+        out("student1\\t1001\\tnew-key\\n" if flag("seeded") else "olduser\\t999\\told-key\\n")
+    elif "SELECT (SELECT COUNT(*)" in sql:
+        out("0\\t0\\t1\\t0\\t0\\t0\\t0\\n")
+else:
+    sys.exit(subprocess.run(["bash", "-c", command]).returncode)
+"""
+LOCAL_DOCKER_STUB = """#!/usr/bin/env python3
+import json, os, sys
+if "users list" in " ".join(sys.argv[1:]):
+    applied = os.path.exists(os.path.join(os.environ["TERM_STATE"], "hs-applied"))
+    names = ["keep-user", "student1" if applied else "olduser"]
+    print(json.dumps([{"name": name} for name in names]))
+"""
+
+
+def _undo_file_function() -> str:
+    doc = (ROOT / "docs" / "TERM_CHANGEOVER.md").read_text()
+    section = doc[doc.index("### Undo one file"):]
+    start = section.index("```bash\n") + len("```bash\n")
+    return section[start:section.index("```", start)]
+
+
+def _undo(line: str, live: Path, host: str = "") -> subprocess.CompletedProcess:
+    script = _undo_file_function() + '\nundo_file check "$1" "$2" "$3" && undo_file apply "$1" "$2" "$3"\n'
+    return subprocess.run(["bash", "-c", script, "undo", line, str(live), host],
+                          capture_output=True, text=True, timeout=30)
+
+
+# The outgoing term's files. The key file must parse: the script reads it.
+OUTGOING = {"keys": "olduser,olduser@example.edu,old-key\n", "local": "outgoing local roster\n",
+            "portal": "outgoing portal roster\n"}
+
+
+def _changeover_with_local_hosts(tmp_path: Path, prior: str):
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    (repo / "data").mkdir()
+    _copy_changeover_tools(repo)
+    _executable(repo / "scripts" / "apply_headscale_policy.sh", POLICY_STAGE_STUB)
+    hs, portal = tmp_path / "headscale-host", tmp_path / "portal-host"
+    (hs / "headscale" / "data").mkdir(parents=True)
+    (hs / "headscale" / "data" / "db.sqlite").write_text("outgoing-db\n")
+    _executable(hs / "headscale_term_changeover.sh", "#!/bin/sh\n")
+    (portal / "data").mkdir(parents=True)
+    (portal / "docker-compose.prod.yml").write_text("services: {}\n")
+    live = {"keys": hs / "students_with_keys.csv", "local": repo / "data" / "students_merged.csv",
+            "portal": portal / "data" / "students_merged.csv"}
+    if prior == "present":
+        for name, path in live.items():
+            path.write_text(OUTGOING[name])
+    config = tmp_path / "site.env"
+    config.write_text("\n".join([
+        "PORTAL_HOST=portal-host", f"PORTAL_DIR={portal}", "PORTAL_COMPOSE=docker-compose.prod.yml",
+        "PORTAL_APP_CONTAINER=lab-playground", "HEADSCALE_HOST=headscale-host", f"HEADSCALE_DIR={hs}",
+        "HEADSCALE_KEEP_USER=keep-user", "HEADSCALE_STAFF=staff-one", "EMAIL_DOMAIN=example.edu",
+        f"REMOTE_BACKUP_DIR={tmp_path / 'backups'}", "KEY_DAYS=45d",
+    ]) + "\n")
+    roster = tmp_path / "roster.csv"
+    roster.write_text("SIS User ID,SIS Login ID\n1001,student1\n")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(bin_dir / "ssh", LOCAL_HOSTS_SSH_STUB)
+    _executable(bin_dir / "docker", LOCAL_DOCKER_STUB)
+    _executable(bin_dir / "chgrp", "#!/bin/sh\nexit 0\n")  # the app group need not exist here
+    _executable(bin_dir / "scp", "#!/usr/bin/env python3\nimport shutil, sys\n"
+                "src, dest = [a for a in sys.argv[1:] if a != '-o' and '=' not in a][-2:]\n"
+                "shutil.copy(src, dest.split(':', 1)[1])\n")
+    _executable(bin_dir / "base64", "#!/usr/bin/env python3\nimport base64, sys\n"
+                "assert sys.argv[1] == '-w0', sys.argv\n"
+                "data = open(sys.argv[2], 'rb').read() if len(sys.argv) > 2 else sys.stdin.buffer.read()\n"
+                "sys.stdout.write(base64.b64encode(data).decode())\n")
+    (tmp_path / "state").mkdir()
+    env = _clean_env(tmp_path, PATH=f"{bin_dir}:{os.environ['PATH']}", SITE_ENV_FILE=str(config),
+                     TERM_STATE=str(tmp_path / "state"), EVENT_LOG=str(tmp_path / "events.log"),
+                     HS_DIR=str(hs))
+    result = subprocess.run(["bash", str(repo / "scripts" / "term_changeover.sh"), "--apply", str(roster)],
+                            env=env, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+    lines = [line.strip() for line in result.stdout.splitlines()
+             if line.strip().startswith(("backup: ", "absent-before: "))]
+    return lines, live, hs
+
+
+# Catches a rollback that cannot tell "there was no file" from "here is the
+# old file": a backup path printed for a file that never existed fails the
+# rollback's check, and a file created from nothing but not reported is left
+# behind as the incoming roster's credentials.
+def test_term_changeover_reports_absent_files_and_the_documented_rollback_deletes_them(tmp_path):
+    lines, live, hs = _changeover_with_local_hosts(tmp_path, "absent")
+    absent = {"keys": f"absent-before: headscale-host:{live['keys']}",
+              "local": f"absent-before: {live['local']}",
+              "portal": f"absent-before: portal-host:{live['portal']}"}
+    assert sorted(line for line in lines if line.startswith("absent-before: ")) == sorted(absent.values())
+    backups = [line for line in lines if line.startswith("backup: ")]
+    assert len(backups) == 2, lines  # the Headscale database and the MySQL dump, nothing else
+    assert not any("students_" in line for line in backups), backups
+    for name, host in (("keys", "headscale-host"), ("local", ""), ("portal", "portal-host")):
+        assert live[name].exists()
+        undone = _undo(absent[name], live[name], host)
+        assert undone.returncode == 0, undone.stderr
+        assert not live[name].exists(), name
+    database = next(line for line in backups if "headscale-db-" in line)
+    (hs / "headscale" / "data" / "db.sqlite").write_text("incoming-db\n")
+    assert _undo(database, hs / "headscale" / "data" / "db.sqlite", "headscale-host").returncode == 0
+    assert (hs / "headscale" / "data" / "db.sqlite").read_text() == "outgoing-db\n"
+
+
+# Catches the other half: a file that existed is backed up, reported as
+# backup:, and the documented rollback puts its content back while the live
+# roster keeps the mode the app container needs.
+def test_term_changeover_backs_up_present_files_and_the_documented_rollback_restores_them(tmp_path):
+    lines, live, _ = _changeover_with_local_hosts(tmp_path, "present")
+    assert not [line for line in lines if line.startswith("absent-before: ")], lines
+    hosts = {"keys": "headscale-host", "local": "", "portal": "portal-host"}
+    patterns = {"keys": "headscale-keys-", "local": "term-changeover-backups", "portal": "students_merged-"}
+    assert live["portal"].stat().st_mode & 0o777 == 0o640
+    for name, path in live.items():
+        line = next(line for line in lines if patterns[name] in line)
+        assert path.read_text() != OUTGOING[name], name
+        undone = _undo(line, path, hosts[name])
+        assert undone.returncode == 0, undone.stderr
+        assert path.read_text() == OUTGOING[name], name
+    assert live["portal"].stat().st_mode & 0o777 == 0o640
+
+
+# Catches the rollback acting on a line meant for another file.
+def test_documented_undo_refuses_an_absent_before_line_for_another_file(tmp_path):
+    live = tmp_path / "students_merged.csv"
+    live.write_text("incoming\n")
+    undone = _undo(f"absent-before: {tmp_path / 'other.csv'}", live)
+    assert undone.returncode != 0 and live.exists()
+    assert _undo(f"backup: {tmp_path / 'missing.csv'}", live).returncode != 0
+    assert live.read_text() == "incoming\n"
+
+
+def _tree(root: Path) -> dict[str, tuple[int, bytes]]:
+    return {str(path.relative_to(root)): (path.stat().st_mode, path.read_bytes())
+            for path in sorted(root.rglob("*")) if path.is_file()}
+
+
+# Catches undo_file mutating on a line it should refuse. Each case runs one
+# undo_file call straight (apply's own checks, not a check run before it).
+# Measured before the fix: a local absent-before: line given with the portal
+# host matched the portal's live path and deleted it, and so did the typo
+# mode "aply"; a backup: line without a live file was restored with plain cp.
+@pytest.mark.parametrize("mode,line,host,live_exists", [
+    ("apply", "absent-before: portal-host:{live}", "other-host", True),     # wrong host
+    ("apply", "absent-before: {live}", "portal-host", True),                # missing host prefix
+    ("apply", "absent-before: portal-host:{live}", "", True),               # host carrier, no host
+    ("aply", "absent-before: {live}", "", True),                            # typo mode
+    ("Apply", "backup: {backup}", "", True),                                # wrong-case mode
+    ("apply", "backup: {backup}", "", False),                               # no live target
+    ("apply", "backup: portal-host:{backup}", "other-host", True),          # backup on another host
+    ("apply", "backup: {backup}", "portal-host", True),                     # backup, missing prefix
+], ids=["wrong-host", "missing-prefix", "carrier-without-host", "typo-mode", "wrong-case-mode",
+        "backup-without-live", "backup-wrong-host", "backup-missing-prefix"])
+def test_documented_undo_refuses_and_changes_nothing(tmp_path, mode, line, host, live_exists):
+    live = tmp_path / "srv" / "data" / "students_merged.csv"
+    backup = tmp_path / "backups" / "students_merged-20261118-000000.csv"
+    live.parent.mkdir(parents=True)
+    backup.parent.mkdir()
+    backup.write_text("outgoing\n")
+    if live_exists:
+        live.write_text("incoming\n")
+        live.chmod(0o640)
+    before = _tree(tmp_path)
+    script = _undo_file_function() + '\nundo_file "$@"\n'
+    result = subprocess.run(
+        ["bash", "-c", script, "undo", mode, line.format(live=live, backup=backup), str(live), host],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "undo_file:" in result.stderr
+    assert _tree(tmp_path) == before
+
+
+# The positive cases the refusals must not break, one call each.
+def test_documented_undo_accepts_exact_host_lines_and_keeps_owner_and_mode(tmp_path):
+    live = tmp_path / "srv" / "students_merged.csv"
+    backup = tmp_path / "backups" / "students_merged-20261118-000000.csv"
+    live.parent.mkdir()
+    backup.parent.mkdir()
+    backup.write_text("outgoing\n")
+    backup.chmod(0o600)
+    live.write_text("incoming\n")
+    live.chmod(0o640)
+    assert _undo(f"backup: portal-host:{backup}", live, "portal-host").returncode == 0
+    assert live.read_text() == "outgoing\n" and live.stat().st_mode & 0o777 == 0o640
+    assert not (live.parent / "students_merged.csv.restoring").exists()
+    assert _undo(f"absent-before: [2001:db8::1]:{live}", live, "[2001:db8::1]").returncode == 0
+    assert not live.exists()
+    assert _undo("", live, "portal-host").returncode == 0

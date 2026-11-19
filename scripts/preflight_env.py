@@ -139,6 +139,26 @@ def _aws_client_cidrs(env, mode):
     return (slots.TAILNET_CIDR,), None
 
 
+# Mirrors app/config.py: the settings VLAN_BANDS replaced.
+REMOVED_VLAN_SETTINGS = ('JUMPBOX_VLAN_BANDS', 'GROUP_ENTRY_VLAN_MIN', 'GROUP_ENTRY_VLAN_MAX',
+                         'GROUP_INTERNAL_VLAN_MIN', 'GROUP_INTERNAL_VLAN_MAX')
+
+
+def _vlan_bands_problem(env, clouds):
+    """The startup rules for VLAN_BANDS; unset means the valid default."""
+    spec = (env.get('VLAN_BANDS') or '').strip()
+    if not spec:
+        return None
+    try:
+        layout = slots.parse_vlan_layout(spec)
+    except ValueError as error:
+        return str(error)
+    if clouds and layout.highest_tag > slots.SLOT_MAX:
+        return (f'reaches VLAN {layout.highest_tag}, past cloud network slot {slots.SLOT_MAX}, '
+                f'the highest {", ".join(clouds)} can give a VLAN tag')
+    return None
+
+
 def _backend_problems(env, check):
     backends = _enabled_backends(env.get('ENABLED_BACKENDS'))
     if any(name not in KNOWN_BACKENDS for name in backends):
@@ -156,6 +176,11 @@ def _backend_problems(env, check):
             check('FIXED_NODE', 'must not be named aws or gcp (cloud backend names)')
 
     clouds = [name for name in backends if name in CLOUD_REQUIRED]
+    check('VLAN_BANDS', _vlan_bands_problem(env, clouds))
+    for key in REMOVED_VLAN_SETTINGS:
+        if (env.get(key) or '').strip():
+            check(key, 'is no longer read; VLAN_BANDS defines every VLAN pool '
+                  '(rename JUMPBOX_VLAN_BANDS to VLAN_BANDS, express group pools as its bands)')
     if not clouds:
         return
     mode = policy.vpn_mode(env.get('VPN_MODE'))

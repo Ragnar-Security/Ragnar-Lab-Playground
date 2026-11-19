@@ -3,6 +3,7 @@ router exactly, never rewrite live network config by surprise, keep the
 Tailscale key off every command line, and never lock the operator out."""
 
 import configparser
+import fnmatch
 import importlib.util
 import ipaddress
 import os
@@ -92,11 +93,13 @@ def _run(script: Path, args, env, input=None, stdin=None):
 
 @pytest.mark.parametrize("tag, gateway, first, last", [
     (100, "10.100.0.1/24", "10.100.0.50", "10.100.0.254"),
-    (200, "10.200.0.1/24", "10.200.0.50", "10.200.0.254"),
+    (199, "10.199.0.1/24", "10.199.0.50", "10.199.0.254"),
+    (200, "10.100.1.1/24", "10.100.1.50", "10.100.1.254"),
+    (299, "10.199.1.1/24", "10.199.1.50", "10.199.1.254"),
     (300, "10.100.2.1/24", "10.100.2.50", "10.100.2.254"),
     (399, "10.199.2.1/24", "10.199.2.50", "10.199.2.254"),
     (400, "10.100.4.1/24", "10.100.4.50", "10.100.4.254"),
-    (499, "10.199.4.1/24", "10.199.4.50", "10.199.4.254"),
+    (500, "10.200.4.1/24", "10.200.4.50", "10.200.4.254"),
 ])
 def test_vlan_gateway_and_dhcp_pool_follow_the_lab_address_plan(tag, gateway, first, last):
     ng = _netgen()
@@ -105,7 +108,7 @@ def test_vlan_gateway_and_dhcp_pool_follow_the_lab_address_plan(tag, gateway, fi
     assert ng.dhcp_pool(tag, bands) == (first, last)
 
 
-@pytest.mark.parametrize("tag", [99, 201, 250, 299, 501])
+@pytest.mark.parametrize("tag", [99, 501, 600])
 def test_vlans_outside_the_routed_bands_get_no_gateway(tag):
     ng = _netgen()
     bands = ng.parse_bands(ng.DEFAULT_BANDS)
@@ -114,21 +117,32 @@ def test_vlans_outside_the_routed_bands_get_no_gateway(tag):
         ng.gateway(tag, bands)
 
 
-def test_jumpbox_routes_every_vlan_the_portal_hands_out_for_entry_and_group_networks():
+def test_jumpbox_routes_every_vlan_the_portal_hands_out():
     # A VLAN the portal assigns but the jumpbox does not serve leaves that
     # student's VMs without DHCP or a route; the allocator bounds are inclusive.
     from app import vlan_allocator
 
     ng = _netgen()
     bands = ng.parse_bands(ng.DEFAULT_BANDS)
-    (user_lo, user_hi), _user_internal = vlan_allocator._pool_for("user")
+    (user_lo, user_hi), (ui_lo, ui_hi) = vlan_allocator._pool_for("user")
     (ge_lo, ge_hi), (gi_lo, gi_hi) = vlan_allocator._pool_for("group")
-    portal = (set(range(user_lo, user_hi + 1)) | set(range(ge_lo, ge_hi + 1))
-              | set(range(gi_lo, gi_hi + 1)))
+    portal = (set(range(user_lo, user_hi + 1)) | set(range(ui_lo, ui_hi + 1))
+              | set(range(ge_lo, ge_hi + 1)) | set(range(gi_lo, gi_hi + 1)))
     served = set(ng.vlan_tags(bands))
     assert sorted(portal - served) == []
     gateways = [ng.gateway(t, bands) for t in served]
     assert len(set(gateways)) == len(gateways)
+
+
+# Catches VLAN 200 (or any tag) belonging to the entry and internal bands at once.
+def test_each_student_pool_sits_in_its_own_band():
+    from app import vlan_allocator
+    ng = _netgen()
+    bands = ng.parse_bands(ng.DEFAULT_BANDS)
+    (e_lo, e_hi), (i_lo, i_hi) = vlan_allocator._pool_for("user")
+    assert {ng._band_for(t, bands).name for t in range(e_lo, e_hi + 1)} == {"entry"}
+    assert {ng._band_for(t, bands).name for t in range(i_lo, i_hi + 1)} == {"internal"}
+    assert (ng.gateway(142, bands), ng.gateway(242, bands)) == ("10.142.0.1/24", "10.142.1.1/24")
 
 
 def test_overlapping_or_out_of_range_bands_are_rejected():
@@ -152,6 +166,7 @@ def test_generated_netplan_is_valid_yaml_with_a_gateway_on_every_lab_vlan():
     vlans = net["vlans"]
     assert set(vlans) == {f"vlan{t}" for t in ng.vlan_tags(bands)}
     assert vlans["vlan100"] == {"id": 100, "link": "ens19", "addresses": ["10.100.0.1/24"]}
+    assert vlans["vlan200"] == {"id": 200, "link": "ens19", "addresses": ["10.100.1.1/24"]}
     assert vlans["vlan399"] == {"id": 399, "link": "ens19", "addresses": ["10.199.2.1/24"]}
     assert vlans["vlan499"] == {"id": 499, "link": "ens19", "addresses": ["10.199.4.1/24"]}
     with pytest.raises(ValueError):
@@ -171,6 +186,8 @@ def test_dnsmasq_serves_twelve_hour_leases_on_lab_vlans_and_never_on_management(
     ranges = [l for l in lines if l.startswith("dhcp-range=")]
     assert len(ranges) == len(ng.vlan_tags(bands))
     assert "dhcp-range=10.100.0.50,10.100.0.254,255.255.255.0,12h" in ranges
+    assert "dhcp-range=10.100.1.50,10.100.1.254,255.255.255.0,12h" in ranges
+    assert not any(r.startswith("dhcp-range=10.200.0.") for r in ranges)
     assert "dhcp-range=10.100.2.50,10.100.2.254,255.255.255.0,12h" in ranges
     assert "dhcp-range=10.199.4.50,10.199.4.254,255.255.255.0,12h" in ranges
     hosts = [l for l in lines if l.startswith("dhcp-host=")]
@@ -195,17 +212,30 @@ SITE = (
 )
 
 
+# Every --apply installs the lab egress table and enables its unit; the stubs
+# keep that unit's state in $UNIT_STATE_DIR so a converged run changes nothing.
+EGRESS_SYSTEMCTL_CASES = (
+    '  "is-active --quiet jumpbox-lab-egress.service") [ -f "$UNIT_STATE_DIR/egress-active" ] || exit 1 ;;\n'
+    '  "is-enabled jumpbox-lab-egress.service")\n'
+    '    if [ -f "$UNIT_STATE_DIR/egress-enabled" ]; then echo enabled; else echo disabled; exit 1; fi ;;\n'
+    '  "enable jumpbox-lab-egress.service") touch "$UNIT_STATE_DIR/egress-enabled" ;;\n'
+    '  "start jumpbox-lab-egress.service") touch "$UNIT_STATE_DIR/egress-active" ;;\n'
+)
+
+
 def _configure_env(tmp_path: Path, site_extra: str = ""):
     sysroot = tmp_path / "root"
     for d in ("etc/netplan", "sys/class/net/ens18", "sys/class/net/ens19"):
         (sysroot / d).mkdir(parents=True)
     env = _base_env(tmp_path, SITE + site_extra)
     bin_dir = tmp_path / "bin"
-    for name in ("netplan", "systemctl", "sysctl", "apt-get", "snap", "dnsmasq", "lvextend"):
+    for name in ("netplan", "sysctl", "apt-get", "snap", "dnsmasq", "lvextend", "nft"):
         _tool(bin_dir, name, LOG_CALL)
+    _tool(bin_dir, "systemctl", LOG_CALL + 'case "$*" in\n' + EGRESS_SYSTEMCTL_CASES + 'esac\nexit 0\n')
     _tool(bin_dir, "qemu-ga", "exit 0\n")  # guest agent already installed
     _tool(bin_dir, "findmnt", "echo /dev/vda1\n")
     env["JUMPBOX_SYSROOT"] = str(sysroot)
+    env["UNIT_STATE_DIR"] = str(tmp_path)
     return env, sysroot
 
 
@@ -250,6 +280,81 @@ def test_configure_apply_converges_and_a_second_run_changes_nothing(tmp_path):
     assert second.returncode == 0, second.stdout + second.stderr
     assert _tree(sysroot) == converged
     assert _mutations(_calls(tmp_path)) == []
+
+
+DNSMASQ_LIMITS = "etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf"
+
+
+# Catches dnsmasq failing to start on a full band string. With bind-dynamic it opens a
+# UDP and a TCP DNS socket per address, and every VLAN interface has an IPv4 and an IPv6
+# link-local address: 401 VLANs took 1,617 descriptors on a staging jumpbox, over
+# systemd's default soft limit of 1,024 ("Too many open files").
+def test_configure_raises_dnsmasq_open_file_limit_above_its_vlan_sockets(tmp_path):
+    env, sysroot = _configure_env(tmp_path)
+    dry = _run(CONFIGURE, [], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert f"changes:   /{DNSMASQ_LIMITS} (mode 644)" in dry.stdout
+    assert "would run: systemctl daemon-reload" in dry.stdout
+
+    result = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    limits = sysroot / DNSMASQ_LIMITS
+    assert stat.S_IMODE(limits.stat().st_mode) == 0o644
+    lines = limits.read_text().splitlines()
+    assert "[Service]" in lines
+    limit = int(next(l for l in lines if l.startswith("LimitNOFILE=")).split("=", 1)[1])
+    vlans = sum(1 for l in (sysroot / DNSMASQ).read_text().splitlines() if l.startswith("dhcp-range="))
+    assert vlans == 401
+    assert limit >= 4 * vlans + 1024
+    # The new limit reaches dnsmasq only through a daemon-reload before the restart.
+    calls = _calls(tmp_path).splitlines()
+    assert calls.index("systemctl daemon-reload") < calls.index("systemctl restart dnsmasq")
+
+
+# Catches the lab egress drop waiting for --isolate-vlans (J2), or any later
+# --apply leaving it out: every --apply installs it, validated, enabled and
+# started, before IP forwarding is switched on.
+def test_every_configure_apply_installs_the_lab_egress_table(tmp_path):
+    env, sysroot = _configure_env(tmp_path)
+    dry = _run(CONFIGURE, [], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "changes:   /etc/nftables.d/jumpbox-lab-egress.nft (mode 644)" in dry.stdout
+    assert '+        iifname "vlan*" oifname != "tailscale0" counter drop' in dry.stdout
+    assert "would run: systemctl enable jumpbox-lab-egress.service" in dry.stdout
+
+    first = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    assert _nft_structure((sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text())[3] == [
+        'iifname "vlan*" oifname "vlan*" return',
+        'iifname "vlan*" oifname != "tailscale0" counter drop']
+    unit = (sysroot / "etc/systemd/system/jumpbox-lab-egress.service").read_text()
+    assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-lab-egress.nft" in unit
+    assert not (sysroot / "etc/nftables.d/jumpbox-vlan-isolation.nft").exists()  # J2 stays opt-in
+    calls = _calls(tmp_path).splitlines()
+    check = next(i for i, c in enumerate(calls) if c.startswith("nft -c -f "))
+    assert check < calls.index("systemctl enable jumpbox-lab-egress.service")
+    assert calls.index("systemctl start jumpbox-lab-egress.service") < calls.index(
+        next(c for c in calls if c.startswith("sysctl -p")))
+
+    converged = _tree(sysroot)
+    (tmp_path / "calls.log").unlink()
+    second = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert second.returncode == 0, second.stdout + second.stderr
+    assert _tree(sysroot) == converged
+    assert _mutations(_calls(tmp_path)) == []
+
+
+def test_configure_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_path):
+    env, sysroot = _configure_env(tmp_path)
+    _without_nft(tmp_path, env)
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert result.returncode != 0 and "nftables" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
+    dry = _run(CONFIGURE, [], env)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "nft not installed" in dry.stdout + dry.stderr
 
 
 def test_configure_uses_netplan_try_so_a_bad_change_reverts_itself(tmp_path):
@@ -512,7 +617,7 @@ def _ssh_filter_env(tmp_path: Path, staff: str = STAFF):
         'set -f\nfor p in $SSHD_PORTS; do echo "port $p"; done\n'
         'for a in $SSHD_LISTEN; do echo "listenaddress $a"; done\nexit ${SSHD_RC:-0}\n'))
     _tool(bin_dir, "systemctl", LOG_CALL + (
-        'case "$*" in\n'
+        'case "$*" in\n' + EGRESS_SYSTEMCTL_CASES +
         '  "show -p Listen ssh.socket") printf "%b" "$SOCKET_LISTEN"; exit ${SOCKET_RC:-0} ;;\n'
         '  "is-active --quiet jumpbox-ssh-filter.service") [ -n "$UNIT_ACTIVE" ] || exit 1 ;;\n'
         'esac\nexit 0\n'))
@@ -819,6 +924,13 @@ def test_ssh_staff_only_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_
 VLAN_NFT = "etc/nftables.d/jumpbox-vlan-isolation.nft"
 VLAN_UNIT = "etc/systemd/system/jumpbox-vlan-isolation.service"
 VLAN_UNIT_NAME = "jumpbox-vlan-isolation.service"
+ISOLATION_RULES = ['iifname "vlan*" oifname "vlan*" counter drop']
+EGRESS_NFT = "etc/nftables.d/jumpbox-lab-egress.nft"
+EGRESS_UNIT = "etc/systemd/system/jumpbox-lab-egress.service"
+EGRESS_UNIT_NAME = "jumpbox-lab-egress.service"
+# Routed lab traffic leaves the jumpbox only to the tailnet; VLAN to VLAN is J2's.
+EGRESS_RULES = ['iifname "vlan*" oifname "vlan*" return',
+                'iifname "vlan*" oifname != "tailscale0" counter drop']
 
 
 def _nft_structure(text):
@@ -833,29 +945,86 @@ def _nft_structure(text):
     return tables, chains, hooks, rules
 
 
+def _nft_verdict(rules, iif, oif, policy="accept"):
+    """First-match verdict of one table's forward rules for one interface pair.
+
+    `return` in a base chain ends that chain with its policy."""
+    def matches(spec, name):
+        negate = spec.startswith("!= ")
+        spec = spec[3:] if negate else spec
+        names = re.findall(r'"([^"]+)"', spec)
+        hit = any(fnmatch.fnmatchcase(name, n) for n in names)
+        return hit != negate
+    for rule in rules:
+        m = re.fullmatch(r'iifname (.+?) oifname (.+?) (?:counter )?(accept|drop|return)', rule)
+        assert m, f"unparsed rule {rule!r}"
+        if matches(m.group(1), iif) and matches(m.group(2), oif):
+            return policy if m.group(3) == "return" else m.group(3)
+    return policy
+
+
+def _forwarded(tables, iif, oif):
+    """A packet is forwarded only if no base chain on the hook drops it."""
+    return all(_nft_verdict(rules, iif, oif) == "accept" for rules in tables)
+
+
 def test_vlan_isolation_drops_only_vlan_to_vlan_forwarding():
-    # Catches a broad forward drop breaking VPN access to every lab.
+    # Catches a broad forward drop breaking VPN access to every lab, or J2
+    # taking over the egress drop that must not wait for J2.
     text = _netgen().render_vlan_isolation()
     tables, chains, hooks, rules = _nft_structure(text)
     assert tables == ["table inet jumpbox_vlan_isolation {"]
     assert chains == ["chain forward {"]
     assert hooks == ["type filter hook forward priority -10; policy accept;"]
-    assert rules == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert rules == ISOLATION_RULES
     # Declare-then-delete-then-recreate makes a repeated load idempotent.
     stmts = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")][:3]
     assert stmts == ["table inet jumpbox_vlan_isolation", "delete table inet jumpbox_vlan_isolation",
                      "table inet jumpbox_vlan_isolation {"]
 
 
-def test_allow_vlans_exempts_listed_tags_in_both_directions_before_drop():
-    # Catches KOTH team VLANs losing their route to the KOTH VLAN (I11).
+def test_lab_egress_lets_lab_vlans_leave_only_to_the_tailnet_and_leaves_vlan_to_vlan_to_j2():
+    # Catches a lab VM routing through the jumpbox into the management LAN, the
+    # Proxmox API or the internet: measured on staging, the jumpbox forwarded a lab
+    # VM's SYNs to the node's API port and its NTP to the internet (no NAT, so only
+    # the replies were missing). And catches the egress table dropping VLAN to
+    # VLAN, which must stay allowed until --isolate-vlans.
+    text = _netgen().render_lab_egress()
+    tables, chains, hooks, rules = _nft_structure(text)
+    assert tables == ["table inet jumpbox_lab_egress {"]
+    assert chains == ["chain forward {"]
+    assert hooks == ["type filter hook forward priority -10; policy accept;"]
+    assert rules == EGRESS_RULES
+    stmts = [l.strip() for l in text.splitlines() if l.strip() and not l.startswith("#")][:3]
+    assert stmts == ["table inet jumpbox_lab_egress", "delete table inet jumpbox_lab_egress",
+                     "table inet jumpbox_lab_egress {"]
+    egress_only = [rules]
+    with_j2 = [rules, ISOLATION_RULES]
+    for iif, oif, before_j2, after_j2 in [
+            ("vlan200", "tailscale0", True, True), ("tailscale0", "vlan200", True, True),
+            ("vlan100", "vlan101", True, False), ("vlan200", "eth0", False, False),
+            ("vlan200", "ens18", False, False), ("vlan500", "docker0", False, False),
+            ("eth0", "tailscale0", True, True), ("eth0", "vlan200", True, True)]:
+        assert _forwarded(egress_only, iif, oif) == before_j2, (iif, oif)
+        assert _forwarded(with_j2, iif, oif) == after_j2, (iif, oif)
+
+
+def test_allow_vlans_exempts_listed_tags_between_vlans_only():
+    # Catches KOTH team VLANs losing their route to the KOTH VLAN (I11), or the
+    # exemption opening the management LAN to a KOTH VLAN.
     text = _netgen().render_vlan_isolation(allow_vlans=[300, 301])
     _tables, _chains, _hooks, rules = _nft_structure(text)
     assert rules == [
         'iifname "vlan*" oifname { "vlan300", "vlan301" } accept',
         'iifname { "vlan300", "vlan301" } oifname "vlan*" accept',
-        'iifname "vlan*" oifname "vlan*" counter drop',
+        *ISOLATION_RULES,
     ]
+    tables = [_nft_structure(_netgen().render_lab_egress())[3], rules]
+    for iif, oif, forwarded in [
+            ("vlan200", "vlan300", True), ("vlan301", "vlan200", True),
+            ("vlan200", "vlan201", False), ("vlan300", "eth0", False),
+            ("vlan300", "tailscale0", True)]:
+        assert _forwarded(tables, iif, oif) == forwarded, (iif, oif)
 
 
 def test_allow_vlans_leaves_the_hook_and_policy_unchanged():
@@ -899,18 +1068,30 @@ def test_portal_and_jumpbox_reject_the_same_bad_bands(spec):
         parse_vlan_bands(spec)
 
 
-def test_vlan_isolation_unit_is_persistent_and_reloadable():
+@pytest.mark.parametrize("render,nft_file,table", [
+    ("render_vlan_isolation_unit", "/etc/nftables.d/jumpbox-vlan-isolation.nft", "jumpbox_vlan_isolation"),
+    ("render_lab_egress_unit", "/etc/nftables.d/jumpbox-lab-egress.nft", "jumpbox_lab_egress"),
+])
+def test_nft_table_units_are_persistent_and_reloadable(render, nft_file, table):
     parser = configparser.ConfigParser(strict=False, interpolation=None)
     parser.optionxform = str
-    parser.read_string(_netgen().render_vlan_isolation_unit())
+    parser.read_string(getattr(_netgen(), render)())
     service = parser["Service"]
     assert service["Type"] == "oneshot" and service["RemainAfterExit"] == "yes"
-    assert service["ExecStart"] == "/usr/sbin/nft -f /etc/nftables.d/jumpbox-vlan-isolation.nft"
-    assert service["ExecReload"] == "/usr/sbin/nft -f /etc/nftables.d/jumpbox-vlan-isolation.nft"
-    assert service["ExecStop"] == "-/usr/sbin/nft delete table inet jumpbox_vlan_isolation"
+    assert service["ExecStart"] == f"/usr/sbin/nft -f {nft_file}"
+    assert service["ExecReload"] == f"/usr/sbin/nft -f {nft_file}"
+    assert service["ExecStop"] == f"-/usr/sbin/nft delete table inet {table}"
     assert parser["Install"]["WantedBy"] == "multi-user.target"
-    assert parser["Unit"]["Before"] == "network-pre.target"
-    assert parser["Unit"]["Wants"] == "network-pre.target"
+    # Catches a boot that switches IP forwarding on (systemd-sysctl applies
+    # 90-jumpbox-router.conf) before the table that filters forwarded lab
+    # traffic is loaded, which would forward lab traffic unfiltered for a moment.
+    unit = parser["Unit"]
+    assert unit["DefaultDependencies"] == "no"
+    assert unit["Before"].split() == ["systemd-sysctl.service", "network-pre.target"]
+    assert unit["Wants"] == "network-pre.target"
+    # nft and the rule file must be mounted, and nothing later than that.
+    assert unit["RequiresMountsFor"].split() == ["/usr/sbin/nft", nft_file]
+    assert "After" not in unit
 
 
 def test_netgen_cli_emits_the_isolation_table_and_unit():
@@ -923,6 +1104,12 @@ def test_netgen_cli_emits_the_isolation_table_and_unit():
     bad = subprocess.run(["python3", str(NETGEN), "isolate-vlans", "--allow-vlans", "1"],
                          capture_output=True, text=True)
     assert bad.returncode == 2 and "ERROR" in bad.stderr
+    egress = subprocess.run(["python3", str(NETGEN), "lab-egress"],
+                            capture_output=True, text=True, check=True).stdout
+    assert _nft_structure(egress)[3] == EGRESS_RULES
+    unit = subprocess.run(["python3", str(NETGEN), "lab-egress-unit"],
+                          capture_output=True, text=True, check=True).stdout
+    assert "jumpbox-lab-egress.nft" in unit
 
 
 def _isolate_env(tmp_path: Path):
@@ -930,7 +1117,7 @@ def _isolate_env(tmp_path: Path):
     bin_dir = tmp_path / "bin"
     _tool(bin_dir, "nft", LOG_CALL)
     _tool(bin_dir, "systemctl", LOG_CALL + (
-        'case "$*" in\n'
+        'case "$*" in\n' + EGRESS_SYSTEMCTL_CASES +
         '  "is-active --quiet jumpbox-vlan-isolation.service") [ -n "$UNIT_ACTIVE" ] || [ -f "$UNIT_STATE_DIR/active" ] || exit 1 ;;\n'
         '  "is-enabled jumpbox-vlan-isolation.service")\n'
         '    if [ -f "$UNIT_STATE_DIR/enabled" ]; then echo enabled\n'
@@ -959,7 +1146,7 @@ def test_isolate_vlans_apply_validates_installs_enables_and_converges(tmp_path):
     first = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans"], env)
     assert first.returncode == 0, first.stdout + first.stderr
     nft_path, unit_path = sysroot / VLAN_NFT, sysroot / VLAN_UNIT
-    assert _nft_structure(nft_path.read_text())[3] == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert _nft_structure(nft_path.read_text())[3] == ISOLATION_RULES
     assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-vlan-isolation.nft" in unit_path.read_text()
     assert stat.S_IMODE(nft_path.stat().st_mode) == 0o644
     assert stat.S_IMODE(unit_path.stat().st_mode) == 0o644
@@ -1003,7 +1190,7 @@ def test_isolate_vlans_with_allow_vlans_installs_the_exemption_rules(tmp_path):
     assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == [
         'iifname "vlan*" oifname { "vlan300", "vlan301" } accept',
         'iifname { "vlan300", "vlan301" } oifname "vlan*" accept',
-        'iifname "vlan*" oifname "vlan*" counter drop',
+        *ISOLATION_RULES,
     ]
 
 
@@ -1026,7 +1213,7 @@ def test_isolate_vlans_accepts_an_empty_allow_list(tmp_path):
     env, sysroot = _isolate_env(tmp_path)
     result = _run(CONFIGURE, ["--apply", "--no-try", "--isolate-vlans", "--allow-vlans", ""], env)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == ['iifname "vlan*" oifname "vlan*" counter drop']
+    assert _nft_structure((sysroot / VLAN_NFT).read_text())[3] == ISOLATION_RULES
 
 
 def test_isolate_vlans_refuses_a_ruleset_nft_rejects(tmp_path):

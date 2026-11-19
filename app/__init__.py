@@ -38,7 +38,8 @@ __version__ = "1.1.0"
 __all__ = ["create_app", "db"]
 
 
-def create_app(testing=False, test_config=None, start_background_tasks=True):
+def create_app(testing=False, test_config=None, start_background_tasks=True,
+               check_vlan_layout=True):
     """
     Application factory function
 
@@ -54,6 +55,9 @@ def create_app(testing=False, test_config=None, start_background_tasks=True):
             recovery and scorer resume. One-shot tools (the network-slot
             export) run beside a live server and must not revert its
             in-flight deploy to draft or start a second scorer.
+        check_vlan_layout: If False, skip the startup VLAN layout checks;
+            only scripts/accept_vlan_layout.py, which exists to resolve
+            what they refuse, passes it.
 
     Returns:
         Flask: Configured Flask application
@@ -106,7 +110,14 @@ def create_app(testing=False, test_config=None, start_background_tasks=True):
 
     # Initialize database
     db.init_app(app)
-    
+
+    # A student pair outside VLAN_BANDS, or a VLAN_BANDS changed under stored
+    # pairs, leaves students without their networks, so startup refuses.
+    if check_vlan_layout and not testing and not app.config.get('TESTING'):
+        from .vlan_allocator import check_stored_vlan_tags
+        with app.app_context():
+            check_stored_vlan_tags()
+
     # Register blueprints
     from .routes import api
     from .auth import auth

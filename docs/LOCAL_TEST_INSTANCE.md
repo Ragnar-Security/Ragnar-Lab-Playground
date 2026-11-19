@@ -3,7 +3,8 @@
 A throwaway copy of the portal, run with the development stack on a workstation or a lab VM, that
 deploys real VMs on the same Proxmox cluster as production. Use it to try a new template, test a
 `templates.yaml` change, or develop against real infrastructure without touching the production
-portal.
+portal. For the permanent staging portal on an isolated bridge, with its own jumpbox and Headscale,
+see `docs/STAGING.md`.
 
 It shares the cluster with production, so three things must be true **before** it gets real
 credentials. Everything else in this guide is convenience.
@@ -32,9 +33,12 @@ production data (`data/students_merged.csv`, `data/untracked-survivors.jsonl`).
 
 ## What it still shares with production
 
-- **VMIDs.** It allocates above the cluster's highest VMID, like production. Production reads the
-  cluster live when it allocates, so the two do not collide while a test VM exists, and nothing
-  remains after you destroy it.
+- **VMIDs.** With `VMID_RANGE` unset it allocates above the cluster's highest VMID, like
+  production. Production reads the cluster live when it allocates, so the two do not collide while
+  a test VM exists, and nothing remains after you destroy it. `VMID_RANGE=<min>-<max>` keeps it in
+  its own block instead. Choose a range below the cluster's highest VMID: a guest above another
+  portal's high-water mark raises that portal's next VMIDs for good
+  (`app/proxmox_service.py`, `get_next_available_vmid`).
 - **Capacity.** Test VMs use real memory and storage on the nodes.
 - **Proxmox task log.** Each operation shows up there under the token's user.
 

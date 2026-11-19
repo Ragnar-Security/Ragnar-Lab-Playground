@@ -17,6 +17,7 @@ student laptop ──tailnet── Headscale (vpn.example.edu)
                  ├─ net0  management: vmbr0, VLAN 1, DHCP
                  └─ net1  trunk: vmbr0, untagged, firewall on
                      ├─ vlan100  10.100.0.1/24  ─ student entry network
+                     ├─ vlan200  10.100.1.1/24  ─ student internal network
                      ├─ vlan300  10.100.2.1/24  ─ group entry network
                      └─ vlan400  10.100.4.1/24  ─ group internal network …
 ```
@@ -36,26 +37,90 @@ jumpbox section of `scripts/site.env.example`.
 
 ## Address plan
 
-Each lab VLAN tag *N* gets one /24 network. The jumpbox holds `.1`, and
-dnsmasq leases `.50` to `.254` for 12 hours:
-
-| Band | VLANs | Network | Portal pool |
-|------|-------|---------|-------------|
-| `entry` | 100–200 | `10.<N>.0.0/24` | per-student entry VLAN (`app/vlan_allocator.py`) |
-| `group-entry` | 300–399 | `10.<N-200>.2.0/24` | group entry VLAN (`GROUP_ENTRY_VLAN_MIN/MAX`) |
-| `group-internal` | 400–500 | `10.<N-300>.4.0/24` | group internal VLAN (`GROUP_INTERNAL_VLAN_MIN/MAX`) |
-
-The bands must cover every VLAN the portal can assign. The portal's bounds
-are inclusive, so group-internal includes VLAN 500, and
-`tests/test_jumpbox_scripts.py` fails if the defaults stop covering the
-allocator's pools. Per-student internal VLANs (200–300) are not served by the
-jumpbox. If you change the portal's `GROUP_*_VLAN_*` settings, set
-`JUMPBOX_VLAN_BANDS` to match:
+One setting, `VLAN_BANDS`, is the whole VLAN layout. The portal allocates
+every VLAN from it and the jumpbox routes exactly it, so it must have the
+same value in the portal's `.env` and in `scripts/site.env`. Each band is
+`name:first-last:offset:third`, and VLAN tag *N* in a band gets the /24
+`10.<N-offset>.<third>.0/24`. The jumpbox holds `.1`, and dnsmasq leases
+`.50` to `.254` for 12 hours. The default:
 
 ```
-JUMPBOX_VLAN_BANDS="entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4"
-#                   name:first-last:offset:third  ->  VLAN N = 10.<N-offset>.<third>.1/24
+VLAN_BANDS="entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
+#           name:first-last:offset:third  ->  VLAN N = 10.<N-offset>.<third>.1/24
 ```
+
+| Band | Default VLANs | Default network | Portal pool |
+|------|---------------|-----------------|-------------|
+| `entry` | 100–199 | `10.<N>.0.0/24` | per-student entry VLAN: student *i* gets `first+i` |
+| `internal` | 200–299 | `10.<N-100>.1.0/24` | per-student internal VLAN: student *i* gets `first+i` |
+| `group-entry` | 300–399 | `10.<N-200>.2.0/24` | group entry VLAN: the first free tag |
+| `group-internal` | 400–500 | `10.<N-300>.4.0/24` | group internal VLAN: the first free tag |
+
+A student's two networks share the second octet: entry VLAN 142 is
+`10.142.0.0/24` and internal VLAN 242 is `10.142.1.0/24`. The roster holds
+as many students as the `entry` band has tags (100 by default); the
+changeover and the seed refuse a larger one.
+
+The portal refuses to start unless the layout satisfies these rules, each
+because something depends on it:
+
+- `entry`, `internal`, `group-entry` and `group-internal` each appear
+  exactly once: they are the pools the portal allocates from. Other bands
+  may be added for the jumpbox to route; the portal never assigns them.
+- No two bands share a tag or a subnet.
+- `internal` has exactly as many tags as `entry`, because a student's pair
+  is one index into both bands.
+- `group-internal` has at least as many tags as `group-entry`, because each
+  group takes one tag from each. The default's `group-internal` holds one
+  tag more (400–500).
+- Every tag lies in 2–4094 and every derived address is valid
+  (`0 <= N-offset <= 255`, `0 <= third <= 255`).
+- With `aws` or `gcp` enabled, no tag is above 500: a cloud gives each VLAN
+  tag its own network slot, and slot 500 is the highest.
+- Every stored student pair (users and the whitelist) lies in the `entry`
+  and `internal` bands.
+- `VLAN_BANDS` equals the layout recorded in the database while any student
+  pair is stored. The portal records its layout on its first start (and
+  again whenever it changes with no pair stored). A changed layout can keep
+  every tag inside its band yet move it to another subnet (a new offset or
+  third octet), so startup refuses it, naming the recorded and the new
+  layout, instead of cutting students off their labs.
+
+The bands describe what the jumpbox serves. A group or KOTH game given an
+explicit VLAN outside every band is allowed, and startup names each one in
+a warning, but the jumpbox and the Headscale policy do not route it; that
+VLAN is the operator's to route.
+
+To change `VLAN_BANDS` while students are stored, do it between terms:
+
+1. Destroy every lab, then stop the portal
+   (`docker compose -f <PORTAL_COMPOSE> stop vm-automation`). The accept
+   refuses while any VM record is live or a deployment is being admitted,
+   because a running lab keeps its old addresses.
+2. Set the new value in the portal's `.env` and in `scripts/site.env`. The
+   accept records the value the portal's `.env` holds.
+3. Accept it in a one-off container:
+   `docker compose -f <PORTAL_COMPOSE> run --rm vm-automation python
+   scripts/accept_vlan_layout.py`. This dry run prints the recorded and new
+   layouts and every student network that moves, `old subnet -> new subnet`.
+   Re-run it with `--apply` to record the new layout. The live-VM check and
+   the write run in one transaction under the lock deployment admission
+   takes, so no deployment can slip in between.
+4. Start the portal, re-run `jumpbox_configure.sh --apply` on the jumpbox,
+   and re-run `scripts/apply_headscale_policy.sh --apply`, which refuses
+   while the portal's exported bands and `scripts/site.env` differ.
+
+A portal process still running the old layout (one that was not stopped)
+refuses every deployment after the accept with `portal VLAN layout differs
+from the recorded layout — restart required`. With no student pair stored,
+setting the same value in both files and step 4 are enough: the portal
+records the new layout itself.
+
+The record is created by `scripts/migrate_add_vlan_layout_record.py`. On a
+database that already holds student pairs, the portal refuses to start until
+that migration has seeded the layout those pairs were numbered under
+(`docs/INTERNAL_VLAN_ROLLOUT.md`, section 2); a new database, or one with no
+student pair, records the configured layout on its first start.
 
 Templates with a `static_mac` can get a fixed address on every network of
 one band, for example a domain controller at `.10` on each group-internal
@@ -66,9 +131,11 @@ JUMPBOX_DHCP_RESERVATIONS="group-internal=02:00:00:00:00:01,dc,10"
 ```
 
 The Proxmox bridge must carry these VLANs (`bridge-vlan-aware yes`, with
-`bridge-vids` including 100–500), and so must the switch ports between nodes.
+`bridge-vids` including every tag in `VLAN_BANDS`, 100–500 by default), and so must the switch ports between nodes.
 
 ## 1. Create the VM
+
+A staging jumpbox puts `JUMPBOX_TRUNK_BRIDGE` on an isolated bridge; see `docs/STAGING.md`.
 
 Set the provisioning values in `scripts/site.env`: `JUMPBOX_NODE`,
 `JUMPBOX_STORAGE`, `JUMPBOX_VMID`, `JUMPBOX_SSH_PUBKEY`, and if they differ
@@ -113,7 +180,9 @@ It writes:
 |------|---------|
 | `/etc/netplan/60-jumpbox-vlans.yaml` | management NIC on DHCP; trunk NIC unaddressed; one `vlan<N>` per lab VLAN with its `.1/24` |
 | `/etc/dnsmasq.d/jumpbox.conf` | `interface=vlan*` with `bind-dynamic`; `no-dhcp-interface` for the management NIC; `no-resolv` plus `JUMPBOX_DNS_UPSTREAM`; one `dhcp-range` per VLAN |
+| `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf` | `LimitNOFILE=65536`: dnsmasq opens a UDP and a TCP DNS socket for each VLAN's IPv4 and IPv6 link-local address, about 1,600 for the full band string, and fails with "Too many open files" at systemd's default soft limit of 1,024 |
 | `/etc/sysctl.d/90-jumpbox-router.conf` | `net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`, `rp_filter=2` |
+| `/etc/nftables.d/jumpbox-lab-egress.nft`, `/etc/systemd/system/jumpbox-lab-egress.service` | the lab egress table, enabled and started before forwarding is switched on (below) |
 
 Behaviour to know:
 
@@ -139,6 +208,52 @@ Behaviour to know:
 - **DNS is not exposed.** dnsmasq answers only on lab VLAN interfaces, so it
   is not a resolver on the management LAN or the tailnet, and it leaves
   systemd-resolved's stub listener alone.
+
+### Lab egress: routed lab traffic leaves only to the tailnet
+
+The jumpbox forwards whatever a lab VM hands it, and it does no NAT. Without a
+filter, a lab VM can send packets through the jumpbox's management NIC into
+the management LAN, the Proxmox API and the internet. Their replies usually
+find no way back, but the packets arrive: on staging, a lab VM's SYNs to the
+Proxmox API port and its NTP and HTTPS traffic were captured leaving the
+jumpbox. The Headscale policy cannot stop this, since the traffic never
+touches the tailnet.
+
+So every `--apply` installs `inet jumpbox_lab_egress`, with its own oneshot
+unit `jumpbox-lab-egress.service`. At boot the unit loads the table before
+`systemd-sysctl.service` switches IP forwarding on, and before the network
+(`Before=systemd-sysctl.service network-pre.target`; it needs only `nft` and
+the rule file mounted), so lab traffic is never forwarded unfiltered. It needs `nft`:
+`--apply` refuses without it, and the dry run notes it. The table has a
+forward hook at priority -10, policy accept, and two rules:
+
+```
+iifname "vlan*" oifname "vlan*" return
+iifname "vlan*" oifname != "tailscale0" counter drop
+```
+
+Routed lab traffic may go only to the tailnet; everything else that enters on
+a lab VLAN is counted and dropped. Lab VMs have no egress except the student's
+tailnet: no lab needs outbound internet during a lab session, and build-time
+package installs happen in the image builder, not in a lab session. Name
+lookups still work, because dnsmasq on the jumpbox answers them (input, not
+forwarding). VLAN-to-VLAN traffic is not this table's business: `return` ends
+its chain, and the separate VLAN isolation table below (`--isolate-vlans`, J2)
+decides it. From `tailscale0` to a VLAN, and the jumpbox's own DHCP and DNS,
+are untouched.
+
+**Verify:** from a lab VM, a ping to the management gateway gets no reply,
+and the counter in `sudo nft list table inet jumpbox_lab_egress` rises.
+Because the jumpbox does no NAT, a missing reply alone proves nothing; the
+counter does, as does an empty `sudo tcpdump -ni <mgmt-if> src <lab-vm-address>`.
+
+A lab VM can still reach the jumpbox itself (ping, and SSH on any of its
+addresses), which is input, not forwarding. `--ssh-staff-only` (below) closes
+SSH to everyone but staff; a changeover turns it on.
+
+**Reload, never restart** the unit (as for VLAN isolation below). Rolling it
+back is `sudo systemctl disable --now jumpbox-lab-egress.service` (ExecStop
+deletes the table), but the next `--apply` installs it again.
 
 ### Adopting a jumpbox that was built by hand
 
@@ -210,6 +325,72 @@ jumpbox is approved without a manual step:
 "autoApprovers": { "routes": { "10.0.0.0/8": ["tag:jumpbox"] } }
 ```
 
+### Headscale peer watchdog
+
+Headscale v0.27.1 can leave the jumpbox with no peers: once after a policy
+reload and once after the jumpbox's Tailscale reconnected (staging). The
+jumpbox then routes for nobody, and no student reaches any lab, until Headscale
+restarts. `scripts/apply_headscale_policy.sh --apply` checks for this after
+every reload. A reconnect can happen at any time, though: a jumpbox reboot,
+a Tailscale upgrade, or a network blip. `scripts/headscale_peer_watchdog.sh`
+runs the same check on a timer and never writes or reloads the policy:
+
+- If every roster device is a peer of the jumpbox, it logs `ok` and exits 0.
+- If the jumpbox's Tailscale is not `Running`, it logs that and exits 1
+  without touching Headscale, since a restart cannot fix it.
+- If roster devices are missing, it restarts Headscale once and checks again.
+  It restarts at most once per `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL`
+  seconds (default 1800). Within that interval a still-missing device only
+  logs an error and exits 1, so a fault that a restart cannot fix never turns
+  into a restart loop. A healthy run ends the interval, so a new fault after
+  a recovery (a jumpbox reboot, say) is repaired at the next run. The time of
+  the last restart is kept in `HEADSCALE_WATCHDOG_STATE` (default
+  `~/.local/state/headscale-peer-watchdog/last-restart`).
+- Without the proxmox backend it logs that the check is skipped.
+
+It reads the same `scripts/site.env` as the policy script (`PORTAL_HOST`,
+`PORTAL_APP_CONTAINER`, `HEADSCALE_HOST`, `HEADSCALE_DIR`, `JUMPBOX_SSH`), so
+run it on the operator host that runs that script. As a systemd timer every
+5 minutes, with `<checkout>` the repository checkout and `<user>` the account
+whose SSH key reaches the three hosts:
+
+```ini
+# /etc/systemd/system/headscale-peer-watchdog.service
+[Unit]
+Description=Restart Headscale once if the jumpbox has lost its roster peers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=<user>
+Environment=SITE_ENV_FILE=<checkout>/scripts/site.env
+ExecStart=<checkout>/scripts/headscale_peer_watchdog.sh
+```
+
+```ini
+# /etc/systemd/system/headscale-peer-watchdog.timer
+[Unit]
+Description=Check the jumpbox's Headscale peers every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl enable --now headscale-peer-watchdog.timer
+systemctl list-timers headscale-peer-watchdog.timer       # next run within 5 minutes
+journalctl -u headscale-peer-watchdog.service -n 20        # "ok: the jumpbox lists every roster device as a peer."
+```
+
+A failed run leaves the service `failed`, which `systemctl --failed` and any
+unit-failure alerting the host has will show. Treat it as "no student can
+reach a lab".
+
 ## Recommended security settings
 
 ### Headscale ACL: each student reaches only their own labs
@@ -220,8 +401,8 @@ traffic is matched against its destination (`10.x.x.x`), not against the
 router's tag, so the policy is
 where per-student access is decided. `scripts/apply_headscale_policy.sh`
 renders it from the portal (dry run by default, `--apply` to install): each
-roster login reaches only its own entry network, its groups' networks and the
-running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
+roster login reaches only its own entry and internal networks, its groups'
+networks and the running KOTH arenas, on Proxmox and on every enabled cloud. It keeps every
 rule of your base policy except the blanket rule whose `src` is exactly
 `["autogroup:member"]`, which it cuts down to its `autogroup:self`
 destinations (students keep reaching their own devices), so a rule like
@@ -338,6 +519,8 @@ a password.
 The jumpbox is every lab VLAN's gateway, so without this step a lab VM can
 reach another student's lab VM on another VLAN by routing through it. The
 Headscale policy cannot stop that: the traffic never leaves the jumpbox.
+Traffic from a lab VLAN to anything else is the lab egress table's business
+(section 2), which every `--apply` installs.
 
 ```bash
 sudo jumpbox/jumpbox_configure.sh --isolate-vlans                         # dry run: shows the diff
@@ -347,21 +530,24 @@ sudo jumpbox/jumpbox_configure.sh --apply --no-try --isolate-vlans --allow-vlans
 
 This writes `/etc/nftables.d/jumpbox-vlan-isolation.nft` and
 `/etc/systemd/system/jumpbox-vlan-isolation.service` (a oneshot that loads the
-file before the network) and enables the unit. The file is its own table,
+file before IP forwarding is switched on and before the network, like the lab
+egress unit) and enables the unit. The file is its own table,
 `inet jumpbox_vlan_isolation`, with a forward hook at priority -10 and policy
 accept, holding one rule: count and drop what enters **and** leaves through a
 `vlan*` interface. Traffic between `tailscale0` and a VLAN (students, staff),
-management traffic and the jumpbox's own traffic are untouched, and so is
-traffic inside one VLAN, which never crosses the jumpbox. A group's entry and
-internal networks are joined by the entry machine's second NIC, not by
-jumpbox routing, so group labs keep working. The ruleset is checked with
-`nft -c -f` first, and the script refuses when `nft` is missing. Have console
-or recovery access before the first `--apply`; `--no-try` applies a pending
-netplan change without the interactive `netplan try`.
+the jumpbox's own traffic, and traffic inside one VLAN, which never crosses
+the jumpbox, are untouched. A group's entry and internal networks are joined
+by the entry machine's second NIC, not by jumpbox routing, so group labs keep
+working. The ruleset is checked with `nft -c -f` first, and the script
+refuses when `nft` is missing. Have console or recovery access before the
+first `--apply`; `--no-try` applies a pending netplan change without the
+interactive `netplan try`.
 
 **`--allow-vlans LIST`** (comma-separated tags and `first-last` ranges, tags
 2-4094; only with `--isolate-vlans`) exempts those VLANs from the drop in
-both directions: an exempt VLAN may exchange traffic with every lab VLAN.
+both directions: an exempt VLAN may exchange traffic with every lab VLAN. It
+never opens the management side or the internet, which the lab egress table
+keeps closed.
 KOTH players arrive over the tailnet, which the table never touches, so set
 it to the KOTH VLAN range only if KOTH boxes must reach each other across
 VLANs, or team VLANs must reach the KOTH VLANs. Re-run with the new list
@@ -440,5 +626,5 @@ list.
 |---------|-------|
 | Lab VMs get no address | `ip -br addr \| grep vlan` shows the `.1` gateways; `journalctl -u dnsmasq`; `df -h /`, because a full disk stops lease writes |
 | Students cannot reach lab VMs | `tailscale status`; route approved (`headscale nodes list-routes`); ACL allows `10.0.0.0/8`; `sysctl net.ipv4.ip_forward` |
-| A VLAN works but a new group's does not | the group's VLAN is outside `JUMPBOX_VLAN_BANDS`; re-run configure after widening the bands |
+| A VLAN works but a new group's does not | the group's VLAN is outside `VLAN_BANDS` (an explicit tag; the startup log names it); widen the bands in both `.env` and `scripts/site.env`, then re-run configure |
 | `netplan try` reverted | you did not confirm within the timeout, or the change cut your session; read the dry-run diff and re-run |

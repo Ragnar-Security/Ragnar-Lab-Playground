@@ -6,7 +6,7 @@ from app.backends.network_slots import (
     proxmox_slot_cidr, routed_slots, validate_lab_cidr,
 )
 
-DEFAULT_BANDS = 'entry:100-200:0:0 group-entry:300-399:200:2 group-internal:400-500:300:4'
+DEFAULT_BANDS = 'entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4'
 
 
 # Catches off-by-one subnet reuse between adjacent students.
@@ -35,10 +35,13 @@ def test_cloud_slot_rejects_out_of_range_or_small_base():
 def test_default_vlan_bands_map_documented_slots():
     bands = parse_vlan_bands(DEFAULT_BANDS)
     assert proxmox_slot_cidr(100, bands) == '10.100.0.0/24'
+    assert proxmox_slot_cidr(199, bands) == '10.199.0.0/24'
+    assert proxmox_slot_cidr(200, bands) == '10.100.1.0/24'
+    assert proxmox_slot_cidr(250, bands) == '10.150.1.0/24'
     assert proxmox_slot_cidr(300, bands) == '10.100.2.0/24'
     assert proxmox_slot_cidr(400, bands) == '10.100.4.0/24'
-    assert proxmox_slot_cidr(250, bands) is None
-    assert routed_slots([250, 400, 100], bands) == [100, 400]
+    assert proxmox_slot_cidr(600, bands) is None
+    assert routed_slots([600, 400, 250, 100], bands) == [100, 250, 400]
 
 
 # Catches nondeterministic or duplicated policy rows.

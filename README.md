@@ -35,7 +35,7 @@ Each deployment group runs on one backend, chosen in `templates.yaml` by `backen
 - **Weighted load balancing** -- distributes VMs across Proxmox nodes by CPU (30%), memory (30%), and free memory (40%); cloud backends admit against their machine cap instead
 - **Cross-node template sync** -- `sync_template.sh` replicates templates between nodes using vzdump/qmrestore (no NFS)
 - **Automatic cleanup** -- a background task destroys expired VMs every minute on every backend; a record whose guest was deleted by hand in Proxmox is retired, with an admin alert, once fresh inventory has confirmed the absence for five minutes; a time-boxed orphan reaper removes expired guests that have no record, and on each enabled cloud only leftovers carrying this portal's `LAB_SITE_ID`
-- **Per-student VLAN isolation** -- entry VLAN (100-200) and internal VLAN (200-300) per student; on a cloud backend the same tags select the student's two network slots
+- **Per-student VLAN isolation** -- an entry VLAN and an internal VLAN per student (100-199 and 200-299 by default; `VLAN_BANDS` sets the layout); on a cloud backend the same tags select the student's two network slots
 - **Startup config validation** -- templates.yaml is validated at boot; mismatches are caught before any VM is created
 
 ## Tech Stack
@@ -303,11 +303,13 @@ These values normally live in `.env`:
 | `ADMIN_USERS` | Comma-separated admin login IDs |
 | `ENABLE_LOAD_BALANCING` | Global load-balancing toggle |
 | `FIXED_NODE` | Default node when load balancing is off; may not be `aws` or `gcp`, the names cloud admission reserves under |
+| `LAB_BRIDGE` | Proxmox bridge for every lab NIC; default `vmbr0`; only a staging portal on an isolated bridge changes it (`docs/STAGING.md`). Startup refuses a value that is not an interface name, because it is spliced into the Proxmox `netN` strings |
+| `VMID_RANGE` | `<min>-<max>` (100 to 999999999) that this portal allocates VMIDs from; unset means above the cluster's highest VMID. Inside a range the allocator ignores every VMID outside it and refuses a deployment that would pass `<max>`; an invalid value fails startup. Choose a range below the cluster's highest VMID: a guest above another portal's high-water mark raises that portal's next VMIDs for good (`app/proxmox_service.py`, `get_next_available_vmid`) |
 | `CPU_THRESHOLD` / `MEMORY_THRESHOLD` | Global resource thresholds |
 | `DISTRIBUTED_VM_LOCKS` | Serialize each VMID's stop/delete/retire across gunicorn workers with MySQL `GET_LOCK`; defaults to `false`, which uses an in-process lock only, enough for the single production worker. Set `true` before running more than one worker; each lock holder then uses a second database connection |
 | `ENABLED_BACKENDS` | Comma list of `proxmox`, `aws`, `gcp`; unset or empty means `proxmox`. Startup refuses an unknown name and the missing settings of an enabled backend |
 | `LAB_SITE_ID` | Ownership tag on every cloud resource; required when `aws` or `gcp` is enabled. The orphan reaper deletes resources carrying it that no record owns, so two portals sharing one value would sweep each other's machines |
-| `JUMPBOX_VLAN_BANDS` | The jumpbox's VLAN bands, exactly as `scripts/site.env` sets them; exported to the Headscale policy |
+| `VLAN_BANDS` | The one VLAN layout, `name:first-last:offset:third` bands (default `entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4`). The student pairs, the group pools, the roster cap (the entry band's size), the jumpbox's subnets and the Headscale policy all derive from it; set the same value in `scripts/site.env`. Startup refuses a layout without exactly one `entry`, `internal`, `group-entry` and `group-internal` band, overlapping bands, an `internal` band of a different size than `entry`, a `group-internal` band smaller than `group-entry`, an invalid tag or address, a tag above cloud slot 500 with `aws`/`gcp` enabled, and a stored student pair outside the `entry`/`internal` bands (`docs/JUMPBOX.md`) |
 | `AWS_*` / `GCP_*` | Region and zone, lab VPC or network, lab CIDR, router instance, the mandatory `AWS_MAX_VMS` / `GCP_MAX_VMS` cap, router idle minutes and timeouts; each is described in `.env.example`. Credentials come from boto3's standard chain and Application Default Credentials (`docs/CLOUD_BACKENDS.md`) |
 | `SMTP_*` / `ALERT_WEBHOOK_*` | Alert notification settings |
 | `DOCKERHUB_USERNAME` | Docker Hub namespace |
@@ -336,6 +338,9 @@ any required value that is missing.
 | `EMAIL_DOMAIN` | Student email domain used while building the roster |
 | `REMOTE_BACKUP_DIR` | Remote directory for changeover backups |
 | `KEY_DAYS` | Lifetime of new student pre-auth keys (for example `150d`), used by changeover and key rotation |
+| `JUMPBOX_SSH` | SSH destination of the jumpbox (for example `ubuntu@<jumpbox-mgmt-address>`). With the proxmox backend, `apply_headscale_policy.sh --apply`, its `--preflight` (which `term_changeover.sh --apply` runs before stage 1) and `headscale_peer_watchdog.sh` read `tailscale status --json` there to check that every roster device is a jumpbox peer. Required on a Proxmox site; a cloud-only site needs neither this nor `JUMPBOX_PEER_WAIT` |
+| `JUMPBOX_PEER_WAIT` | Seconds to wait for the jumpbox to list every roster device after a reload, before restarting Headscale once (default `60`) |
+| `HEADSCALE_WATCHDOG_MIN_RESTART_INTERVAL`, `HEADSCALE_WATCHDOG_STATE` | `headscale_peer_watchdog.sh`: at most one Headscale restart per this many seconds (default `1800`), and the file recording the last one (`docs/JUMPBOX.md`, "Headscale peer watchdog") |
 | `HEADSCALE_URL` | Login-server URL the jumpbox joins |
 | `JUMPBOX_NODE` | Proxmox node on which to create the jumpbox |
 | `JUMPBOX_STORAGE` | Proxmox storage for the jumpbox |
@@ -363,13 +368,22 @@ deployment_groups:
     templates:
       - name: "hw2-active-recon"
         type: "qemu"
-        entry_point: true      # gets entry VLAN NIC; IP shown to student
+        entry_point: true      # entry VLAN NIC (net0) plus internal NIC (net1); IP shown to student
+        internal_nic: false    # QEMU templates only: single-homed, entry VLAN only
         memory: 2048
         cores: 1
         template_locations:
           node1: 116           # VMID on node1
           node2: 117           # VMID on node2
 ```
+
+NIC rules for QEMU templates. An LXC entry point always gets both NICs, and `internal_nic` is ignored:
+
+- An **entry point** machine gets `net0` on the student's entry VLAN and `net1` on the student's internal VLAN, unless it sets `internal_nic: false`, which leaves it with the entry NIC only. Set `internal_nic: false` on a single-machine lab: the jumpbox serves the internal VLANs, so a second NIC means a second lease and a second address.
+- A **plain machine** (no `entry_point`) gets one NIC, `net0` on the internal VLAN. Never set `internal_nic` on it.
+- The portal rewrites `net0` on every clone, then rewrites `net1` to the internal VLAN (an entry point) or deletes it (a plain machine, or an entry point with `internal_nic: false`), so build templates with one NIC.
+
+The disabled `two-machine-individual-example` group in `templates.example.yaml` shows an entry point beside a plain machine.
 
 The startup validator cross-checks `templates.yaml` against Proxmox to catch missing templates or misconfigured VMIDs before students deploy anything.
 
@@ -383,7 +397,7 @@ A group runs on Proxmox unless it, or one of its machines, sets `backend: aws` o
 python scripts/import_students.py data/students.csv
 ```
 
-The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags (100-200) and internal VLAN tags (200-300), plus optional Headscale auth keys.
+The CSV must include `SIS Login ID` and `Student` (full name) columns. The import script pre-assigns entry VLAN tags from the `entry` band and internal VLAN tags from the `internal` band of `VLAN_BANDS` (100-199 and 200-299 by default), plus optional Headscale auth keys.
 
 ### Registration flow
 
@@ -420,9 +434,9 @@ See `docs/TERM_CHANGEOVER.md`.
 ### Per-student Headscale policy
 
 `scripts/apply_headscale_policy.sh` (dry run by default; `--apply` installs)
-renders a policy in which each roster login reaches only its own entry slot,
-its groups' slots and the non-ended KOTH arenas, on every enabled backend. It
-is a snapshot: re-run it after every roster import, group or membership change,
+renders a policy in which each roster login reaches only its own entry and
+internal slots, its groups' slots and the non-ended KOTH arenas, on every
+enabled backend. It is a snapshot: re-run it after every roster import, group or membership change,
 VLAN reassignment, and KOTH game creation or ending. Until then a new student
 or member is refused, never let in. `scripts/term_changeover.sh` runs it as its
 last stage. Details and rollback: "Apply the Headscale policy" in

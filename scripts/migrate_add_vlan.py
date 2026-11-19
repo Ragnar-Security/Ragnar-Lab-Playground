@@ -19,13 +19,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from app import create_app
 from app.models import db, User, StudentWhitelist
+from app.vlan_allocator import VlanPoolExhausted, _used_tags, user_pair_for_index, vlan_layout
 from sqlalchemy import text
-
-# VLAN range configuration
-ENTRY_VLAN_MIN = 100
-ENTRY_VLAN_MAX = 200
-INTERNAL_VLAN_MIN = 200
-INTERNAL_VLAN_MAX = 300
 
 
 def migrate_database():
@@ -49,9 +44,10 @@ def migrate_database():
 
             print("\n" + "=" * 60)
             print("Migration completed!")
-            print(f"\nVLAN Configuration:")
-            print(f"  - Entry VLAN Range: {ENTRY_VLAN_MIN}-{ENTRY_VLAN_MAX}")
-            print(f"  - Internal VLAN Range: {INTERNAL_VLAN_MIN}-{INTERNAL_VLAN_MAX}")
+            layout = vlan_layout()
+            print(f"\nVLAN Configuration (VLAN_BANDS):")
+            print(f"  - Entry VLAN Range: {layout.entry.first}-{layout.entry.last}")
+            print(f"  - Internal VLAN Range: {layout.internal.first}-{layout.internal.last}")
 
         except Exception as e:
             print(f"\nMigration failed: {str(e)}")
@@ -179,74 +175,63 @@ def migrate_whitelist_table():
     print("  Whitelist table migration complete")
 
 
+def _assign_vlans(records, other_model, label):
+    """Give every record without VLAN tags a pair, or raise before touching any.
+
+    A record whose login has both tags in `other_model` takes that pair: one
+    login holds one pair. Every other record takes the lowest index whose
+    entry and internal tags are both unused anywhere (users, whitelist, groups,
+    live KOTH games) and not already chosen in this call. The pairs are all
+    chosen first and set together, so an exhausted pool leaves nothing
+    half-numbered.
+    """
+    pending = [r for r in records if r.entry_vlan_tag is None]
+    if not pending:
+        print(f"  Assigned 0 new dual VLAN tags to {label}")
+        return
+
+    owners = {
+        o.login_id: o
+        for o in other_model.query.filter(
+            other_model.login_id.in_([r.login_id for r in pending]),
+            other_model.entry_vlan_tag.isnot(None),
+            other_model.internal_vlan_tag.isnot(None),
+        ).all()
+    }
+    used = _used_tags()
+
+    chosen = []
+    for record in pending:
+        owner = owners.get(record.login_id)
+        if owner is not None:
+            pair = (owner.entry_vlan_tag, owner.internal_vlan_tag)
+        else:
+            layout = vlan_layout()
+            for pair in (user_pair_for_index(index) for index in range(layout.roster_max)):
+                if pair[0] not in used and pair[1] not in used:
+                    break
+            else:
+                raise VlanPoolExhausted(
+                    f"No VLAN pair is free for {record.login_id}; nothing was assigned")
+        used.update(pair)
+        chosen.append((record, pair))
+
+    for record, (entry_vlan, internal_vlan) in chosen:
+        record.entry_vlan_tag = entry_vlan
+        record.internal_vlan_tag = internal_vlan
+        print(f"  Assigned VLANs to {record.login_id}: entry={entry_vlan}, internal={internal_vlan}")
+    db.session.commit()
+    print(f"  Assigned {len(chosen)} new dual VLAN tags to {label}")
+
+
 def assign_vlans_to_users(users):
     """Assign unique dual VLAN tags to a list of users"""
-    assigned_entry = set(
-        u.entry_vlan_tag for u in User.query.filter(User.entry_vlan_tag.isnot(None)).all()
-    )
-
-    next_vlan_offset = 0
-    for vlan in range(ENTRY_VLAN_MIN, ENTRY_VLAN_MAX + 1):
-        if vlan not in assigned_entry:
-            next_vlan_offset = vlan - ENTRY_VLAN_MIN
-            break
-
-    assigned_count = 0
-    for user in users:
-        if user.entry_vlan_tag is not None:
-            continue
-
-        entry_vlan = ENTRY_VLAN_MIN + next_vlan_offset
-        internal_vlan = INTERNAL_VLAN_MIN + next_vlan_offset
-
-        if entry_vlan > ENTRY_VLAN_MAX:
-            print(f"  WARNING: Ran out of VLANs for user {user.login_id}")
-            break
-
-        user.entry_vlan_tag = entry_vlan
-        user.internal_vlan_tag = internal_vlan
-        assigned_entry.add(entry_vlan)
-        print(f"  Assigned VLANs to {user.login_id}: entry={entry_vlan}, internal={internal_vlan}")
-        assigned_count += 1
-        next_vlan_offset += 1
-
-    db.session.commit()
-    print(f"  Assigned {assigned_count} new dual VLAN tags to users")
+    _assign_vlans(users, StudentWhitelist, "users")
 
 
 def assign_vlans_to_whitelist(entries):
     """Assign unique dual VLAN tags to whitelist entries"""
-    assigned_entry = set(
-        e.entry_vlan_tag for e in StudentWhitelist.query.filter(StudentWhitelist.entry_vlan_tag.isnot(None)).all()
-    )
-
-    next_vlan_offset = 0
-    for vlan in range(ENTRY_VLAN_MIN, ENTRY_VLAN_MAX + 1):
-        if vlan not in assigned_entry:
-            next_vlan_offset = vlan - ENTRY_VLAN_MIN
-            break
-
-    assigned_count = 0
-    for entry in entries:
-        if entry.entry_vlan_tag is not None:
-            continue
-
-        entry_vlan = ENTRY_VLAN_MIN + next_vlan_offset
-        internal_vlan = INTERNAL_VLAN_MIN + next_vlan_offset
-
-        if entry_vlan > ENTRY_VLAN_MAX:
-            print(f"  WARNING: Ran out of VLANs for {entry.login_id}")
-            break
-
-        entry.entry_vlan_tag = entry_vlan
-        entry.internal_vlan_tag = internal_vlan
-        assigned_entry.add(entry_vlan)
-        print(f"  Assigned VLANs to {entry.login_id}: entry={entry_vlan}, internal={internal_vlan}")
-        assigned_count += 1
-        next_vlan_offset += 1
-
-    db.session.commit()
-    print(f"  Assigned {assigned_count} new dual VLAN tags to whitelist entries")
+    _assign_vlans(entries, User, "whitelist entries")
 
 
 if __name__ == '__main__':
