@@ -97,6 +97,43 @@ class KothModelTestCase(unittest.TestCase):
         with self.assertRaises(IntegrityError):
             db.session.commit()
 
+    def test_flag_submission_unique_index_spares_rejected_rows_on_mysql(self):
+        # MySQL has no partial indexes and ignores `sqlite_where`, so
+        # create_all built a plain UNIQUE(flag_id, team_id) there. Wrong
+        # guesses are recorded against the game's first flag, so a team's
+        # second wrong guess was a 500 and its first one blocked that flag
+        # for the team. NULLs never collide, so the index keys on a column
+        # that is NULL for every rejected row.
+        from sqlalchemy.dialects import mysql
+        from sqlalchemy.schema import CreateIndex, CreateTable
+        table = KothFlagSubmission.__table__
+        index = next(i for i in table.indexes
+                     if i.name == 'uq_koth_flag_sub_accepted')
+        self.assertEqual([c.name for c in index.columns],
+                         ['flag_id', 'team_id', 'accepted_singleton'])
+        self.assertNotIn('WHERE', str(CreateIndex(index).compile(dialect=mysql.dialect())))
+        ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        self.assertIn('accepted_singleton', ddl)
+        self.assertIn('GENERATED ALWAYS AS', ddl)
+
+    def test_rejected_flag_submissions_do_not_block_an_accept(self):
+        g = KothGame(name='g', deployment_group_name='x',
+                     entry_vlan_tag=550, internal_vlan_tag=551, status='active', is_active=True)
+        db.session.add(g)
+        sg = self._make_group()
+        db.session.commit()
+        team = KothTeam(game_id=g.id, student_group_id=sg.id,
+                        color='red', submission_token='tok', display_name='A')
+        flag = KothFlag(game_id=g.id, name='f1', value='secret', points=10)
+        db.session.add_all([team, flag])
+        db.session.commit()
+        for accepted in (False, False, True):
+            db.session.add(KothFlagSubmission(
+                game_id=g.id, flag_id=flag.id, team_id=team.id, accepted=accepted))
+            db.session.commit()
+        rows = KothFlagSubmission.query.order_by(KothFlagSubmission.id).all()
+        self.assertEqual([r.accepted_singleton for r in rows], [None, None, True])
+
     def test_vmrecord_has_koth_game_id(self):
         # Ensures the VMRecord migration column is wired.
         col = VMRecord.__table__.c.get('koth_game_id')

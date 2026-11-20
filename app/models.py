@@ -7,7 +7,7 @@ import secrets
 from flask import current_app
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime
-from sqlalchemy import Index, UniqueConstraint, CheckConstraint
+from sqlalchemy import Computed, Index, UniqueConstraint, CheckConstraint
 from sqlalchemy.orm import validates
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -771,10 +771,11 @@ class KothFlagSubmission(db.Model):
     """
     Append-only record of every flag submission, accepted or not.
 
-    The partial-unique index on `(flag_id, team_id) WHERE accepted` enforces
+    The unique index on `(flag_id, team_id, accepted_singleton)` enforces
     at most one accepted submission per (flag, team) pair. Rejected
-    submissions are also recorded for audit/anti-abuse purposes (and are not
-    constrained by the partial unique). New rows are inserted by the
+    submissions are also recorded for audit/anti-abuse purposes; their
+    `accepted_singleton` is NULL, and NULLs never collide in a unique index,
+    so they are not constrained. New rows are inserted by the
     session-authed `submit_flag` route in `app/routes/koth_player.py`;
     rows are never updated in place.
     """
@@ -788,6 +789,15 @@ class KothFlagSubmission(db.Model):
                         nullable=False, index=True)
     submitted_by_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     accepted = db.Column(db.Boolean, nullable=False, default=False)
+    # 1 for an accepted row, NULL otherwise; computed by the database. It
+    # exists because MySQL has no partial indexes: `sqlite_where` is
+    # SQLite-only, and the plain UNIQUE(flag_id, team_id) MySQL built from it
+    # turned a team's second wrong guess into a 500. Same definition as
+    # scripts/migrate_add_koth.py; scripts/migrate_koth_flag_submission_index.py
+    # repairs a table created without it.
+    accepted_singleton = db.Column(
+        db.Boolean,
+        Computed('CASE WHEN accepted = 1 THEN 1 ELSE NULL END', persisted=True))
     submitted_at = db.Column(db.DateTime, default=datetime.now, nullable=False)
 
     flag = db.relationship('KothFlag')
@@ -797,7 +807,7 @@ class KothFlagSubmission(db.Model):
     __table_args__ = (
         # one accepted submission per (flag, team)
         Index('uq_koth_flag_sub_accepted', 'flag_id', 'team_id',
-              unique=True, sqlite_where=db.text('accepted = 1')),
+              'accepted_singleton', unique=True),
     )
 
     def __repr__(self):
