@@ -152,6 +152,19 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - Card text on the dark theme was near-invisible (dark text on the dark card
   background), which hid the VPN setup instructions on the student page;
   `.card` now sets the theme's text colour.
+- An open KOTH scoreboard stream re-checked its session (logout, disabled
+  account) on every frame. Every tab wakes on the same publish, so each tick
+  checked out one pooled database connection per open tab at the same
+  moment. Measured: 90 tabs drove MySQL to 97 connections, and 200 tabs to
+  150, the whole pool (50 + 100), on every tick; anything else needing a
+  connection then waits, up to `pool_timeout`. Each stream now checks at
+  most every `KOTH_STREAM_REVALIDATE_SEC` (default 60) from a random phase.
+- On MySQL, `db.create_all()` built `koth_flag_submissions` with a plain
+  `UNIQUE(flag_id, team_id)`, because the model's partial index is
+  SQLite-only. Wrong guesses are recorded against the game's first flag, so a
+  team's second wrong guess returned 500 and its first one blocked that flag
+  for the team. The model now declares the generated `accepted_singleton`
+  column `migrate_add_koth.py` already created, and the unique index uses it.
 
 ### Upgrade notes
 
@@ -234,6 +247,15 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   `build_students_merged.py` must add `--site-env` or `--bands`. Update the
   portal and the operator checkout together: the export's band key is now
   `vlan_bands`, and `apply_headscale_policy.sh` refuses an export without it.
+- Run `scripts/migrate_koth_flag_submission_index.py` with the other
+  migrations. It adds `koth_flag_submissions.accepted_singleton` and rebuilds
+  `uq_koth_flag_sub_accepted` on a table `db.create_all()` created, and does
+  nothing on one `migrate_add_koth.py` created. Check with
+  `SHOW CREATE TABLE koth_flag_submissions`: the unique key must list
+  `accepted_singleton`.
+- New optional setting `KOTH_STREAM_REVALIDATE_SEC` (default `60`): the
+  longest a logged-out or disabled user's open scoreboard tab keeps
+  receiving the student-visible scoreboard.
 
 ## [1.1.0] - 2026-11-14
 

@@ -74,6 +74,7 @@ python scripts/migrate_koth_singleton_index.py
 python scripts/migrate_koth_duration.py
 python scripts/migrate_koth_claim_files.py
 python scripts/migrate_koth_claim_mode.py
+python scripts/migrate_koth_flag_submission_index.py
 ```
 
 All idempotent — safe to re-run in order:
@@ -84,6 +85,7 @@ All idempotent — safe to re-run in order:
 4. `migrate_koth_duration.py` — adds `duration_minutes` and `ends_at` columns to `koth_games` for time-boxed games.
 5. `migrate_koth_claim_files.py` — adds `koth_boxes.claim_file_path` for the file claim transport. Backfills existing rows with `/koth/claim`.
 6. `migrate_koth_claim_mode.py` — adds `koth_games.claim_mode` / `claim_port` (the beacon transport), `koth_teams.score` (the live scoreboard value, backfilled from the latest snapshot so an in-flight game keeps its scores), and the per-team history index.
+7. `migrate_koth_flag_submission_index.py` — repairs the one-accepted-flag-per-team UNIQUE on a `koth_flag_submissions` table that `db.create_all()` built as plain `UNIQUE(flag_id, team_id)` (MySQL ignores the SQLite-only partial index): adds the generated `accepted_singleton` column and keys the index on it, so wrong guesses no longer collide.
 
 ### 3. Create a game
 
@@ -315,6 +317,7 @@ Defaults live in `app/config.py`; per-game overrides are editable in the admin U
 | `KOTH_DEFAULT_CLAIM_MODE` | `both` | Claim transport for NEW games: `file`, `beacon`, or `both`. Games created before this column existed stay on `file`. |
 | `KOTH_DEFAULT_CLAIM_PORT` | `31337` | Port the claim beacon listens on. Per-game editable, 1024–65535. |
 | `KOTH_SNAPSHOT_INTERVAL_SEC` | `60` | Wall-clock seconds between `KothScoreSnapshot` history rows. The live scoreboard reads `KothTeam.score` and never touches this table. |
+| `KOTH_STREAM_REVALIDATE_SEC` | `60` | Seconds between an open scoreboard stream's session re-checks. Every tab wakes on the same publish, so checking on each frame cost one pooled DB connection per open tab per tick. A logged-out or disabled user's open tab keeps receiving the student-visible scoreboard for at most this long. |
 | `KOTH_DEFAULT_BOX_OWNERSHIP_SCORE` | `1` | Points per owned box per tick (pre-exp). |
 | `KOTH_DEFAULT_PORT_OPEN_SCORE` | `3` | Points per open service per tick (pre-exp). |
 | `KOTH_DEFAULT_EXP_SCORING` | `true` | Enable exponential late-game multiplier. |
@@ -363,6 +366,10 @@ the 12 s default interval. SQL is flat in team count: the scoreboard reads
 SSE is one `json.dumps` per tick regardless of how many tabs are open — the
 frame is built once and handed to every subscriber — and each `scan` carries
 the complete state so no client ever polls `/koth/api/state` during a game.
+Each open stream re-checks its session at most every
+`KOTH_STREAM_REVALIDATE_SEC`, from a random phase, rather than on every frame:
+at 90 open tabs the per-frame check opened about 45 overflow DB connections
+every tick.
 
 If a tick ever runs longer than its own interval, APScheduler silently skips
 runs. The scorer now logs a warning when that happens and counts it in
@@ -403,7 +410,7 @@ the scoreboard and map but no "MY TEAM" panel and no submission token.
 - **Guest agent must be available for `file` mode.** If `qemu-guest-agent` isn't running on a template, the read fails, the box enters backoff, and ownership stays at whatever it was before. Confirm with `systemctl status qemu-guest-agent` (Linux) or `Get-Service QEMU-GA` (Windows). Proxmox VM config must also have `agent: 1` set.
 - **A hostile box can't flood or stall the scorer.** The beacon read is capped at 256 bytes with a 1.5 s budget for the *whole* exchange, and the guest-agent read at 4096 bytes — so a root-owned box can neither make the tick buffer nor hold its slot in the fan-out by drip-feeding bytes. (It could before: the beacon's timeout used to apply per-`recv()` inside a 256-iteration loop, which one box could stretch to minutes, freezing scoring for the whole class.) Watch `tick.overruns` in `/koth/api/_diag` during a game regardless.
 - **Flag submission** is session-authed via the player's already-logged-in browser. Team identity comes from the user's `StudentGroupMember` row, not from a token. A user not on a participating team gets HTTP 403 with no points credited.
-- **One accept per (flag, team)** is enforced by a partial unique index on `koth_flag_submissions` (`uq_koth_flag_sub_accepted`), not just by application logic — even a race condition can't double-credit.
+- **One accept per (flag, team)** is enforced by a unique index on `koth_flag_submissions` (`uq_koth_flag_sub_accepted`, over `flag_id`, `team_id` and the generated `accepted_singleton`, which is NULL for rejected rows), not just by application logic — even a race condition can't double-credit.
 - **Plaintext flag storage:** `KothFlag.value` is stored as plain text so admins can edit/copy after creation. Anyone with admin DB access can read the answer key — same posture as the rest of the app's secrets.
 
 ---
