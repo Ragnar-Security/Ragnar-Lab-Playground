@@ -2,10 +2,13 @@
 
 import hmac
 import logging
+import random
+import time
 from flask import current_app, jsonify, render_template, request, Response
 from sqlalchemy.exc import IntegrityError
 
 from ..auth import login_required, get_authenticated_user
+from ..config import KOTH_STREAM_REVALIDATE_SEC
 from ..models import (
     db, User, KothGame, KothTeam, KothBox, KothFlag, KothFlagSubmission,
     KothClaimEvent, StudentGroupMember,
@@ -14,6 +17,9 @@ from .koth import koth_bp
 from .. import koth_scorer
 
 logger = logging.getLogger(__name__)
+
+# Module-level so a test can shorten it.
+STREAM_REVALIDATE_SEC = KOTH_STREAM_REVALIDATE_SEC
 
 
 def _active_game():
@@ -204,13 +210,22 @@ def stream():
         # Frames arrive already serialized: the bus builds each one once
         # per publish instead of once per subscriber. With 60 open tabs
         # that is 1 json.dumps per tick instead of 60.
+        # Every stream wakes on the same publish, so a session check on
+        # each wake ran once per open tab per tick, all at once: one pooled
+        # DB connection each (measured: pool peak = open tabs). Check at
+        # most every STREAM_REVALIDATE_SEC instead, from a random phase so
+        # tabs opened together do not check on the same tick.
+        next_check = time.monotonic() + random.uniform(0, STREAM_REVALIDATE_SEC)
         try:
             # Tell the browser not to hammer us if the stream drops.
             yield "retry: 5000\n\n"
             while True:
                 frames = sub.drain(timeout=15)
-                if not session_is_current():
-                    return
+                now = time.monotonic()
+                if now >= next_check:
+                    if not session_is_current():
+                        return
+                    next_check = now + STREAM_REVALIDATE_SEC
                 if not frames:
                     yield ": ping\n\n"
                     continue
