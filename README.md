@@ -23,9 +23,9 @@ Each deployment group runs on one backend, chosen in `templates.yaml` by `backen
 ### King of the Hill (KOTH) Mode
 - **Competitive lab arena** -- one shared deployment of a `templates.yaml` group, multiple `StudentGroup`s play as teams, single-active-game enforced at the DB. Proxmox backend only: a `koth_mode` group on a cloud backend is refused
 - **Live scoreboard + network map** -- Cytoscape.js topology view, scoreboard with rank/score, event log, all updated via Server-Sent Events
-- **Token-authenticated box claims** -- students `curl /koth/claim -d token=... -d box=$(hostname)` from inside rooted boxes; per-team submission tokens are rotatable
+- **Token-authenticated box claims** -- the server pulls ownership every tick: a team serves its submission token on a TCP port of a rooted box (beacon) or writes it to the claim file (`/koth/claim` on Linux, read through the guest agent); per-team submission tokens are rotatable
 - **Service-uptime scoring** -- in-process port scanner ticks every 12s, awards points for each open service the team owns; exponential late-game multiplier
-- **Admin-defined flags** -- per-game flags entered in the admin UI, submitted via `/koth/flag`, deduplicated per (flag, team)
+- **Admin-defined flags** -- per-game flags entered in the admin UI, submitted on the KOTH page (`/koth/api/flags/submit`, session-authenticated), deduplicated per (flag, team)
 - **Pause + hide controls** -- pause non-admin deployments while the game is in progress; hide scoreboard or map for end-of-game reveal
 - **Deploy / redeploy** -- redeploy preserves scores/teams/history but re-clones VMs (new IPs, ownership clears)
 - See [docs/KING_OF_THE_HILL.md](docs/KING_OF_THE_HILL.md) for the full guide. Operators enable KOTH on deployment groups in their own `templates.yaml`.
