@@ -356,6 +356,13 @@ KOTH_CLAIM_MODES = ('file', 'beacon', 'both')
 # this; it only bounds how fast the history table grows (a full class on a
 # 12s tick writes one row per team per tick, tens of thousands per game).
 KOTH_SNAPSHOT_INTERVAL_SEC = _env_number('KOTH_SNAPSHOT_INTERVAL_SEC', 60, int)
+# Seconds between an open scoreboard stream's checks of its session (logout,
+# password change, disabled or deleted account) and of its game. Every open
+# tab wakes on the same publish, so checking on every frame took one pooled
+# DB connection per open tab per tick, all at the same moment. A stream ends
+# within this many seconds of its session being revoked or its game ending
+# (at once when the game ends through the end button or its timer).
+KOTH_STREAM_REVALIDATE_SEC = _env_number('KOTH_STREAM_REVALIDATE_SEC', 60, float)
 # Per-team color palette. Index = team selection order. Limits the
 # maximum number of teams per game (UNIQUE(game_id, color) on koth_teams
 # enforces no reuse within a game). 24 entries cover a large classroom

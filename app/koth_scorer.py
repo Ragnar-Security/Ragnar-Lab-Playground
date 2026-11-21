@@ -486,16 +486,13 @@ def latest_scores(game_id: int, *, teams=None) -> dict:
 
 # --- game end -------------------------------------------------------------
 def _auto_end(game: KothGame) -> None:
-    """Tick-driven auto-end: destroy VMs, mark ended, stop the scheduler.
+    """Tick-driven auto-end: mark ended, tell open scoreboards, stop the
+    scheduler, then destroy the VMs.
 
+    The game ends before the VMs go: teardown is serial Proxmox work that
+    can take minutes, and players' scoreboards must not wait for it.
     `koth_admin` is imported lazily to avoid a routes <-> scorer cycle.
     """
-    try:
-        from .routes.koth_admin import _destroy_game_vms
-        destroyed = _destroy_game_vms(game.id)
-    except Exception:
-        logger.exception("auto-end: VM destroy failed for game %d", game.id)
-        destroyed = 0
     game.status = 'ended'
     game.is_active = False
     if game.ended_at is None:
@@ -504,9 +501,13 @@ def _auto_end(game: KothGame) -> None:
     forget_game(game.id)
     event_bus.publish('game_ended', {
         'game_id': game.id, 'reason': 'duration_elapsed',
-        'destroyed_vms': destroyed,
     })
     stop_scheduler()
+    try:
+        from .routes.koth_admin import _destroy_game_vms
+        _destroy_game_vms(game.id)
+    except Exception:
+        logger.exception("auto-end: VM destroy failed for game %d", game.id)
 
 
 def forget_game(game_id: int) -> None:

@@ -152,6 +152,30 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - Card text on the dark theme was near-invisible (dark text on the dark card
   background), which hid the VPN setup instructions on the student page;
   `.card` now sets the theme's text colour.
+- An open KOTH scoreboard stream re-checked its session (logout, disabled
+  account) on every frame. Every tab wakes on the same publish, so each tick
+  checked out one pooled database connection per open tab at the same
+  moment. Measured: 90 tabs drove MySQL to 97 connections, and 200 tabs to
+  150, the whole pool (50 + 100), on every tick; anything else needing a
+  connection then waits, up to `pool_timeout`. Each stream now checks every
+  `KOTH_STREAM_REVALIDATE_SEC` (default 60) from a random phase, and ends
+  within that many seconds of a logout, password change, disabled or deleted
+  account, or of its game no longer being the active one.
+- Ending a KOTH game from the admin page left every open scoreboard stream
+  running: open pages were never told the game had ended, and the streams
+  stayed open until the tab closed. The end button now publishes `game_ended`, as
+  the game timer already did, and a stream closes after delivering it; the
+  browser reconnects to a stream that follows the next game. Both the end
+  button and the timer now mark the game ended and publish `game_ended`
+  before destroying the VMs, so scoreboards no longer wait for the serial
+  Proxmox teardown. The `game_ended` event no longer carries
+  `destroyed_vms` (no client read it); the end button's response still does.
+- On MySQL, `db.create_all()` built `koth_flag_submissions` with a plain
+  `UNIQUE(flag_id, team_id)`, because the model's partial index is
+  SQLite-only. Wrong guesses are recorded against the game's first flag, so a
+  team's second wrong guess returned 500 and its first one blocked that flag
+  for the team. The model now declares the generated `accepted_singleton`
+  column `migrate_add_koth.py` already created, and the unique index uses it.
 
 ### Upgrade notes
 
@@ -234,6 +258,19 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   `build_students_merged.py` must add `--site-env` or `--bands`. Update the
   portal and the operator checkout together: the export's band key is now
   `vlan_bands`, and `apply_headscale_policy.sh` refuses an export without it.
+- Run `scripts/migrate_koth_flag_submission_index.py` with the other
+  migrations, **between games**: it copies `koth_flag_submissions`
+  (`ALGORITHM=COPY, LOCK=SHARED`), so reads continue and flag submissions
+  wait until it finishes, and it refuses while a game is active unless given
+  `--during-game`. Measured on MySQL 8.0: 0.3 s for 2,000 rows, 0.6 s for
+  20,000, 2.3 s for 200,000, 17 s for 1,000,000. Run it with `--check` first
+  to see the row count and what it would change. It repairs a table
+  `db.create_all()` created and does nothing on one `migrate_add_koth.py`
+  created. Check afterwards with `SHOW CREATE TABLE koth_flag_submissions`:
+  the unique key must list `accepted_singleton`.
+- New optional setting `KOTH_STREAM_REVALIDATE_SEC` (default `60`): the
+  longest an open scoreboard stream outlives a logout, password change,
+  disabled or deleted account, or the end of its game.
 
 ## [1.1.0] - 2026-11-14
 
