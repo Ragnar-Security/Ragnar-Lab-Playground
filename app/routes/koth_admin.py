@@ -428,7 +428,13 @@ def update_settings(game_id):
 @login_required
 @admin_required
 def end_game(game_id):
-    """End game: stop scheduler, destroy all KOTH VMs in Proxmox, mark ended.
+    """End game: stop scheduler, mark ended, tell open scoreboards, then
+    destroy all KOTH VMs in Proxmox.
+
+    The game ends before the VMs go: teardown is serial Proxmox work that
+    can take minutes, and players' scoreboards must not wait for it. A
+    cleanup failure still fails this request; the game stays ended and
+    END can be pressed again.
 
     Idempotent: calling end on an already-ended game still cleans up any
     VMRecords that survived a previous attempt (recovery path for stranded
@@ -443,7 +449,6 @@ def end_game(game_id):
     try:
         from .. import koth_scorer
         koth_scorer.stop_scheduler()
-        destroyed = _destroy_game_vms(game.id)
         was_active = game.is_active
         game.status = 'ended'
         game.is_active = False
@@ -461,8 +466,8 @@ def end_game(game_id):
         if was_active:
             koth_scorer.event_bus.publish('game_ended', {
                 'game_id': game.id, 'reason': 'ended_by_admin',
-                'destroyed_vms': destroyed,
             })
+        destroyed = _destroy_game_vms(game.id)
         return jsonify({'game': game.to_dict(), 'destroyed_vms': destroyed})
     finally:
         lock.release()

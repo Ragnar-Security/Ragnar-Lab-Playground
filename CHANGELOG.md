@@ -165,7 +165,11 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   running: open pages were never told the game had ended, and the streams
   stayed open until the tab closed. The end button now publishes `game_ended`, as
   the game timer already did, and a stream closes after delivering it; the
-  browser reconnects to a stream that follows the next game.
+  browser reconnects to a stream that follows the next game. Both the end
+  button and the timer now mark the game ended and publish `game_ended`
+  before destroying the VMs, so scoreboards no longer wait for the serial
+  Proxmox teardown. The `game_ended` event no longer carries
+  `destroyed_vms` (no client read it); the end button's response still does.
 - On MySQL, `db.create_all()` built `koth_flag_submissions` with a plain
   `UNIQUE(flag_id, team_id)`, because the model's partial index is
   SQLite-only. Wrong guesses are recorded against the game's first flag, so a

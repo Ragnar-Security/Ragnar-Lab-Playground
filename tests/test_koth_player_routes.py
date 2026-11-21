@@ -181,7 +181,12 @@ class KothPlayerRoutesTestCase(unittest.TestCase):
         elapsed = self._revoke_and_measure(remove)
         self.assertLess(elapsed, self.BOUND + self.SLACK)
 
-    def test_ending_the_game_closes_open_streams_at_once(self):
+    def test_ending_the_game_closes_streams_before_vm_cleanup_finishes(self):
+        # VM teardown is serial Proxmox work and can take minutes for 22
+        # boxes. The players' streams must not wait for it.
+        import threading
+        from sqlalchemy import select
+        from app.routes import koth_player
         game_id = self.game.id
         admin = User(login_id='admin-3.2', is_admin=True, password_hash='x')
         db.session.add(admin)
@@ -190,18 +195,38 @@ class KothPlayerRoutesTestCase(unittest.TestCase):
         with admin_client.session_transaction() as s:
             s['user_id'] = admin.id
             s['session_version'] = admin.session_version
+        cleanup_running = threading.Event()
+        release_cleanup = threading.Event()
+
+        def blocking_cleanup(_game_id):
+            cleanup_running.set()
+            release_cleanup.wait(10)
+            return 0
+
         bus = EventBus()
         self._login(self.student)
+        result = {}
         with patch.object(koth_scorer, 'event_bus', bus), \
-                patch('app.routes.koth_admin._destroy_game_vms', return_value=0):
+                patch.object(koth_player, 'STREAM_KEEPALIVE_SEC', 1), \
+                patch('app.routes.koth_admin._destroy_game_vms',
+                      side_effect=blocking_cleanup):
             response = self._open_stream(bus)
-            r = admin_client.post(f'/koth/api/games/{game_id}/end')
-            self.assertEqual(r.status_code, 200, r.data)
-            started = time.monotonic()
-            self.assertTrue(next(response.response).startswith(b'event: game_ended'))
-            with self.assertRaises(StopIteration):
-                next(response.response)
-            self.assertLess(time.monotonic() - started, self.SLACK)
+            ender = threading.Thread(target=lambda: result.update(
+                r=admin_client.post(f'/koth/api/games/{game_id}/end')))
+            ender.start()
+            try:
+                self.assertTrue(cleanup_running.wait(5), 'cleanup never started')
+                self.assertTrue(next(response.response).startswith(b'event: game_ended'))
+                with self.assertRaises(StopIteration):
+                    next(response.response)
+                db.session.expire_all()
+                self.assertFalse(db.session.execute(
+                    select(KothGame.is_active).where(KothGame.id == game_id)).scalar())
+                self.assertTrue(ender.is_alive(), 'cleanup finished before the check')
+            finally:
+                release_cleanup.set()
+                ender.join(10)
+        self.assertEqual(result['r'].status_code, 200, result['r'].data)
 
     def test_stream_ends_within_the_bound_when_its_game_stops_being_active(self):
         # A path that ends or resets the game without publishing game_ended

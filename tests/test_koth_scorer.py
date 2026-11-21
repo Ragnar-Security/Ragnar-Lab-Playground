@@ -87,6 +87,47 @@ class ScorerTestCase(unittest.TestCase):
         # Auto-end returns BEFORE scoring, so no snapshot inserted on this tick.
         self.assertEqual(KothScoreSnapshot.query.count(), 0)
 
+    def test_auto_end_publishes_game_ended_before_vm_cleanup_finishes(self):
+        import threading
+        from datetime import datetime, timedelta
+        from sqlalchemy import select
+        from app import koth_scorer
+        from app.koth_events import EventBus
+        game_id = self.game.id
+        self.game.ends_at = datetime.now() - timedelta(seconds=10)
+        db.session.commit()
+        cleanup_running = threading.Event()
+        release_cleanup = threading.Event()
+
+        def blocking_cleanup(_game_id):
+            cleanup_running.set()
+            release_cleanup.wait(10)
+            return 0
+
+        def tick():
+            with self.app.app_context():
+                koth_scorer.run_tick(game_id)
+
+        bus = EventBus()
+        sub = bus.subscribe()
+        with patch.object(koth_scorer, 'event_bus', bus), \
+                patch('app.routes.koth_admin._destroy_game_vms',
+                      side_effect=blocking_cleanup):
+            ticker = threading.Thread(target=tick)
+            ticker.start()
+            try:
+                self.assertTrue(cleanup_running.wait(5), 'cleanup never started')
+                frames = sub.drain(timeout=1)
+                self.assertTrue(any(f.startswith('event: game_ended') for f in frames),
+                                frames)
+                db.session.expire_all()
+                self.assertFalse(db.session.execute(
+                    select(KothGame.is_active).where(KothGame.id == game_id)).scalar())
+                self.assertTrue(ticker.is_alive(), 'cleanup finished before the check')
+            finally:
+                release_cleanup.set()
+                ticker.join(10)
+
     def test_tick_does_not_auto_end_before_ends_at(self):
         from datetime import datetime, timedelta
         from app import koth_scorer
