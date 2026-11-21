@@ -462,6 +462,22 @@ Existing rows become `backend='proxmox'` through the column default. The new
 code reads these columns for every record it creates, extends or destroys,
 so they must exist before it starts; the old code ignores them.
 
+`migrate_koth_flag_submission_index.py` repairs `koth_flag_submissions` where
+`db.create_all()` built its one-accept-per-team index as a plain
+`UNIQUE(flag_id, team_id)`; on such a table a team's second wrong flag guess
+returns 500. **Run it between games.** The repair copies the table
+(`ALGORITHM=COPY, LOCK=SHARED`): reads continue, flag submissions wait until
+the copy ends. Measured on MySQL 8.0: 0.3 s for 2,000 rows, 0.6 s for 20,000,
+2.3 s for 200,000, 17 s for 1,000,000 (a 22-team game produces a few thousand).
+It refuses while a KOTH game is active (exit 2) unless given `--during-game`,
+and does nothing on a table that is already correct. Pre-check, which changes
+nothing and prints the row count and the change it would make:
+
+```bash
+docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
+  python scripts/migrate_koth_flag_submission_index.py --check
+```
+
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \

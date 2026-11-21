@@ -85,7 +85,7 @@ All idempotent — safe to re-run in order:
 4. `migrate_koth_duration.py` — adds `duration_minutes` and `ends_at` columns to `koth_games` for time-boxed games.
 5. `migrate_koth_claim_files.py` — adds `koth_boxes.claim_file_path` for the file claim transport. Backfills existing rows with `/koth/claim`.
 6. `migrate_koth_claim_mode.py` — adds `koth_games.claim_mode` / `claim_port` (the beacon transport), `koth_teams.score` (the live scoreboard value, backfilled from the latest snapshot so an in-flight game keeps its scores), and the per-team history index.
-7. `migrate_koth_flag_submission_index.py` — repairs the one-accepted-flag-per-team UNIQUE on a `koth_flag_submissions` table that `db.create_all()` built as plain `UNIQUE(flag_id, team_id)` (MySQL ignores the SQLite-only partial index): adds the generated `accepted_singleton` column and keys the index on it, so wrong guesses no longer collide.
+7. `migrate_koth_flag_submission_index.py` — repairs the one-accepted-flag-per-team UNIQUE on a `koth_flag_submissions` table that `db.create_all()` built as plain `UNIQUE(flag_id, team_id)` (MySQL ignores the SQLite-only partial index): adds the generated `accepted_singleton` column and keys the index on it, so wrong guesses no longer collide. Run it between games: it copies the table, so flag submissions wait for the copy (under a second for a game's worth of rows), and it refuses while a game is active unless given `--during-game`. `--check` reports without changing anything. Timings: `docs/PRODUCTION_DEPLOYMENT.md`.
 
 ### 3. Create a game
 
@@ -317,7 +317,7 @@ Defaults live in `app/config.py`; per-game overrides are editable in the admin U
 | `KOTH_DEFAULT_CLAIM_MODE` | `both` | Claim transport for NEW games: `file`, `beacon`, or `both`. Games created before this column existed stay on `file`. |
 | `KOTH_DEFAULT_CLAIM_PORT` | `31337` | Port the claim beacon listens on. Per-game editable, 1024–65535. |
 | `KOTH_SNAPSHOT_INTERVAL_SEC` | `60` | Wall-clock seconds between `KothScoreSnapshot` history rows. The live scoreboard reads `KothTeam.score` and never touches this table. |
-| `KOTH_STREAM_REVALIDATE_SEC` | `60` | Seconds between an open scoreboard stream's session re-checks. Every tab wakes on the same publish, so checking on each frame cost one pooled DB connection per open tab per tick. A logged-out or disabled user's open tab keeps receiving the student-visible scoreboard for at most this long. |
+| `KOTH_STREAM_REVALIDATE_SEC` | `60` | Seconds between an open scoreboard stream's checks of its session and its game. Every tab wakes on the same publish, so checking on each frame cost one pooled DB connection per open tab per tick. A stream ends within this many seconds of a logout, password change, disabled or deleted account, or of its game no longer being active; at once when the game ends through the end button or its timer. |
 | `KOTH_DEFAULT_BOX_OWNERSHIP_SCORE` | `1` | Points per owned box per tick (pre-exp). |
 | `KOTH_DEFAULT_PORT_OPEN_SCORE` | `3` | Points per open service per tick (pre-exp). |
 | `KOTH_DEFAULT_EXP_SCORING` | `true` | Enable exponential late-game multiplier. |
@@ -366,10 +366,10 @@ the 12 s default interval. SQL is flat in team count: the scoreboard reads
 SSE is one `json.dumps` per tick regardless of how many tabs are open — the
 frame is built once and handed to every subscriber — and each `scan` carries
 the complete state so no client ever polls `/koth/api/state` during a game.
-Each open stream re-checks its session at most every
+Each open stream checks its session and its game every
 `KOTH_STREAM_REVALIDATE_SEC`, from a random phase, rather than on every frame:
-at 90 open tabs the per-frame check opened about 45 overflow DB connections
-every tick.
+at 90 open tabs the per-frame check drove MySQL to 97 connections every tick,
+and at 200 tabs to the whole 150-connection pool.
 
 If a tick ever runs longer than its own interval, APScheduler silently skips
 runs. The scorer now logs a warning when that happens and counts it in
