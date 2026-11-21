@@ -444,6 +444,7 @@ def end_game(game_id):
         from .. import koth_scorer
         koth_scorer.stop_scheduler()
         destroyed = _destroy_game_vms(game.id)
+        was_active = game.is_active
         game.status = 'ended'
         game.is_active = False
         if game.ended_at is None:
@@ -454,6 +455,14 @@ def end_game(game_id):
         # uses, and with max_requests=0 the worker never recycles to clear
         # it. Must run after the commit so the box rows are still readable.
         koth_scorer.forget_game(game.id)
+        # Open scoreboards show the game as over and their streams close,
+        # as on auto-end. Only for the game that was running: re-ending an
+        # old game to clean up its VMs must not close a later game's streams.
+        if was_active:
+            koth_scorer.event_bus.publish('game_ended', {
+                'game_id': game.id, 'reason': 'ended_by_admin',
+                'destroyed_vms': destroyed,
+            })
         return jsonify({'game': game.to_dict(), 'destroyed_vms': destroyed})
     finally:
         lock.release()

@@ -18,8 +18,10 @@ from .. import koth_scorer
 
 logger = logging.getLogger(__name__)
 
-# Module-level so a test can shorten it.
+# Module-level so a test can shorten them.
 STREAM_REVALIDATE_SEC = KOTH_STREAM_REVALIDATE_SEC
+# Longest silence on an open stream; the ping keeps proxies from closing it.
+STREAM_KEEPALIVE_SEC = 15
 
 
 def _active_game():
@@ -127,8 +129,9 @@ def submit_flag():
     # One-time-per-team: each flag awards bonus points to a team exactly
     # once. Wrong-value attempts above are recorded as accepted=False for
     # audit and DON'T burn the team's chance — they can keep guessing.
-    # Backed by the partial unique index uq_koth_flag_sub_accepted which
-    # would also reject the duplicate at the DB level.
+    # Backed by uq_koth_flag_sub_accepted on (flag_id, team_id,
+    # accepted_singleton), NULL for rejected rows, which would also reject
+    # the duplicate at the DB level.
     existing = KothFlagSubmission.query.filter_by(
         flag_id=matched.id, team_id=team.id, accepted=True).first()
     if existing:
@@ -147,8 +150,8 @@ def submit_flag():
     except IntegrityError:
         # The check-then-insert above has a race window: two concurrent
         # POSTs from the same team can both pass the check and try to
-        # insert. The partial unique index uq_koth_flag_sub_accepted then
-        # rejects the second one. Convert it to the same friendly response
+        # insert. uq_koth_flag_sub_accepted then rejects the second one.
+        # Convert it to the same friendly response
         # the synchronous duplicate-check returns instead of bubbling a 500.
         db.session.rollback()
         return jsonify({'accepted': False, 'reason': 'duplicate'}), 200
@@ -175,16 +178,27 @@ def submit_flag():
 @login_required
 def stream():
     # SSE streams stay open for the entire client session (minutes to
-    # hours), so capture the authenticated identity for periodic revocation
-    # checks after the request context is gone. Each check uses a short-lived
-    # application context and returns its connection immediately.
+    # hours), so capture the authenticated identity, and the game the stream
+    # follows, for periodic checks after the request context is gone. Each
+    # check uses a short-lived application context and returns its
+    # connection immediately.
     user = get_authenticated_user()
     user_id = user.id
     session_version = user.session_version
+    game = _active_game()
+    followed_game_id = game.id if game else None
     app = current_app._get_current_object()
     db.session.remove()
 
-    def session_is_current():
+    def still_allowed(game_id):
+        """(may this stream continue?, id of the game it now follows).
+
+        Ends the stream when the session was revoked (logout, password
+        change, disabled or deleted account) or when the game it follows is
+        no longer the active one. A stream opened between games follows the
+        next game to start; closing it instead would only make every tab
+        reconnect every 5 s until then.
+        """
         with app.app_context():
             try:
                 current_version = (
@@ -195,7 +209,14 @@ def stream():
                     )
                     .scalar()
                 )
-                return current_version == session_version
+                if current_version != session_version:
+                    return False, game_id
+                active = (db.session.query(KothGame.id)
+                          .filter(KothGame.is_active.is_(True)).first())
+                active_id = active[0] if active else None
+                if game_id is not None and active_id != game_id:
+                    return False, game_id
+                return True, active_id
             finally:
                 db.session.remove()
 
@@ -210,20 +231,26 @@ def stream():
         # Frames arrive already serialized: the bus builds each one once
         # per publish instead of once per subscriber. With 60 open tabs
         # that is 1 json.dumps per tick instead of 60.
-        # Every stream wakes on the same publish, so a session check on
-        # each wake ran once per open tab per tick, all at once: one pooled
-        # DB connection each (measured: pool peak = open tabs). Check at
-        # most every STREAM_REVALIDATE_SEC instead, from a random phase so
-        # tabs opened together do not check on the same tick.
+        # Every stream wakes on the same publish, so a check on each wake
+        # ran once per open tab per tick, all at once: one pooled DB
+        # connection each (measured: pool peak = open tabs). Check every
+        # STREAM_REVALIDATE_SEC instead, from a random phase so tabs opened
+        # together do not check on the same tick. The wait is cut short at
+        # the check deadline, so a revoked session or an ended game loses
+        # its stream within STREAM_REVALIDATE_SEC even when nothing is
+        # published.
+        game_id = followed_game_id
         next_check = time.monotonic() + random.uniform(0, STREAM_REVALIDATE_SEC)
         try:
             # Tell the browser not to hammer us if the stream drops.
             yield "retry: 5000\n\n"
             while True:
-                frames = sub.drain(timeout=15)
+                wait = min(STREAM_KEEPALIVE_SEC, next_check - time.monotonic())
+                frames = sub.drain(timeout=max(0.0, wait))
                 now = time.monotonic()
                 if now >= next_check:
-                    if not session_is_current():
+                    allowed, game_id = still_allowed(game_id)
+                    if not allowed:
                         return
                     next_check = now + STREAM_REVALIDATE_SEC
                 if not frames:
@@ -231,6 +258,10 @@ def stream():
                     continue
                 for frame in frames:
                     yield frame
+                # The game this stream showed is over; the browser
+                # reconnects (retry above) to whatever comes next.
+                if any(frame.startswith('event: game_ended') for frame in frames):
+                    return
         finally:
             koth_scorer.event_bus.unsubscribe(sub)
 

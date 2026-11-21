@@ -117,20 +117,130 @@ class KothPlayerRoutesTestCase(unittest.TestCase):
             response.close()
         self.assertLessEqual(len(checks), 1, checks)
 
-    def test_open_stream_stops_after_logout_once_the_interval_passes(self):
+    # --- how long an open stream outlives the reason it was allowed -------
+    # Revalidation runs every STREAM_REVALIDATE_SEC; shortened here so the
+    # bound is measurable. SLACK covers scheduling and the test client.
+    BOUND = 0.3
+    SLACK = 0.7
+
+    def _open_stream(self, bus, client=None):
+        response = (client or self.client).get('/koth/api/stream', buffered=False)
+        self.assertEqual(next(response.response), b'retry: 5000\n\n')
+        return response
+
+    def _seconds_until_stream_ends(self, response, limit=20.0):
+        """Read until the generator stops; fail on anything but pings."""
+        started = time.monotonic()
+        for frame in response.response:
+            self.assertEqual(frame, b': ping\n\n')
+            self.assertLess(time.monotonic() - started, limit)
+        return time.monotonic() - started
+
+    def _revoke_and_measure(self, revoke):
         from app.routes import koth_player
         bus = EventBus()
-        logout_client = self.app.test_client()
         self._login(self.student)
+        with patch.object(koth_scorer, 'event_bus', bus), \
+                patch.object(koth_player, 'STREAM_REVALIDATE_SEC', self.BOUND):
+            response = self._open_stream(bus)
+            revoke()
+            # No publish: an idle stream must also notice.
+            return self._seconds_until_stream_ends(response)
+
+    def test_open_stream_ends_within_the_bound_after_logout(self):
+        logout_client = self.app.test_client()
         with logout_client.session_transaction() as s:
             s['user_id'] = self.student.id
             s['session_version'] = self.student.session_version
+        elapsed = self._revoke_and_measure(lambda: logout_client.post('/auth/logout'))
+        self.assertLess(elapsed, self.BOUND + self.SLACK)
+
+    def test_open_stream_ends_within_the_bound_after_disabling_the_user(self):
+        # Write through UPDATE: the stream view's db.session.remove() runs in
+        # the test's app context, which detaches setUp's instances.
+        from sqlalchemy import update
+        student_id = self.student.id
+
+        def disable():
+            db.session.execute(update(User).where(User.id == student_id)
+                               .values(disabled=True))
+            db.session.commit()
+        elapsed = self._revoke_and_measure(disable)
+        self.assertLess(elapsed, self.BOUND + self.SLACK)
+
+    def test_open_stream_ends_within_the_bound_after_deleting_the_user(self):
+        from sqlalchemy import delete
+        from app.models import StudentGroupMember
+        student_id = self.student.id
+
+        def remove():
+            db.session.execute(delete(StudentGroupMember)
+                               .where(StudentGroupMember.user_id == student_id))
+            db.session.execute(delete(User).where(User.id == student_id))
+            db.session.commit()
+        elapsed = self._revoke_and_measure(remove)
+        self.assertLess(elapsed, self.BOUND + self.SLACK)
+
+    def test_ending_the_game_closes_open_streams_at_once(self):
+        game_id = self.game.id
+        admin = User(login_id='admin-3.2', is_admin=True, password_hash='x')
+        db.session.add(admin)
+        db.session.commit()
+        admin_client = self.app.test_client()
+        with admin_client.session_transaction() as s:
+            s['user_id'] = admin.id
+            s['session_version'] = admin.session_version
+        bus = EventBus()
+        self._login(self.student)
         with patch.object(koth_scorer, 'event_bus', bus), \
-                patch.object(koth_player, 'STREAM_REVALIDATE_SEC', 0.2):
-            response = self.client.get('/koth/api/stream', buffered=False)
-            self.assertEqual(next(response.response), b'retry: 5000\n\n')
-            logout_client.post('/auth/logout')
-            time.sleep(0.25)
-            bus.publish('scan', {'i': 1}, coalesce_key='scan')
+                patch('app.routes.koth_admin._destroy_game_vms', return_value=0):
+            response = self._open_stream(bus)
+            r = admin_client.post(f'/koth/api/games/{game_id}/end')
+            self.assertEqual(r.status_code, 200, r.data)
+            started = time.monotonic()
+            self.assertTrue(next(response.response).startswith(b'event: game_ended'))
             with self.assertRaises(StopIteration):
                 next(response.response)
+            self.assertLess(time.monotonic() - started, self.SLACK)
+
+    def test_stream_ends_within_the_bound_when_its_game_stops_being_active(self):
+        # A path that ends or resets the game without publishing game_ended
+        # (force-reset, a direct DB change) must not leave streams open.
+        from sqlalchemy import update
+        game_id = self.game.id
+
+        def deactivate():
+            db.session.execute(update(KothGame).where(KothGame.id == game_id)
+                               .values(status='draft', is_active=False))
+            db.session.commit()
+        elapsed = self._revoke_and_measure(deactivate)
+        self.assertLess(elapsed, self.BOUND + self.SLACK)
+
+    def test_stream_opened_between_games_follows_the_next_game_and_ends_with_it(self):
+        from app.routes import koth_player
+        self.game.status = 'ended'
+        self.game.is_active = False
+        db.session.commit()
+        bus = EventBus()
+        self._login(self.student)
+        with patch.object(koth_scorer, 'event_bus', bus), \
+                patch.object(koth_player, 'STREAM_REVALIDATE_SEC', self.BOUND):
+            response = self._open_stream(bus)
+            # No game: the stream stays open (closing it would only make
+            # every tab reconnect every 5 s until a game starts).
+            deadline = time.monotonic() + 3 * self.BOUND
+            while time.monotonic() < deadline:
+                self.assertEqual(next(response.response), b': ping\n\n')
+            game2 = KothGame(name='g2', deployment_group_name='x',
+                             entry_vlan_tag=552, internal_vlan_tag=553,
+                             status='active', is_active=True)
+            db.session.add(game2)
+            db.session.commit()
+            deadline = time.monotonic() + 2 * self.BOUND
+            while time.monotonic() < deadline:
+                self.assertEqual(next(response.response), b': ping\n\n')
+            game2.status = 'ended'
+            game2.is_active = False
+            db.session.commit()
+            elapsed = self._seconds_until_stream_ends(response)
+        self.assertLess(elapsed, self.BOUND + self.SLACK)
