@@ -1,6 +1,7 @@
 """The per-student Headscale policy renderer (pure) and its CLI."""
 
 import copy
+import ipaddress
 import json
 import subprocess
 import sys
@@ -13,7 +14,9 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
+    advertised_routes,
     canonical,
+    cloud_slot_cidr,
     missing_peers,
     normalize_login,
     parse_vlan_bands,
@@ -479,3 +482,49 @@ def test_an_individual_only_site_renders_byte_identical_to_the_previous_release(
     base.write_text(json.dumps(BASE))
     result = _cli("render", str(base), str(slots_file))
     assert (result.returncode, result.stdout) == (0, expected)
+
+
+# ---- routes: what each subnet router advertises ----------------------------
+
+# Catches a cloud router advertising its whole base again. Headscale hands a
+# client every advertised route that overlaps a network it is granted, so a
+# /16 would put every group internal slot in a member's route table and
+# shadow the route the member adds for a pivot tunnel. Each band's slots are
+# advertised separately, so a route never spans two bands.
+@pytest.mark.parametrize("backend", ["aws", "gcp"])
+def test_a_cloud_router_advertises_each_band_separately_never_its_whole_base(backend):
+    routes = advertised_routes(DEFAULT_POLICY_BANDS, backend, CLOUDS)
+    nets = [ipaddress.ip_network(r) for r in routes]
+    base = ipaddress.ip_network(CLOUDS[backend])
+    assert base not in nets and all(n.subnet_of(base) for n in nets)
+    for band in DEFAULT_POLICY_BANDS.values:
+        slots = [ipaddress.ip_network(cloud_slot_cidr(CLOUDS[backend], t))
+                 for t in range(band.first, band.last + 1)]
+        covering = [n for n in nets if any(s.subnet_of(n) for s in slots)]
+        # Exactly this band's slots, nothing of another band's.
+        assert sum(n.num_addresses for n in covering) == sum(s.num_addresses for s in slots)
+        assert all(any(s.subnet_of(n) for n in covering) for s in slots)
+    # A group's internal slot is never inside a route that also covers its entry slot.
+    entry, internal = (ipaddress.ip_network(cloud_slot_cidr(CLOUDS[backend], t)) for t in (300, 400))
+    assert not [n for n in nets if entry.subnet_of(n) and internal.subnet_of(n)]
+
+
+# Catches the jumpbox and the policy script disagreeing on the Proxmox routes.
+def test_proxmox_routes_are_one_slash24_per_band_vlan():
+    routes = advertised_routes(DEFAULT_POLICY_BANDS, "proxmox", CLOUDS)
+    assert len(routes) == 401
+    assert routes[0] == "10.100.0.0/24" and "10.100.4.0/24" in routes and "10.0.0.0/8" not in routes
+
+
+def test_cli_routes_prints_one_comma_separated_line(tmp_path):
+    slots = tmp_path / "slots.json"
+    slots.write_text(json.dumps(SLOTS))
+    for backend in ("proxmox", "aws", "gcp"):
+        result = _cli("routes", str(slots), backend)
+        assert result.returncode == 0, result.stderr
+        bands, cidrs = policy_inputs(SLOTS)
+        assert result.stdout == ",".join(advertised_routes(bands, backend, cidrs)) + "\n"
+    disabled = tmp_path / "aws-only.json"
+    disabled.write_text(json.dumps({**SLOTS, "config": {**SLOTS["config"], "enabled_backends": ["aws"]}}))
+    result = _cli("routes", str(disabled), "gcp")
+    assert result.returncode != 0 and result.stdout == "" and "gcp" in result.stderr

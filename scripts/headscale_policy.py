@@ -4,6 +4,7 @@
     headscale_policy.py render BASE_POLICY.json SLOTS.json   # desired policy
     headscale_policy.py diff CURRENT.json DESIRED.json       # unified diff
     headscale_policy.py missing-peers NODES.json SLOTS.json STATUS.json
+    headscale_policy.py routes SLOTS.json BACKEND          # a router's --advertise-routes
 
 BASE_POLICY is the operator's policy file (config/headscale-acl.json): every
 section and every ACL rule is kept, except the blanket rule whose src is
@@ -34,6 +35,7 @@ import argparse
 import copy
 import difflib
 import importlib.util
+import ipaddress
 import json
 import re
 import sys
@@ -216,6 +218,32 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
     return policy
 
 
+def advertised_routes(bands: PolicyBands, backend: str,
+                      cloud_cidrs: Mapping[str, str]) -> List[str]:
+    """What one backend's subnet router advertises: every band's networks, and
+    never a route that spans two bands.
+
+    Headscale sends a client each advertised route that overlaps a network the
+    policy grants it. A covering route (10.0.0.0/8, a cloud's whole base) would
+    put the withheld group and KOTH internal networks in a player's route table
+    and shadow the player's own route through a pivot host. Proxmox: one /24
+    per VLAN, the jumpbox's list. A cloud: each band's /26 slots, collapsed
+    within that band only.
+    """
+    tags = [range(band.first, band.last + 1) for band in sorted(bands.values, key=lambda b: b.first)]
+    if backend == "proxmox":
+        if not bands.proxmox_enabled:
+            raise ValueError("proxmox is not an enabled backend in the slots export")
+        return [proxmox_slot_cidr(tag, bands.values) for band in tags for tag in band]
+    if backend not in cloud_cidrs:
+        raise ValueError(f"{backend} is not an enabled backend in the slots export")
+    routes = []
+    for band in tags:
+        slots = (ipaddress.ip_network(cloud_slot_cidr(cloud_cidrs[backend], tag)) for tag in band)
+        routes += [str(net) for net in ipaddress.collapse_addresses(slots)]
+    return routes
+
+
 def _base_rules(base_acls: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """The base rules the policy keeps.
 
@@ -325,6 +353,10 @@ def main(argv=None) -> int:
     peers_cmd.add_argument("nodes")
     peers_cmd.add_argument("slots")
     peers_cmd.add_argument("status")
+    routes_cmd = commands.add_parser("routes",
+                                     help="print one backend router's advertised routes")
+    routes_cmd.add_argument("slots")
+    routes_cmd.add_argument("backend", choices=KNOWN_BACKENDS)
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
@@ -333,6 +365,9 @@ def main(argv=None) -> int:
         elif args.command == "missing-peers":
             output = "".join(f"{device}\n" for device in missing_peers(
                 _load(args.nodes), _load(args.slots), _load(args.status)))
+        elif args.command == "routes":
+            bands, cidrs = policy_inputs(_load(args.slots))
+            output = ",".join(advertised_routes(bands, args.backend, cidrs)) + "\n"
         else:
             output = policy_diff(_load(args.current), _load(args.desired))
     except ValueError as exc:

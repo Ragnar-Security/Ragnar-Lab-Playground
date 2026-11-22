@@ -649,17 +649,26 @@ routing.
 ## Router Tailscale flags
 
 Each cloud router joins the same Headscale as the jumpbox, with
-`tag:jumpbox`, and advertises its whole cloud base; the per-student policy
-narrows what each student may use:
+`tag:jumpbox`, and advertises its bands' slots, never its whole cloud base.
+Headscale sends a client every advertised route that overlaps a network the
+policy grants it, so a covering `/16` would put every group's internal slots
+in a member's route table and shadow the route the member adds for a pivot
+tunnel. `scripts/headscale_policy.py routes` prints the list from the
+portal's slots export (each band's `/26` slots, collapsed within that band
+only: 21 routes for the default bands); a client then receives only the
+routes of the slots it is granted:
 
 ```bash
+# On the operator workstation, from the portal's export (scripts/export_network_slots.py)
+python3 scripts/headscale_policy.py routes slots.json aws   # or gcp
 # AWS router (AWS_LAB_CIDR)
-sudo tailscale up --login-server=<headscale-url> --advertise-routes=172.20.0.0/16 \
+sudo tailscale up --login-server=<headscale-url> --advertise-routes=<the printed list> \
   --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false
-# GCP router (GCP_LAB_CIDR)
-sudo tailscale up --login-server=<headscale-url> --advertise-routes=172.21.0.0/16 \
-  --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false
+# GCP router (GCP_LAB_CIDR): the same, with the gcp list
 ```
+
+Re-run `tailscale set --advertise-routes=<list>` on the router after a
+`VLAN_BANDS` change.
 
 Join with a short-lived, single-use pre-auth key **created with
 `--tags tag:jumpbox`**, for a user that `tagOwners` lets own `tag:jumpbox`:
@@ -682,11 +691,12 @@ Headscale host:
 
 ```bash
 headscale nodes list-routes
-headscale nodes approve-routes --identifier <router-node-id> --routes <cloud-cidr>
+headscale nodes approve-routes --identifier <router-node-id> --routes <the printed list>
 ```
 
 or add `"autoApprovers": {"routes": {"<cloud-cidr>": ["tag:jumpbox"]}}` to
-the base policy.
+the base policy: an autoApprovers prefix approves every advertised route
+inside it.
 
 **Router host input filter (required before students use the cloud).** A
 student may reach every `tag:jumpbox` node's own tailnet address while the
