@@ -263,7 +263,8 @@ each host the scripts run on:
    `apt-get install dnsmasq qemu-guest-agent` that `--apply` runs.
 3. `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale
    (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`).
-4. `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`.
+4. `headscale nodes approve-routes --identifier <id> --routes "$(python3 scripts/jumpbox_netgen.py routes --bands "$VLAN_BANDS")"`
+   (one `/24` per VLAN; `docs/JUMPBOX.md`, step 3).
 5. `--apply --ssh-staff-only`, so a lab VM cannot SSH to the jumpbox. Staging has no staff
    devices, so `JUMPBOX_SSH_STAFF_IPS` stays empty and SSH answers only on the management NIC and
    loopback. Run it from an SSH session on the management address (its lockout guard keeps that

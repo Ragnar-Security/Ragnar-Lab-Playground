@@ -110,6 +110,18 @@ def gateway(tag, bands):
     return f"{_prefix(tag, bands)}.1/24"
 
 
+def advertised_routes(bands):
+    """The routes the jumpbox advertises to Headscale: one /24 per routed VLAN, by tag.
+
+    Headscale sends a client every advertised route that overlaps a network the
+    policy grants it. A covering 10.0.0.0/8 would land whole in the client's
+    route table, which Linux consults before the main table, and shadow the
+    student's own route through a pivot host to a network the policy
+    withholds. A per-VLAN route reaches a client only for a VLAN it is granted.
+    """
+    return [f"{_prefix(tag, bands)}.0/24" for tag in sorted(vlan_tags(bands))]
+
+
 def dhcp_pool(tag, bands, start=DEFAULT_DHCP_START, end=DEFAULT_DHCP_END):
     if not 2 <= start <= end <= 254:
         raise ValueError("DHCP pool must satisfy 2 <= start <= end <= 254 (.1 is the gateway)")
@@ -247,6 +259,8 @@ EGRESS_TABLE = "jumpbox_lab_egress"
 EGRESS_NFT_FILE = "/etc/nftables.d/jumpbox-lab-egress.nft"
 # The only interface routed lab traffic may leave through, other than a VLAN.
 TAILNET_IF = "tailscale0"
+# The band whose networks the tailnet may not reach through the jumpbox.
+TAILNET_INTERNAL_BAND = "group-internal"
 
 
 def _staff_networks(addresses):
@@ -304,7 +318,7 @@ def render_ssh_filter(mgmt_if, staff_ips, ports=(22,)):
     and listed staff tailnet addresses.
 
     Students route THROUGH the jumpbox and never log in to it, but its own
-    10.x.x.1 gateway addresses sit inside the advertised 10.0.0.0/8 route, so a
+    10.x.x.1 gateway addresses sit inside each lab VLAN's advertised /24, so a
     Headscale ACL alone cannot close port 22 to them. A separate table at input
     priority -10 with policy accept touches only tcp/22 and never forwarding.
     """
@@ -411,8 +425,28 @@ def render_vlan_isolation(allow_vlans=()):
     return "\n".join(lines) + "\n"
 
 
-def render_lab_egress():
-    """nftables table that lets routed lab traffic leave only to the tailnet.
+def tailnet_internal_vlans(bands, extra=()):
+    """VLAN tags the tailnet may not reach through the jumpbox: every tag of the
+    group-internal band plus `extra` (for example a KOTH game's internal VLAN
+    placed in another band), sorted and de-duplicated."""
+    tags = {tag for band in bands if band.name == TAILNET_INTERNAL_BAND for tag in band.tags()}
+    for tag in extra:
+        if isinstance(tag, bool) or not isinstance(tag, int) or not 2 <= tag <= 4094:
+            raise ValueError(f"VLAN tag {tag!r} must satisfy 2 <= tag <= 4094")
+        tags.add(tag)
+    return sorted(tags)
+
+
+def _nft_set(name, kind, elements, interval=False):
+    flags = " flags interval;" if interval else ""
+    # nft rejects an empty element list, so an empty set omits it.
+    items = f" elements = {{ {', '.join(elements)} }};" if elements else ""
+    return f"    set {name} {{ type {kind};{flags}{items} }}"
+
+
+def render_lab_egress(internal_vlans=(), staff_ips=()):
+    """nftables table that lets routed lab traffic leave only to the tailnet, and
+    keeps the tailnet out of the internal networks.
 
     The jumpbox forwards whatever a lab VM hands it and does no NAT, so without
     this table a lab VM's packets leave through the management NIC into the
@@ -421,21 +455,42 @@ def render_lab_egress():
     vlan* interface and leaves on anything but tailscale0 or another vlan* is
     counted and dropped. VLAN to VLAN is left to render_vlan_isolation
     (--isolate-vlans) and its KOTH exemptions: `return` ends this chain with its
-    accept policy, and the other table still sees the packet. tailscale0 -> vlan*
-    and the jumpbox's own DHCP and DNS (the input hook) are untouched.
+    accept policy, and the other table still sees the packet.
+
+    Traffic between tailscale0 and a VLAN in `internal_vlans` is counted and
+    dropped in both directions, except to and from `staff_ips`: those networks
+    are reached by pivoting through a host on the entry network, never straight
+    from the VPN. Staff devices and the portal host (KOTH service probes and
+    beacon claims) keep their access. The jumpbox's own DHCP and DNS (the input
+    hook) are untouched.
     """
-    return "\n".join([
-        f"# {HEADER}",
-        f"table inet {EGRESS_TABLE}",
-        f"delete table inet {EGRESS_TABLE}",
-        f"table inet {EGRESS_TABLE} {{",
-        "    chain forward {",
-        "        type filter hook forward priority -10; policy accept;",
-        '        iifname "vlan*" oifname "vlan*" return',
-        f'        iifname "vlan*" oifname != "{TAILNET_IF}" counter drop',
-        "    }",
-        "}",
-    ]) + "\n"
+    lines = [f"# {HEADER}",
+             f"table inet {EGRESS_TABLE}",
+             f"delete table inet {EGRESS_TABLE}",
+             f"table inet {EGRESS_TABLE} {{"]
+    rules = []
+    if internal_vlans:
+        names = [f'"vlan{tag}"' for tag in tailnet_internal_vlans((), internal_vlans)]
+        v4, v6 = _staff_networks(staff_ips)
+        lines += [_nft_set("tailnet_internal", "ifname", names),
+                  _nft_set("tailnet_staff_v4", "ipv4_addr", v4, interval=True),
+                  _nft_set("tailnet_staff_v6", "ipv6_addr", v6, interval=True)]
+        to_internal = f'iifname "{TAILNET_IF}" oifname @tailnet_internal'
+        from_internal = f'iifname @tailnet_internal oifname "{TAILNET_IF}"'
+        rules += [f"{to_internal} ip saddr @tailnet_staff_v4 accept",
+                  f"{to_internal} ip6 saddr @tailnet_staff_v6 accept",
+                  f"{to_internal} counter drop",
+                  f"{from_internal} ip daddr @tailnet_staff_v4 accept",
+                  f"{from_internal} ip6 daddr @tailnet_staff_v6 accept",
+                  f"{from_internal} counter drop"]
+    rules += ['iifname "vlan*" oifname "vlan*" return',
+              f'iifname "vlan*" oifname != "{TAILNET_IF}" counter drop']
+    lines += ["    chain forward {",
+              "        type filter hook forward priority -10; policy accept;",
+              *(f"        {rule}" for rule in rules),
+              "    }",
+              "}"]
+    return "\n".join(lines) + "\n"
 
 
 def _nft_table_unit(description, nft_file, table):
@@ -492,7 +547,7 @@ def main(argv=None):
     parser.add_argument("what", choices=[
         "netplan", "dnsmasq", "dnsmasq-limits", "sysctl", "zeek-node", "zeek-networks", "vlans",
         "ssh-filter", "ssh-filter-unit", "isolate-vlans", "isolate-vlans-unit", "lab-egress",
-        "lab-egress-unit", "staff-has", "ssh-source", "diff"])
+        "lab-egress-unit", "staff-has", "ssh-source", "routes", "diff"])
     parser.add_argument("--bands", default=DEFAULT_BANDS)
     parser.add_argument("--mgmt-if")
     parser.add_argument("--trunk-if")
@@ -502,7 +557,10 @@ def main(argv=None):
     parser.add_argument("--dhcp-end", type=int, default=DEFAULT_DHCP_END)
     parser.add_argument("--lease", default=DEFAULT_LEASE)
     parser.add_argument("--routes", default="10.0.0.0/8")
-    parser.add_argument("--staff-ips", default="", help="ssh-filter: comma/space separated")
+    parser.add_argument("--staff-ips", default="",
+                        help="ssh-filter, lab-egress: comma/space separated")
+    parser.add_argument("--deny-vlans", default="",
+                        help="lab-egress: tags/ranges the tailnet may not reach, beyond the group-internal band")
     parser.add_argument("--ports", default="", help="ssh-filter: comma/space separated, default 22")
     parser.add_argument("--nft-file")
     parser.add_argument("--allow-vlans", default="", help="isolate-vlans: tags/ranges exempt from the drop")
@@ -546,8 +604,6 @@ def main(argv=None):
             out = render_vlan_isolation(parse_vlan_list(args.allow_vlans))
         elif args.what == "isolate-vlans-unit":
             out = render_vlan_isolation_unit(args.nft_file or VLAN_NFT_FILE)
-        elif args.what == "lab-egress":
-            out = render_lab_egress()
         elif args.what == "lab-egress-unit":
             out = render_lab_egress_unit(args.nft_file or EGRESS_NFT_FILE)
         elif args.what == "zeek-node":
@@ -558,6 +614,11 @@ def main(argv=None):
             bands = parse_bands(args.bands or DEFAULT_BANDS)
             if args.what == "vlans":
                 out = "\n".join(f"vlan{t}" for t in vlan_tags(bands)) + "\n"
+            elif args.what == "routes":
+                out = ",".join(advertised_routes(bands)) + "\n"
+            elif args.what == "lab-egress":
+                internal = tailnet_internal_vlans(bands, parse_vlan_list(args.deny_vlans))
+                out = render_lab_egress(internal, _split(args.staff_ips))
             elif args.what == "netplan":
                 out = render_netplan(args.mgmt_if, args.trunk_if, bands)
             else:

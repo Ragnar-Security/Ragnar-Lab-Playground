@@ -17,9 +17,13 @@
 #   - dnsmasq: DHCP and DNS forwarding on the lab VLANs only
 #   - sysctl: IPv4/IPv6 forwarding, loose reverse-path filtering
 #   - lab egress: an nftables table (its own unit) that lets traffic routed
-#     from a lab VLAN leave only to tailscale0 or another VLAN; needs nft
+#     from a lab VLAN leave only to tailscale0 or another VLAN, and drops
+#     traffic between tailscale0 and the internal VLANs (the group-internal
+#     band and JUMPBOX_TAILNET_DENY_VLANS) except for JUMPBOX_TAILNET_STAFF_IPS;
+#     needs nft
 # Options:
-#   --tailscale       join Headscale as the 10.0.0.0/8 subnet router. The
+#   --tailscale       join Headscale as the subnet router for every lab VLAN,
+#                     advertising one /24 per VLAN in VLAN_BANDS. The
 #                     auth key comes from JUMPBOX_TS_AUTHKEY in the
 #                     environment, or one line on stdin with --authkey-stdin;
 #                     it never appears on a command line.
@@ -60,8 +64,9 @@ load_site_env "$SITE_ENV_FILE" HEADSCALE_URL JUMPBOX_ADMIN_USER JUMPBOX_MGMT_IF 
     JUMPBOX_TRUNK_IF VLAN_BANDS JUMPBOX_DHCP_START JUMPBOX_DHCP_END \
     JUMPBOX_DHCP_LEASE JUMPBOX_DNS_UPSTREAM JUMPBOX_DHCP_RESERVATIONS \
     JUMPBOX_NETPLAN_FILE JUMPBOX_DNSMASQ_FILE JUMPBOX_NETPLAN_TRY_TIMEOUT \
-    JUMPBOX_TS_ROUTES JUMPBOX_TS_TAG JUMPBOX_TS_HOSTNAME JUMPBOX_TS_KEY_DIR \
-    JUMPBOX_SSH_STAFF_IPS JUMPBOX_MONITORING_MIN_GB JUMPBOX_RITA_VERSION JUMPBOX_RITA_DATABASE
+    JUMPBOX_TS_TAG JUMPBOX_TS_HOSTNAME JUMPBOX_TS_KEY_DIR \
+    JUMPBOX_SSH_STAFF_IPS JUMPBOX_TAILNET_DENY_VLANS JUMPBOX_TAILNET_STAFF_IPS \
+    JUMPBOX_MONITORING_MIN_GB JUMPBOX_RITA_VERSION JUMPBOX_RITA_DATABASE
 
 # The key must not reach any child process's environment or argv.
 TS_KEY="${JUMPBOX_TS_AUTHKEY:-}"
@@ -84,7 +89,6 @@ EGRESS_NFT_FILE=/etc/nftables.d/jumpbox-lab-egress.nft
 EGRESS_UNIT_NAME=jumpbox-lab-egress.service
 EGRESS_UNIT_FILE=/etc/systemd/system/jumpbox-lab-egress.service
 TRY_TIMEOUT="${JUMPBOX_NETPLAN_TRY_TIMEOUT:-120}"
-TS_ROUTES="${JUMPBOX_TS_ROUTES:-10.0.0.0/8}"
 TS_TAG="${JUMPBOX_TS_TAG:-tag:jumpbox}"
 MIN_GB="${JUMPBOX_MONITORING_MIN_GB:-64}"
 RITA_VERSION="${JUMPBOX_RITA_VERSION:-v5.1.1}"
@@ -129,6 +133,16 @@ command -v python3 >/dev/null || die "python3 is required"
 # bands and renumber every lab network.
 [ -z "${JUMPBOX_VLAN_BANDS:-}" ] \
     || die "JUMPBOX_VLAN_BANDS was renamed VLAN_BANDS; rename it in $SITE_ENV_FILE (the portal's .env uses the same name and value)"
+# A covering route such as 10.0.0.0/8 would land whole in every client's
+# route table and shadow a student's own route through a pivot host.
+[ -z "${JUMPBOX_TS_ROUTES:-}" ] \
+    || die "JUMPBOX_TS_ROUTES is no longer read: the jumpbox advertises one /24 per VLAN in VLAN_BANDS, so a client gets only the networks the Headscale policy grants it. Remove it from $SITE_ENV_FILE"
+TS_ROUTES="$(python3 "$NETGEN" routes --bands "${VLAN_BANDS:-}")" \
+    || die "VLAN_BANDS is not a valid band layout"
+EGRESS_ARGS=(--bands "${VLAN_BANDS:-}" --deny-vlans "${JUMPBOX_TAILNET_DENY_VLANS:-}"
+             --staff-ips "${JUMPBOX_TAILNET_STAFF_IPS:-}")
+python3 "$NETGEN" lab-egress "${EGRESS_ARGS[@]}" > /dev/null \
+    || die "JUMPBOX_TAILNET_DENY_VLANS ('${JUMPBOX_TAILNET_DENY_VLANS:-}': tags and first-last ranges, 2-4094) or JUMPBOX_TAILNET_STAFF_IPS ('${JUMPBOX_TAILNET_STAFF_IPS:-}': IPv4/IPv6 addresses) is invalid"
 if [ "$HAVE_ALLOW" -eq 1 ] && [ "$DO_ISO" -eq 0 ]; then
     die "--allow-vlans only applies with --isolate-vlans"
 fi
@@ -293,6 +307,12 @@ ok = sorted(p.get("AdvertiseRoutes") or []) == want and p.get("NoSNAT") and p.ge
 sys.exit(0 if ok else 1)'
 }
 
+ts_route_count() { printf '%s\n' "$TS_ROUTES" | tr ',' '\n' | grep -c .; }
+
+ts_approve_hint() {
+    printf 'Approve the routes in Headscale unless autoApprovers covers %s with 10.0.0.0/8 or the bands (docs/JUMPBOX.md, step 3).' "$TS_TAG"
+}
+
 apply_tailscale() {
     local keydir keyfile cmd
     if ! command -v tailscale >/dev/null; then
@@ -301,10 +321,11 @@ apply_tailscale() {
     fi
     if [ "$TS_STATE" = "Running" ]; then
         if tailscale_prefs_match; then
-            say "unchanged: tailscale advertises $TS_ROUTES without SNAT"
+            say "unchanged: tailscale advertises the $(ts_route_count) lab VLAN routes without SNAT"
         else
             run tailscale set --advertise-routes="$TS_ROUTES" --snat-subnet-routes=false \
                 --stateful-filtering=false
+            say "tailscale: now advertising $(ts_route_count) lab VLAN routes. $(ts_approve_hint)"
         fi
         return 0
     fi
@@ -332,7 +353,7 @@ apply_tailscale() {
         die "tailscale up failed"
     fi
     rm -f "$keyfile"
-    say "tailscale: joined. Approve the $TS_ROUTES route in Headscale (docs/JUMPBOX.md) unless autoApprovers covers $TS_TAG."
+    say "tailscale: joined, advertising $(ts_route_count) lab VLAN routes. $(ts_approve_hint)"
 }
 
 # --- ssh -----------------------------------------------------------------------
@@ -531,9 +552,10 @@ install_nft_table() {
 
 # Routed lab traffic may leave only to the tailnet: the jumpbox does no NAT and
 # would otherwise forward a lab VM's packets into the management LAN, the
-# Proxmox API and the internet. VLAN to VLAN is --isolate-vlans' business.
+# Proxmox API and the internet. VLAN to VLAN is --isolate-vlans' business. The
+# tailnet may not reach the internal VLANs, which are reached by pivoting.
 plan_lab_egress() {
-    python3 "$NETGEN" lab-egress > "$TMP/lab-egress.nft"
+    python3 "$NETGEN" lab-egress "${EGRESS_ARGS[@]}" > "$TMP/lab-egress.nft"
     python3 "$NETGEN" lab-egress-unit --nft-file "$EGRESS_NFT_FILE" > "$TMP/lab-egress.service"
     plan_nft_table "lab egress" "$EGRESS_NFT_FILE" "$EGRESS_UNIT_FILE" \
         "$TMP/lab-egress.nft" "$TMP/lab-egress.service"

@@ -203,6 +203,36 @@ def test_zeek_watches_the_trunk_and_treats_lab_routes_as_local():
     assert ng.render_zeek_networks(["10.0.0.0/8"]).splitlines()[-1].startswith("10.0.0.0/8")
 
 
+# Catches the jumpbox advertising 10.0.0.0/8 again. Headscale hands a client
+# every advertised route that overlaps a network the policy grants it, so a
+# /8 lands whole in the client's route table (table 52, looked up before
+# main) and shadows the student's own pivot route to an internal network the
+# policy withholds. One /24 per routed VLAN reaches a client only when the
+# policy grants that VLAN.
+def test_the_jumpbox_advertises_one_slash24_per_routed_vlan():
+    ng = _netgen()
+    bands = ng.parse_bands(ng.DEFAULT_BANDS)
+    routes = ng.advertised_routes(bands)
+    assert len(routes) == len(set(routes)) == len(ng.vlan_tags(bands)) == 401
+    assert routes[:3] == ["10.100.0.0/24", "10.101.0.0/24", "10.102.0.0/24"]
+    assert routes[-1] == "10.200.4.0/24"
+    for tag in (100, 200, 300, 400, 500):
+        assert str(ipaddress.ip_interface(ng.gateway(tag, bands)).network) in routes
+    assert all(ipaddress.ip_network(r).prefixlen == 24 for r in routes)
+    out = subprocess.run(["python3", str(NETGEN), "routes", "--bands", ng.DEFAULT_BANDS],
+                         capture_output=True, text=True, check=True).stdout
+    assert out == ",".join(routes) + "\n"
+
+
+# Catches the jumpbox and the Headscale policy disagreeing on a network's address.
+def test_advertised_routes_match_the_policy_slot_cidrs():
+    ng = _netgen()
+    spec = "entry:100-109:0:0 internal:200-209:100:1 group-entry:300-309:200:2 group-internal:400-410:300:4"
+    portal = parse_vlan_bands(spec)
+    assert ng.advertised_routes(ng.parse_bands(spec)) == [
+        proxmox_slot_cidr(t, portal) for t in sorted(t for b in portal for t in range(b.first, b.last + 1))]
+
+
 # --- configure (runs on the jumpbox) ----------------------------------------
 
 SITE = (
@@ -211,6 +241,12 @@ SITE = (
     "JUMPBOX_TRUNK_IF=ens19\n"
 )
 
+
+# The jumpbox's advertisement for the default bands, built from the portal's
+# address arithmetic rather than the jumpbox's: one /24 per VLAN, by tag.
+_PORTAL_BANDS = parse_vlan_bands(_netgen().DEFAULT_BANDS)
+DEFAULT_ROUTES = ",".join(proxmox_slot_cidr(t, _PORTAL_BANDS) for t in sorted(
+    t for b in _PORTAL_BANDS for t in range(b.first, b.last + 1)))
 
 # Every --apply installs the lab egress table and enables its unit; the stubs
 # keep that unit's state in $UNIT_STATE_DIR so a converged run changes nothing.
@@ -324,9 +360,11 @@ def test_every_configure_apply_installs_the_lab_egress_table(tmp_path):
 
     first = _run(CONFIGURE, ["--apply", "--no-try"], env)
     assert first.returncode == 0, first.stdout + first.stderr
-    assert _nft_structure((sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text())[3] == [
-        'iifname "vlan*" oifname "vlan*" return',
-        'iifname "vlan*" oifname != "tailscale0" counter drop']
+    egress = (sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text()
+    assert _nft_structure(egress)[3] == TAILNET_RULES + EGRESS_RULES
+    # The default layout's group-internal band, and no staff exemption unless listed.
+    assert _nft_sets(egress) == {"tailnet_internal": [f"vlan{t}" for t in range(400, 501)],
+                                 "tailnet_staff_v4": [], "tailnet_staff_v6": []}
     unit = (sysroot / "etc/systemd/system/jumpbox-lab-egress.service").read_text()
     assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-lab-egress.nft" in unit
     assert not (sysroot / "etc/nftables.d/jumpbox-vlan-isolation.nft").exists()  # J2 stays opt-in
@@ -342,6 +380,28 @@ def test_every_configure_apply_installs_the_lab_egress_table(tmp_path):
     assert second.returncode == 0, second.stdout + second.stderr
     assert _tree(sysroot) == converged
     assert _mutations(_calls(tmp_path)) == []
+
+
+# Catches the site's KOTH internal VLAN or staff exemption never reaching the
+# jumpbox, and a malformed list being installed instead of refused.
+def test_configure_takes_the_tailnet_internal_vlans_and_staff_from_site_env(tmp_path):
+    env, sysroot = _configure_env(
+        tmp_path, 'JUMPBOX_TAILNET_DENY_VLANS="250,260-261"\nJUMPBOX_TAILNET_STAFF_IPS="100.64.0.10"\n')
+    result = _run(CONFIGURE, ["--apply", "--no-try"], env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    sets = _nft_sets((sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text())
+    assert sets["tailnet_internal"] == [f"vlan{t}" for t in [250, 260, 261, *range(400, 501)]]
+    assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
+
+    for i, bad in enumerate(('JUMPBOX_TAILNET_DENY_VLANS="1"\n', 'JUMPBOX_TAILNET_STAFF_IPS="nope"\n')):
+        bad_dir = tmp_path / f"bad{i}"
+        bad_env, bad_root = _configure_env(bad_dir, bad)
+        before = _tree(bad_root)
+        refused = _run(CONFIGURE, ["--apply", "--no-try"], bad_env)
+        assert refused.returncode != 0, bad
+        assert "JUMPBOX_TAILNET_" in refused.stderr, refused.stderr
+        assert _tree(bad_root) == before
+        assert _mutations(_calls(bad_dir)) == []
 
 
 def test_configure_apply_refuses_without_nft_and_dry_run_only_notes_it(tmp_path):
@@ -460,7 +520,7 @@ def test_tailscale_auth_key_reaches_tailscale_without_ever_being_on_a_command_li
     text = log.read_text()
     argv = [l for l in text.splitlines() if l.startswith("ARGV")]
     up = next(l for l in argv if l.startswith("ARGV up")).split()
-    for flag in ("--login-server=https://vpn.example.edu", "--advertise-routes=10.0.0.0/8",
+    for flag in ("--login-server=https://vpn.example.edu", f"--advertise-routes={DEFAULT_ROUTES}",
                  "--advertise-tags=tag:jumpbox", "--snat-subnet-routes=false",
                  "--stateful-filtering=false"):
         assert flag in up
@@ -481,9 +541,22 @@ def test_tailscale_on_a_joined_jumpbox_reasserts_routing_without_a_key(tmp_path)
     argv = [l for l in log.read_text().splitlines() if l.startswith("ARGV")]
     assert not any(l.startswith("ARGV up") for l in argv)
     set_line = next(l for l in argv if l.startswith("ARGV set")).split()
-    for flag in ("--advertise-routes=10.0.0.0/8", "--snat-subnet-routes=false",
+    for flag in (f"--advertise-routes={DEFAULT_ROUTES}", "--snat-subnet-routes=false",
                  "--stateful-filtering=false"):
         assert flag in set_line
+    assert "10.0.0.0/8" not in log.read_text()
+
+
+# Catches a site override putting the whole 10.0.0.0/8 back into every
+# client's route table: the routes now follow VLAN_BANDS only.
+def test_configure_refuses_the_retired_jumpbox_ts_routes_setting(tmp_path):
+    env, sysroot = _configure_env(tmp_path, "JUMPBOX_TS_ROUTES=10.0.0.0/8\n")
+    before = _tree(sysroot)
+    result = _run(CONFIGURE, ["--apply", "--no-try", "--tailscale"], env)
+    assert result.returncode != 0
+    assert "JUMPBOX_TS_ROUTES" in result.stderr and "VLAN_BANDS" in result.stderr
+    assert _tree(sysroot) == before
+    assert _mutations(_calls(tmp_path)) == []
 
 
 def _ssh_env(tmp_path: Path, authorized_keys: str):
@@ -932,6 +1005,19 @@ EGRESS_UNIT_NAME = "jumpbox-lab-egress.service"
 EGRESS_RULES = ['iifname "vlan*" oifname "vlan*" return',
                 'iifname "vlan*" oifname != "tailscale0" counter drop']
 
+# Group and KOTH internal networks are reached only by pivoting through a host
+# on the entry network: the tailnet may not forward to or from them, except
+# for the listed staff addresses (staff devices, and the portal host whose
+# KOTH service probes and beacon claims reach every box).
+TAILNET_RULES = [
+    'iifname "tailscale0" oifname @tailnet_internal ip saddr @tailnet_staff_v4 accept',
+    'iifname "tailscale0" oifname @tailnet_internal ip6 saddr @tailnet_staff_v6 accept',
+    'iifname "tailscale0" oifname @tailnet_internal counter drop',
+    'iifname @tailnet_internal oifname "tailscale0" ip daddr @tailnet_staff_v4 accept',
+    'iifname @tailnet_internal oifname "tailscale0" ip6 daddr @tailnet_staff_v6 accept',
+    'iifname @tailnet_internal oifname "tailscale0" counter drop',
+]
+
 
 def _nft_structure(text):
     """Parse the rendered table rather than matching substrings of it."""
@@ -945,27 +1031,48 @@ def _nft_structure(text):
     return tables, chains, hooks, rules
 
 
-def _nft_verdict(rules, iif, oif, policy="accept"):
-    """First-match verdict of one table's forward rules for one interface pair.
+def _nft_sets(text):
+    """Named sets of a rendered table: name -> its elements, unquoted."""
+    sets = {}
+    for name, body in re.findall(r"^\s*set (\w+) \{(.*)\}\s*$", text, re.M):
+        m = re.search(r"elements = \{(.*?)\}", body)
+        sets[name] = [e.strip().strip('"') for e in m.group(1).split(",")] if m else []
+    return sets
+
+
+def _nft_verdict(rules, iif, oif, policy="accept", sets=None, src=None, dst=None):
+    """First-match verdict of one table's forward rules for one packet: its
+    interface pair and, for rules that match one, its source or destination.
 
     `return` in a base chain ends that chain with its policy."""
     def matches(spec, name):
         negate = spec.startswith("!= ")
         spec = spec[3:] if negate else spec
-        names = re.findall(r'"([^"]+)"', spec)
+        names = sets[spec[1:]] if spec.startswith("@") else re.findall(r'"([^"]+)"', spec)
         hit = any(fnmatch.fnmatchcase(name, n) for n in names)
         return hit != negate
+
+    def address_matches(family, field, set_name):
+        addr = src if field == "saddr" else dst
+        if addr is None:
+            return False
+        addr = ipaddress.ip_address(addr)
+        if addr.version != (4 if family == "ip" else 6):
+            return False
+        return any(addr in ipaddress.ip_network(n) for n in sets[set_name])
     for rule in rules:
-        m = re.fullmatch(r'iifname (.+?) oifname (.+?) (?:counter )?(accept|drop|return)', rule)
+        m = re.fullmatch(r'iifname (.+?) oifname (.+?)(?: (ip6?) (saddr|daddr) @(\w+))?'
+                         r' (?:counter )?(accept|drop|return)', rule)
         assert m, f"unparsed rule {rule!r}"
-        if matches(m.group(1), iif) and matches(m.group(2), oif):
-            return policy if m.group(3) == "return" else m.group(3)
+        if matches(m.group(1), iif) and matches(m.group(2), oif) and (
+                m.group(3) is None or address_matches(m.group(3), m.group(4), m.group(5))):
+            return policy if m.group(6) == "return" else m.group(6)
     return policy
 
 
-def _forwarded(tables, iif, oif):
+def _forwarded(tables, iif, oif, **packet):
     """A packet is forwarded only if no base chain on the hook drops it."""
-    return all(_nft_verdict(rules, iif, oif) == "accept" for rules in tables)
+    return all(_nft_verdict(rules, iif, oif, **packet) == "accept" for rules in tables)
 
 
 def test_vlan_isolation_drops_only_vlan_to_vlan_forwarding():
@@ -1007,6 +1114,74 @@ def test_lab_egress_lets_lab_vlans_leave_only_to_the_tailnet_and_leaves_vlan_to_
             ("eth0", "tailscale0", True, True), ("eth0", "vlan200", True, True)]:
         assert _forwarded(egress_only, iif, oif) == before_j2, (iif, oif)
         assert _forwarded(with_j2, iif, oif) == after_j2, (iif, oif)
+
+
+# Catches the jumpbox forwarding a VPN client straight into a group's or a
+# KOTH game's internal network (or a box there calling back to the tailnet),
+# which would skip the pivot the lab is built around; and catches the drop
+# reaching an entry network or a student's own internal network.
+def test_lab_egress_drops_the_tailnet_to_and_from_internal_networks_but_staff():
+    ng = _netgen()
+    bands = ng.parse_bands(ng.DEFAULT_BANDS)
+    internal = ng.tailnet_internal_vlans(bands, extra=[250])
+    assert internal == [250] + list(range(400, 501))
+    text = ng.render_lab_egress(internal, staff_ips=["100.64.0.10", "fd7a:115c:a1e0::a"])
+    tables, chains, hooks, rules = _nft_structure(text)
+    assert (tables, chains) == (["table inet jumpbox_lab_egress {"], ["chain forward {"])
+    assert hooks == ["type filter hook forward priority -10; policy accept;"]
+    assert rules == TAILNET_RULES + EGRESS_RULES
+    sets = _nft_sets(text)
+    assert sets["tailnet_internal"] == [f"vlan{t}" for t in internal]
+    assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
+    assert sets["tailnet_staff_v6"] == ["fd7a:115c:a1e0::a"]
+    student, staff = "100.64.0.20", "100.64.0.10"
+    for tables_, j2 in (([rules], False), ([rules, ISOLATION_RULES], True)):
+        for iif, oif, packet, forwarded in [
+                ("tailscale0", "vlan400", {"src": student}, False),  # group internal
+                ("vlan400", "tailscale0", {"dst": student}, False),
+                ("tailscale0", "vlan500", {"src": student}, False),
+                ("tailscale0", "vlan250", {"src": student}, False),  # a listed KOTH internal
+                ("vlan250", "tailscale0", {"dst": student}, False),
+                ("tailscale0", "vlan400", {"src": staff}, True),
+                ("vlan400", "tailscale0", {"dst": staff}, True),
+                ("tailscale0", "vlan300", {"src": student}, True),  # group entry
+                ("vlan300", "tailscale0", {"dst": student}, True),
+                ("tailscale0", "vlan200", {"src": student}, True),  # own internal
+                ("tailscale0", "vlan100", {"src": student}, True),  # own entry
+                ("vlan400", "eth0", {"dst": "192.0.2.1"}, False),
+                ("vlan300", "vlan400", {}, not j2)]:
+            assert _forwarded(tables_, iif, oif, sets=sets, **packet) == forwarded, (iif, oif, packet, j2)
+
+
+# Catches the drop silently matching nothing (no group-internal band) or
+# refusing a layout without one, and staff sets that nft would reject.
+def test_tailnet_internal_vlans_follow_the_group_internal_band_plus_listed_tags():
+    ng = _netgen()
+    no_groups = ng.parse_bands("entry:100-199:0:0 internal:200-299:100:1")
+    assert ng.tailnet_internal_vlans(no_groups) == []
+    assert ng.tailnet_internal_vlans(no_groups, extra=[260, 250, 260]) == [250, 260]
+    text = ng.render_lab_egress([400])
+    assert _nft_structure(text)[3] == TAILNET_RULES + EGRESS_RULES
+    sets = _nft_sets(text)
+    assert sets == {"tailnet_internal": ["vlan400"], "tailnet_staff_v4": [], "tailnet_staff_v6": []}
+    # nft rejects an empty element list, so an empty staff set has none.
+    assert "elements = { }" not in text
+    assert _nft_structure(ng.render_lab_egress([]))[3] == EGRESS_RULES
+    with pytest.raises(ValueError):
+        ng.render_lab_egress([400], staff_ips=["not-an-address"])
+
+
+def test_netgen_cli_renders_the_tailnet_internal_drop_from_the_bands():
+    out = subprocess.run(["python3", str(NETGEN), "lab-egress", "--bands", _netgen().DEFAULT_BANDS,
+                          "--deny-vlans", "250", "--staff-ips", "100.64.0.10"],
+                         capture_output=True, text=True, check=True).stdout
+    assert _nft_structure(out)[3] == TAILNET_RULES + EGRESS_RULES
+    sets = _nft_sets(out)
+    assert sets["tailnet_internal"] == [f"vlan{t}" for t in [250, *range(400, 501)]]
+    assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
+    bad = subprocess.run(["python3", str(NETGEN), "lab-egress", "--deny-vlans", "1"],
+                         capture_output=True, text=True)
+    assert bad.returncode == 2 and "ERROR" in bad.stderr
 
 
 def test_allow_vlans_exempts_listed_tags_between_vlans_only():
@@ -1106,7 +1281,8 @@ def test_netgen_cli_emits_the_isolation_table_and_unit():
     assert bad.returncode == 2 and "ERROR" in bad.stderr
     egress = subprocess.run(["python3", str(NETGEN), "lab-egress"],
                             capture_output=True, text=True, check=True).stdout
-    assert _nft_structure(egress)[3] == EGRESS_RULES
+    # The default layout has a group-internal band, so the tailnet drop is in.
+    assert _nft_structure(egress)[3] == TAILNET_RULES + EGRESS_RULES
     unit = subprocess.run(["python3", str(NETGEN), "lab-egress-unit"],
                           capture_output=True, text=True, check=True).stdout
     assert "jumpbox-lab-egress.nft" in unit

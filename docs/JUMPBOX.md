@@ -3,8 +3,9 @@
 The jumpbox is one Ubuntu VM that routes for every lab VLAN. It is:
 
 - the default gateway and DHCP server for each lab VLAN;
-- a Tailscale subnet router that advertises `10.0.0.0/8` to the Headscale
-  tailnet, so a student on the VPN reaches lab VMs directly;
+- a Tailscale subnet router that advertises one `/24` per lab VLAN to the
+  Headscale tailnet, so a student on the VPN reaches the lab networks the
+  policy grants them directly;
 - optionally, a Zeek/RITA sensor on the lab trunk.
 
 Students do not need to log in to the jumpbox. If the jumpbox stops, every
@@ -13,7 +14,7 @@ lab VLAN loses DHCP and every student loses VPN access to the labs.
 ```
 student laptop ──tailnet── Headscale (vpn.example.edu)
                                │
-                 jumpbox (tag:jumpbox, advertises 10.0.0.0/8, no SNAT)
+                 jumpbox (tag:jumpbox, advertises one /24 per VLAN, no SNAT)
                  ├─ net0  management: vmbr0, VLAN 1, DHCP
                  └─ net1  trunk: vmbr0, untagged, firewall on
                      ├─ vlan100  10.100.0.1/24  ─ student entry network
@@ -225,9 +226,15 @@ unit `jumpbox-lab-egress.service`. At boot the unit loads the table before
 (`Before=systemd-sysctl.service network-pre.target`; it needs only `nft` and
 the rule file mounted), so lab traffic is never forwarded unfiltered. It needs `nft`:
 `--apply` refuses without it, and the dry run notes it. The table has a
-forward hook at priority -10, policy accept, and two rules:
+forward hook at priority -10, policy accept, and these rules:
 
 ```
+iifname "tailscale0" oifname @tailnet_internal ip saddr @tailnet_staff_v4 accept
+iifname "tailscale0" oifname @tailnet_internal ip6 saddr @tailnet_staff_v6 accept
+iifname "tailscale0" oifname @tailnet_internal counter drop
+iifname @tailnet_internal oifname "tailscale0" ip daddr @tailnet_staff_v4 accept
+iifname @tailnet_internal oifname "tailscale0" ip6 daddr @tailnet_staff_v6 accept
+iifname @tailnet_internal oifname "tailscale0" counter drop
 iifname "vlan*" oifname "vlan*" return
 iifname "vlan*" oifname != "tailscale0" counter drop
 ```
@@ -239,11 +246,36 @@ package installs happen in the image builder, not in a lab session. Name
 lookups still work, because dnsmasq on the jumpbox answers them (input, not
 forwarding). VLAN-to-VLAN traffic is not this table's business: `return` ends
 its chain, and the separate VLAN isolation table below (`--isolate-vlans`, J2)
-decides it. From `tailscale0` to a VLAN, and the jumpbox's own DHCP and DNS,
-are untouched.
+decides it. The jumpbox's own DHCP and DNS are untouched.
+
+**The tailnet never reaches an internal network directly.** The set
+`tailnet_internal` holds the `vlan<N>` interfaces of the `group-internal` band
+plus any tags in `JUMPBOX_TAILNET_DENY_VLANS`; traffic between `tailscale0`
+and those VLANs is counted and dropped in both directions. Players reach a
+group's or KOTH game's internal network by pivoting through a host they hold
+on the entry network, which is VLAN-to-VLAN traffic (or the entry host's own
+second NIC), not tailnet traffic. This backs up the Headscale policy, which
+grants groups and KOTH games their entry network only. The exceptions are
+`JUMPBOX_TAILNET_STAFF_IPS` (the sets `tailnet_staff_v4` and
+`tailnet_staff_v6`): list the staff devices that need the internal networks,
+and **the portal host's tailnet address when you run KOTH**, because the
+service probes and beacon claims reach every box, internal ones included. A
+student's own entry and internal networks and a group's entry network are not
+in the set.
+
+```bash
+# scripts/site.env
+JUMPBOX_TAILNET_STAFF_IPS="100.64.0.10,100.64.0.11"   # staff device, portal host
+JUMPBOX_TAILNET_DENY_VLANS="250"   # a KOTH internal VLAN outside the group-internal band
+```
+
+Re-run `--apply` after changing either; a KOTH game whose internal VLAN lies in
+the `group-internal` band needs no entry.
 
 **Verify:** from a lab VM, a ping to the management gateway gets no reply,
-and the counter in `sudo nft list table inet jumpbox_lab_egress` rises.
+and the counter in `sudo nft list table inet jumpbox_lab_egress` rises. From
+a student device, a group internal address does not answer and the
+`tailnet_internal` drop counter rises.
 Because the jumpbox does no NAT, a missing reply alone proves nothing; the
 counter does, as does an empty `sudo tcpdump -ni <mgmt-if> src <lab-vm-address>`.
 
@@ -292,7 +324,7 @@ a mode-0600 file that `tailscale up --auth-key=file:<path>` reads, and deletes
 the file afterwards. It joins with:
 
 ```
---login-server=$HEADSCALE_URL --advertise-routes=10.0.0.0/8 --advertise-tags=tag:jumpbox
+--login-server=$HEADSCALE_URL --advertise-routes=<one /24 per VLAN in VLAN_BANDS> --advertise-tags=tag:jumpbox
 --snat-subnet-routes=false --stateful-filtering=false
 ```
 
@@ -303,6 +335,20 @@ every lab VLAN's gateway. If the jumpbox has already joined, the script
 re-asserts the routes, SNAT and filtering settings with `tailscale set` and
 needs no key.
 
+**Why one route per VLAN, not `10.0.0.0/8`.** Headscale sends a client every
+advertised route that overlaps a network the policy grants it (`ReduceRoutes`
+in Headscale v0.27). A `10.0.0.0/8` route therefore lands whole in the
+client's route table (on Linux, table 52, which `ip rule` 5270 consults
+before the main table) and shadows the route a student adds for a pivot
+tunnel to an internal network: the traffic goes to the VPN instead and is
+dropped. With one `/24` per VLAN, a client receives only the routes of the
+networks the policy grants it, and staff (`*:*`) receive all of them. The
+list follows `VLAN_BANDS` (`python3 scripts/jumpbox_netgen.py routes --bands
+"$VLAN_BANDS"` prints it): 401 routes for the default bands, which
+Headscale v0.27.1 and Tailscale v1.102.3 handle (measured: all 401
+auto-approved and served). `JUMPBOX_TS_ROUTES` is no longer read; the script
+refuses to run while it is set.
+
 Create the key with `--tags tag:jumpbox`. With an untagged key, Headscale
 v0.27 ignores the advertised tag when it resolves users, so the jumpbox
 stays a node of its user: if that user is in `group:staff`, the jumpbox
@@ -310,16 +356,20 @@ gets the staff rule (`*:*`) and can open connections to every student
 device. `headscale nodes list -o json` must show `tag:jumpbox` in the
 node's `forced_tags`.
 
-Approve the route in Headscale. Headscale 0.26 and later:
+Approve the routes in Headscale. Headscale 0.26 and later:
 
 ```bash
 headscale nodes list-routes
-headscale nodes approve-routes --identifier <jumpbox-node-id> --routes 10.0.0.0/8
+headscale nodes approve-routes --identifier <jumpbox-node-id> \
+  --routes "$(python3 scripts/jumpbox_netgen.py routes --bands "$VLAN_BANDS")"
 ```
 
-Older versions use `headscale routes list` and `headscale routes enable -r <id>`.
-Alternatively, add an `autoApprovers` entry to the policy so that a rebuilt
-jumpbox is approved without a manual step:
+`approve-routes` replaces the node's approved list, so this also withdraws an
+earlier `10.0.0.0/8` approval. Older versions use `headscale routes list` and
+`headscale routes enable -r <id>`. Alternatively, add an `autoApprovers` entry
+to the policy so that a rebuilt jumpbox is approved without a manual step. An
+autoApprovers prefix approves every advertised route inside it, so the
+covering entry approves each per-VLAN `/24`:
 
 ```json
 "autoApprovers": { "routes": { "10.0.0.0/8": ["tag:jumpbox"] } }
@@ -448,9 +498,9 @@ courses use no jumpbox accounts at all (below).
 Students route *through* the jumpbox and never log in to it, yet without this
 step SSH answers every tailnet device and every lab VLAN. A Headscale ACL
 cannot fix that on its own: the jumpbox's gateway addresses (`10.x.x.1`) sit
-inside the advertised `10.0.0.0/8` route, so a student's SSH to their own
-gateway is matched as routed traffic to `10.0.0.0/8`, which the member rule
-above has to allow. Close the port on the jumpbox itself:
+inside each VLAN's advertised `/24`, so a student's SSH to their own gateway
+is matched as routed traffic to their own network, which the policy has to
+allow. Close the port on the jumpbox itself:
 
 ```bash
 # scripts/site.env: staff tailnet addresses, IPv4 and IPv6 mixed
@@ -581,7 +631,7 @@ sudo jumpbox/jumpbox_configure.sh --apply --monitoring
 ```
 
 This installs Zeek from the openSUSE `security:zeek` repository and runs it
-standalone on the trunk interface, with `10.0.0.0/8` as the local network and
+standalone on the trunk interface, with the advertised lab routes as the local networks and
 `zeekctl cron` every 5 minutes. Logs expire after 7 days. It also installs
 RITA (`JUMPBOX_RITA_VERSION`, default v5.1.1; Docker and ClickHouse) with
 its release installer, and imports the Zeek logs into a rolling database
@@ -627,6 +677,7 @@ list.
 | Symptom | Check |
 |---------|-------|
 | Lab VMs get no address | `ip -br addr \| grep vlan` shows the `.1` gateways; `journalctl -u dnsmasq`; `df -h /`, because a full disk stops lease writes |
-| Students cannot reach lab VMs | `tailscale status`; route approved (`headscale nodes list-routes`); ACL allows `10.0.0.0/8`; `sysctl net.ipv4.ip_forward` |
+| Students cannot reach lab VMs | `tailscale status`; routes approved (`headscale nodes list-routes`); the policy grants the network; `sysctl net.ipv4.ip_forward` |
+| A group or KOTH internal address does not answer from the VPN | intended: reach it through a host on the entry network. Staff or the portal host: add its tailnet address to `JUMPBOX_TAILNET_STAFF_IPS` and re-run `--apply` |
 | A VLAN works but a new group's does not | the group's VLAN is outside `VLAN_BANDS` (an explicit tag; the startup log names it); widen the bands in both `.env` and `scripts/site.env`, then re-run configure |
 | `netplan try` reverted | you did not confirm within the timeout, or the change cut your session; read the dry-run diff and re-run |
