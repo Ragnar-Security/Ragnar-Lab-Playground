@@ -13,6 +13,7 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
+    canonical,
     missing_peers,
     normalize_login,
     parse_vlan_bands,
@@ -441,3 +442,19 @@ def test_cli_missing_peers_prints_one_device_per_line(tmp_path):
         paths[name].write_text(json.dumps(value))
     result = _cli("missing-peers", str(paths["nodes"]), str(paths["slots"]), str(paths["status"]))
     assert (result.returncode, result.stdout) == (0, "alice-laptop (alice)\n")
+
+
+# ---- individual mode is unchanged ------------------------------------------
+
+# Catches any change to what an individual-only site grants. The fixture is the
+# render of the release before group and KOTH internal networks were withdrawn,
+# so the comparison is byte for byte against that release's output.
+def test_an_individual_only_site_renders_byte_identical_to_the_previous_release(tmp_path):
+    slots_file = ROOT / "tests" / "fixtures" / "individual_only_slots.json"
+    slots = json.loads(slots_file.read_text())
+    expected = (ROOT / "tests" / "fixtures" / "individual_only_policy.json").read_text()
+    assert canonical(render(BASE, slots, *policy_inputs(slots))) == expected
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps(BASE))
+    result = _cli("render", str(base), str(slots_file))
+    assert (result.returncode, result.stdout) == (0, expected)
