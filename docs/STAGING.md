@@ -495,6 +495,57 @@ VPN VM, and the lease and `nft` lines on the staging jumpbox.
 9. Record the date, commit, four VMIDs, `TA`, `TB` and each result in the operator's staging log.
    Then destroy both deployments; step 3's query prints nothing.
 
+### Group and KOTH internal networks
+
+Repeatable, after the steps above. A group's and a KOTH game's internal network is reached only by
+pivoting through a host on its entry network: the policy grants the entry network only, the
+routers advertise one route per network, and the jumpbox drops the tailnet's traffic to and from
+the `group-internal` band. A student's own entry and internal networks are unchanged (step 5 above
+is the proof that they still work).
+
+Preparation, once per staging rebuild:
+
+- The staging `site.env` leaves `JUMPBOX_TAILNET_STAFF_IPS` and `JUMPBOX_TAILNET_DENY_VLANS` empty
+  (staging has no staff device and runs its KOTH draft in the group bands).
+- `templates.yaml` gains a second group, `staging-two-machine-group`: the same two entries as
+  `staging-two-machine`, with `group_mode: true`.
+- In the admin Groups tab, create the group `zz-team` with members `zz-a` and `zz-b`. With the
+  default bands it takes VLANs 300/400: entry `10.100.2.0/24`, internal `10.100.4.0/24`.
+- Section 6 again, so the policy holds the group.
+
+1. **Routes.** On the VPN VM, `docker compose exec -T headscale headscale nodes list-routes`
+   shows the staging jumpbox with 401 approved and 401 serving routes, and no `10.0.0.0/8`. In
+   each client, `docker exec zz-a ip route show table 52 | grep '^10\.'` lists exactly
+   `10.100.0.0/24`, `10.100.1.0/24` (A's own) and `10.100.2.0/24` (the group's entry), and for
+   `zz-b` `10.101.0.0/24`, `10.101.1.0/24` and `10.100.2.0/24`. Neither lists `10.100.4.0/24`.
+2. `zz-a` deploys `staging-two-machine-group`. The group `srv01` holds a lease in `10.100.2.0/24`
+   and one in `10.100.4.0/24`; the group `dc01` one in `10.100.4.0/24`.
+3. **Entry works, internal does not, from the VPN.** From each client, `ping -c2 -W2` and
+   `nc -w3 <addr> 22 </dev/null` succeed against the group `srv01`'s entry address, and fail against
+   its internal address and against the group `dc01`. `docker exec zz-a ip route get <dc01 addr>`
+   does not name `tailscale0`. On an Active Directory pair, also `nc -w3 -z <dc01 addr> 88` and
+   `445` from the VPN: both must fail.
+4. **The jumpbox layer on its own.** Simulate a policy mistake: add a rule to the staging base
+   policy granting `zz-b@` `10.100.4.0/24:*`, and apply section 6. `zz-b` now lists
+   `10.100.4.0/24` in table 52, yet `docker exec zz-b nc -w3 <dc01 addr> 22 </dev/null` still
+   fails, and on the staging jumpbox the `iifname "tailscale0" oifname @tailnet_internal counter`
+   in `sudo nft list table inet jumpbox_lab_egress` rises. Remove the rule and apply section 6
+   again; table 52 loses the route.
+5. **Staff exemption.** Set `JUMPBOX_TAILNET_STAFF_IPS` to `zz-b`'s tailnet address, run
+   `jumpbox_configure.sh --apply` on the staging jumpbox, repeat step 4's grant: `zz-b` now reaches
+   `dc01` on port 22. Revert both (empty `JUMPBOX_TAILNET_STAFF_IPS`, `--apply`, policy without the
+   rule) and confirm step 3 again.
+6. **The pivot.** Through a TUN tunnel whose agent runs on the group `srv01`, for example
+   ligolo-ng with its proxy in the `zz-a` container: start the tunnel, then in `zz-a`
+   `ip route add 10.100.4.0/24 dev <tunnel interface>` (the main table). `ip route get <dc01 addr>`
+   names the tunnel interface, and `nc -w3 <dc01 addr> 22 </dev/null` (or `88`/`445` on an Active
+   Directory pair) succeeds. Remove the route and stop the tunnel.
+7. **KOTH.** In `/admin/koth`, create a draft game on `staging-two-machine-group` with entry VLAN
+   350 and internal VLAN 450, and apply section 6. Both clients' table 52 gains `10.150.2.0/24` and
+   not `10.150.4.0/24`; the rendered policy names `10.150.2.0/24` in each login's forward rule
+   only, and `10.150.4.0/24` nowhere. Delete the draft and apply section 6 again.
+8. Record the date, commit and each result in the staging log, then destroy the group deployment.
+
 ### Stop, start, reset, remove
 
 Portal commands run in the staging checkout on `<STAGING_PORTAL_HOST>`.
