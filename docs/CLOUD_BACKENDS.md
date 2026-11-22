@@ -1066,12 +1066,15 @@ student every lab.
 What the policy grants:
 
 - Each roster login `<login>@` reaches its own entry and internal slots, its
-  groups' entry and internal slots, and the entry and internal blocks of
-  **every KOTH game whose status is not `ended`** (Proxmox only, since KOTH runs only there).
-  Only slots inside `VLAN_BANDS` are granted, the same kinds on every
-  backend. The login's own and groups' blocks may connect back to that
+  groups' entry slots, and the entry block of **every KOTH game whose status
+  is not `ended`** (Proxmox only, since KOTH runs only there). Only slots
+  inside `VLAN_BANDS` are granted, the same kinds on every backend. The
+  login's own blocks and its groups' entry blocks may connect back to that
   login's own devices only. KOTH blocks may not connect back at all: a box
   any player has rooted must not reach every player's devices.
+- **A group's or KOTH game's internal network is never granted, in either
+  direction.** Players reach it only by pivoting through a host they hold on
+  the entry network. Its tag is still checked for clashes.
 - **The render keeps every section and every `acls` rule of the base file,
   except the blanket rule whose `src` is exactly `["autogroup:member"]`,
   which it cuts down to its `autogroup:self` destinations.** Students keep

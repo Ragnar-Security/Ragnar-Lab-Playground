@@ -43,11 +43,12 @@ SLOTS = {
     "koth": [],
 }
 DEFAULT_POLICY_BANDS = PolicyBands(tuple(parse_vlan_bands(DEFAULT_BANDS)), proxmox_enabled=True)
-# Own entry 100 and internal 200 plus the group's 300/400.
+# Own entry 100 and internal 200 plus the group's entry 300; never the
+# group's internal 400, which members reach only by pivoting.
 EXPECTED_ALICE_CIDRS = [
-    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24", "10.100.4.0/24",
-    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26", "172.20.100.0/26",
-    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26", "172.21.100.0/26",
+    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24",
+    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26",
+    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26",
 ]
 SELF_RULE = {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
 
@@ -101,21 +102,23 @@ def test_empty_or_malformed_login_is_rejected(raw):
 
 
 # Catches KOTH players losing reachability to the arena once the blanket rule
-# is gone, and (D-plan F2) a KOTH box any player has rooted reaching every
-# player's devices through the reverse rule.
-def test_every_roster_login_gets_non_ended_koth_blocks_on_proxmox_only():
+# is gone, (D-plan F2) a KOTH box any player has rooted reaching every
+# player's devices through the reverse rule, and a player reaching the
+# arena's internal network without pivoting through a box they hold.
+def test_every_roster_login_gets_the_non_ended_koth_entry_block_on_proxmox_only():
     slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {"aws": "172.20.0.0/16"})
-    koth = {"10.150.2.0/24", "10.150.4.0/24"}
+    koth_entry, koth_internal = "10.150.2.0/24", "10.150.4.0/24"
     for login in ("alice@", "bob@"):
         forward = _forward(policy, login)
-        assert {f"{cidr}:*" for cidr in koth} <= set(forward["dst"])
+        assert f"{koth_entry}:*" in forward["dst"]
         assert not {"172.20.87.128/26:*", "172.20.112.128/26:*"} & set(forward["dst"])
         reverse = next(r for r in policy["acls"] if r["dst"] == [f"{login}:*"])
-        assert not koth & set(reverse["src"])
+        assert koth_entry not in reverse["src"]
         # The login's own and group blocks still reach back to its devices.
-        assert set(reverse["src"]) == {d[:-2] for d in forward["dst"]} - koth
-    assert not any(koth & set(r["src"]) for r in policy["acls"])
+        assert set(reverse["src"]) == {d[:-2] for d in forward["dst"]} - {koth_entry}
+    assert not any(koth_entry in r["src"] for r in policy["acls"])
+    assert koth_internal not in json.dumps(policy)
     cloud_only = render(BASE, slots, replace(DEFAULT_POLICY_BANDS, proxmox_enabled=False),
                         {"aws": "172.20.0.0/16"})
     assert "10.150." not in json.dumps(cloud_only)
@@ -127,7 +130,7 @@ def test_a_login_with_only_koth_blocks_gets_no_reverse_rule():
     slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": [], "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
-    assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*", "10.150.4.0/24:*"]
+    assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*"]
     assert not [r for r in policy["acls"] if r["dst"] == ["carol@:*"]]
 
 
@@ -265,9 +268,25 @@ def test_group_membership_grants_only_that_groups_blocks():
     ]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "alice@")["dst"] == [
-        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
+        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*"]
     assert _forward(policy, "bob@")["dst"] == [
-        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
+        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*"]
+
+
+# Catches a group member or KOTH player reaching a group or arena internal
+# network directly, in either direction and on any backend: those networks are
+# reached only by pivoting through a host on the entry network. A student's
+# own internal network stays granted.
+def test_group_and_koth_internal_networks_are_never_granted_in_either_direction():
+    slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
+    policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
+    withheld = {"10.100.4.0/24", "10.150.4.0/24",  # group 400, KOTH 450 on Proxmox
+                "172.20.100.0/26", "172.21.100.0/26"}  # group 400 on each cloud
+    for rule in policy["acls"][2:]:
+        granted = set(rule["src"]) | {d.rsplit(":", 1)[0] for d in rule["dst"]}
+        assert not withheld & granted, rule
+    for login, own_internal in (("alice@", "10.100.1.0/24"), ("bob@", "10.101.1.0/24")):
+        assert f"{own_internal}:*" in _forward(policy, login)["dst"]
 
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
@@ -296,6 +315,8 @@ def _with(**changes):
     (_with(groups=[{"slug": "red-team", "members": ["alice"], "entry_vlan": 101,
                     "internal_vlan": 400}]), {}),
     (_with(koth=[{"game_id": 1, "entry_vlan": 300, "internal_vlan": 450}]), {}),
+    # Internal networks that are withheld are still claimed, so a clash is refused.
+    (_with(koth=[{"game_id": 1, "entry_vlan": 350, "internal_vlan": 400}]), {}),
     (_with(groups=[{"slug": "red-team", "members": ["mallory"], "entry_vlan": 300,
                     "internal_vlan": 400}]), {}),
     (_with(users=[{"login": "alice", "entry_vlan": "100", "internal_vlan": 200}], groups=[]), {}),

@@ -15,10 +15,13 @@ per-student rules replace. SLOTS is scripts/export_network_slots.py
 output from the running portal; the backends, lab CIDRs and VLAN bands come
 only from it, so the policy grants exactly the networks that portal
 allocates. Each roster login gets one rule to its own entry and internal
-networks, its group's entry and internal networks, and every non-ended KOTH
-game's networks (Proxmox only), plus the reverse rule back to its devices from
-its own and its groups' networks. KOTH networks get no reverse rule: a box any
-player has rooted must not reach every player's devices.
+networks, its groups' entry networks, and every non-ended KOTH game's entry
+network (Proxmox only), plus the reverse rule back to its devices from its
+own networks and its groups' entry networks. A group's or KOTH game's
+internal network is never granted, in either direction: players reach it only
+by pivoting through a host they hold on the entry network. KOTH networks get
+no reverse rule: a box any player has rooted must not reach every player's
+devices.
 
 missing-peers reads `headscale nodes list -o json`, the slots export and
 `tailscale status --json` from the jumpbox, and prints each roster device the
@@ -166,8 +169,10 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
             raise ValueError(f"group slug {slug!r} is empty or repeated")
         slugs.add(slug)
         what = f"group {slug}"
-        pair = {claim(_tag(group, "entry_vlan", what), what),
-                claim(_tag(group, "internal_vlan", what), what)}
+        # The internal tag is claimed (a clash is still refused) but never
+        # granted: members reach it only through a host on the entry network.
+        entry = claim(_tag(group, "entry_vlan", what), what)
+        claim(_tag(group, "internal_vlan", what), what)
         members = group.get("members")
         if not isinstance(members, list):
             raise ValueError(f"{what} members must be a list")
@@ -175,13 +180,13 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
             identity = normalize_login(member)
             if identity not in granted:
                 raise ValueError(f"{what} member {identity} is not on the roster")
-            granted[identity] |= pair
+            granted[identity].add(entry)
 
     koth: Set[int] = set()
     for game in _list(slots, "koth"):
         what = f"KOTH game {game.get('game_id')!r}"
-        koth |= {claim(_tag(game, "entry_vlan", what), what),
-                 claim(_tag(game, "internal_vlan", what), what)}
+        koth.add(claim(_tag(game, "entry_vlan", what), what))
+        claim(_tag(game, "internal_vlan", what), what)
     # KOTH is refused on the cloud backends, so its slots exist on Proxmox only.
     koth_routed = routed_slots(koth, bands.values) if bands.proxmox_enabled else []
 
