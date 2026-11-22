@@ -269,9 +269,10 @@ package installs belong in the image build. The table needs `nft`.
     tailscaled || systemctl is-active snap.tailscale.tailscaled` prints
     `active` twice, the second from whichever unit exists.
   - `sudo nft list table inet jumpbox_lab_egress` shows `iifname "vlan*"
-    oifname "vlan*" return` and `iifname "vlan*" oifname != "tailscale0"
-    counter drop`, and `systemctl is-enabled jumpbox-lab-egress.service`
-    prints `enabled`.
+    oifname "vlan*" return`, `iifname "vlan*" oifname != "tailscale0"
+    counter drop` and the two `tailnet_internal` drops (`docs/JUMPBOX.md`,
+    "Lab egress"), its `tailnet_staff_v4` set lists `JUMPBOX_TAILNET_STAFF_IPS`,
+    and `systemctl is-enabled jumpbox-lab-egress.service` prints `enabled`.
 - **Staff-only SSH (required).** `sudo jumpbox/jumpbox_configure.sh --apply
   --ssh-staff-only` (`docs/JUMPBOX.md`, "Staff-only SSH"), with
   `JUMPBOX_SSH_STAFF_IPS` listing the staff devices. A lab VM can otherwise
@@ -591,7 +592,9 @@ this order, skipping any item whose section never ran.
    console:
 
    ```bash
-   python3 jumpbox/jumpbox_netgen.py lab-egress | sudo tee /etc/nftables.d/jumpbox-lab-egress.nft >/dev/null
+   python3 jumpbox/jumpbox_netgen.py lab-egress --bands "<VLAN_BANDS value>" \
+     --deny-vlans "<JUMPBOX_TAILNET_DENY_VLANS>" --staff-ips "<JUMPBOX_TAILNET_STAFF_IPS>" \
+     | sudo tee /etc/nftables.d/jumpbox-lab-egress.nft >/dev/null
    python3 jumpbox/jumpbox_netgen.py lab-egress-unit | sudo tee /etc/systemd/system/jumpbox-lab-egress.service >/dev/null
    sudo nft -c -f /etc/nftables.d/jumpbox-lab-egress.nft && sudo systemctl daemon-reload \
      && sudo systemctl enable --now jumpbox-lab-egress.service

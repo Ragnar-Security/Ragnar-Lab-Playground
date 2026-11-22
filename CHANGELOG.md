@@ -137,6 +137,22 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
 - `jumpbox_configure.sh --isolate-vlans` (J2) drops VLAN-to-VLAN forwarding
   only; lab egress moved to its own table (above), which does not wait for J2.
   `--allow-vlans` (KOTH) still exempts VLAN-to-VLAN traffic only.
+- Group and KOTH internal networks are no longer reachable straight from the
+  VPN; players reach them by pivoting through a host on the entry network.
+  The Headscale policy grants a group its entry network only (both
+  directions) and a KOTH game its entry network only, on every backend.
+  A student's own entry and internal networks are unchanged (an
+  individual-only site renders byte for byte as before).
+- The jumpbox advertises one `/24` per VLAN in `VLAN_BANDS` instead of
+  `10.0.0.0/8` (`jumpbox_netgen.py routes`), and a cloud router each band's
+  slots instead of its whole base (`headscale_policy.py routes`). Headscale
+  sends a client every advertised route that overlaps a network it is
+  granted, so a covering route shadowed a player's own route through a
+  pivot host.
+- The lab egress table also drops traffic between `tailscale0` and the
+  `group-internal` band's VLANs in both directions, plus the tags in the new
+  `JUMPBOX_TAILNET_DENY_VLANS`; addresses in the new
+  `JUMPBOX_TAILNET_STAFF_IPS` are exempt.
 
 ### Removed
 
@@ -234,6 +250,25 @@ lacks it (`scripts/release_notes.py`), and the GitHub Release shows it.
   `build_students_merged.py` must add `--site-env` or `--bands`. Update the
   portal and the operator checkout together: the export's band key is now
   `vlan_bands`, and `apply_headscale_policy.sh` refuses an export without it.
+- **Group and KOTH internal networks need a pivot from the VPN.** Labs whose
+  student-facing hosts sit on a group or KOTH internal network must move
+  those hosts to the entry network before this release is applied. Then:
+  1. Remove `JUMPBOX_TS_ROUTES` from `scripts/site.env` (`jumpbox_configure.sh`
+     refuses to run while it is set). Set `JUMPBOX_TAILNET_STAFF_IPS` to the
+     staff devices that need the internal networks and, if you run KOTH, the
+     portal host's tailnet address (its service probes and beacon claims
+     reach every box). Set `JUMPBOX_TAILNET_DENY_VLANS` to any KOTH internal
+     VLAN outside the `group-internal` band.
+  2. `jumpbox_configure.sh --apply --tailscale` re-advertises the routes and
+     installs the new lab egress table. If no `autoApprovers` entry covers
+     `10.0.0.0/8` for `tag:jumpbox`, approve the new list:
+     `headscale nodes approve-routes --identifier <id> --routes "$(python3
+     scripts/jumpbox_netgen.py routes --bands "$VLAN_BANDS")"`, which also
+     withdraws the old `10.0.0.0/8` approval.
+  3. On each cloud router, `tailscale set --advertise-routes=<list>` with
+     the list from `headscale_policy.py routes slots.json <aws|gcp>`, then
+     approve it the same way.
+  4. Re-render and apply the Headscale policy (`apply_headscale_policy.sh`).
 
 ## [1.1.0] - 2026-11-14
 
