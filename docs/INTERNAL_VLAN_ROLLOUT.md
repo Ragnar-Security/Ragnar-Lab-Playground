@@ -599,13 +599,17 @@ this order, skipping any item whose section never ran.
    console:
 
    ```bash
-   python3 jumpbox/jumpbox_netgen.py lab-egress --bands "<VLAN_BANDS value>" \
-     --deny-vlans "<JUMPBOX_TAILNET_DENY_VLANS>" --staff-ips "<JUMPBOX_TAILNET_STAFF_IPS>" \
+   # The protection file survives in the backup if section 9 ran; otherwise write
+   # {"vlans": [], "staff_ips": []} to it first.
+   python3 jumpbox/jumpbox_netgen.py lab-egress --protection /etc/jumpbox/tailnet-protection.json \
      | sudo tee /etc/nftables.d/jumpbox-lab-egress.nft >/dev/null
    python3 jumpbox/jumpbox_netgen.py lab-egress-unit | sudo tee /etc/systemd/system/jumpbox-lab-egress.service >/dev/null
    sudo nft -c -f /etc/nftables.d/jumpbox-lab-egress.nft && sudo systemctl daemon-reload \
      && sudo systemctl enable --now jumpbox-lab-egress.service
    ```
+
+   The unit switches IP forwarding on once the table loads; until then the
+   restored jumpbox forwards nothing if its own sysctl files no longer enable it.
 
    Decide whether to restore the SSH filter by hand before the next attempt.
 5. **Portal.** If section 2 ran, redeploy the previous release. It reads the

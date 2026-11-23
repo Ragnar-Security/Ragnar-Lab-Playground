@@ -711,6 +711,6 @@ list.
 |---------|-------|
 | Lab VMs get no address | `ip -br addr \| grep vlan` shows the `.1` gateways; `journalctl -u dnsmasq`; `df -h /`, because a full disk stops lease writes |
 | Students cannot reach lab VMs | `tailscale status`; routes approved (`headscale nodes list-routes`); the policy grants the network; `sysctl net.ipv4.ip_forward` |
-| A group or KOTH internal address does not answer from the VPN | intended: reach it through a host on the entry network. Staff or the portal host: add its tailnet address to `JUMPBOX_TAILNET_STAFF_IPS` and re-run `--apply` |
+| A group or KOTH internal address does not answer from the VPN | intended: reach it through a host on the entry network. Staff or the portal host: add its tailnet address to `JUMPBOX_TAILNET_STAFF_IPS` and re-run `scripts/apply_headscale_policy.sh --apply` |
 | A VLAN works but a new group's does not | the group's VLAN is outside `VLAN_BANDS` (an explicit tag; the startup log names it); widen the bands in both `.env` and `scripts/site.env`, then re-run configure |
 | `netplan try` reverted | you did not confirm within the timeout, or the change cut your session; read the dry-run diff and re-run |
