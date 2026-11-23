@@ -19,6 +19,7 @@ from scripts.headscale_policy import (
     parse_vlan_bands,
     policy_diff,
     policy_inputs,
+    protection,
     render,
 )
 
@@ -504,3 +505,116 @@ def test_an_individual_only_site_renders_byte_identical_to_the_previous_release(
     result = _cli("render", str(base), str(slots_file))
     assert (result.returncode, result.stdout) == (0, expected)
 
+
+
+# ---- base rules that would reopen a protected network ----------------------
+
+PROTECTED_SLOTS = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
+
+
+def _base_with(*rules, groups=None, hosts=None):
+    return {**BASE, "groups": {**BASE["groups"], **(groups or {})},
+            "hosts": {**BASE["hosts"], **(hosts or {})},
+            "acls": [BASE["acls"][0], BASE["acls"][1], *rules]}
+
+
+# Catches an operator rule that hands a roster login (directly, through a
+# group, an alias or a covering prefix) a group or KOTH internal network, or
+# lets such a network reach roster devices: the generated rules withhold it,
+# but Headscale unions every rule, so one base rule would reopen it.
+@pytest.mark.parametrize("rule, extra", [
+    ({"action": "accept", "src": ["alice@"], "dst": ["10.100.4.0/24:*"]}, {}),
+    ({"action": "accept", "src": ["alice@"], "dst": ["10.100.4.10:88"]}, {}),
+    ({"action": "accept", "src": ["group:players"], "dst": ["10.0.0.0/8:22"]},
+     {"groups": {"group:players": ["Alice@"]}}),
+    ({"action": "accept", "src": ["bob@"], "dst": ["lab-int:*"]},
+     {"hosts": {"lab-int": "10.150.4.0/24"}}),
+    ({"action": "accept", "src": ["bob@"], "dst": ["*:*"]}, {}),
+    ({"action": "accept", "src": ["10.100.4.0/24"], "dst": ["alice@:*"]}, {}),
+    ({"action": "accept", "src": ["10.0.0.0/8"], "dst": ["*:445"]}, {}),
+    ({"action": "accept", "src": ["lab-int"], "dst": ["group:players:*"]},
+     {"hosts": {"lab-int": "10.100.4.128/25"}, "groups": {"group:players": ["bob@"]}}),
+    ({"action": "accept", "src": ["*"], "dst": ["autogroup:self:*"]}, {}),  # harmless: kept
+])
+def test_a_base_rule_reopening_a_protected_network_fails_the_render(rule, extra):
+    base = _base_with(rule, **extra)
+    if rule["src"] == ["*"]:
+        render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+        return
+    with pytest.raises(ValueError, match="protected"):
+        render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+
+
+# Catches the check refusing what staff and the portal legitimately need: a
+# group of non-roster staff, a portal host alias, and a tag.
+def test_staff_and_portal_rules_into_protected_networks_are_kept():
+    base = _base_with(
+        {"action": "accept", "src": ["node1-v4"], "dst": ["10.150.4.0/24:*"]},
+        {"action": "accept", "src": ["10.100.4.0/24"], "dst": ["group:staff:*"]},
+        {"action": "accept", "src": ["tag:portal"], "dst": ["10.0.0.0/8:*"]})
+    render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+    # A roster login added to the staff group makes the staff rule a breach.
+    with pytest.raises(ValueError, match="protected"):
+        render({**base, "groups": {"group:staff": ["instructor@", "alice@"]}},
+               PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+
+
+# Catches the check firing on a site with nothing protected, or on the cloud
+# backends, where isolation is not enforced.
+def test_the_check_applies_only_to_protected_proxmox_networks():
+    rule = {"action": "accept", "src": ["alice@"], "dst": ["10.100.4.0/24:*"]}
+    render(_base_with(rule), {**SLOTS, "groups": []}, DEFAULT_POLICY_BANDS, {})
+    render(_base_with(rule), PROTECTED_SLOTS, replace(DEFAULT_POLICY_BANDS, proxmox_enabled=False),
+           {"aws": "172.20.0.0/16"})
+
+
+NODES_WITH_PORTAL = NODES + [_node("portal", "term-infrastructure", "100.64.0.6")]
+
+
+# Catches a tailnet address of a roster device, given as a literal in a base
+# rule, reaching a protected network; the render cannot resolve it, so the
+# protection command does, from Headscale's node list.
+def test_protection_rejects_a_roster_device_address_in_a_base_rule():
+    base = _base_with({"action": "accept", "src": ["100.64.0.1"], "dst": ["10.100.4.0/24:*"]})
+    with pytest.raises(ValueError, match="protected"):
+        protection(base, PROTECTED_SLOTS, NODES_WITH_PORTAL, [])
+    ok = _base_with({"action": "accept", "src": ["100.64.0.6/32"], "dst": ["10.100.4.0/24:*"]})
+    assert protection(ok, PROTECTED_SLOTS, NODES_WITH_PORTAL, [])["vlans"] == [400, 450]
+
+
+# Catches the jumpbox's protected set drifting from the real assignments: it
+# is every group's and non-ended KOTH game's internal tag, wherever it lies.
+def test_protection_lists_every_group_and_koth_internal_tag():
+    slots = {**PROTECTED_SLOTS, "groups": [
+        {"slug": "red-team", "members": ["alice"], "entry_vlan": 300, "internal_vlan": 400},
+        {"slug": "odd-team", "members": ["bob"], "entry_vlan": 305, "internal_vlan": 250}]}
+    assert protection(BASE, slots, NODES, []) == {"vlans": [250, 400, 450], "staff_ips": []}
+
+
+# Catches a staff exemption that is a network (a whole range, a default route)
+# or a roster student's device: only single addresses of non-roster nodes.
+@pytest.mark.parametrize("staff", [["100.64.0.0/10"], ["0.0.0.0/0"], ["100.64.0.6/32"],
+                                   ["100.64.0.1"], ["100.64.0.99"], ["fd7a:115c:a1e0::9"],
+                                   ["not-an-address"]])
+def test_protection_accepts_only_verified_non_roster_node_addresses(staff):
+    with pytest.raises(ValueError, match="JUMPBOX_TAILNET_STAFF_IPS"):
+        protection(BASE, PROTECTED_SLOTS, NODES_WITH_PORTAL, staff)
+
+
+def test_protection_keeps_verified_staff_and_portal_addresses():
+    assert protection(BASE, PROTECTED_SLOTS, NODES_WITH_PORTAL, ["100.64.0.6", "100.64.0.4"]) == {
+        "vlans": [400, 450], "staff_ips": ["100.64.0.4", "100.64.0.6"]}
+
+
+def test_cli_protection_prints_json_and_refuses_bad_staff(tmp_path):
+    paths = {}
+    for name, value in (("base", BASE), ("slots", PROTECTED_SLOTS), ("nodes", NODES_WITH_PORTAL)):
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(value))
+    result = _cli("protection", str(paths["base"]), str(paths["slots"]), str(paths["nodes"]),
+                  "--staff-ips", "100.64.0.6")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"vlans": [400, 450], "staff_ips": ["100.64.0.6"]}
+    bad = _cli("protection", str(paths["base"]), str(paths["slots"]), str(paths["nodes"]),
+               "--staff-ips", "100.64.0.1")
+    assert bad.returncode != 0 and bad.stdout == ""
