@@ -353,7 +353,15 @@ def event(text):
         log.write(text + "\\n")
 def digest(path):
     return hashlib.sha256(open(path, "rb").read()).hexdigest()
-if args[:1] == ["exec"]:
+if args[:1] == ["exec"] and "scripts/record_protected_vlans.py" in args:
+    event("record protected vlans")
+    if os.environ.get("RECORD_FAIL"):
+        sys.exit("cannot record")
+    data = sys.stdin.read()
+    json.loads(data)
+    open(os.environ["RECORD_FILE"], "w").write(data)
+    print("recorded")
+elif args[:1] == ["exec"]:
     event("exec " + " ".join(args[1:]))
     sys.stdout.write(open(os.environ["SLOTS_FILE"]).read())
 elif args == ["inspect", "headscale-cid"]:
@@ -405,6 +413,64 @@ nodes = json.load(open(os.environ["NODES_FILE"])) if shown else []
 print(json.dumps({"BackendState": os.environ.get("TS_BACKEND", "Running"),
                   "Peer": {f"nodekey:{n['id']}": {"TailscaleIPs": n["ip_addresses"]} for n in nodes}}))
 """
+# The jumpbox side of the protection stage. sudo runs the command as is; the
+# remote script writes under $JUMPBOX_SYSROOT; nft answers the staff-only SSH
+# table (absent with NO_SSH_FILTER, holding SSH_STAFF) and reads the installed
+# lab egress table back from its file (an empty set with EGRESS_LIE); ss lists
+# the listeners in SS_OUT.
+SUDO_STUB = """#!/bin/bash
+[ "$1" = -n ] && shift
+exec "$@"
+"""
+JUMPBOX_NFT_STUB = """#!/usr/bin/env python3
+import json, os, re, sys
+args = sys.argv[1:]
+def event(text):
+    with open(os.environ["DOCKER_LOG"], "a") as log:
+        log.write(text + "\\n")
+if args[:2] == ["-c", "-f"]:
+    event("jumpbox nft check")
+    sys.exit(1 if os.environ.get("NFT_CHECK_FAIL") else 0)
+if args == ["-j", "list", "table", "inet", "jumpbox_ssh"]:
+    if os.environ.get("NO_SSH_FILTER"):
+        sys.exit("Error: No such file or directory")
+    staff = [s for s in os.environ.get("SSH_STAFF", "").split(",") if s]
+    print(json.dumps({"nftables": [
+        {"table": {"family": "inet", "name": "jumpbox_ssh"}},
+        {"set": {"name": "staff_v4", "type": "ipv4_addr", "elem": staff}},
+        {"rule": {"chain": "input", "expr": [{"match": {"right": 22}}, {"counter": {}}, {"drop": None}]}}]}))
+    sys.exit(0)
+if args == ["-j", "list", "table", "inet", "jumpbox_lab_egress"]:
+    event("jumpbox egress read-back")
+    text = open(os.environ["JUMPBOX_SYSROOT"] + "/etc/nftables.d/jumpbox-lab-egress.nft").read()
+    items = [{"table": {"family": "inet", "name": "jumpbox_lab_egress"}}]
+    for name, body in re.findall(r"set (\\w+) \\{(.*)\\}", text):
+        m = re.search(r"elements = \\{(.*?)\\}", body)
+        elem = [e.strip().strip('"') for e in m.group(1).split(",")] if m else []
+        if os.environ.get("EGRESS_LIE"):
+            elem = []
+        items.append({"set": {"name": name, "elem": elem}})
+    for line in text.splitlines():
+        if "@tailnet_internal" in line and line.strip().endswith("drop"):
+            items.append({"rule": {"chain": "forward", "expr": [
+                {"match": {"right": "@tailnet_internal"}}, {"counter": {}}, {"drop": None}]}})
+    print(json.dumps({"nftables": items}))
+    sys.exit(0)
+sys.exit("unexpected nft " + " ".join(args))
+"""
+SS_STUB = """#!/bin/bash
+printf '%s\\n' "${SS_OUT:-tcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\\"sshd\\",pid=1,fd=3))
+udp UNCONN 0 0 10.100.0.1:53 0.0.0.0:* users:((\\"dnsmasq\\",pid=2,fd=4))
+udp UNCONN 0 0 127.0.0.53%lo:53 0.0.0.0:* users:((\\"systemd-resolve\\",pid=3,fd=5))
+tcp LISTEN 0 4096 100.64.0.3:41641 0.0.0.0:* users:((\\"tailscaled\\",pid=4,fd=6))}"
+"""
+JUMPBOX_SYSTEMCTL_STUB = """#!/bin/bash
+printf 'jumpbox systemctl %s\\n' "$*" >> "$DOCKER_LOG"
+case "$1" in
+    is-active) [ -f "$JUMPBOX_SYSROOT/egress-active" ] ;;
+    enable) touch "$JUMPBOX_SYSROOT/egress-active" ;;
+esac
+"""
 POLICY_NODES = [
     {"id": 1, "given_name": "alice-laptop", "user": {"name": "alice"},
      "ip_addresses": ["100.64.0.1"], "expiry": {"seconds": -62135596800}},
@@ -425,6 +491,11 @@ def _policy_rig(tmp_path: Path, **extra: str):
     _executable(bin_dir / "scp", SCP_STUB)
     _executable(bin_dir / "docker", DOCKER_STUB)
     _executable(bin_dir / "tailscale", TAILSCALE_STUB)
+    _executable(bin_dir / "sudo", SUDO_STUB)
+    _executable(bin_dir / "nft", JUMPBOX_NFT_STUB)
+    _executable(bin_dir / "ss", SS_STUB)
+    _executable(bin_dir / "systemctl", JUMPBOX_SYSTEMCTL_STUB)
+    (tmp_path / "jumpbox").mkdir()
     nodes = tmp_path / "nodes.json"
     nodes.write_text(json.dumps(POLICY_NODES))
     headscale_dir = tmp_path / "headscale"
@@ -460,6 +531,8 @@ def _policy_rig(tmp_path: Path, **extra: str):
         SLOTS_FILE=str(slots),
         SSH_LOG=str(tmp_path / "ssh.log"),
         DOCKER_LOG=str(tmp_path / "docker.log"),
+        JUMPBOX_SYSROOT=str(tmp_path / "jumpbox"),
+        RECORD_FILE=str(tmp_path / "recorded.json"),
         **extra,
     )
     desired = canonical(render(EXAMPLE_POLICY, POLICY_SLOTS, *policy_inputs(POLICY_SLOTS)))
@@ -530,7 +603,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     docker = _log(env, "DOCKER_LOG").splitlines()
     check = docker.index(f"policy check while-installed={original_digest}")
     assert check < docker.index("reload headscale") < len(docker) - 1
-    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
+    assert docker[-4:] == ["policy get", "nodes list", "jumpbox status", "record protected vlans"]
     assert not any("restart" in line for line in docker)
     assert "verified: the policy file Headscale serves matches the rendered one." in result.stdout
     assert Path(env["LOADED_POLICY"]).read_text() == desired
@@ -546,7 +619,7 @@ def test_apply_policy_checks_backs_up_and_installs_atomically(tmp_path):
     assert not any("restart" in line for line in rerun)
     rechecks = [i for i, line in enumerate(rerun) if line.startswith("policy check")]
     assert len(rechecks) == 1 and rechecks[0] < len(rerun) - 1
-    assert rerun[-3:] == ["reload headscale", "nodes list", "jumpbox status"]
+    assert rerun[-4:] == ["reload headscale", "nodes list", "jumpbox status", "record protected vlans"]
 
     dry = _apply_policy(env)
     assert dry.returncode == 0, dry.stderr
@@ -601,7 +674,7 @@ def test_apply_policy_restarts_headscale_once_when_the_read_back_is_stale(tmp_pa
     assert docker.count("reload headscale") == 1
     assert docker.count("restart headscale") == 1
     assert docker.index("reload headscale") < docker.index("restart headscale")
-    assert docker[-3:] == ["policy get", "nodes list", "jumpbox status"]
+    assert docker[-4:] == ["policy get", "nodes list", "jumpbox status", "record protected vlans"]
     assert Path(env["LOADED_POLICY"]).read_text() == desired
     assert policy.read_text() == desired
 
@@ -646,7 +719,7 @@ def test_apply_policy_restarts_headscale_once_when_the_jumpbox_lacks_peers(tmp_p
     docker = _log(env, "DOCKER_LOG").splitlines()
     assert docker.count("restart headscale") == 1
     assert docker.index("reload headscale") < docker.index("jumpbox status") < docker.index("restart headscale")
-    assert docker[-1] == "jumpbox status"
+    assert docker[-2:] == ["jumpbox status", "record protected vlans"]
     assert "alice-laptop (alice)" in result.stdout
     assert "verified: the jumpbox lists every roster device as a peer." in result.stdout
 
@@ -732,6 +805,97 @@ def test_apply_policy_refuses_an_export_with_no_enabled_backend(tmp_path):
     assert "policy check" not in docker and "reload" not in docker and "restart" not in docker
     assert "scp " not in _log(env, "SSH_LOG")
     assert policy.read_text() == original and _backups(policy) == []
+
+
+# ---- the jumpbox protection stage ------------------------------------------
+
+def _jumpbox_file(env, path):
+    target = Path(env["JUMPBOX_SYSROOT"] + path)
+    return target.read_text() if target.exists() else None
+
+
+# Catches the narrowed policy (or the portal's go-ahead) arriving before the
+# jumpbox drops the tailnet to and from the protected VLANs, and the portal
+# being told a set the jumpbox does not actually enforce.
+def test_apply_installs_and_verifies_the_jumpbox_drop_first_and_records_it_last(tmp_path):
+    env, policy, _, desired = _policy_rig(tmp_path)
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(_jumpbox_file(env, "/etc/jumpbox/tailnet-protection.json")) == \
+        {"vlans": [400], "staff_ips": []}
+    egress = _jumpbox_file(env, "/etc/nftables.d/jumpbox-lab-egress.nft")
+    assert 'set tailnet_internal { type ifname; elements = { "vlan400" }; }' in egress
+    assert "ExecStartPost=/usr/sbin/sysctl -w net.ipv4.ip_forward=1" in \
+        _jumpbox_file(env, "/etc/systemd/system/jumpbox-lab-egress.service")
+    docker = _log(env, "DOCKER_LOG").splitlines()
+    readback = docker.index("jumpbox egress read-back")
+    assert docker.index("jumpbox nft check") < docker.index(
+        "jumpbox systemctl enable --now jumpbox-lab-egress.service") < readback
+    assert readback < next(i for i, line in enumerate(docker) if line.startswith("policy check"))
+    assert docker[-1] == "record protected vlans"
+    assert json.loads(Path(env["RECORD_FILE"]).read_text()) == {"staff_ips": [], "vlans": [400]}
+    assert "verified: the lab egress table drops the tailnet to and from VLAN(s) 400" in result.stdout
+    assert policy.read_text() == desired
+
+    # A second run reloads the live table instead of restarting it.
+    again = _apply_policy(env, "--apply")
+    assert again.returncode == 0, again.stderr
+    assert "jumpbox systemctl reload jumpbox-lab-egress.service" in _log(env, "DOCKER_LOG")
+
+
+def test_apply_dry_run_reports_the_protection_and_installs_nothing(tmp_path):
+    env, policy, original, _ = _policy_rig(tmp_path)
+    result = _apply_policy(env)
+    assert result.returncode == 0, result.stderr
+    assert 'jumpbox protection: {"staff_ips": [], "vlans": [400]}' in result.stdout
+    assert "would install the protection file and the lab egress table" in result.stdout
+    assert _jumpbox_file(env, "/etc/jumpbox/tailnet-protection.json") is None
+    assert not Path(env["RECORD_FILE"]).exists()
+    assert "jumpbox systemctl" not in _log(env, "DOCKER_LOG")
+    assert policy.read_text() == original
+
+
+# Catches protected group or KOTH access being enabled on a jumpbox a student
+# can log in to or use as a proxy: there the student originates traffic from
+# the jumpbox itself, outside its forward hook, with no entry host at all.
+@pytest.mark.parametrize("extra, message", [
+    ({"NO_SSH_FILTER": "1"}, "staff-only SSH"),
+    ({"SSH_STAFF": "100.64.0.1"}, "100.64.0.1"),
+    ({"SS_OUT": "tcp LISTEN 0 128 0.0.0.0:3128 0.0.0.0:* users:((\"squid\",pid=9,fd=3))"}, "squid"),
+    ({"JUMPBOX_TAILNET_STAFF_IPS": "100.64.0.2"}, "JUMPBOX_TAILNET_STAFF_IPS"),
+    ({"EGRESS_LIE": "1"}, "does not match"),
+    ({"NFT_CHECK_FAIL": "1"}, "lab egress"),
+])
+def test_apply_refuses_an_unprotected_jumpbox_before_the_policy_changes(tmp_path, extra, message):
+    env, policy, original, _ = _policy_rig(tmp_path, **extra)
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert message in result.stderr, result.stderr
+    docker = _log(env, "DOCKER_LOG").splitlines()
+    assert not any(line.startswith("policy check") for line in docker)
+    assert "reload headscale" not in docker and "record protected vlans" not in docker
+    assert policy.read_text() == original and _backups(policy) == []
+
+
+# Catches the staff-only requirement blocking a site with nothing protected
+# (no group or KOTH game), which still gets an empty drop and an empty record.
+def test_apply_with_nothing_protected_needs_no_staff_only_jumpbox(tmp_path):
+    env, policy, _, _ = _policy_rig(tmp_path, NO_SSH_FILTER="1")
+    slots = {**POLICY_SLOTS, "groups": []}
+    Path(env["SLOTS_FILE"]).write_text(json.dumps(slots) + "\n")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(Path(env["RECORD_FILE"]).read_text())["vlans"] == []
+    assert json.loads(_jumpbox_file(env, "/etc/jumpbox/tailnet-protection.json"))["vlans"] == []
+
+
+# Catches a portal told nothing after a fully verified apply (its deployments
+# would stay refused), and a failed record being reported as success.
+def test_apply_fails_when_the_portal_cannot_record_the_protection(tmp_path):
+    env, _, _, _ = _policy_rig(tmp_path, RECORD_FAIL="1")
+    result = _apply_policy(env, "--apply")
+    assert result.returncode != 0
+    assert "record" in result.stderr
 
 
 # ---- apply_headscale_policy.sh --preflight -----------------------------------
@@ -1073,7 +1237,8 @@ def test_term_changeover_policy_stage_keeps_exported_policy_paths(tmp_path, expo
 # The policy stage's remote commands, which the combined rig runs against the
 # policy rig's docker and tailscale stubs; everything else is a stage 1-3 command.
 POLICY_STAGE_MARKERS = ("export_network_slots", "headscale policy", "ps -q headscale",
-                        "kill -s HUP", "restart headscale", "nodes list -o json", "tailscale status")
+                        "kill -s HUP", "restart headscale", "nodes list -o json", "tailscale status",
+                        "sudo -n python3 -", "sudo -n bash -s", "record_protected_vlans.py")
 
 
 def _term_rig_with_the_real_policy_stage(tmp_path: Path, slots, **policy_extra: str):
@@ -1109,7 +1274,8 @@ os.execv(sys.executable, [sys.executable, {str(term_bin / "term_ssh.py")!r}, *sy
     policy_bin = policy_env["PATH"].split(":", 1)[0]
     stage_env = {name: policy_env[name] for name in (
         "HEADSCALE_DIR", "HEADSCALE_BASE_POLICY", "HEADSCALE_POLICY_FILE", "HOST_POLICY", "HOST_DATA",
-        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK")}
+        "LOADED_POLICY", "SLOTS_FILE", "SSH_LOG", "DOCKER_LOG", "NODES_FILE", "RESTART_MARK",
+        "JUMPBOX_SYSROOT", "RECORD_FILE")}
     stage_env.update({name: policy_env[name] for name in ("PEERS", "JUMPBOX_SSH", "TS_BACKEND")
                       if name in policy_env})
     env.update(stage_env, PATH=f"{term_bin}:{policy_bin}:{os.environ['PATH']}")

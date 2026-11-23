@@ -1,0 +1,31 @@
+{
+  "config": {
+    "enabled_backends": [
+      "proxmox",
+      "aws",
+      "gcp"
+    ],
+    "aws_lab_cidr": "172.20.0.0/16",
+    "gcp_lab_cidr": "172.21.0.0/16",
+    "vlan_bands": "entry:100-199:0:0 internal:200-299:100:1 group-entry:300-399:200:2 group-internal:400-500:300:4"
+  },
+  "users": [
+    {
+      "login": "alice",
+      "entry_vlan": 100,
+      "internal_vlan": 200
+    },
+    {
+      "login": "bob",
+      "entry_vlan": 101,
+      "internal_vlan": 201
+    },
+    {
+      "login": "carol",
+      "entry_vlan": 199,
+      "internal_vlan": 299
+    }
+  ],
+  "groups": [],
+  "koth": []
+}

@@ -22,6 +22,7 @@ from typing import List, Literal, Optional, Tuple
 from sqlalchemy import func, insert, inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
+from . import network_protection
 from .models import db, User, StudentWhitelist, StudentGroup, KothGame, VlanLayoutRecord
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,12 @@ def allocate_pair(
     if (explicit_entry is None) != (explicit_internal is None):
         raise ValueError("explicit_entry and explicit_internal must both be set or both be None")
 
+    # A tag the jumpbox still drops (a group's or KOTH game's internal VLAN
+    # until the next verified apply) may not become a network players reach
+    # directly: an entry VLAN, or a student's own internal VLAN.
+    protected = network_protection.protected_tags()
+    reachable = ('entry', 'internal') if scope == 'user' else ('entry',)
+
     if explicit_entry is not None:
         for tag in (explicit_entry, explicit_internal):
             if not isinstance(tag, int) or tag < 2 or tag > 4094:
@@ -144,13 +151,17 @@ def allocate_pair(
             validate_vlan_free(tag, exclude_group_id=exclude_group_id)
         if explicit_entry == explicit_internal:
             raise ValueError("entry and internal VLAN tags must differ")
+        for role, tag in (('entry', explicit_entry), ('internal', explicit_internal)):
+            if role in reachable and tag in protected:
+                raise VlanInUse(network_protection.reuse_refusal(tag, f"an {role} VLAN"))
         return explicit_entry, explicit_internal
 
     (entry_lo, entry_hi), (internal_lo, internal_hi) = _pool_for(scope)
     used = _used_tags()
-    entry = _first_free(entry_lo, entry_hi, used)
+    entry = _first_free(entry_lo, entry_hi, used | protected)
     used.add(entry)
-    internal = _first_free(internal_lo, internal_hi, used)
+    internal = _first_free(internal_lo, internal_hi,
+                           used | protected if 'internal' in reachable else used)
     return entry, internal
 
 

@@ -17,6 +17,7 @@ from ..models import (
     KothFlagSubmission, KothClaimEvent, VMRecord,
 )
 from ..config import KOTH_CLAIM_MODES, KOTH_TEAM_COLORS, get_koth_defaults
+from .. import network_protection
 from ..vlan_allocator import validate_vlan_free, VlanInUse
 from ..template_manager import (
     load_template_config, get_koth_groups, get_koth_services,
@@ -290,6 +291,9 @@ def create_game():
         validate_vlan_free(internal)
     except VlanInUse as e:
         return jsonify({'error': str(e)}), 409
+    refusal = network_protection.reuse_refusal(entry, "a KOTH entry VLAN")
+    if refusal:
+        return jsonify({'error': refusal}), 409
 
     defaults = get_koth_defaults()
     game = KothGame(
@@ -888,6 +892,11 @@ def _resolve_koth_group(game):
         return None, (jsonify({
             'error': f'koth_mode requires the proxmox backend, not {backend_name}'
         }), 400)
+    # Players reach the arena's internal network only through a box they hold,
+    # once the jumpbox and the policy enforce it.
+    refusal = network_protection.deployment_refusal(game.entry_vlan_tag, game.internal_vlan_tag)
+    if refusal:
+        return None, (jsonify({'error': refusal}), 409)
     return group, None
 
 

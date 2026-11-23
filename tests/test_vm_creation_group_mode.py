@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app import create_app
+from app import create_app, network_protection
 from app.backends import register_backend_factory
 from app.backends.proxmox import ProxmoxBackend
 from app.models import (
@@ -58,6 +58,8 @@ class GroupModeCreationTestCase(unittest.TestCase):
         db.session.commit()
         db.session.add(StudentGroupMember(group_id=self.group.id, user_id=self.alice.id))
         db.session.commit()
+        # The operator's apply script verified both groups' internal networks.
+        network_protection.record([400, 401])
 
     def tearDown(self):
         db.session.remove()
@@ -114,6 +116,28 @@ class GroupModeCreationTestCase(unittest.TestCase):
         self.assertEqual(build_group_vm_name('team-a', 'entry'), 'group-team-a-entry')
         self.assertEqual(build_group_vm_name('Team_A!', 'Win-11'),
                          'group-teama-win-11')
+
+    # Catches a Proxmox group deployment starting before the jumpbox drop and
+    # the narrowed policy for the group's internal network are verified: the
+    # members would reach it straight from the VPN instead of by pivoting.
+    def test_group_deploy_waits_until_its_internal_vlan_is_protected(self):
+        network_protection.record([401])  # only team-b's internal network
+        self._login('alice')
+        with patch('app.routes.vm_creation.load_template_config', return_value=FAKE_CONFIG), \
+                patch('app.routes.vm_creation._acquire_deploy_lock') as lock:
+            r = self.client.post('/create', data={'deployment_group': 'Shared Lab'})
+        body = json.loads(r.data)
+        self.assertFalse(body.get('success'))
+        self.assertIn('400', body['error'])
+        self.assertIn('apply_headscale_policy.sh', body['error'])
+        lock.assert_not_called()
+
+        network_protection.record([400, 401])
+        with patch('app.routes.vm_creation.load_template_config', return_value=FAKE_CONFIG), \
+                patch('app.routes.vm_creation._acquire_deploy_lock', return_value=None) as lock:
+            r = self.client.post('/create', data={'deployment_group': 'Shared Lab'})
+        self.assertEqual(r.status_code, 409)  # past the gate, stopped by the stubbed lock
+        lock.assert_called_once()
 
 
 # --- group-mode cloud deploys: the group's tags are the network slots -------

@@ -462,11 +462,16 @@ Existing rows become `backend='proxmox'` through the column default. The new
 code reads these columns for every record it creates, extends or destroys,
 so they must exist before it starts; the old code ignores them.
 
+`migrate_add_protected_vlans.py` adds the `protected_vlans` table, the group
+and KOTH internal VLANs that `apply_headscale_policy.sh --apply` verified on the
+jumpbox and in the Headscale policy. The new code reads it on every VLAN
+allocation and every Proxmox group or KOTH deployment; the old code ignores it.
+
 ```bash
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
                  migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
-                 migrate_add_vm_backend.py; do
+                 migrate_add_vm_backend.py migrate_add_protected_vlans.py; do
   docker compose -f docker-compose.prod.yml exec -T -w /app vm-automation \
     python scripts/$migration
 done
@@ -479,7 +484,7 @@ the migration itself, the file is not there yet. Inject it for this one run:
 for migration in migrate_koth_claim_mode.py migrate_add_session_version.py \
                  migrate_vm_deletion_retry.py migrate_add_password_reset_tokens.py \
                  migrate_add_coordination_tables.py migrate_add_alert_outbox.py \
-                 migrate_add_vm_backend.py; do
+                 migrate_add_vm_backend.py migrate_add_protected_vlans.py; do
   docker cp scripts/$migration proxmox-vm-automation-prod:/tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T vm-automation python /tmp/$migration
   docker compose -f docker-compose.prod.yml exec -T -u root vm-automation rm -f /tmp/$migration

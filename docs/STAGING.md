@@ -258,12 +258,15 @@ Then follow `docs/JUMPBOX.md` sections 1-3 exactly, with `SITE_ENV_FILE=` pointi
 each host the scripts run on:
 
 1. `jumpbox_provision.sh` dry run, then `--apply`.
-2. `jumpbox_configure.sh` dry run, then `--apply`, confirming `netplan try` with ENTER from the same
+2. Write `{"vlans": [], "staff_ips": []}` to `/etc/jumpbox/tailnet-protection.json` (the script
+   refuses without it; section 6's `--apply` replaces it). `jumpbox_configure.sh` dry run, then
+   `--apply`, confirming `netplan try` with ENTER from the same
    SSH session on the management address. On a fresh VM the dry run does not list the
    `apt-get install dnsmasq qemu-guest-agent` that `--apply` runs.
 3. `--apply --tailscale --authkey-stdin` with a tagged key from the staging Headscale
    (`headscale preauthkeys create --user <staging-infra-id> --expiration 1h --tags tag:jumpbox`).
-4. `headscale nodes approve-routes --identifier <id> --routes 10.0.0.0/8`.
+4. `headscale nodes approve-routes --identifier <id> --routes "$(python3 scripts/jumpbox_netgen.py routes --bands "$VLAN_BANDS")"`
+   (one `/24` per VLAN; `docs/JUMPBOX.md`, step 3).
 5. `--apply --ssh-staff-only`, so a lab VM cannot SSH to the jumpbox. Staging has no staff
    devices, so `JUMPBOX_SSH_STAFF_IPS` stays empty and SSH answers only on the management NIC and
    loopback. Run it from an SSH session on the management address (its lockout guard keeps that
@@ -493,6 +496,81 @@ VPN VM, and the lease and `nft` lines on the staging jumpbox.
    showed every packet leaving. The counter is the evidence; so is a capture that stays empty.
 9. Record the date, commit, four VMIDs, `TA`, `TB` and each result in the operator's staging log.
    Then destroy both deployments; step 3's query prints nothing.
+
+### Group and KOTH internal networks
+
+Repeatable, after the steps above. On Proxmox a group's or KOTH game's internal network is reached
+only by pivoting through a host on its entry network: the policy grants the entry network only, the
+jumpbox advertises one route per network and drops the tailnet's traffic to and from every
+protected internal VLAN, and the portal starts those deployments only once the apply script has
+recorded them. A student's own entry and internal networks are unchanged (step 5 above is the proof
+that they still work).
+
+Preparation, once per staging rebuild:
+
+- The staging jumpbox has the staff-only SSH filter (section 4, step 5), no student account and no
+  proxy service. Its `/etc/jumpbox/tailnet-protection.json` exists (section 4 writes
+  `{"vlans": [], "staff_ips": []}` before the first `jumpbox_configure.sh --apply`).
+- The staging portal host joins the staging Headscale as a node of a non-roster user, so its KOTH
+  service probes reach the boxes over the tailnet. The staging `site.env` sets
+  `JUMPBOX_TAILNET_STAFF_IPS` to that node's address and nothing else.
+- `templates.yaml` gains two groups, both on `<STAGING_TEMPLATE_VMID>`:
+  - `staging-two-machine-group`: the same two entries as `staging-two-machine`, with
+    `group_mode: true`;
+  - `staging-koth`: a separate, enabled `koth_mode: true` group (the KOTH form lists only
+    `koth_mode` groups) with an entry box (`entry_point: true`, two NICs) and an internal box
+    (plain), each with a `koth_services` entry for port 22.
+- In the admin Groups tab, create the group `zz-team` with members `zz-a` and `zz-b`. With the
+  default bands it takes VLANs 300/400: entry `10.100.2.0/24`, internal `10.100.4.0/24`.
+- Routes (section 4, step 4) are the per-VLAN list: `headscale nodes list-routes` shows the staging
+  jumpbox with 401 approved and served routes, and no `10.0.0.0/8`.
+
+1. **The gate.** Before the next apply, `zz-a` deploys `staging-two-machine-group`: the portal
+   refuses it, naming VLAN 400 and `apply_headscale_policy.sh`. Then run section 6's `--apply`. It
+   prints `jumpbox protection: {"staff_ips": ["<portal node>"], "vlans": [400]}`, verifies the lab
+   egress table, then the policy and the peers, and ends with `recorded the protected VLANs in the
+   portal.`. On the jumpbox, `sudo nft list set inet jumpbox_lab_egress tailnet_internal` lists
+   `vlan400` only.
+2. **Routes on the clients.** `docker exec zz-a ip route show table 52 | grep '^10\.'` lists exactly
+   `10.100.0.0/24`, `10.100.1.0/24` (A's own) and `10.100.2.0/24` (the group's entry), and for
+   `zz-b` `10.101.0.0/24`, `10.101.1.0/24` and `10.100.2.0/24`. Neither lists `10.100.4.0/24`.
+3. `zz-a` deploys `staging-two-machine-group`; it starts. The group `srv01` holds a lease in
+   `10.100.2.0/24` and one in `10.100.4.0/24`; the group `dc01` one in `10.100.4.0/24`.
+4. **Entry works, internal does not, from the VPN.** From each client, `ping -c2 -W2` and
+   `nc -w3 <addr> 22 </dev/null` succeed against the group `srv01`'s entry address, and fail against
+   its internal address and against the group `dc01`. `docker exec zz-a ip route get <dc01 addr>`
+   does not name `tailscale0`. On an Active Directory pair, also `nc -w3 -z <dc01 addr> 88` and
+   `445` from the VPN: both must fail.
+5. **The jumpbox layer on its own.** Simulate a policy mistake with a hand-edited policy (the
+   render refuses such a base rule): copy the applied file, add a rule granting `zz-b@`
+   `10.100.4.0/24:*`, and on the VPN VM check it (`docker compose exec -T headscale headscale policy
+   check --file /dev/stdin < <file>`), copy it over `/opt/headscale/config/acl.json` and run
+   `docker compose kill -s HUP headscale`.
+   `zz-b` now lists `10.100.4.0/24` in table 52, yet `docker exec zz-b nc -w3 <dc01 addr> 22
+   </dev/null` still fails, and the `iifname "tailscale0" oifname @tailnet_internal counter` in
+   `sudo nft list table inet jumpbox_lab_egress` rises. Run section 6's `--apply` again; table 52
+   loses the route.
+6. **The pivot.** Through a TUN tunnel whose agent runs on the group `srv01`, for example ligolo-ng
+   with its proxy in the `zz-a` container: start the tunnel, then in `zz-a`
+   `ip route add 10.100.4.0/24 dev <tunnel interface>` (the main table). `ip route get <dc01 addr>`
+   names the tunnel interface, and `nc -w3 <dc01 addr> 22 </dev/null` (or `88`/`445` on an Active
+   Directory pair) succeeds. Remove the route and stop the tunnel; destroy the group deployment.
+7. **A KOTH arena whose internal VLAN lies outside the group-internal band.** In `/admin/koth`,
+   create a game on `staging-koth` with entry VLAN 360 and internal VLAN 260 (an unassigned tag of
+   the `internal` band), with `zz-team` playing. Deploy: the portal refuses, naming VLAN 260. Run
+   section 6's `--apply`: the protection lists `[260, 400]`, and `tailnet_internal` on the jumpbox
+   holds `vlan260` and `vlan400`. Deploy again; it starts.
+   - Both clients' table 52 gains `10.160.0.0/24` (the arena's entry) and not `10.160.1.0/24`; the
+     rendered policy names `10.160.1.0/24` nowhere.
+   - From each client, the entry box's entry address answers on port 22; the internal box and the
+     entry box's internal address do not, and the `tailnet_internal` drop counter rises.
+   - Through a tunnel whose agent runs on the entry box, as in step 6, the internal box answers on
+     port 22 and `ip route get` names the tunnel interface.
+   - The portal's KOTH service probes reach every box: the admin map and `/koth/api/_diag` show
+     both boxes' port 22 `open`.
+   End the game, destroy it, and run section 6's `--apply`; `tailnet_internal` no longer lists
+   `vlan260`, and a new game may take VLAN 260 as its entry VLAN only after that run.
+8. Record the date, commit and each result in the staging log.
 
 ### Stop, start, reset, remove
 

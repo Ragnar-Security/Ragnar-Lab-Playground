@@ -26,7 +26,7 @@ from ..proxmox_service import (
     wait_for_proxmox_task,
     vm_lifecycle_lock,
 )
-from .. import vm_provisioning
+from .. import network_protection, vm_provisioning
 from ..auth import login_required, get_authenticated_user
 from ..backends import enabled_backends, get_backend
 from ..backends.base import (
@@ -1340,6 +1340,12 @@ def create_vm():
             internal_vlan = group.internal_vlan_tag
             owning_identifier = group.name
             owner_group_id = group.id
+            if backend_name == BACKEND_PROXMOX:
+                # The members reach the group's internal network only through
+                # its entry host, once the jumpbox and the policy enforce it.
+                refusal = network_protection.deployment_refusal(entry_vlan, internal_vlan)
+                if refusal:
+                    return jsonify({'success': False, 'error': refusal})
         else:
             # Individual mode — existing slot rule, filter to individual-only
             if not user.is_admin:

@@ -13,11 +13,13 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
+    canonical,
     missing_peers,
     normalize_login,
     parse_vlan_bands,
     policy_diff,
     policy_inputs,
+    protection,
     render,
 )
 
@@ -42,9 +44,11 @@ SLOTS = {
     "koth": [],
 }
 DEFAULT_POLICY_BANDS = PolicyBands(tuple(parse_vlan_bands(DEFAULT_BANDS)), proxmox_enabled=True)
-# Own entry 100 and internal 200 plus the group's 300/400.
+# Own entry 100 and internal 200 plus the group's entry 300; never the
+# group's internal 400 on Proxmox, which members reach only by pivoting. The
+# cloud slots are the previous release's: the group's 300 and 400 alike.
 EXPECTED_ALICE_CIDRS = [
-    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24", "10.100.4.0/24",
+    "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24",
     "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26", "172.20.100.0/26",
     "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26", "172.21.100.0/26",
 ]
@@ -100,21 +104,23 @@ def test_empty_or_malformed_login_is_rejected(raw):
 
 
 # Catches KOTH players losing reachability to the arena once the blanket rule
-# is gone, and (D-plan F2) a KOTH box any player has rooted reaching every
-# player's devices through the reverse rule.
-def test_every_roster_login_gets_non_ended_koth_blocks_on_proxmox_only():
+# is gone, a KOTH box any player has rooted reaching every player's devices
+# through the reverse rule, and a player reaching the arena's internal network
+# without pivoting through a box they hold.
+def test_every_roster_login_gets_the_non_ended_koth_entry_block_on_proxmox_only():
     slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {"aws": "172.20.0.0/16"})
-    koth = {"10.150.2.0/24", "10.150.4.0/24"}
+    koth_entry, koth_internal = "10.150.2.0/24", "10.150.4.0/24"
     for login in ("alice@", "bob@"):
         forward = _forward(policy, login)
-        assert {f"{cidr}:*" for cidr in koth} <= set(forward["dst"])
+        assert f"{koth_entry}:*" in forward["dst"]
         assert not {"172.20.87.128/26:*", "172.20.112.128/26:*"} & set(forward["dst"])
         reverse = next(r for r in policy["acls"] if r["dst"] == [f"{login}:*"])
-        assert not koth & set(reverse["src"])
+        assert koth_entry not in reverse["src"]
         # The login's own and group blocks still reach back to its devices.
-        assert set(reverse["src"]) == {d[:-2] for d in forward["dst"]} - koth
-    assert not any(koth & set(r["src"]) for r in policy["acls"])
+        assert set(reverse["src"]) == {d[:-2] for d in forward["dst"]} - {koth_entry}
+    assert not any(koth_entry in r["src"] for r in policy["acls"])
+    assert koth_internal not in json.dumps(policy)
     cloud_only = render(BASE, slots, replace(DEFAULT_POLICY_BANDS, proxmox_enabled=False),
                         {"aws": "172.20.0.0/16"})
     assert "10.150." not in json.dumps(cloud_only)
@@ -126,7 +132,7 @@ def test_a_login_with_only_koth_blocks_gets_no_reverse_rule():
     slots = {**SLOTS, "users": [{"login": "carol", "entry_vlan": 600, "internal_vlan": 601}],
              "groups": [], "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
-    assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*", "10.150.4.0/24:*"]
+    assert _forward(policy, "carol@")["dst"] == ["10.150.2.0/24:*"]
     assert not [r for r in policy["acls"] if r["dst"] == ["carol@:*"]]
 
 
@@ -264,9 +270,48 @@ def test_group_membership_grants_only_that_groups_blocks():
     ]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {})
     assert _forward(policy, "alice@")["dst"] == [
-        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*", "10.100.4.0/24:*"]
+        "10.100.0.0/24:*", "10.100.1.0/24:*", "10.100.2.0/24:*"]
     assert _forward(policy, "bob@")["dst"] == [
-        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*", "10.101.4.0/24:*"]
+        "10.101.0.0/24:*", "10.101.1.0/24:*", "10.101.2.0/24:*"]
+
+
+# Catches a group member or KOTH player reaching a group or arena internal
+# network on Proxmox directly, in either direction: those networks are reached
+# only by pivoting through a host on the entry network. A student's own
+# internal network stays granted. Cloud slots are not covered (yet): they keep
+# the previous release's grants, the group's internal slot included.
+def test_proxmox_group_and_koth_internal_networks_are_never_granted_in_either_direction():
+    slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
+    policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
+    withheld = {"10.100.4.0/24", "10.150.4.0/24"}  # group 400, KOTH 450
+    for rule in policy["acls"][2:]:
+        granted = set(rule["src"]) | {d.rsplit(":", 1)[0] for d in rule["dst"]}
+        assert not withheld & granted, rule
+    for login, own_internal in (("alice@", "10.100.1.0/24"), ("bob@", "10.101.1.0/24")):
+        assert f"{own_internal}:*" in _forward(policy, login)["dst"]
+    assert "172.20.100.0/26:*" in _forward(policy, "alice@")["dst"]
+
+
+def _fixture(name):
+    return (ROOT / "tests" / "fixtures" / name).read_text()
+
+
+# Catches a change to any cloud grant. The fixtures are the previous release's
+# renders: a cloud-only site with groups and a KOTH game renders byte for byte
+# the same, and a mixed site differs only by the withheld Proxmox internal
+# networks (two groups' and one KOTH game's).
+def test_cloud_grants_are_byte_identical_to_the_previous_release():
+    slots = json.loads(_fixture("cloud_only_slots.json"))
+    assert canonical(render(BASE, slots, *policy_inputs(slots))) == \
+        _fixture("cloud_only_policy_previous_release.json")
+
+    slots = json.loads(_fixture("mixed_slots.json"))
+    previous = json.loads(_fixture("mixed_policy_previous_release.json"))
+    withheld = {"10.100.4.0/24", "10.101.4.0/24", "10.150.4.0/24"}
+    for rule in previous["acls"]:
+        rule["src"] = [s for s in rule["src"] if s not in withheld]
+        rule["dst"] = [d for d in rule["dst"] if d.rsplit(":", 1)[0] not in withheld]
+    assert render(BASE, slots, *policy_inputs(slots)) == previous
 
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
@@ -295,6 +340,8 @@ def _with(**changes):
     (_with(groups=[{"slug": "red-team", "members": ["alice"], "entry_vlan": 101,
                     "internal_vlan": 400}]), {}),
     (_with(koth=[{"game_id": 1, "entry_vlan": 300, "internal_vlan": 450}]), {}),
+    # Internal networks that are withheld are still claimed, so a clash is refused.
+    (_with(koth=[{"game_id": 1, "entry_vlan": 350, "internal_vlan": 400}]), {}),
     (_with(groups=[{"slug": "red-team", "members": ["mallory"], "entry_vlan": 300,
                     "internal_vlan": 400}]), {}),
     (_with(users=[{"login": "alice", "entry_vlan": "100", "internal_vlan": 200}], groups=[]), {}),
@@ -441,3 +488,133 @@ def test_cli_missing_peers_prints_one_device_per_line(tmp_path):
         paths[name].write_text(json.dumps(value))
     result = _cli("missing-peers", str(paths["nodes"]), str(paths["slots"]), str(paths["status"]))
     assert (result.returncode, result.stdout) == (0, "alice-laptop (alice)\n")
+
+
+# ---- individual mode is unchanged ------------------------------------------
+
+# Catches any change to what an individual-only site grants. The fixture is the
+# render of the release before group and KOTH internal networks were withdrawn,
+# so the comparison is byte for byte against that release's output.
+def test_an_individual_only_site_renders_byte_identical_to_the_previous_release(tmp_path):
+    slots_file = ROOT / "tests" / "fixtures" / "individual_only_slots.json"
+    slots = json.loads(slots_file.read_text())
+    expected = (ROOT / "tests" / "fixtures" / "individual_only_policy.json").read_text()
+    assert canonical(render(BASE, slots, *policy_inputs(slots))) == expected
+    base = tmp_path / "base.json"
+    base.write_text(json.dumps(BASE))
+    result = _cli("render", str(base), str(slots_file))
+    assert (result.returncode, result.stdout) == (0, expected)
+
+
+
+# ---- base rules that would reopen a protected network ----------------------
+
+PROTECTED_SLOTS = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
+
+
+def _base_with(*rules, groups=None, hosts=None):
+    return {**BASE, "groups": {**BASE["groups"], **(groups or {})},
+            "hosts": {**BASE["hosts"], **(hosts or {})},
+            "acls": [BASE["acls"][0], BASE["acls"][1], *rules]}
+
+
+# Catches an operator rule that hands a roster login (directly, through a
+# group, an alias or a covering prefix) a group or KOTH internal network, or
+# lets such a network reach roster devices: the generated rules withhold it,
+# but Headscale unions every rule, so one base rule would reopen it.
+@pytest.mark.parametrize("rule, extra", [
+    ({"action": "accept", "src": ["alice@"], "dst": ["10.100.4.0/24:*"]}, {}),
+    ({"action": "accept", "src": ["alice@"], "dst": ["10.100.4.10:88"]}, {}),
+    ({"action": "accept", "src": ["group:players"], "dst": ["10.0.0.0/8:22"]},
+     {"groups": {"group:players": ["Alice@"]}}),
+    ({"action": "accept", "src": ["bob@"], "dst": ["lab-int:*"]},
+     {"hosts": {"lab-int": "10.150.4.0/24"}}),
+    ({"action": "accept", "src": ["bob@"], "dst": ["*:*"]}, {}),
+    ({"action": "accept", "src": ["10.100.4.0/24"], "dst": ["alice@:*"]}, {}),
+    ({"action": "accept", "src": ["10.0.0.0/8"], "dst": ["*:445"]}, {}),
+    ({"action": "accept", "src": ["lab-int"], "dst": ["group:players:*"]},
+     {"hosts": {"lab-int": "10.100.4.128/25"}, "groups": {"group:players": ["bob@"]}}),
+    ({"action": "accept", "src": ["*"], "dst": ["autogroup:self:*"]}, {}),  # harmless: kept
+])
+def test_a_base_rule_reopening_a_protected_network_fails_the_render(rule, extra):
+    base = _base_with(rule, **extra)
+    if rule["src"] == ["*"]:
+        render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+        return
+    with pytest.raises(ValueError, match="protected"):
+        render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+
+
+# Catches the check refusing what staff and the portal legitimately need: a
+# group of non-roster staff, a portal host alias, and a tag.
+def test_staff_and_portal_rules_into_protected_networks_are_kept():
+    base = _base_with(
+        {"action": "accept", "src": ["node1-v4"], "dst": ["10.150.4.0/24:*"]},
+        {"action": "accept", "src": ["10.100.4.0/24"], "dst": ["group:staff:*"]},
+        {"action": "accept", "src": ["tag:portal"], "dst": ["10.0.0.0/8:*"]})
+    render(base, PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+    # A roster login added to the staff group makes the staff rule a breach.
+    with pytest.raises(ValueError, match="protected"):
+        render({**base, "groups": {"group:staff": ["instructor@", "alice@"]}},
+               PROTECTED_SLOTS, DEFAULT_POLICY_BANDS, {})
+
+
+# Catches the check firing on a site with nothing protected, or on the cloud
+# backends, where isolation is not enforced.
+def test_the_check_applies_only_to_protected_proxmox_networks():
+    rule = {"action": "accept", "src": ["alice@"], "dst": ["10.100.4.0/24:*"]}
+    render(_base_with(rule), {**SLOTS, "groups": []}, DEFAULT_POLICY_BANDS, {})
+    render(_base_with(rule), PROTECTED_SLOTS, replace(DEFAULT_POLICY_BANDS, proxmox_enabled=False),
+           {"aws": "172.20.0.0/16"})
+
+
+NODES_WITH_PORTAL = NODES + [_node("portal", "term-infrastructure", "100.64.0.6")]
+
+
+# Catches a tailnet address of a roster device, given as a literal in a base
+# rule, reaching a protected network; the render cannot resolve it, so the
+# protection command does, from Headscale's node list.
+def test_protection_rejects_a_roster_device_address_in_a_base_rule():
+    base = _base_with({"action": "accept", "src": ["100.64.0.1"], "dst": ["10.100.4.0/24:*"]})
+    with pytest.raises(ValueError, match="protected"):
+        protection(base, PROTECTED_SLOTS, NODES_WITH_PORTAL, [])
+    ok = _base_with({"action": "accept", "src": ["100.64.0.6/32"], "dst": ["10.100.4.0/24:*"]})
+    assert protection(ok, PROTECTED_SLOTS, NODES_WITH_PORTAL, [])["vlans"] == [400, 450]
+
+
+# Catches the jumpbox's protected set drifting from the real assignments: it
+# is every group's and non-ended KOTH game's internal tag, wherever it lies.
+def test_protection_lists_every_group_and_koth_internal_tag():
+    slots = {**PROTECTED_SLOTS, "groups": [
+        {"slug": "red-team", "members": ["alice"], "entry_vlan": 300, "internal_vlan": 400},
+        {"slug": "odd-team", "members": ["bob"], "entry_vlan": 305, "internal_vlan": 250}]}
+    assert protection(BASE, slots, NODES, []) == {"vlans": [250, 400, 450], "staff_ips": []}
+
+
+# Catches a staff exemption that is a network (a whole range, a default route)
+# or a roster student's device: only single addresses of non-roster nodes.
+@pytest.mark.parametrize("staff", [["100.64.0.0/10"], ["0.0.0.0/0"], ["100.64.0.6/32"],
+                                   ["100.64.0.1"], ["100.64.0.99"], ["fd7a:115c:a1e0::9"],
+                                   ["not-an-address"]])
+def test_protection_accepts_only_verified_non_roster_node_addresses(staff):
+    with pytest.raises(ValueError, match="JUMPBOX_TAILNET_STAFF_IPS"):
+        protection(BASE, PROTECTED_SLOTS, NODES_WITH_PORTAL, staff)
+
+
+def test_protection_keeps_verified_staff_and_portal_addresses():
+    assert protection(BASE, PROTECTED_SLOTS, NODES_WITH_PORTAL, ["100.64.0.6", "100.64.0.4"]) == {
+        "vlans": [400, 450], "staff_ips": ["100.64.0.4", "100.64.0.6"]}
+
+
+def test_cli_protection_prints_json_and_refuses_bad_staff(tmp_path):
+    paths = {}
+    for name, value in (("base", BASE), ("slots", PROTECTED_SLOTS), ("nodes", NODES_WITH_PORTAL)):
+        paths[name] = tmp_path / f"{name}.json"
+        paths[name].write_text(json.dumps(value))
+    result = _cli("protection", str(paths["base"]), str(paths["slots"]), str(paths["nodes"]),
+                  "--staff-ips", "100.64.0.6")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"vlans": [400, 450], "staff_ips": ["100.64.0.6"]}
+    bad = _cli("protection", str(paths["base"]), str(paths["slots"]), str(paths["nodes"]),
+               "--staff-ips", "100.64.0.1")
+    assert bad.returncode != 0 and bad.stdout == ""

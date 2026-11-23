@@ -884,6 +884,19 @@ class KothScoreSnapshot(db.Model):
 # local DateTimes: one worker writes them and another compares them, and a
 # lease must not stretch or shrink by an hour across a DST change.
 
+class ProtectedVlan(db.Model):
+    """A group or KOTH internal VLAN the jumpbox and the Headscale policy were
+    verified to keep from the VPN (players reach it only through an entry
+    host). Written only by scripts/record_protected_vlans.py, which the
+    operator's apply script runs after both checks pass; app.network_protection
+    reads it."""
+
+    __tablename__ = 'protected_vlans'
+
+    tag = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    verified_at = db.Column(db.DateTime, nullable=False)
+
+
 class CoordinationState(db.Model):
     """Named rows that serialize a check-and-reserve across workers.
 

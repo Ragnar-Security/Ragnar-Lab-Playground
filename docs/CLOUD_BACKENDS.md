@@ -574,7 +574,10 @@ AWS_ROUTER_INSTANCE_ID=                    # empty: the VPN does the routing
   empty or absent.
 
 **The isolation trade-off, plainly:** on the tailnet, the Headscale policy
-lets each student reach only their own and their groups' slots. Another VPN
+lets each student reach only their own and their groups' slots. Group and
+KOTH internal-network isolation (reached only through a pivot) is enforced
+on the Proxmox labs through Headscale only; it is not enforced through
+another VPN. Another VPN
 has no such per-student policy here: **any connected VPN user can reach any
 lab VM's address.** Labs remain isolated from each other (each deployment's
 security group admits only itself and the client networks) and have no
@@ -1066,12 +1069,21 @@ student every lab.
 What the policy grants:
 
 - Each roster login `<login>@` reaches its own entry and internal slots, its
-  groups' entry and internal slots, and the entry and internal blocks of
-  **every KOTH game whose status is not `ended`** (Proxmox only, since KOTH runs only there).
-  Only slots inside `VLAN_BANDS` are granted, the same kinds on every
-  backend. The login's own and groups' blocks may connect back to that
-  login's own devices only. KOTH blocks may not connect back at all: a box
-  any player has rooted must not reach every player's devices.
+  groups' entry slots, and the entry block of **every KOTH game whose status
+  is not `ended`** (Proxmox only, since KOTH runs only there). On a cloud
+  backend it also reaches its groups' internal slots (below). Only slots
+  inside `VLAN_BANDS` are granted. The login's own and groups' blocks may
+  connect back to that login's own devices only. KOTH blocks may not connect
+  back at all: a box any player has rooted must not reach every player's
+  devices.
+- **On Proxmox, a group's or KOTH game's internal network is never granted,
+  in either direction.** Players reach it only by pivoting through a host
+  they hold on the entry network; the jumpbox also drops tailnet traffic to
+  and from it (`docs/JUMPBOX.md`, "Lab egress"). **This is not yet enforced
+  on the cloud backends or through another VPN:** a group's AWS or GCP
+  internal slot is granted to its members as before, each cloud router
+  still advertises its whole base, and a VPN outside Headscale (below)
+  reaches every slot its routes and security groups admit.
 - **The render keeps every section and every `acls` rule of the base file,
   except the blanket rule whose `src` is exactly `["autogroup:member"]`,
   which it cuts down to its `autogroup:self` destinations.** Students keep
