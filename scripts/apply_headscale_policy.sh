@@ -11,7 +11,8 @@ source "$SCRIPT_DIR/headscale_peers.sh"
 SITE_ENV_FILE="${SITE_ENV_FILE:-$SCRIPT_DIR/site.env}"
 load_site_env "$SITE_ENV_FILE" \
     PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR \
-    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT VLAN_BANDS
+    HEADSCALE_BASE_POLICY HEADSCALE_POLICY_FILE JUMPBOX_SSH JUMPBOX_PEER_WAIT VLAN_BANDS \
+    JUMPBOX_TAILNET_STAFF_IPS
 for name in PORTAL_HOST PORTAL_APP_CONTAINER HEADSCALE_HOST HEADSCALE_DIR; do
     require_site_var "$name"
 done
@@ -89,6 +90,19 @@ required) that the jumpbox lists every roster device as a peer, waiting up to
 JUMPBOX_PEER_WAIT seconds; if any is missing it restarts Headscale once and
 checks again, and fails if one still is. A portal without the proxmox backend
 has no jumpbox, and the check is skipped.
+
+With the proxmox backend, every run also derives the jumpbox's protection
+from the export and Headscale's nodes: every group's and non-ended KOTH
+game's internal VLAN, which the tailnet may not reach directly, and the
+JUMPBOX_TAILNET_STAFF_IPS exemptions, each verified as a live non-roster
+node (a staff device, the portal host). While any VLAN is protected, the
+jumpbox must have the staff-only SSH filter and no listener a student could
+use as a proxy. --apply then installs the protection file and the lab egress
+table on the jumpbox and verifies the loaded table BEFORE it changes the
+policy, and after the policy and peer checks it records the protected VLANs
+in the portal (scripts/record_protected_vlans.py), which lets Proxmox group
+and KOTH deployments on them start. Any failure stops the run before the
+next step.
 
 --preflight reads the portal export and checks only what --apply will need:
 with the proxmox backend, that JUMPBOX_SSH is set, answers over SSH, and
@@ -212,6 +226,98 @@ reload_headscale() {
         || die "Could not signal Headscale to reload its policy."
 }
 
+# Facts the jumpbox check needs, read as root on the jumpbox (sudo -n): the
+# staff-only SSH table and the listening sockets.
+JUMPBOX_FACTS_PY='import json, subprocess
+def out(*args):
+    try:
+        run = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return run.stdout if run.returncode == 0 else None
+ssh = out("nft", "-j", "list", "table", "inet", "jumpbox_ssh")
+print(json.dumps({"ssh_table": json.loads(ssh) if ssh else None,
+                  "listeners": out("ss", "-Hlntup")}))'
+
+read_jumpbox_facts() {
+    ssh "${SSH_OPTIONS[@]}" "$JUMPBOX_SSH" "sudo -n python3 -" <<< "$JUMPBOX_FACTS_PY" \
+        > "$TMP_DIR/jumpbox-facts.json" \
+        || die "Could not read the jumpbox's SSH filter and listeners as root ($JUMPBOX_SSH needs passwordless sudo)."
+}
+
+# One root shell script on the jumpbox: stage the three files, check the
+# ruleset, move them into place, then start (forwarding goes on only after the
+# table loads) or reload the unit, and print the loaded table. The files
+# travel base64-encoded inside the script and are decoded by python3, which
+# the jumpbox has; base64 flags differ between platforms.
+B64_PY='import base64, sys; print(base64.b64encode(open(sys.argv[1], "rb").read()).decode())'
+install_jumpbox_protection() {
+    local script=$'set -euo pipefail\nR="${JUMPBOX_SYSROOT:-}"\n'
+    script+=$'install -d -m 755 "$R/etc/jumpbox" "$R/etc/nftables.d" "$R/etc/systemd/system"\n'
+    local src dest encoded
+    for pair in "protection.json:/etc/jumpbox/tailnet-protection.json" \
+                "egress.nft:/etc/nftables.d/jumpbox-lab-egress.nft" \
+                "egress.service:/etc/systemd/system/jumpbox-lab-egress.service"; do
+        src="${pair%%:*}" dest="${pair#*:}"
+        encoded="$("$PYTHON" -c "$B64_PY" "$TMP_DIR/$src")" || return 1
+        script+="python3 -c 'import base64, sys; sys.stdout.buffer.write(base64.b64decode(sys.argv[1]))'"
+        script+=" '$encoded' > \"\$R$dest.new\""$'\n'
+        script+="chmod 644 \"\$R$dest.new\""$'\n'
+    done
+    script+=$'nft -c -f "$R/etc/nftables.d/jumpbox-lab-egress.nft.new"\n'
+    for dest in /etc/jumpbox/tailnet-protection.json /etc/nftables.d/jumpbox-lab-egress.nft \
+                /etc/systemd/system/jumpbox-lab-egress.service; do
+        script+="mv -f \"\$R$dest.new\" \"\$R$dest\""$'\n'
+    done
+    script+=$'systemctl daemon-reload\n'
+    script+=$'if systemctl is-active --quiet jumpbox-lab-egress.service; then\n'
+    script+=$'    systemctl reload jumpbox-lab-egress.service\n'
+    script+=$'else\n    systemctl enable --now jumpbox-lab-egress.service\nfi\n'
+    script+=$'nft -j list table inet jumpbox_lab_egress\n'
+    ssh "${SSH_OPTIONS[@]}" "$JUMPBOX_SSH" "sudo -n bash -s" <<< "$script" > "$TMP_DIR/egress-live.json"
+}
+
+# The jumpbox stage: what it must enforce, whether it may, and (with --apply)
+# installing and verifying it. Runs before the policy changes.
+protection_stage() {
+    fetch_nodes > "$TMP_DIR/nodes.json" || die "Could not list Headscale's nodes."
+    "$PYTHON" "$POLICY_TOOL" protection "$HEADSCALE_BASE_POLICY" "$TMP_DIR/slots.json" \
+        "$TMP_DIR/nodes.json" --staff-ips "${JUMPBOX_TAILNET_STAFF_IPS:-}" > "$TMP_DIR/protection.json" \
+        || die "Could not derive the jumpbox's protection (above)."
+    printf '  jumpbox protection: %s\n' "$(cat "$TMP_DIR/protection.json")"
+    if [[ -z "${JUMPBOX_SSH:-}" ]]; then
+        printf '  not checked: the jumpbox (JUMPBOX_SSH is unset).\n'
+        return 0
+    fi
+    read_jumpbox_facts
+    "$PYTHON" "$POLICY_TOOL" jumpbox-check "$TMP_DIR/jumpbox-facts.json" "$TMP_DIR/nodes.json" \
+        "$TMP_DIR/slots.json" "$TMP_DIR/protection.json" \
+        || die "The jumpbox may not carry protected group or KOTH networks yet (above): require staff-only SSH (docs/JUMPBOX.md) before enabling them."
+    "$PYTHON" "$NETGEN" lab-egress --protection "$TMP_DIR/protection.json" > "$TMP_DIR/egress.nft" \
+        || die "Could not render the lab egress table."
+    "$PYTHON" "$NETGEN" lab-egress-unit > "$TMP_DIR/egress.service" \
+        || die "Could not render the lab egress unit."
+    if ((APPLY == 0)); then
+        printf '  would install the protection file and the lab egress table on the jumpbox, then verify them.\n'
+        return 0
+    fi
+    install_jumpbox_protection \
+        || die "Installing the lab egress table on the jumpbox failed (above); the policy is unchanged."
+    "$PYTHON" "$POLICY_TOOL" verify-egress "$TMP_DIR/egress-live.json" "$TMP_DIR/protection.json" \
+        || die "The jumpbox's loaded lab egress table does not match the protection; the policy is unchanged."
+    printf '  verified: the lab egress table drops the tailnet to and from VLAN(s) %s.\n' \
+        "$("$PYTHON" -c 'import json,sys; print(", ".join(map(str, json.load(open(sys.argv[1]))["vlans"])) or "none")' "$TMP_DIR/protection.json")"
+}
+
+# Last: the portal lets deployments on the protected VLANs start.
+record_protection() {
+    ssh "${SSH_OPTIONS[@]}" "$PORTAL_HOST" \
+        "docker exec -i '$PORTAL_APP_CONTAINER' python scripts/record_protected_vlans.py" \
+        < "$TMP_DIR/protection.json" \
+        || die "The jumpbox and the policy are in place, but the portal did not record the protected VLANs; re-run --apply."
+    printf '  recorded the protected VLANs in the portal.\n'
+}
+
 verify_jumpbox_peers() {
     local missing=""
     if ((PROXMOX_ENABLED == 0)); then
@@ -268,38 +374,46 @@ fi
 # Before any change: with Proxmox, a reload nothing can check is never applied.
 ((APPLY == 0 || PROXMOX_ENABLED == 0)) || require_site_var JUMPBOX_SSH
 
-changes="$(policy_changes)"
-if [[ -z "$changes" ]]; then
-    if ((APPLY == 0)); then
-        printf '  nothing to do: the policy file Headscale serves matches the rendered one.\n'
-        printf '  not checked: which policy Headscale has loaded; --apply signals a reload.\n'
-        exit 0
-    fi
-    # An earlier --apply can have installed this file and then failed to
-    # signal, leaving Headscale on the old rules; SIGHUP is safe to repeat.
-    printf '  nothing to install: the policy file Headscale serves matches the rendered one.\n'
-    check_policy
-    reload_headscale
-    printf '  signalled Headscale to reload that file.\n'
-    verify_jumpbox_peers
-    exit 0
-fi
-printf '%s\n' "$changes"
-if ((APPLY == 0)); then
-    printf '  would check, back up, install, reload, and verify the rendered policy.\n'
-    exit 0
-fi
+((PROXMOX_ENABLED == 0)) || protection_stage
 
-host_file="$(resolve_host_policy_file)"
-install_policy "$host_file" "$(date -u +%Y%m%dT%H%M%SZ)"
-reload_headscale
-readback="$(policy_changes)"
-if [[ -n "$readback" ]]; then
-    # A single-file bind mount keeps showing the replaced file until restart.
-    printf '  read-back differs; restarting the headscale service once.\n'
-    restart_headscale
+policy_stage() {
+    local changes readback host_file
+    changes="$(policy_changes)"
+    if [[ -z "$changes" ]]; then
+        if ((APPLY == 0)); then
+            printf '  nothing to do: the policy file Headscale serves matches the rendered one.\n'
+            printf '  not checked: which policy Headscale has loaded; --apply signals a reload.\n'
+            return 0
+        fi
+        # An earlier --apply can have installed this file and then failed to
+        # signal, leaving Headscale on the old rules; SIGHUP is safe to repeat.
+        printf '  nothing to install: the policy file Headscale serves matches the rendered one.\n'
+        check_policy
+        reload_headscale
+        printf '  signalled Headscale to reload that file.\n'
+        verify_jumpbox_peers
+        return 0
+    fi
+    printf '%s\n' "$changes"
+    if ((APPLY == 0)); then
+        printf '  would check, back up, install, reload, and verify the rendered policy.\n'
+        return 0
+    fi
+
+    host_file="$(resolve_host_policy_file)"
+    install_policy "$host_file" "$(date -u +%Y%m%dT%H%M%SZ)"
+    reload_headscale
     readback="$(policy_changes)"
-    [[ -z "$readback" ]] || die "The policy file Headscale serves still differs after one restart."
-fi
-printf '  verified: the policy file Headscale serves matches the rendered one.\n'
-verify_jumpbox_peers
+    if [[ -n "$readback" ]]; then
+        # A single-file bind mount keeps showing the replaced file until restart.
+        printf '  read-back differs; restarting the headscale service once.\n'
+        restart_headscale
+        readback="$(policy_changes)"
+        [[ -z "$readback" ]] || die "The policy file Headscale serves still differs after one restart."
+    fi
+    printf '  verified: the policy file Headscale serves matches the rendered one.\n'
+    verify_jumpbox_peers
+}
+
+policy_stage
+((APPLY == 0 || PROXMOX_ENABLED == 0)) || record_protection

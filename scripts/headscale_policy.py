@@ -5,6 +5,8 @@
     headscale_policy.py diff CURRENT.json DESIRED.json       # unified diff
     headscale_policy.py missing-peers NODES.json SLOTS.json STATUS.json
     headscale_policy.py protection BASE_POLICY.json SLOTS.json NODES.json [--staff-ips LIST]
+    headscale_policy.py jumpbox-check FACTS.json NODES.json SLOTS.json PROTECTION.json
+    headscale_policy.py verify-egress LIVE.json PROTECTION.json
 
 BASE_POLICY is the operator's policy file (config/headscale-acl.json): every
 section and every ACL rule is kept, except the blanket rule whose src is
@@ -34,7 +36,11 @@ group's and non-ended KOTH game's internal tag, and `staff_ips`, the
 JUMPBOX_TAILNET_STAFF_IPS addresses, each verified as the exact address of a
 live node of a non-roster user (a staff device or the portal host). It fails
 when a base rule would reopen a protected network, counting the roster
-devices' own addresses from the node list.
+devices' own addresses from the node list. jumpbox-check fails, while any
+VLAN is protected, unless the jumpbox has the staff-only SSH filter (admitting
+no roster device) and no listener a student could use as a proxy.
+verify-egress fails unless the lab egress table the jumpbox loaded
+(`nft -j list table inet jumpbox_lab_egress`) holds exactly the protection.
 
 Standard library only: this runs on the operator's workstation.
 """
@@ -371,6 +377,88 @@ def protection(base_policy: Mapping[str, Any], slots: Mapping[str, Any], nodes: 
                                                       ipaddress.ip_address(a)))}
 
 
+# Processes that may listen on a jumpbox address other than loopback: sshd
+# (behind the staff-only filter), dnsmasq (DHCP and DNS for the lab VLANs),
+# tailscaled, and the resolver and DHCP client of the host itself.
+JUMPBOX_LISTENERS = frozenset({"sshd", "dnsmasq", "tailscaled", "systemd-resolve",
+                               "systemd-network"})
+
+
+def _listener_problems(listing: str) -> List[str]:
+    problems = []
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        local = fields[4]
+        host = local.rsplit(":", 1)[0].strip("[]").split("%")[0]
+        try:
+            if host not in ("*", "0.0.0.0", "::") and ipaddress.ip_address(host).is_loopback:
+                continue
+        except ValueError:
+            pass
+        names = re.findall(r'\("([^"]+)"', line)
+        if not names:
+            problems.append(f"an unidentified process listens on {local}")
+        problems += [f"{name} listens on {local}" for name in names if name not in JUMPBOX_LISTENERS]
+    return problems
+
+
+def jumpbox_problems(facts: Mapping[str, Any], nodes: Any, slots: Mapping[str, Any],
+                     protection_data: Mapping[str, Any]) -> List[str]:
+    """Why the jumpbox cannot carry protected networks yet; empty when it can.
+
+    A student who can log in to the jumpbox, or use a service on it as a
+    proxy, originates traffic from the jumpbox itself: outside its forward
+    hook and without any entry host. So while any VLAN is protected the
+    jumpbox needs the staff-only SSH filter, admitting no roster device, and
+    no listener beyond sshd, dnsmasq, tailscaled and the host's own resolver.
+    """
+    if not protection_data.get("vlans"):
+        return []
+    assigned = _assignments(slots)
+    roster_ips = set()
+    for node in _live_nodes(nodes):
+        if _identity_or_none((node.get("user") or {}).get("name") or "") in assigned.proxmox:
+            roster_ips.update(str(ipaddress.ip_address(ip)) for ip in node.get("ip_addresses") or [])
+    problems = []
+    items = ((facts.get("ssh_table") or {}).get("nftables") or []) if isinstance(facts, Mapping) else []
+    rules = [i["rule"] for i in items if isinstance(i, Mapping) and "rule" in i]
+    if not any(any("drop" in e for e in r.get("expr") or [] if isinstance(e, Mapping)) for r in rules):
+        problems.append("the staff-only SSH filter (table inet jumpbox_ssh) is not installed: "
+                        "run jumpbox_configure.sh --apply --ssh-staff-only")
+    for item in items:
+        elems = (item.get("set") or {}).get("elem") if isinstance(item, Mapping) else None
+        for elem in elems or []:
+            if isinstance(elem, str) and elem in roster_ips:
+                problems.append(f"the staff-only SSH filter admits roster device {elem}")
+    listing = facts.get("listeners") if isinstance(facts, Mapping) else None
+    if not isinstance(listing, str):
+        problems.append("could not list the jumpbox's listening sockets")
+    else:
+        problems += [f"{p}: a student could use it as a proxy" for p in _listener_problems(listing)]
+    return problems
+
+
+def egress_mismatch(live: Any, protection_data: Mapping[str, Any]) -> List[str]:
+    """Differences between the jumpbox's loaded lab egress table and the protection."""
+    items = (live or {}).get("nftables") or [] if isinstance(live, Mapping) else []
+    sets = {i["set"]["name"]: sorted(e for e in i["set"].get("elem") or [] if isinstance(e, str))
+            for i in items if isinstance(i, Mapping) and isinstance(i.get("set"), Mapping)}
+    vlans = protection_data.get("vlans") or []
+    staff = protection_data.get("staff_ips") or []
+    want = {"tailnet_internal": sorted(f"vlan{v}" for v in vlans),
+            "staff": sorted(staff)} if vlans else {"tailnet_internal": [], "staff": []}
+    have = {"tailnet_internal": sets.get("tailnet_internal", []),
+            "staff": sorted(sets.get("tailnet_staff_v4", []) + sets.get("tailnet_staff_v6", []))}
+    drops = sum(1 for i in items if isinstance(i, Mapping) and "@tailnet_internal" in json.dumps(i.get("rule"))
+                and '"drop"' in json.dumps(i.get("rule")))
+    problems = [f"{key}: loaded {have[key]}, expected {want[key]}" for key in want if have[key] != want[key]]
+    if vlans and drops != 2:
+        problems.append(f"{drops} tailnet_internal drop rule(s) loaded, expected 2")
+    return problems
+
+
 def _base_rules(base_acls: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
     """The base rules the policy keeps.
 
@@ -487,6 +575,14 @@ def main(argv=None) -> int:
     protection_cmd.add_argument("nodes")
     protection_cmd.add_argument("--staff-ips", default="",
                                 help="JUMPBOX_TAILNET_STAFF_IPS: comma/space separated")
+    check_cmd = commands.add_parser(
+        "jumpbox-check", help="fail unless the jumpbox may carry the protected networks")
+    for name in ("facts", "nodes", "slots", "protection"):
+        check_cmd.add_argument(name)
+    verify_cmd = commands.add_parser(
+        "verify-egress", help="fail unless the loaded lab egress table matches the protection")
+    verify_cmd.add_argument("live")
+    verify_cmd.add_argument("protection")
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
@@ -495,6 +591,13 @@ def main(argv=None) -> int:
         elif args.command == "missing-peers":
             output = "".join(f"{device}\n" for device in missing_peers(
                 _load(args.nodes), _load(args.slots), _load(args.status)))
+        elif args.command in ("jumpbox-check", "verify-egress"):
+            data = _load(args.protection)
+            problems = (jumpbox_problems(_load(args.facts), _load(args.nodes), _load(args.slots), data)
+                        if args.command == "jumpbox-check" else egress_mismatch(_load(args.live), data))
+            if problems:
+                raise ValueError("; ".join(problems))
+            output = ""
         elif args.command == "protection":
             staff = [s for s in re.split(r"[\s,]+", args.staff_ips) if s]
             output = json.dumps(protection(_load(args.base_policy), _load(args.slots),
