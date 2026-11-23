@@ -6,6 +6,7 @@ import configparser
 import fnmatch
 import importlib.util
 import ipaddress
+import json
 import os
 import pty
 import re
@@ -259,10 +260,20 @@ EGRESS_SYSTEMCTL_CASES = (
 )
 
 
-def _configure_env(tmp_path: Path, site_extra: str = ""):
+PROTECTION_FILE = "etc/jumpbox/tailnet-protection.json"
+# What scripts/apply_headscale_policy.sh installs: two protected internal
+# VLANs (a group's 400, a KOTH game's 450) and no staff exemption.
+PROTECTION = {"vlans": [400, 450], "staff_ips": []}
+
+
+def _configure_env(tmp_path: Path, site_extra: str = "", protection=PROTECTION):
     sysroot = tmp_path / "root"
     for d in ("etc/netplan", "sys/class/net/ens18", "sys/class/net/ens19"):
         (sysroot / d).mkdir(parents=True)
+    if protection is not None:
+        (sysroot / PROTECTION_FILE).parent.mkdir(parents=True)
+        (sysroot / PROTECTION_FILE).write_text(
+            protection if isinstance(protection, str) else json.dumps(protection))
     env = _base_env(tmp_path, SITE + site_extra)
     bin_dir = tmp_path / "bin"
     for name in ("netplan", "sysctl", "apt-get", "snap", "dnsmasq", "lvextend", "nft"):
@@ -289,7 +300,7 @@ def test_configure_dry_run_shows_the_change_and_writes_nothing(tmp_path):
     assert _mutations(_calls(tmp_path)) == []
     assert "+    vlan100:" in result.stdout
     assert "+dhcp-range=10.199.4.50,10.199.4.254,255.255.255.0,12h" in result.stdout
-    assert "+net.ipv4.ip_forward = 1" in result.stdout
+    assert "+net.ipv4.conf.all.rp_filter = 2" in result.stdout
     assert "--apply" in result.stdout
 
 
@@ -302,9 +313,10 @@ def test_configure_apply_converges_and_a_second_run_changes_nothing(tmp_path):
     assert stat.S_IMODE(netplan.stat().st_mode) == 0o600
     assert "dhcp-range=10.100.0.50,10.100.0.254,255.255.255.0,12h" in (sysroot / DNSMASQ).read_text()
     sysctl = (sysroot / SYSCTL).read_text().splitlines()
-    for line in ("net.ipv4.ip_forward = 1", "net.ipv6.conf.all.forwarding = 1",
-                 "net.ipv4.conf.all.rp_filter = 2", "net.ipv4.conf.default.rp_filter = 2"):
+    for line in ("net.ipv4.conf.all.rp_filter = 2", "net.ipv4.conf.default.rp_filter = 2"):
         assert line in sysctl
+    # Forwarding is switched on only by the lab egress unit, once its table loaded.
+    assert not [l for l in sysctl if "forward" in l and not l.startswith("#")]
     calls = _calls(tmp_path)
     assert "netplan apply" in calls
     assert "systemctl restart dnsmasq" in calls
@@ -362,8 +374,8 @@ def test_every_configure_apply_installs_the_lab_egress_table(tmp_path):
     assert first.returncode == 0, first.stdout + first.stderr
     egress = (sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text()
     assert _nft_structure(egress)[3] == TAILNET_RULES + EGRESS_RULES
-    # The default layout's group-internal band, and no staff exemption unless listed.
-    assert _nft_sets(egress) == {"tailnet_internal": [f"vlan{t}" for t in range(400, 501)],
+    # Exactly the protection file's VLANs, and no staff exemption.
+    assert _nft_sets(egress) == {"tailnet_internal": ["vlan400", "vlan450"],
                                  "tailnet_staff_v4": [], "tailnet_staff_v6": []}
     unit = (sysroot / "etc/systemd/system/jumpbox-lab-egress.service").read_text()
     assert "ExecStart=/usr/sbin/nft -f /etc/nftables.d/jumpbox-lab-egress.nft" in unit
@@ -382,24 +394,27 @@ def test_every_configure_apply_installs_the_lab_egress_table(tmp_path):
     assert _mutations(_calls(tmp_path)) == []
 
 
-# Catches the site's KOTH internal VLAN or staff exemption never reaching the
-# jumpbox, and a malformed list being installed instead of refused.
-def test_configure_takes_the_tailnet_internal_vlans_and_staff_from_site_env(tmp_path):
-    env, sysroot = _configure_env(
-        tmp_path, 'JUMPBOX_TAILNET_DENY_VLANS="250,260-261"\nJUMPBOX_TAILNET_STAFF_IPS="100.64.0.10"\n')
+# Catches the jumpbox protecting a stale or invented VLAN list: it takes the
+# set the apply script derived from the real assignments, and refuses to
+# install anything when that file is missing or malformed.
+def test_configure_takes_the_protected_vlans_and_staff_from_the_protection_file(tmp_path):
+    env, sysroot = _configure_env(tmp_path, protection={"vlans": [250, 400], "staff_ips": ["100.64.0.10"]})
     result = _run(CONFIGURE, ["--apply", "--no-try"], env)
     assert result.returncode == 0, result.stdout + result.stderr
     sets = _nft_sets((sysroot / "etc/nftables.d/jumpbox-lab-egress.nft").read_text())
-    assert sets["tailnet_internal"] == [f"vlan{t}" for t in [250, 260, 261, *range(400, 501)]]
+    assert sets["tailnet_internal"] == ["vlan250", "vlan400"]
     assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
 
-    for i, bad in enumerate(('JUMPBOX_TAILNET_DENY_VLANS="1"\n', 'JUMPBOX_TAILNET_STAFF_IPS="nope"\n')):
+    for i, bad in enumerate((None, "{not json", {"vlans": [400]},
+                             {"vlans": [1], "staff_ips": []},
+                             {"vlans": [400], "staff_ips": ["100.64.0.0/10"]},
+                             {"vlans": [], "staff_ips": ["nope"]})):
         bad_dir = tmp_path / f"bad{i}"
-        bad_env, bad_root = _configure_env(bad_dir, bad)
+        bad_env, bad_root = _configure_env(bad_dir, protection=bad)
         before = _tree(bad_root)
         refused = _run(CONFIGURE, ["--apply", "--no-try"], bad_env)
         assert refused.returncode != 0, bad
-        assert "JUMPBOX_TAILNET_" in refused.stderr, refused.stderr
+        assert "tailnet-protection.json" in refused.stderr, refused.stderr
         assert _tree(bad_root) == before
         assert _mutations(_calls(bad_dir)) == []
 
@@ -1122,16 +1137,14 @@ def test_lab_egress_lets_lab_vlans_leave_only_to_the_tailnet_and_leaves_vlan_to_
 # reaching an entry network or a student's own internal network.
 def test_lab_egress_drops_the_tailnet_to_and_from_internal_networks_but_staff():
     ng = _netgen()
-    bands = ng.parse_bands(ng.DEFAULT_BANDS)
-    internal = ng.tailnet_internal_vlans(bands, extra=[250])
-    assert internal == [250] + list(range(400, 501))
+    internal = [250, 400, 450]
     text = ng.render_lab_egress(internal, staff_ips=["100.64.0.10", "fd7a:115c:a1e0::a"])
     tables, chains, hooks, rules = _nft_structure(text)
     assert (tables, chains) == (["table inet jumpbox_lab_egress {"], ["chain forward {"])
     assert hooks == ["type filter hook forward priority -10; policy accept;"]
     assert rules == TAILNET_RULES + EGRESS_RULES
     sets = _nft_sets(text)
-    assert sets["tailnet_internal"] == [f"vlan{t}" for t in internal]
+    assert sets["tailnet_internal"] == ["vlan250", "vlan400", "vlan450"]
     assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
     assert sets["tailnet_staff_v6"] == ["fd7a:115c:a1e0::a"]
     student, staff = "100.64.0.20", "100.64.0.10"
@@ -1139,11 +1152,12 @@ def test_lab_egress_drops_the_tailnet_to_and_from_internal_networks_but_staff():
         for iif, oif, packet, forwarded in [
                 ("tailscale0", "vlan400", {"src": student}, False),  # group internal
                 ("vlan400", "tailscale0", {"dst": student}, False),
-                ("tailscale0", "vlan500", {"src": student}, False),
-                ("tailscale0", "vlan250", {"src": student}, False),  # a listed KOTH internal
+                ("tailscale0", "vlan450", {"src": student}, False),  # KOTH internal
+                ("tailscale0", "vlan250", {"src": student}, False),  # internal outside the band
                 ("vlan250", "tailscale0", {"dst": student}, False),
                 ("tailscale0", "vlan400", {"src": staff}, True),
                 ("vlan400", "tailscale0", {"dst": staff}, True),
+                ("tailscale0", "vlan401", {"src": student}, True),  # not assigned: not protected
                 ("tailscale0", "vlan300", {"src": student}, True),  # group entry
                 ("vlan300", "tailscale0", {"dst": student}, True),
                 ("tailscale0", "vlan200", {"src": student}, True),  # own internal
@@ -1153,35 +1167,49 @@ def test_lab_egress_drops_the_tailnet_to_and_from_internal_networks_but_staff():
             assert _forwarded(tables_, iif, oif, sets=sets, **packet) == forwarded, (iif, oif, packet, j2)
 
 
-# Catches the drop silently matching nothing (no group-internal band) or
-# refusing a layout without one, and staff sets that nft would reject.
-def test_tailnet_internal_vlans_follow_the_group_internal_band_plus_listed_tags():
+# Catches missing or malformed protection data reaching the jumpbox: the
+# file must name both keys, VLAN tags 2-4094 and single node addresses only
+# (never a network such as a whole tailnet or a default route).
+@pytest.mark.parametrize("text", [
+    "", "{not json", "[]", '{"vlans": [400]}', '{"staff_ips": []}',
+    '{"vlans": [400], "staff_ips": [], "extra": 1}', '{"vlans": "400", "staff_ips": []}',
+    '{"vlans": [1], "staff_ips": []}', '{"vlans": [4095], "staff_ips": []}',
+    '{"vlans": [true], "staff_ips": []}', '{"vlans": [400], "staff_ips": ["100.64.0.0/10"]}',
+    '{"vlans": [400], "staff_ips": ["0.0.0.0/0"]}', '{"vlans": [], "staff_ips": ["nope"]}',
+    '{"vlans": [], "staff_ips": ["100.64.0.10/32"]}'])
+def test_protection_data_is_validated_before_anything_renders(text):
+    with pytest.raises(ValueError):
+        _netgen().parse_protection(text)
+
+
+def test_protection_data_parses_and_an_empty_set_protects_nothing():
     ng = _netgen()
-    no_groups = ng.parse_bands("entry:100-199:0:0 internal:200-299:100:1")
-    assert ng.tailnet_internal_vlans(no_groups) == []
-    assert ng.tailnet_internal_vlans(no_groups, extra=[260, 250, 260]) == [250, 260]
+    assert ng.parse_protection('{"vlans": [450, 400, 400], "staff_ips": ["fd7a::1", "100.64.0.10"]}') \
+        == ([400, 450], ["100.64.0.10", "fd7a::1"])
     text = ng.render_lab_egress([400])
     assert _nft_structure(text)[3] == TAILNET_RULES + EGRESS_RULES
-    sets = _nft_sets(text)
-    assert sets == {"tailnet_internal": ["vlan400"], "tailnet_staff_v4": [], "tailnet_staff_v6": []}
-    # nft rejects an empty element list, so an empty staff set has none.
+    assert _nft_sets(text) == {"tailnet_internal": ["vlan400"], "tailnet_staff_v4": [],
+                               "tailnet_staff_v6": []}
     assert "elements = { }" not in text
     assert _nft_structure(ng.render_lab_egress([]))[3] == EGRESS_RULES
-    with pytest.raises(ValueError):
-        ng.render_lab_egress([400], staff_ips=["not-an-address"])
+    for bad in (["not-an-address"], ["100.64.0.0/10"]):
+        with pytest.raises(ValueError):
+            ng.render_lab_egress([], staff_ips=bad)
 
 
-def test_netgen_cli_renders_the_tailnet_internal_drop_from_the_bands():
-    out = subprocess.run(["python3", str(NETGEN), "lab-egress", "--bands", _netgen().DEFAULT_BANDS,
-                          "--deny-vlans", "250", "--staff-ips", "100.64.0.10"],
+def test_netgen_cli_renders_the_lab_egress_table_from_a_protection_file(tmp_path):
+    good = tmp_path / "protection.json"
+    good.write_text('{"vlans": [250, 400], "staff_ips": ["100.64.0.10"]}')
+    out = subprocess.run(["python3", str(NETGEN), "lab-egress", "--protection", str(good)],
                          capture_output=True, text=True, check=True).stdout
     assert _nft_structure(out)[3] == TAILNET_RULES + EGRESS_RULES
     sets = _nft_sets(out)
-    assert sets["tailnet_internal"] == [f"vlan{t}" for t in [250, *range(400, 501)]]
+    assert sets["tailnet_internal"] == ["vlan250", "vlan400"]
     assert sets["tailnet_staff_v4"] == ["100.64.0.10"]
-    bad = subprocess.run(["python3", str(NETGEN), "lab-egress", "--deny-vlans", "1"],
-                         capture_output=True, text=True)
-    assert bad.returncode == 2 and "ERROR" in bad.stderr
+    for args in ([], ["--protection", str(tmp_path / "absent.json")]):
+        bad = subprocess.run(["python3", str(NETGEN), "lab-egress", *args],
+                             capture_output=True, text=True)
+        assert bad.returncode == 2 and "ERROR" in bad.stderr, args
 
 
 def test_allow_vlans_exempts_listed_tags_between_vlans_only():
@@ -1243,28 +1271,59 @@ def test_portal_and_jumpbox_reject_the_same_bad_bands(spec):
         parse_vlan_bands(spec)
 
 
-@pytest.mark.parametrize("render,nft_file,table", [
-    ("render_vlan_isolation_unit", "/etc/nftables.d/jumpbox-vlan-isolation.nft", "jumpbox_vlan_isolation"),
-    ("render_lab_egress_unit", "/etc/nftables.d/jumpbox-lab-egress.nft", "jumpbox_lab_egress"),
-])
-def test_nft_table_units_are_persistent_and_reloadable(render, nft_file, table):
+def _unit(text):
     parser = configparser.ConfigParser(strict=False, interpolation=None)
     parser.optionxform = str
-    parser.read_string(getattr(_netgen(), render)())
+    parser.read_string(text)
+    return parser
+
+
+FORWARDING = "net.ipv4.ip_forward={0} net.ipv6.conf.all.forwarding={0}"
+
+
+# Catches a boot or a failed load that forwards lab traffic unfiltered. The
+# egress unit switches both forwarding sysctls off, loads its table, and
+# switches them on only when the load succeeded (ExecStartPost runs only after
+# a successful ExecStart); it runs after systemd-sysctl, so no sysctl file can
+# switch forwarding on behind it, and stopping it switches forwarding off.
+def test_the_lab_egress_unit_owns_forwarding_and_enables_it_only_after_a_successful_load():
+    nft_file = "/etc/nftables.d/jumpbox-lab-egress.nft"
+    parser = _unit(_netgen().render_lab_egress_unit())
     service = parser["Service"]
     assert service["Type"] == "oneshot" and service["RemainAfterExit"] == "yes"
+    assert service["ExecStartPre"] == f"/usr/sbin/sysctl -w {FORWARDING.format(0)}"
     assert service["ExecStart"] == f"/usr/sbin/nft -f {nft_file}"
+    assert service["ExecStartPost"] == f"/usr/sbin/sysctl -w {FORWARDING.format(1)}"
     assert service["ExecReload"] == f"/usr/sbin/nft -f {nft_file}"
-    assert service["ExecStop"] == f"-/usr/sbin/nft delete table inet {table}"
-    assert parser["Install"]["WantedBy"] == "multi-user.target"
-    # Catches a boot that switches IP forwarding on (systemd-sysctl applies
-    # 90-jumpbox-router.conf) before the table that filters forwarded lab
-    # traffic is loaded, which would forward lab traffic unfiltered for a moment.
+    stop = _unit_values(_netgen().render_lab_egress_unit(), "ExecStop")
+    assert stop == [f"/usr/sbin/sysctl -w {FORWARDING.format(0)}",
+                    "-/usr/sbin/nft delete table inet jumpbox_lab_egress"]
     unit = parser["Unit"]
     assert unit["DefaultDependencies"] == "no"
-    assert unit["Before"].split() == ["systemd-sysctl.service", "network-pre.target"]
+    assert unit["After"] == "systemd-sysctl.service"
+    assert unit["Before"] == "network-pre.target"
     assert unit["Wants"] == "network-pre.target"
-    # nft and the rule file must be mounted, and nothing later than that.
+    assert unit["RequiresMountsFor"].split() == ["/usr/sbin/nft", "/usr/sbin/sysctl", nft_file]
+    assert parser["Install"]["WantedBy"] == "multi-user.target"
+
+
+def _unit_values(text, key):
+    return [line.split("=", 1)[1] for line in text.splitlines() if line.startswith(f"{key}=")]
+
+
+# Catches the VLAN isolation table (J2) loading after forwarding is switched on.
+def test_the_vlan_isolation_unit_loads_before_forwarding_and_never_touches_it():
+    nft_file = "/etc/nftables.d/jumpbox-vlan-isolation.nft"
+    text = _netgen().render_vlan_isolation_unit()
+    parser = _unit(text)
+    service = parser["Service"]
+    assert service["ExecStart"] == f"/usr/sbin/nft -f {nft_file}"
+    assert service["ExecReload"] == f"/usr/sbin/nft -f {nft_file}"
+    assert service["ExecStop"] == "-/usr/sbin/nft delete table inet jumpbox_vlan_isolation"
+    assert "sysctl" not in text
+    unit = parser["Unit"]
+    assert unit["DefaultDependencies"] == "no"
+    assert unit["Before"].split() == ["jumpbox-lab-egress.service", "network-pre.target"]
     assert unit["RequiresMountsFor"].split() == ["/usr/sbin/nft", nft_file]
     assert "After" not in unit
 
@@ -1279,10 +1338,6 @@ def test_netgen_cli_emits_the_isolation_table_and_unit():
     bad = subprocess.run(["python3", str(NETGEN), "isolate-vlans", "--allow-vlans", "1"],
                          capture_output=True, text=True)
     assert bad.returncode == 2 and "ERROR" in bad.stderr
-    egress = subprocess.run(["python3", str(NETGEN), "lab-egress"],
-                            capture_output=True, text=True, check=True).stdout
-    # The default layout has a group-internal band, so the tailnet drop is in.
-    assert _nft_structure(egress)[3] == TAILNET_RULES + EGRESS_RULES
     unit = subprocess.run(["python3", str(NETGEN), "lab-egress-unit"],
                           capture_output=True, text=True, check=True).stdout
     assert "jumpbox-lab-egress.nft" in unit

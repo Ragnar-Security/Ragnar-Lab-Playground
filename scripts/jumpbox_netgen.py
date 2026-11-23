@@ -30,6 +30,7 @@ Ubuntu jumpbox.
 import argparse
 import difflib
 import ipaddress
+import json
 import re
 import sys
 
@@ -210,9 +211,8 @@ def render_dnsmasq(mgmt_if, bands, upstreams, reservations=(), start=DEFAULT_DHC
 def render_sysctl():
     return "\n".join([
         f"# {HEADER}",
-        "# The jumpbox routes between the lab VLANs and the tailnet.",
-        "net.ipv4.ip_forward = 1",
-        "net.ipv6.conf.all.forwarding = 1",
+        "# The jumpbox routes between the lab VLANs and the tailnet. Forwarding is",
+        "# switched on by jumpbox-lab-egress.service once its table has loaded, never here.",
         "# Loose reverse-path filtering: replies to tailnet clients arrive on a",
         "# VLAN interface but route back out tailscale0.",
         "net.ipv4.conf.all.rp_filter = 2",
@@ -259,8 +259,9 @@ EGRESS_TABLE = "jumpbox_lab_egress"
 EGRESS_NFT_FILE = "/etc/nftables.d/jumpbox-lab-egress.nft"
 # The only interface routed lab traffic may leave through, other than a VLAN.
 TAILNET_IF = "tailscale0"
-# The band whose networks the tailnet may not reach through the jumpbox.
-TAILNET_INTERNAL_BAND = "group-internal"
+# Where scripts/apply_headscale_policy.sh installs the protected VLANs and staff
+# exemptions it derived from the portal's assignments (headscale_policy.py protection).
+PROTECTION_FILE = "/etc/jumpbox/tailnet-protection.json"
 
 
 def _staff_networks(addresses):
@@ -425,16 +426,43 @@ def render_vlan_isolation(allow_vlans=()):
     return "\n".join(lines) + "\n"
 
 
-def tailnet_internal_vlans(bands, extra=()):
-    """VLAN tags the tailnet may not reach through the jumpbox: every tag of the
-    group-internal band plus `extra` (for example a KOTH game's internal VLAN
-    placed in another band), sorted and de-duplicated."""
-    tags = {tag for band in bands if band.name == TAILNET_INTERNAL_BAND for tag in band.tags()}
-    for tag in extra:
-        if isinstance(tag, bool) or not isinstance(tag, int) or not 2 <= tag <= 4094:
-            raise ValueError(f"VLAN tag {tag!r} must satisfy 2 <= tag <= 4094")
-        tags.add(tag)
-    return sorted(tags)
+def _vlan_tag(tag):
+    if isinstance(tag, bool) or not isinstance(tag, int) or not 2 <= tag <= 4094:
+        raise ValueError(f"VLAN tag {tag!r} must satisfy 2 <= tag <= 4094")
+    return tag
+
+
+def _staff_addresses(addresses):
+    """Single staff node addresses (never a network) as sorted IPv4 and IPv6 lists."""
+    v4, v6 = set(), set()
+    for raw in addresses:
+        try:
+            address = ipaddress.ip_address(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"staff exemption {raw!r} is not a single IPv4 or IPv6 address") from None
+        (v4 if address.version == 4 else v6).add(address)
+    return [str(a) for a in sorted(v4)], [str(a) for a in sorted(v6)]
+
+
+def parse_protection(text):
+    """The protection file: (protected VLAN tags, staff addresses).
+
+    Exactly two keys: `vlans`, every group's and non-ended KOTH game's internal
+    VLAN tag, and `staff_ips`, single node addresses still allowed to and from
+    them. Anything else, or a missing or unreadable file, installs nothing:
+    without it the jumpbox would not know which networks to keep from the tailnet.
+    """
+    try:
+        data = json.loads(text)
+    except ValueError:
+        raise ValueError("the protection file is not JSON") from None
+    if not isinstance(data, dict) or set(data) != {"vlans", "staff_ips"}:
+        raise ValueError("the protection file must be an object with exactly vlans and staff_ips")
+    vlans, staff = data["vlans"], data["staff_ips"]
+    if not isinstance(vlans, list) or not isinstance(staff, list):
+        raise ValueError("the protection file's vlans and staff_ips must be lists")
+    v4, v6 = _staff_addresses(staff)
+    return sorted({_vlan_tag(tag) for tag in vlans}), v4 + v6
 
 
 def _nft_set(name, kind, elements, interval=False):
@@ -469,9 +497,9 @@ def render_lab_egress(internal_vlans=(), staff_ips=()):
              f"delete table inet {EGRESS_TABLE}",
              f"table inet {EGRESS_TABLE} {{"]
     rules = []
+    v4, v6 = _staff_addresses(staff_ips)
     if internal_vlans:
-        names = [f'"vlan{tag}"' for tag in tailnet_internal_vlans((), internal_vlans)]
-        v4, v6 = _staff_networks(staff_ips)
+        names = [f'"vlan{tag}"' for tag in sorted({_vlan_tag(tag) for tag in internal_vlans})]
         lines += [_nft_set("tailnet_internal", "ifname", names),
                   _nft_set("tailnet_staff_v4", "ipv4_addr", v4, interval=True),
                   _nft_set("tailnet_staff_v6", "ipv6_addr", v6, interval=True)]
@@ -493,28 +521,55 @@ def render_lab_egress(internal_vlans=(), staff_ips=()):
     return "\n".join(lines) + "\n"
 
 
-def _nft_table_unit(description, nft_file, table):
+FORWARDING_SYSCTLS = ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding")
+
+
+def _forwarding(value):
+    return "/usr/sbin/sysctl -w " + " ".join(f"{name}={value}" for name in FORWARDING_SYSCTLS)
+
+
+def _nft_table_unit(description, nft_file, table, forwarding=False):
+    """A oneshot unit that loads one nft table at boot, ahead of the network.
+
+    The lab egress unit (`forwarding`) owns IP forwarding: it switches both
+    forwarding sysctls off, loads its table, and switches them on only after
+    the load succeeded (ExecStartPost runs only after a successful ExecStart),
+    so a failed load leaves the jumpbox forwarding nothing. It runs after
+    systemd-sysctl.service, so no sysctl file can switch forwarding on behind
+    it. Other tables load before it, so they are in place when forwarding starts.
+    """
     if not re.match(r"^/[A-Za-z0-9_./-]+$", nft_file):
         raise ValueError(f"invalid nft file path {nft_file!r}")
+    if forwarding:
+        order = ["RequiresMountsFor=/usr/sbin/nft /usr/sbin/sysctl " + nft_file,
+                 "Wants=network-pre.target",
+                 "After=systemd-sysctl.service",
+                 "Before=network-pre.target"]
+        start = [f"ExecStartPre={_forwarding(0)}",
+                 f"ExecStart=/usr/sbin/nft -f {nft_file}",
+                 f"ExecStartPost={_forwarding(1)}"]
+        stop = [f"ExecStop={_forwarding(0)}"]
+    else:
+        order = [f"RequiresMountsFor=/usr/sbin/nft {nft_file}",
+                 "Wants=network-pre.target",
+                 "Before=jumpbox-lab-egress.service network-pre.target"]
+        start = [f"ExecStart=/usr/sbin/nft -f {nft_file}"]
+        stop = []
     return "\n".join([
         f"# {HEADER}",
         "[Unit]",
         f"Description={description}",
-        # Before systemd-sysctl.service, which switches IP forwarding on
-        # (90-jumpbox-router.conf), so lab traffic is never forwarded unfiltered;
-        # and before the network. It needs only nft and its rule file mounted.
         "DefaultDependencies=no",
-        f"RequiresMountsFor=/usr/sbin/nft {nft_file}",
-        "Wants=network-pre.target",
-        "Before=systemd-sysctl.service network-pre.target",
+        *order,
         "",
         "[Service]",
         "Type=oneshot",
         "RemainAfterExit=yes",
-        f"ExecStart=/usr/sbin/nft -f {nft_file}",
+        *start,
         # Reload swaps the table in one transaction; a restart would run ExecStop first
         # and leave the table missing until ExecStart.
         f"ExecReload=/usr/sbin/nft -f {nft_file}",
+        *stop,
         f"ExecStop=-/usr/sbin/nft delete table inet {table}",
         "",
         "[Install]",
@@ -528,8 +583,9 @@ def render_vlan_isolation_unit(nft_file=VLAN_NFT_FILE):
 
 
 def render_lab_egress_unit(nft_file=EGRESS_NFT_FILE):
-    return _nft_table_unit("Let routed lab VLAN traffic leave the jumpbox only to the tailnet (nftables)",
-                           nft_file, EGRESS_TABLE)
+    return _nft_table_unit("Let routed lab VLAN traffic leave the jumpbox only to the tailnet, "
+                           "then switch IP forwarding on (nftables)",
+                           nft_file, EGRESS_TABLE, forwarding=True)
 
 
 def unified_diff(path, current, generated):
@@ -557,10 +613,8 @@ def main(argv=None):
     parser.add_argument("--dhcp-end", type=int, default=DEFAULT_DHCP_END)
     parser.add_argument("--lease", default=DEFAULT_LEASE)
     parser.add_argument("--routes", default="10.0.0.0/8")
-    parser.add_argument("--staff-ips", default="",
-                        help="ssh-filter, lab-egress: comma/space separated")
-    parser.add_argument("--deny-vlans", default="",
-                        help="lab-egress: tags/ranges the tailnet may not reach, beyond the group-internal band")
+    parser.add_argument("--staff-ips", default="", help="ssh-filter: comma/space separated")
+    parser.add_argument("--protection", help="lab-egress: the protection file (JSON)")
     parser.add_argument("--ports", default="", help="ssh-filter: comma/space separated, default 22")
     parser.add_argument("--nft-file")
     parser.add_argument("--allow-vlans", default="", help="isolate-vlans: tags/ranges exempt from the drop")
@@ -617,8 +671,14 @@ def main(argv=None):
             elif args.what == "routes":
                 out = ",".join(advertised_routes(bands)) + "\n"
             elif args.what == "lab-egress":
-                internal = tailnet_internal_vlans(bands, parse_vlan_list(args.deny_vlans))
-                out = render_lab_egress(internal, _split(args.staff_ips))
+                if not args.protection:
+                    raise ValueError("lab-egress needs --protection FILE")
+                try:
+                    with open(args.protection, encoding="utf-8") as fh:
+                        text = fh.read()
+                except OSError as exc:
+                    raise ValueError(f"{args.protection}: {exc.strerror}") from None
+                out = render_lab_egress(*parse_protection(text))
             elif args.what == "netplan":
                 out = render_netplan(args.mgmt_if, args.trunk_if, bands)
             else:
