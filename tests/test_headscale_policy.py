@@ -1,7 +1,6 @@
 """The per-student Headscale policy renderer (pure) and its CLI."""
 
 import copy
-import ipaddress
 import json
 import subprocess
 import sys
@@ -14,9 +13,7 @@ import pytest
 # bands with its own parser: dataclass equality is per class object.
 from scripts.headscale_policy import (
     PolicyBands,
-    advertised_routes,
     canonical,
-    cloud_slot_cidr,
     missing_peers,
     normalize_login,
     parse_vlan_bands,
@@ -47,11 +44,12 @@ SLOTS = {
 }
 DEFAULT_POLICY_BANDS = PolicyBands(tuple(parse_vlan_bands(DEFAULT_BANDS)), proxmox_enabled=True)
 # Own entry 100 and internal 200 plus the group's entry 300; never the
-# group's internal 400, which members reach only by pivoting.
+# group's internal 400 on Proxmox, which members reach only by pivoting. The
+# cloud slots are the previous release's: the group's 300 and 400 alike.
 EXPECTED_ALICE_CIDRS = [
     "10.100.0.0/24", "10.100.1.0/24", "10.100.2.0/24",
-    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26",
-    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26",
+    "172.20.25.0/26", "172.20.50.0/26", "172.20.75.0/26", "172.20.100.0/26",
+    "172.21.25.0/26", "172.21.50.0/26", "172.21.75.0/26", "172.21.100.0/26",
 ]
 SELF_RULE = {"action": "accept", "src": ["autogroup:member"], "dst": ["autogroup:self:*"]}
 
@@ -105,9 +103,9 @@ def test_empty_or_malformed_login_is_rejected(raw):
 
 
 # Catches KOTH players losing reachability to the arena once the blanket rule
-# is gone, (D-plan F2) a KOTH box any player has rooted reaching every
-# player's devices through the reverse rule, and a player reaching the
-# arena's internal network without pivoting through a box they hold.
+# is gone, a KOTH box any player has rooted reaching every player's devices
+# through the reverse rule, and a player reaching the arena's internal network
+# without pivoting through a box they hold.
 def test_every_roster_login_gets_the_non_ended_koth_entry_block_on_proxmox_only():
     slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, {"aws": "172.20.0.0/16"})
@@ -277,19 +275,42 @@ def test_group_membership_grants_only_that_groups_blocks():
 
 
 # Catches a group member or KOTH player reaching a group or arena internal
-# network directly, in either direction and on any backend: those networks are
-# reached only by pivoting through a host on the entry network. A student's
-# own internal network stays granted.
-def test_group_and_koth_internal_networks_are_never_granted_in_either_direction():
+# network on Proxmox directly, in either direction: those networks are reached
+# only by pivoting through a host on the entry network. A student's own
+# internal network stays granted. Cloud slots are not covered (yet): they keep
+# the previous release's grants, the group's internal slot included.
+def test_proxmox_group_and_koth_internal_networks_are_never_granted_in_either_direction():
     slots = {**SLOTS, "koth": [{"game_id": 1, "entry_vlan": 350, "internal_vlan": 450}]}
     policy = render(BASE, slots, DEFAULT_POLICY_BANDS, CLOUDS)
-    withheld = {"10.100.4.0/24", "10.150.4.0/24",  # group 400, KOTH 450 on Proxmox
-                "172.20.100.0/26", "172.21.100.0/26"}  # group 400 on each cloud
+    withheld = {"10.100.4.0/24", "10.150.4.0/24"}  # group 400, KOTH 450
     for rule in policy["acls"][2:]:
         granted = set(rule["src"]) | {d.rsplit(":", 1)[0] for d in rule["dst"]}
         assert not withheld & granted, rule
     for login, own_internal in (("alice@", "10.100.1.0/24"), ("bob@", "10.101.1.0/24")):
         assert f"{own_internal}:*" in _forward(policy, login)["dst"]
+    assert "172.20.100.0/26:*" in _forward(policy, "alice@")["dst"]
+
+
+def _fixture(name):
+    return (ROOT / "tests" / "fixtures" / name).read_text()
+
+
+# Catches a change to any cloud grant. The fixtures are the previous release's
+# renders: a cloud-only site with groups and a KOTH game renders byte for byte
+# the same, and a mixed site differs only by the withheld Proxmox internal
+# networks (two groups' and one KOTH game's).
+def test_cloud_grants_are_byte_identical_to_the_previous_release():
+    slots = json.loads(_fixture("cloud_only_slots.json"))
+    assert canonical(render(BASE, slots, *policy_inputs(slots))) == \
+        _fixture("cloud_only_policy_previous_release.json")
+
+    slots = json.loads(_fixture("mixed_slots.json"))
+    previous = json.loads(_fixture("mixed_policy_previous_release.json"))
+    withheld = {"10.100.4.0/24", "10.101.4.0/24", "10.150.4.0/24"}
+    for rule in previous["acls"]:
+        rule["src"] = [s for s in rule["src"] if s not in withheld]
+        rule["dst"] = [d for d in rule["dst"] if d.rsplit(":", 1)[0] not in withheld]
+    assert render(BASE, slots, *policy_inputs(slots)) == previous
 
 
 # Catches an empty dst list (invalid policy) for a student with nothing routed.
@@ -483,48 +504,3 @@ def test_an_individual_only_site_renders_byte_identical_to_the_previous_release(
     result = _cli("render", str(base), str(slots_file))
     assert (result.returncode, result.stdout) == (0, expected)
 
-
-# ---- routes: what each subnet router advertises ----------------------------
-
-# Catches a cloud router advertising its whole base again. Headscale hands a
-# client every advertised route that overlaps a network it is granted, so a
-# /16 would put every group internal slot in a member's route table and
-# shadow the route the member adds for a pivot tunnel. Each band's slots are
-# advertised separately, so a route never spans two bands.
-@pytest.mark.parametrize("backend", ["aws", "gcp"])
-def test_a_cloud_router_advertises_each_band_separately_never_its_whole_base(backend):
-    routes = advertised_routes(DEFAULT_POLICY_BANDS, backend, CLOUDS)
-    nets = [ipaddress.ip_network(r) for r in routes]
-    base = ipaddress.ip_network(CLOUDS[backend])
-    assert base not in nets and all(n.subnet_of(base) for n in nets)
-    for band in DEFAULT_POLICY_BANDS.values:
-        slots = [ipaddress.ip_network(cloud_slot_cidr(CLOUDS[backend], t))
-                 for t in range(band.first, band.last + 1)]
-        covering = [n for n in nets if any(s.subnet_of(n) for s in slots)]
-        # Exactly this band's slots, nothing of another band's.
-        assert sum(n.num_addresses for n in covering) == sum(s.num_addresses for s in slots)
-        assert all(any(s.subnet_of(n) for n in covering) for s in slots)
-    # A group's internal slot is never inside a route that also covers its entry slot.
-    entry, internal = (ipaddress.ip_network(cloud_slot_cidr(CLOUDS[backend], t)) for t in (300, 400))
-    assert not [n for n in nets if entry.subnet_of(n) and internal.subnet_of(n)]
-
-
-# Catches the jumpbox and the policy script disagreeing on the Proxmox routes.
-def test_proxmox_routes_are_one_slash24_per_band_vlan():
-    routes = advertised_routes(DEFAULT_POLICY_BANDS, "proxmox", CLOUDS)
-    assert len(routes) == 401
-    assert routes[0] == "10.100.0.0/24" and "10.100.4.0/24" in routes and "10.0.0.0/8" not in routes
-
-
-def test_cli_routes_prints_one_comma_separated_line(tmp_path):
-    slots = tmp_path / "slots.json"
-    slots.write_text(json.dumps(SLOTS))
-    for backend in ("proxmox", "aws", "gcp"):
-        result = _cli("routes", str(slots), backend)
-        assert result.returncode == 0, result.stderr
-        bands, cidrs = policy_inputs(SLOTS)
-        assert result.stdout == ",".join(advertised_routes(bands, backend, cidrs)) + "\n"
-    disabled = tmp_path / "aws-only.json"
-    disabled.write_text(json.dumps({**SLOTS, "config": {**SLOTS["config"], "enabled_backends": ["aws"]}}))
-    result = _cli("routes", str(disabled), "gcp")
-    assert result.returncode != 0 and result.stdout == "" and "gcp" in result.stderr

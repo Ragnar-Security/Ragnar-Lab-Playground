@@ -574,7 +574,10 @@ AWS_ROUTER_INSTANCE_ID=                    # empty: the VPN does the routing
   empty or absent.
 
 **The isolation trade-off, plainly:** on the tailnet, the Headscale policy
-lets each student reach only their own and their groups' slots. Another VPN
+lets each student reach only their own and their groups' slots. Group and
+KOTH internal-network isolation (reached only through a pivot) is enforced
+on the Proxmox labs through Headscale only; it is not enforced through
+another VPN. Another VPN
 has no such per-student policy here: **any connected VPN user can reach any
 lab VM's address.** Labs remain isolated from each other (each deployment's
 security group admits only itself and the client networks) and have no
@@ -649,26 +652,17 @@ routing.
 ## Router Tailscale flags
 
 Each cloud router joins the same Headscale as the jumpbox, with
-`tag:jumpbox`, and advertises its bands' slots, never its whole cloud base.
-Headscale sends a client every advertised route that overlaps a network the
-policy grants it, so a covering `/16` would put every group's internal slots
-in a member's route table and shadow the route the member adds for a pivot
-tunnel. `scripts/headscale_policy.py routes` prints the list from the
-portal's slots export (each band's `/26` slots, collapsed within that band
-only: 21 routes for the default bands); a client then receives only the
-routes of the slots it is granted:
+`tag:jumpbox`, and advertises its whole cloud base; the per-student policy
+narrows what each student may use:
 
 ```bash
-# On the operator workstation, from the portal's export (scripts/export_network_slots.py)
-python3 scripts/headscale_policy.py routes slots.json aws   # or gcp
 # AWS router (AWS_LAB_CIDR)
-sudo tailscale up --login-server=<headscale-url> --advertise-routes=<the printed list> \
+sudo tailscale up --login-server=<headscale-url> --advertise-routes=172.20.0.0/16 \
   --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false
-# GCP router (GCP_LAB_CIDR): the same, with the gcp list
+# GCP router (GCP_LAB_CIDR)
+sudo tailscale up --login-server=<headscale-url> --advertise-routes=172.21.0.0/16 \
+  --advertise-tags=tag:jumpbox --snat-subnet-routes=false --stateful-filtering=false
 ```
-
-Re-run `tailscale set --advertise-routes=<list>` on the router after a
-`VLAN_BANDS` change.
 
 Join with a short-lived, single-use pre-auth key **created with
 `--tags tag:jumpbox`**, for a user that `tagOwners` lets own `tag:jumpbox`:
@@ -691,12 +685,11 @@ Headscale host:
 
 ```bash
 headscale nodes list-routes
-headscale nodes approve-routes --identifier <router-node-id> --routes <the printed list>
+headscale nodes approve-routes --identifier <router-node-id> --routes <cloud-cidr>
 ```
 
 or add `"autoApprovers": {"routes": {"<cloud-cidr>": ["tag:jumpbox"]}}` to
-the base policy: an autoApprovers prefix approves every advertised route
-inside it.
+the base policy.
 
 **Router host input filter (required before students use the cloud).** A
 student may reach every `tag:jumpbox` node's own tailnet address while the
@@ -1077,14 +1070,20 @@ What the policy grants:
 
 - Each roster login `<login>@` reaches its own entry and internal slots, its
   groups' entry slots, and the entry block of **every KOTH game whose status
-  is not `ended`** (Proxmox only, since KOTH runs only there). Only slots
-  inside `VLAN_BANDS` are granted, the same kinds on every backend. The
-  login's own blocks and its groups' entry blocks may connect back to that
-  login's own devices only. KOTH blocks may not connect back at all: a box
-  any player has rooted must not reach every player's devices.
-- **A group's or KOTH game's internal network is never granted, in either
-  direction.** Players reach it only by pivoting through a host they hold on
-  the entry network. Its tag is still checked for clashes.
+  is not `ended`** (Proxmox only, since KOTH runs only there). On a cloud
+  backend it also reaches its groups' internal slots (below). Only slots
+  inside `VLAN_BANDS` are granted. The login's own and groups' blocks may
+  connect back to that login's own devices only. KOTH blocks may not connect
+  back at all: a box any player has rooted must not reach every player's
+  devices.
+- **On Proxmox, a group's or KOTH game's internal network is never granted,
+  in either direction.** Players reach it only by pivoting through a host
+  they hold on the entry network; the jumpbox also drops tailnet traffic to
+  and from it (`docs/JUMPBOX.md`, "Lab egress"). **This is not yet enforced
+  on the cloud backends or through another VPN:** a group's AWS or GCP
+  internal slot is granted to its members as before, each cloud router
+  still advertises its whole base, and a VPN outside Headscale (below)
+  reaches every slot its routes and security groups admit.
 - **The render keeps every section and every `acls` rule of the base file,
   except the blanket rule whose `src` is exactly `["autogroup:member"]`,
   which it cuts down to its `autogroup:self` destinations.** Students keep

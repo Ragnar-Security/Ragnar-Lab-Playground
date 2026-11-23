@@ -4,7 +4,6 @@
     headscale_policy.py render BASE_POLICY.json SLOTS.json   # desired policy
     headscale_policy.py diff CURRENT.json DESIRED.json       # unified diff
     headscale_policy.py missing-peers NODES.json SLOTS.json STATUS.json
-    headscale_policy.py routes SLOTS.json BACKEND          # a router's --advertise-routes
 
 BASE_POLICY is the operator's policy file (config/headscale-acl.json): every
 section and every ACL rule is kept, except the blanket rule whose src is
@@ -16,12 +15,13 @@ per-student rules replace. SLOTS is scripts/export_network_slots.py
 output from the running portal; the backends, lab CIDRs and VLAN bands come
 only from it, so the policy grants exactly the networks that portal
 allocates. Each roster login gets one rule to its own entry and internal
-networks, its groups' entry networks, and every non-ended KOTH game's entry
-network (Proxmox only), plus the reverse rule back to its devices from its
-own networks and its groups' entry networks. A group's or KOTH game's
-internal network is never granted, in either direction: players reach it only
-by pivoting through a host they hold on the entry network. KOTH networks get
-no reverse rule: a box any player has rooted must not reach every player's
+networks, its groups' networks, and every non-ended KOTH game's entry network
+(Proxmox only), plus the reverse rule back to its devices from its own and its
+groups' networks. On Proxmox a group's or KOTH game's internal network is never
+granted, in either direction: players reach it only by pivoting through a host
+they hold on the entry network. The cloud backends do not enforce that yet: a
+group's cloud slots, internal included, are granted as before. KOTH networks
+get no reverse rule: a box any player has rooted must not reach every player's
 devices.
 
 missing-peers reads `headscale nodes list -o json`, the slots export and
@@ -149,52 +149,14 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
         others = {other: cidr for other, cidr in cloud_cidrs.items() if other != backend}
         validate_lab_cidr(backend, cloud_cidrs[backend], others=others)
 
-    owners: Dict[int, str] = {}
-
-    def claim(tag: int, owner: str) -> int:
-        if tag in owners:
-            raise ValueError(f"VLAN {tag} is assigned to both {owners[tag]} and {owner}")
-        owners[tag] = owner
-        return tag
-
-    granted: Dict[str, Set[int]] = {}
-    for user in _list(slots, "users"):
-        identity = normalize_login(user.get("login"))
-        if identity in granted:
-            raise ValueError(f"login {identity} appears twice in the roster")
-        granted[identity] = {claim(_tag(user, "entry_vlan", identity), identity),
-                             claim(_tag(user, "internal_vlan", identity), identity)}
-    slugs = set()
-    for group in _list(slots, "groups"):
-        slug = group.get("slug")
-        if not isinstance(slug, str) or not slug or slug in slugs:
-            raise ValueError(f"group slug {slug!r} is empty or repeated")
-        slugs.add(slug)
-        what = f"group {slug}"
-        # The internal tag is claimed (a clash is still refused) but never
-        # granted: members reach it only through a host on the entry network.
-        entry = claim(_tag(group, "entry_vlan", what), what)
-        claim(_tag(group, "internal_vlan", what), what)
-        members = group.get("members")
-        if not isinstance(members, list):
-            raise ValueError(f"{what} members must be a list")
-        for member in members:
-            identity = normalize_login(member)
-            if identity not in granted:
-                raise ValueError(f"{what} member {identity} is not on the roster")
-            granted[identity].add(entry)
-
-    koth: Set[int] = set()
-    for game in _list(slots, "koth"):
-        what = f"KOTH game {game.get('game_id')!r}"
-        koth.add(claim(_tag(game, "entry_vlan", what), what))
-        claim(_tag(game, "internal_vlan", what), what)
+    assigned = _assignments(slots)
     # KOTH is refused on the cloud backends, so its slots exist on Proxmox only.
-    koth_routed = routed_slots(koth, bands.values) if bands.proxmox_enabled else []
+    koth_routed = routed_slots(assigned.koth_entry, bands.values) if bands.proxmox_enabled else []
 
     acls = _base_rules(base_policy["acls"])
-    for identity in sorted(granted):
-        own = routed_slots(granted[identity], bands.values)
+    for identity in sorted(assigned.proxmox):
+        own = routed_slots(assigned.proxmox[identity], bands.values)
+        cloud_own = routed_slots(assigned.cloud[identity], bands.values)
         forward, reverse = [], []
         if bands.proxmox_enabled:
             for slot in sorted(set(own) | set(koth_routed)):
@@ -203,7 +165,7 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
                 if slot in own:
                     reverse.append(prefix)
         for backend in sorted(cloud_cidrs):
-            cloud = [cloud_slot_cidr(cloud_cidrs[backend], slot) for slot in own]
+            cloud = [cloud_slot_cidr(cloud_cidrs[backend], slot) for slot in cloud_own]
             forward += cloud
             reverse += cloud
         if not forward:
@@ -218,30 +180,68 @@ def render(base_policy: Mapping[str, Any], slots: Mapping[str, Any],
     return policy
 
 
-def advertised_routes(bands: PolicyBands, backend: str,
-                      cloud_cidrs: Mapping[str, str]) -> List[str]:
-    """What one backend's subnet router advertises: every band's networks, and
-    never a route that spans two bands.
+@dataclass(frozen=True)
+class Assignments:
+    """Who is granted which VLAN tags, from the portal's export.
 
-    Headscale sends a client each advertised route that overlaps a network the
-    policy grants it. A covering route (10.0.0.0/8, a cloud's whole base) would
-    put the withheld group and KOTH internal networks in a player's route table
-    and shadow the player's own route through a pivot host. Proxmox: one /24
-    per VLAN, the jumpbox's list. A cloud: each band's /26 slots, collapsed
-    within that band only.
+    `proxmox`: each login's own entry and internal tags plus its groups' entry
+    tags. `cloud`: the same plus its groups' internal tags; group isolation is
+    not enforced on the cloud backends yet, so they keep the earlier grants.
+    `koth_entry`: every non-ended KOTH game's entry tag (every login gets it).
+    `protected`: every group's and non-ended KOTH game's internal tag, which no
+    login is granted on Proxmox and the jumpbox drops to and from the tailnet.
     """
-    tags = [range(band.first, band.last + 1) for band in sorted(bands.values, key=lambda b: b.first)]
-    if backend == "proxmox":
-        if not bands.proxmox_enabled:
-            raise ValueError("proxmox is not an enabled backend in the slots export")
-        return [proxmox_slot_cidr(tag, bands.values) for band in tags for tag in band]
-    if backend not in cloud_cidrs:
-        raise ValueError(f"{backend} is not an enabled backend in the slots export")
-    routes = []
-    for band in tags:
-        slots = (ipaddress.ip_network(cloud_slot_cidr(cloud_cidrs[backend], tag)) for tag in band)
-        routes += [str(net) for net in ipaddress.collapse_addresses(slots)]
-    return routes
+    proxmox: Dict[str, Set[int]]
+    cloud: Dict[str, Set[int]]
+    koth_entry: Set[int]
+    protected: Set[int]
+
+
+def _assignments(slots: Mapping[str, Any]) -> Assignments:
+    owners: Dict[int, str] = {}
+
+    def claim(tag: int, owner: str) -> int:
+        if tag in owners:
+            raise ValueError(f"VLAN {tag} is assigned to both {owners[tag]} and {owner}")
+        owners[tag] = owner
+        return tag
+
+    proxmox: Dict[str, Set[int]] = {}
+    cloud: Dict[str, Set[int]] = {}
+    for user in _list(slots, "users"):
+        identity = normalize_login(user.get("login"))
+        if identity in proxmox:
+            raise ValueError(f"login {identity} appears twice in the roster")
+        proxmox[identity] = {claim(_tag(user, "entry_vlan", identity), identity),
+                             claim(_tag(user, "internal_vlan", identity), identity)}
+        cloud[identity] = set(proxmox[identity])
+    protected: Set[int] = set()
+    slugs = set()
+    for group in _list(slots, "groups"):
+        slug = group.get("slug")
+        if not isinstance(slug, str) or not slug or slug in slugs:
+            raise ValueError(f"group slug {slug!r} is empty or repeated")
+        slugs.add(slug)
+        what = f"group {slug}"
+        entry = claim(_tag(group, "entry_vlan", what), what)
+        internal = claim(_tag(group, "internal_vlan", what), what)
+        protected.add(internal)
+        members = group.get("members")
+        if not isinstance(members, list):
+            raise ValueError(f"{what} members must be a list")
+        for member in members:
+            identity = normalize_login(member)
+            if identity not in proxmox:
+                raise ValueError(f"{what} member {identity} is not on the roster")
+            proxmox[identity].add(entry)
+            cloud[identity] |= {entry, internal}
+
+    koth_entry: Set[int] = set()
+    for game in _list(slots, "koth"):
+        what = f"KOTH game {game.get('game_id')!r}"
+        koth_entry.add(claim(_tag(game, "entry_vlan", what), what))
+        protected.add(claim(_tag(game, "internal_vlan", what), what))
+    return Assignments(proxmox, cloud, koth_entry, protected)
 
 
 def _base_rules(base_acls: List[Mapping[str, Any]]) -> List[Dict[str, Any]]:
@@ -353,10 +353,6 @@ def main(argv=None) -> int:
     peers_cmd.add_argument("nodes")
     peers_cmd.add_argument("slots")
     peers_cmd.add_argument("status")
-    routes_cmd = commands.add_parser("routes",
-                                     help="print one backend router's advertised routes")
-    routes_cmd.add_argument("slots")
-    routes_cmd.add_argument("backend", choices=KNOWN_BACKENDS)
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
@@ -365,9 +361,6 @@ def main(argv=None) -> int:
         elif args.command == "missing-peers":
             output = "".join(f"{device}\n" for device in missing_peers(
                 _load(args.nodes), _load(args.slots), _load(args.status)))
-        elif args.command == "routes":
-            bands, cidrs = policy_inputs(_load(args.slots))
-            output = ",".join(advertised_routes(bands, args.backend, cidrs)) + "\n"
         else:
             output = policy_diff(_load(args.current), _load(args.desired))
     except ValueError as exc:
