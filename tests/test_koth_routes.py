@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app import create_app
+from app import create_app, network_protection
 from app.models import db, User, StudentGroup, KothGame
 from tests.backends.fake_backend import StaticInventoryBackend
 
@@ -745,6 +745,7 @@ class KothDeployTestCase(unittest.TestCase):
         g = KothGame(name='g', deployment_group_name='KOTH',
                      entry_vlan_tag=550, internal_vlan_tag=551, status='draft')
         db.session.add(g); db.session.commit()
+        network_protection.record([551])  # the apply script verified the arena's internal VLAN
         fake_cfg = {'deployment_groups': [{
             'display_name': 'KOTH', 'enabled': True, 'koth_mode': True,
             'uptime_minutes': 240,
@@ -887,6 +888,8 @@ def test_koth_cloud_group_redeploy_is_refused_before_teardown(app, admin_client)
 @pytest.mark.parametrize('action,status', [('deploy', 'draft'), ('redeploy', 'active')])
 def test_koth_deploys_name_proxmox_explicitly(app, admin_client, action, status):
     game_id = _commit_game(app, 'Proxmox KOTH', status=status)
+    with app.app_context():
+        network_protection.record([450])
     with patch('app.routes.koth_admin.load_template_config',
                return_value=proxmox_koth_catalog()), patch(
             'app.routes.koth_admin.deploy_bundle', return_value=[]) as deploy, patch(
@@ -895,3 +898,38 @@ def test_koth_deploys_name_proxmox_explicitly(app, admin_client, action, status)
         response = admin_client.post(f'/koth/api/games/{game_id}/{action}')
     assert response.status_code == 200, response.data
     assert deploy.call_args.kwargs['backend_name'] == 'proxmox'
+
+
+# Catches an arena deploying, or redeploying after a teardown, before the
+# jumpbox drop and the narrowed policy for its internal VLAN are verified:
+# players would reach the internal boxes straight from the VPN.
+@pytest.mark.parametrize('action,status', [('deploy', 'draft'), ('redeploy', 'active')])
+def test_koth_deploy_waits_until_its_internal_vlan_is_protected(app, admin_client, action, status):
+    game_id = _commit_game(app, 'Proxmox KOTH', status=status)
+    with patch('app.routes.koth_admin.load_template_config',
+               return_value=proxmox_koth_catalog()), patch(
+            'app.routes.koth_admin.deploy_bundle', return_value=[]) as deploy, patch(
+            'app.routes.koth_admin._destroy_game_vms', return_value=0) as destroy, patch(
+            'app.routes.koth_admin._start_scheduler'):
+        response = admin_client.post(f'/koth/api/games/{game_id}/{action}')
+    assert response.status_code == 409, response.data
+    assert '450' in response.get_json()['error']
+    assert 'apply_headscale_policy.sh' in response.get_json()['error']
+    assert not deploy.called and not destroy.called
+    with app.app_context():
+        assert db.session.get(KothGame, game_id).status == status
+
+
+# Catches a new game taking an entry VLAN the jumpbox still drops (an ended
+# game's or deleted group's internal VLAN before the next verified apply).
+def test_koth_game_cannot_take_a_protected_entry_vlan(app, admin_client):
+    with app.app_context():
+        network_protection.record([351])
+    with patch('app.routes.koth_admin.get_koth_defaults', return_value={}):
+        response = admin_client.post('/koth/api/games', json={
+            'name': 'Arena', 'deployment_group_name': 'Proxmox KOTH',
+            'entry_vlan_tag': 351, 'internal_vlan_tag': 451})
+    assert response.status_code == 409, response.data
+    assert 'protected' in response.get_json()['error']
+    with app.app_context():
+        assert KothGame.query.count() == 0
