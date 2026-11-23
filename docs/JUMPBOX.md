@@ -182,8 +182,9 @@ It writes:
 | `/etc/netplan/60-jumpbox-vlans.yaml` | management NIC on DHCP; trunk NIC unaddressed; one `vlan<N>` per lab VLAN with its `.1/24` |
 | `/etc/dnsmasq.d/jumpbox.conf` | `interface=vlan*` with `bind-dynamic`; `no-dhcp-interface` for the management NIC; `no-resolv` plus `JUMPBOX_DNS_UPSTREAM`; one `dhcp-range` per VLAN |
 | `/etc/systemd/system/dnsmasq.service.d/60-jumpbox-limits.conf` | `LimitNOFILE=65536`: dnsmasq opens a UDP and a TCP DNS socket for each VLAN's IPv4 and IPv6 link-local address, about 1,600 for the full band string, and fails with "Too many open files" at systemd's default soft limit of 1,024 |
-| `/etc/sysctl.d/90-jumpbox-router.conf` | `net.ipv4.ip_forward=1`, `net.ipv6.conf.all.forwarding=1`, `rp_filter=2` |
-| `/etc/nftables.d/jumpbox-lab-egress.nft`, `/etc/systemd/system/jumpbox-lab-egress.service` | the lab egress table, enabled and started before forwarding is switched on (below) |
+| `/etc/sysctl.d/90-jumpbox-router.conf` | `rp_filter=2` (forwarding is the lab egress unit's) |
+| `/etc/nftables.d/jumpbox-lab-egress.nft`, `/etc/systemd/system/jumpbox-lab-egress.service` | the lab egress table; its unit switches IP forwarding on only once the table has loaded (below) |
+| `/etc/jumpbox/tailnet-protection.json` | read, never written, by `jumpbox_configure.sh`: the protected VLANs and staff exemptions that `apply_headscale_policy.sh --apply` installs (below) |
 
 Behaviour to know:
 
@@ -221,12 +222,14 @@ jumpbox. The Headscale policy cannot stop this, since the traffic never
 touches the tailnet.
 
 So every `--apply` installs `inet jumpbox_lab_egress`, with its own oneshot
-unit `jumpbox-lab-egress.service`. At boot the unit loads the table before
-`systemd-sysctl.service` switches IP forwarding on, and before the network
-(`Before=systemd-sysctl.service network-pre.target`; it needs only `nft` and
-the rule file mounted), so lab traffic is never forwarded unfiltered. It needs `nft`:
-`--apply` refuses without it, and the dry run notes it. The table has a
-forward hook at priority -10, policy accept, and these rules:
+unit `jumpbox-lab-egress.service`. **The unit owns IP forwarding:** it runs
+after `systemd-sysctl.service` and before the network, switches both
+forwarding sysctls off, loads the table, and switches them on only when the
+load succeeded (`ExecStartPost` runs only after a successful `ExecStart`).
+Stopping it switches them off. No sysctl file sets forwarding, so a failed
+load leaves the jumpbox forwarding nothing. It needs `nft`: `--apply`
+refuses without it, and the dry run notes it. The table has a forward hook
+at priority -10, policy accept, and these rules:
 
 ```
 iifname "tailscale0" oifname @tailnet_internal ip saddr @tailnet_staff_v4 accept
@@ -248,29 +251,45 @@ forwarding). VLAN-to-VLAN traffic is not this table's business: `return` ends
 its chain, and the separate VLAN isolation table below (`--isolate-vlans`, J2)
 decides it. The jumpbox's own DHCP and DNS are untouched.
 
-**The tailnet never reaches an internal network directly.** The set
-`tailnet_internal` holds the `vlan<N>` interfaces of the `group-internal` band
-plus any tags in `JUMPBOX_TAILNET_DENY_VLANS`; traffic between `tailscale0`
-and those VLANs is counted and dropped in both directions. Players reach a
+**The tailnet never reaches a group or KOTH internal network directly
+(Proxmox).** Traffic between `tailscale0` and the VLANs in the set
+`tailnet_internal` is counted and dropped in both directions. Players reach a
 group's or KOTH game's internal network by pivoting through a host they hold
-on the entry network, which is VLAN-to-VLAN traffic (or the entry host's own
+on its entry network, which is VLAN-to-VLAN traffic (or the entry host's own
 second NIC), not tailnet traffic. This backs up the Headscale policy, which
-grants groups and KOTH games their entry network only. The exceptions are
-`JUMPBOX_TAILNET_STAFF_IPS` (the sets `tailnet_staff_v4` and
-`tailnet_staff_v6`): list the staff devices that need the internal networks,
-and **the portal host's tailnet address when you run KOTH**, because the
-service probes and beacon claims reach every box, internal ones included. A
-student's own entry and internal networks and a group's entry network are not
-in the set.
+grants groups and KOTH games their entry network only.
+
+The set is not configured on the jumpbox. `scripts/apply_headscale_policy.sh
+--apply` derives it from the portal's real assignments, every group's and
+non-ended KOTH game's internal VLAN wherever it lies, and installs it as
+`/etc/jumpbox/tailnet-protection.json` together with the rendered table;
+`jumpbox_configure.sh` renders the table from that same file and refuses to
+run without it or with a malformed one. On a new jumpbox, before the first
+policy apply, write `{"vlans": [], "staff_ips": []}` there.
+
+The exceptions (`tailnet_staff_v4` and `tailnet_staff_v6`) come from
+`JUMPBOX_TAILNET_STAFF_IPS` in the operator's `scripts/site.env`: single
+tailnet addresses only, never a network, and each must be a live Headscale
+node of a user who is not on the roster, or the apply script refuses. List the
+staff devices that need the internal networks and **the portal host's tailnet
+address when you run KOTH**, because its service probes and beacon claims
+reach every box, internal ones included. Empty means no exemption.
 
 ```bash
-# scripts/site.env
+# scripts/site.env, on the operator workstation
 JUMPBOX_TAILNET_STAFF_IPS="100.64.0.10,100.64.0.11"   # staff device, portal host
-JUMPBOX_TAILNET_DENY_VLANS="250"   # a KOTH internal VLAN outside the group-internal band
 ```
 
-Re-run `--apply` after changing either; a KOTH game whose internal VLAN lies in
-the `group-internal` band needs no entry.
+**Protected networks require a staff-only jumpbox.** A student who can log in
+to the jumpbox, or reach a proxy running on it, sends traffic from the
+jumpbox itself: outside its forward hook and with no entry host at all. So
+while any VLAN is protected, `apply_headscale_policy.sh` refuses unless the
+jumpbox has the staff-only SSH filter (below), the filter admits no roster
+device, and nothing but `sshd`, `dnsmasq`, `tailscaled` and the host's own
+resolver listens on a non-loopback address. Turn on `--ssh-staff-only` before
+enabling group or KOTH labs, and never run a proxy or a student login service
+there. The portal then refuses Proxmox group and KOTH deployments until the
+apply script has recorded their internal VLANs (`scripts/record_protected_vlans.py`).
 
 **Verify:** from a lab VM, a ping to the management gateway gets no reply,
 and the counter in `sudo nft list table inet jumpbox_lab_egress` rises. From
@@ -281,7 +300,8 @@ counter does, as does an empty `sudo tcpdump -ni <mgmt-if> src <lab-vm-address>`
 
 A lab VM can still reach the jumpbox itself (ping, and SSH on any of its
 addresses), which is input, not forwarding. `--ssh-staff-only` (below) closes
-SSH to everyone but staff; a changeover turns it on.
+SSH to everyone but staff; a changeover turns it on, and protected group or
+KOTH networks require it.
 
 **Reload, never restart** the unit (as for VLAN isolation below). Rolling it
 back is `sudo systemctl disable --now jumpbox-lab-egress.service` (ExecStop
@@ -524,6 +544,15 @@ and the management interface cannot be determined, since nobody could then log
 in. An empty staff list otherwise leaves SSH on loopback and the management
 interface only.
 
+**Required before group or KOTH labs (Proxmox).** A student with a shell on
+the jumpbox reaches every protected internal network from the jumpbox itself,
+with no entry host. While any group or KOTH internal VLAN is protected,
+`apply_headscale_policy.sh` checks the jumpbox and refuses unless this filter
+is loaded, `JUMPBOX_SSH_STAFF_IPS` names no roster device, and no service other
+than `sshd`, `dnsmasq`, `tailscaled` and the host resolver listens on a
+non-loopback address. The portal refuses Proxmox group and KOTH deployments
+until that apply has passed.
+
 **Ports.** The script collects every port sshd really listens on: the `port`
 and `listenaddress host:port` lines of `sshd -T` (`0.0.0.0:2222`, `[::]:2222`;
 a bare address means the `port` values apply) and the `ListenStream` entries of
@@ -646,7 +675,11 @@ watch `df -h /`. A full root stops dnsmasq from recording leases.
 ## Optional: student SSH accounts
 
 Students reach their VMs over the VPN routes and need no jumpbox login. Some
-courses do want accounts on the jumpbox itself. For those:
+courses do want accounts on the jumpbox itself. **Not on a jumpbox that
+carries group or KOTH labs:** a student shell there reaches every protected
+internal network without an entry host, so those labs require the staff-only
+SSH filter above, which keeps student accounts from logging in at all. For
+other courses:
 
 ```bash
 sudo JUMPBOX_CREDENTIALS_FILE=/root/jumpbox-credentials.csv \
